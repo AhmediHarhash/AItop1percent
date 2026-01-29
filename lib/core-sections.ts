@@ -70,6 +70,7 @@ export const coreSections: CoreSection[] = [
         slug: "ch5",
         subchapters: [
           { id: "5.1", title: "Data Sources", slug: "5-1" },
+          { id: "5.2", title: "Dataset Formats", slug: "5-2" },
         ],
       },
     ],
