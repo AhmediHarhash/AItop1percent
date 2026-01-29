@@ -1,20 +1,18 @@
 # Chapter 5.4 — Splits & Holdouts (Train/Dev/Eval Separation + Leakage Prevention)
 
 **What we're doing here:**
-If your evaluation data overlaps with training data, fine-tuning data, prompt templates, or RAG corpus — your metrics lie.
-If you can't reproduce a result because random seeds changed or tool responses varied — your evaluation is worthless.
+Here's a horror story that happens more than you'd think. A team fine-tunes their model and runs eval. Scores: 97%. They celebrate, ship to production. Users complain immediately. The model memorized the eval answers because the eval set leaked into fine-tuning data.
 
 Data contamination is the silent killer of eval credibility. You can have perfect metrics, perfect labeling, perfect coverage — but if your eval set leaked into training, you're measuring memorization, not capability.
 
-**Enterprise outcome:**
-A rigorously separated dataset architecture where training, development, and evaluation data never overlap — plus deterministic replay for every eval run so results are reproducible, debuggable, and trustworthy.
+This chapter covers how to keep training, development, and evaluation data completely separate — and how to make every eval run reproducible.
 
 ---
 
-## 1) Mechanics: why separation is non-negotiable
+## 1) Why separation is non-negotiable
 
-In classical ML, the train/test split rule is gospel.
-In enterprise AI (2026), the contamination surface is much larger:
+In classical ML, the train/test split rule is gospel. In enterprise AI (2026), the contamination surface is much larger:
+
 - **Fine-tuning data** overlaps with eval cases
 - **Prompt templates** include examples verbatim from the eval set
 - **RAG corpus** contains the exact text you're testing retrieval against
@@ -24,533 +22,112 @@ In enterprise AI (2026), the contamination surface is much larger:
 What happens when contamination occurs:
 - **Metrics inflate** — model scores 95% because it memorized the answers
 - **Regressions go undetected** — the model passes eval but fails new production cases
-- **Leadership gets misled** — approval decisions are based on fake performance
 - **Trust collapses** — when production quality doesn't match eval quality, nobody believes evals anymore
 
-**The 2026 reality:**
-With models trained on internet-scale corpora and fine-tuned on user data, contamination is not a rare edge case — it's the default unless you actively prevent it. Frontier model providers now routinely check for benchmark contamination in pre-training data. Enterprise teams must do the same for custom evals.
+With models trained on internet-scale corpora and fine-tuned on user data, contamination is not a rare edge case — it's the default unless you actively prevent it.
 
 ---
 
-## 2) The three splits (definitions + what they're for)
+## 2) The three splits
 
-### 2.1 Training / Fine-tuning data
-**Definition:** Data used to train or fine-tune the model — including base pre-training, instruction tuning, RLHF, and any domain adaptation.
+### Training / Fine-tuning data
+Data used to train or fine-tune the model — including base pre-training, instruction tuning, RLHF, and domain adaptation. This data must **never** appear in dev or eval sets, even paraphrased.
 
-**What it's for:**
-- Teaching the model patterns, facts, and behaviors
-- Improving specific capabilities (tool use, safety, domain knowledge)
-- Aligning model outputs to desired style or policy
+### Dev / Validation data
+Data used during development to tune prompts, adjust retrieval strategies, debug workflows, and iterate on system design. This data is "burned" for objective evaluation — because you've optimized against it. It should **never** be used for final quality metrics or release gates.
 
-**Critical rule:**
-This data must **never** appear in dev or eval sets, even paraphrased.
-
-### 2.2 Dev / Validation data
-**Definition:** Data used during development to tune prompts, adjust retrieval strategies, debug workflows, and iterate on system design.
-
-**What it's for:**
-- Prompt engineering and template optimization
-- Hyperparameter selection (retrieval K, temperature, top-P)
-- Agent workflow design and tool selection
-- Experimenting with new features or guardrails
-
-**Critical rule:**
-This data is "burned" for objective evaluation — because you've optimized against it. It should **never** be used for final quality metrics or release gates.
-
-### 2.3 Eval / Test data (the holdout)
-**Definition:** Data held out from all training, fine-tuning, and development activities — used only for final evaluation and release decisions.
-
-**What it's for:**
-- Measuring true model/system quality
-- Detecting regressions between versions
-- Generating metrics for release gates and leadership reporting
-- Validating that improvements on dev data generalize
-
-**Critical rule:**
-This data is **read-only**. Once you evaluate against it, you cannot modify the system based on those results and re-evaluate on the same set. If you do, it becomes dev data.
+### Eval / Test data (the holdout)
+Data held out from all training, fine-tuning, and development activities — used only for final evaluation and release decisions. This data is **read-only**. Once you evaluate against it, you cannot modify the system based on those results and re-evaluate on the same set. If you do, it becomes dev data.
 
 ---
 
-## 3) How contamination happens in 2026 (attack vectors)
+## 3) How contamination happens in 2026
 
-### 3.1 Prompt template overlap
-You write a prompt template like:
-```
-User query: {query}
-Answer format: {format}
-```
+**Prompt template overlap.** You write a prompt template, then use the same phrasing in your eval cases. The model has now seen the structure and specific phrasings during system design. Fix: treat prompt templates as versioned artifacts in the dataset registry.
 
-Then you use the same phrasing in your eval cases. The model has now seen the structure, cues, and even specific phrasings during system design.
+**Fine-tuning data includes eval cases.** A customer escalation becomes training data. Later, you add the same escalation to your eval set. Fix: hash-based deduplication across all splits before any data is used.
 
-**Fix:** Treat prompt templates as versioned artifacts in the dataset registry (see section 5).
+**Synthetic generation echoes eval patterns.** You generate synthetic cases using a prompt that samples from internet text including your public docs or leaked eval examples. Fix: track synthetic generation prompts and seeds; ensure the generator has not seen eval data.
 
-### 3.2 Fine-tuning data includes eval cases
-A customer escalation becomes training data. Later, you add the same escalation to your eval set to "make sure we handle this case."
+**RAG corpus contains eval answers verbatim.** Your eval tests "What is our return policy?" and your RAG corpus includes a doc with that exact question as a header and exact answer below. Fix: hash document chunks in the RAG corpus and check for overlap with eval queries or expected answers.
 
-**Fix:** Hash-based deduplication across all splits before any data is used.
-
-### 3.3 Synthetic generation echoes eval patterns
-You generate synthetic cases using a prompt like "create hard customer queries." The generator samples from internet text that includes your public docs, help articles, or even leaked eval examples.
-
-**Fix:** Track synthetic generation prompts + seeds; ensure generator has not seen eval data.
-
-### 3.4 RAG corpus contains eval answers verbatim
-Your eval set tests whether the model can answer "What is our return policy?" Your RAG corpus includes a doc with the exact question as a header and the exact answer below.
-
-**Fix:** Hash document chunks in RAG corpus; ensure no overlap with eval queries or expected answers.
-
-### 3.5 Shared embedding spaces leak signal
-You embed all your data (training, dev, eval) into a single vector store for "efficiency." Retrieval at inference time can now pull eval examples as context.
-
-**Fix:** Isolate eval embeddings into separate stores with strict access control.
+**Shared embedding spaces leak signal.** You embed all your data (training, dev, eval) into a single vector store. Retrieval at inference time can now pull eval examples as context. Fix: isolate eval embeddings into separate stores with strict access control.
 
 ---
 
-## 4) Separation disciplines (how to enforce the rule)
+## 4) Separation disciplines
 
-### 4.1 Dataset registry (single source of truth)
-Every example must be registered in a central dataset registry with:
-- unique ID (hash-based)
-- split assignment: train / dev / eval
-- creation date + source
-- access permissions
-- lock status (eval sets are immutable)
+**Dataset registry (single source of truth).** Every example must be registered with a unique ID (hash-based), split assignment (train/dev/eval), creation date and source, access permissions, and lock status. No data enters training, prompts, or RAG without passing through this registry.
 
-No data enters training, prompts, or RAG without passing through this registry.
+**Hash-based deduplication.** Before assigning splits: hash every example (input + expected output), hash all prompt templates and few-shot examples, hash all RAG corpus chunks, and check for collisions across splits. Priority order: eval is highest priority (never removed), then dev, then training.
 
-### 4.2 Hash-based deduplication
-Before assigning splits:
-1. Hash every example (input + expected output)
-2. Hash all prompt templates and few-shot examples
-3. Hash all RAG corpus chunks (per chunk, not per doc)
-4. Check for collisions across splits
-5. If collision found, remove from lower-priority split
+**Holdout management with access controls.** Eval data must be stored separately with read-only access, versioned and locked (once eval v1.0 ships, it's immutable), audited (track who accessed eval data and when), and time-gated for rotating holdouts.
 
-**Priority order (default):**
-1. Eval (highest priority, never removed)
-2. Dev
-3. Training
-
-### 4.3 Holdout management with access controls
-Eval data must be:
-- Stored in separate directories/databases with read-only access for most roles
-- Versioned and locked — once eval v1.0 ships, it's immutable
-- Audited — track who accessed eval data and when
-- Time-gated — for rotating holdouts (see section 6.3)
-
-### 4.4 Prompt templates as versioned registered artifacts
-Every prompt template gets:
-- A unique version ID
-- Registration in the dataset registry
-- Dedup check against eval examples
-- Lock status after deployment
-
-When you update a prompt, you create a new version and re-check for contamination.
+**Prompt templates as versioned artifacts.** Every prompt template gets a unique version ID, registration in the dataset registry, dedup check against eval examples, and lock status after deployment. When you update a prompt, create a new version and re-check for contamination.
 
 ---
 
-## 5) Determinism & replayability (making evals reproducible)
+## 5) Determinism & replayability
 
 Contamination prevention is half the battle. The other half is ensuring you can **reproduce** an eval run exactly.
 
-### 5.1 Fixed random seeds
-For any operation involving randomness:
-- Sampling from datasets
-- Model temperature > 0
-- Retrieval tie-breaking
-- Tool order selection in agents
+**Fixed random seeds.** For any operation involving randomness — sampling from datasets, model temperature, retrieval tie-breaking, tool order selection in agents — set explicit seeds and log them with the eval run.
 
-Set explicit seeds and log them with the eval run:
-```yaml
-eval_run_id: 2026-01-15_v3.2
-random_seed: 42
-model_temperature: 0.7
-```
+**Tool mocks for agent eval replay.** Agent evals are notoriously non-deterministic because external tools return different results over time. Fix: record all tool calls and responses during first run, store as a "tool response tape," and in replay mode, mock tools return recorded responses. Compare agent decisions, not tool outputs.
 
-### 5.2 Tool mocks for agent eval replay
-Agent evals are notoriously non-deterministic because external tools return different results over time (stock prices, weather, database states).
-
-**Fix:**
-- Record all tool calls + responses during first run
-- Store as a "tool response tape"
-- In replay mode, mock tools return recorded responses
-- Compare agent decisions, not tool outputs
-
-### 5.3 Config version pinning
-Every eval run must lock:
-- Model version (e.g., gpt-4.5-turbo-2026-01-10)
-- Prompt template version (e.g., v2.1)
-- Retriever config (e.g., vector store snapshot ID, K=5, rerank=true)
-- Tool schema versions (e.g., booking_tool v1.3)
-
-Log all versions in a single config file per eval run:
-```yaml
-eval_run_config:
-  model: gpt-4.5-turbo-2026-01-10
-  prompt_template: v2.1
-  retriever_snapshot: 2026-01-14
-  tools:
-    booking_tool: v1.3
-    search_tool: v2.0
-  random_seed: 42
-```
+**Config version pinning.** Every eval run must lock: model version, prompt template version, retriever config (vector store snapshot ID, K value, rerank setting), and tool schema versions. Log all versions in a single config file per eval run.
 
 ---
 
-## 6) Knobs & defaults (what you actually set)
+## 6) Knobs & defaults
 
-### 6.1 Split ratios (default starting points)
+**Split ratios:** For most enterprise datasets: 60–70% training/fine-tuning, 15–20% dev/validation, 15–20% eval/test holdout. If you're not fine-tuning, training split is 0% and dev + eval split the data 50/50. If your dataset is small (fewer than 500 examples), use k-fold cross-validation and rotate holdouts.
 
-For most enterprise datasets:
+**Dedup thresholds:** Exact hash match means reject across splits. Fuzzy near-match (over 95% similarity) means flag for human review.
 
-| Split | Recommended Ratio |
-|---|---|
-| Training/fine-tuning | 60–70% |
-| Dev/validation | 15–20% |
-| Eval/test (holdout) | 15–20% |
-
-**Important:**
-- If you're not fine-tuning, training split = 0% and dev + eval split the data 50/50
-- If your dataset is small (fewer than 500 examples), you may need to use **k-fold cross-validation** and rotate holdouts (see 6.3)
-
-### 6.2 Dedup thresholds
-Hash collisions are binary (exact match). But near-duplicates are trickier.
-
-Use fuzzy dedup for:
-- Paraphrases (Levenshtein distance < 5% or embedding cosine similarity > 0.95)
-- Minor formatting differences (punctuation, whitespace)
-
-**Default rule:**
-- Exact hash match → reject across splits
-- Fuzzy near-match (>95% similarity) → flag for human review
-
-### 6.3 Holdout rotation cadence
-If your eval set is small or your product evolves quickly, you may "burn through" holdouts (use them up as dev data because you iterated too much).
-
-**Fix:** Rotate holdouts periodically.
-
-Example schedule:
-- **Q1:** Use holdout A for eval, B+C for dev
-- **Q2:** Use holdout B for eval, A+C for dev
-- **Q3:** Use holdout C for eval, A+B for dev
-- **Q4:** Refresh all holdouts with new production data
+**Holdout rotation cadence:** If your eval set is small or your product evolves quickly, rotate holdouts periodically. Example: Q1 uses holdout A for eval and B+C for dev. Q2 rotates to holdout B. Q3 to holdout C. Q4 refreshes all holdouts with new production data.
 
 ---
 
-## 7) Failure modes (symptoms + root causes + fixes)
+## 7) Failure modes
 
-### 7.1 "Eval scores are suspiciously high"
-**Symptoms:**
-- Model scores 95%+ on eval set
-- Scores don't match production quality
-- Model seems to "know" the eval questions
+**"Eval scores are suspiciously high."**
+Model scores 95%+ but doesn't match production quality. Eval data leaked into training or fine-tuning. Prompt templates contain eval examples. Fix: run contamination audit — hash all training data against eval data. Rebuild eval set from fresh production logs or expert-written cases.
 
-**Root causes:**
-- Eval data leaked into training or fine-tuning
-- Prompt templates contain eval examples
-- Synthetic generation used eval cases as seeds
+**"We can't reproduce last month's eval results."**
+Same model, same dataset, different scores. No random seed pinning. Model version auto-updated. Tool responses changed. Fix: enforce config version pinning for all runs. Use tool mocks for agent replay. Lock eval corpus snapshots for RAG.
 
-**Fix:**
-- Run contamination audit (see debug playbook, section 8)
-- Hash-check all training data against eval data
-- Rebuild eval set from fresh production logs or expert-written cases
+**"We ran out of holdout data."**
+Team has iterated so much that eval data is effectively dev data now. No holdout rotation plan. Fix: implement holdout rotation. Expand dataset size (aim for 500+ eval examples minimum). Use separate datasets for dev iteration vs final release gate.
+
+**"Prompt changes broke eval comparability."**
+After updating prompts, scores changed dramatically. Can't tell if model regressed or prompt changed the task. Fix: version all prompt templates. When prompt changes, re-run eval on previous model version with new prompt to isolate prompt impact from model impact.
 
 ---
 
-### 7.2 "We can't reproduce last month's eval results"
-**Symptoms:**
-- Same model, same dataset, different scores
-- Debugging is impossible because conditions changed
-- Team loses trust in eval system
-
-**Root causes:**
-- No random seed pinning
-- Model version auto-updated (e.g., "gpt-4-turbo" rolled to a new snapshot)
-- Tool responses changed (agent evals)
-- Retriever corpus updated mid-eval
-
-**Fix:**
-- Enforce config version pinning for all runs
-- Use tool mocks for agent replay
-- Lock eval corpus snapshots (RAG)
-- Log all random seeds
-
----
-
-### 7.3 "We ran out of holdout data"
-**Symptoms:**
-- Team has iterated so much on "eval" data that it's effectively dev data now
-- Can't generate credible release metrics
-- Leadership questions whether quality improved or team just optimized to the test
-
-**Root causes:**
-- No holdout rotation plan
-- Dataset is too small
-- Team re-evaluates on same set after every change
-
-**Fix:**
-- Implement holdout rotation (6.3)
-- Expand dataset size (aim for 500+ eval examples minimum)
-- Use separate datasets for dev iteration vs. final release gate
-
----
-
-### 7.4 "Prompt changes broke eval comparability"
-**Symptoms:**
-- After updating prompts, scores dropped/increased dramatically
-- Can't tell if model regressed or prompt changed the task
-- Historical trend charts are meaningless
-
-**Root causes:**
-- Prompts are not versioned
-- Eval runs don't log which prompt version was used
-- No baseline re-run after prompt changes
-
-**Fix:**
-- Version all prompt templates
-- Log prompt version in every eval run config
-- When prompt changes, re-run eval on previous model version with new prompt to isolate prompt impact vs. model impact
-
----
-
-## 8) Debug playbook: contamination audit
-
-Run this check before every major release (or quarterly for active eval programs):
-
-### Step 1: Hash all eval examples
-Generate content hashes (SHA-256) for:
-- Input (query, context, conversation history)
-- Expected output (reference answer, tool calls, policy action)
-
-### Step 2: Hash all training/fine-tuning data
-Generate same hashes for every piece of training data.
-
-### Step 3: Check for collisions
-```
-if eval_hash in training_hashes:
-  flag as contaminated
-  remove from eval or training (based on priority)
-```
-
-### Step 4: Hash prompt templates & few-shot examples
-Check if any prompt examples match eval cases.
-
-### Step 5: Hash RAG corpus chunks
-For RAG systems:
-- Hash every document chunk
-- Check if eval queries appear as chunk text
-- Check if eval expected answers appear verbatim in chunks
-
-### Step 6: Fuzzy dedup check
-For near-matches:
-- Compute pairwise embedding similarity between eval and training
-- Flag pairs with cosine similarity > 0.95
-- Human review flagged pairs
-
-### Step 7: Audit tool mocks (agents)
-- Check if eval expected tool responses match production tool behavior
-- If mismatch, either update mocks or flag eval case as stale
-
-### Step 8: Document findings
-Create a contamination audit report:
-- Number of collisions found
-- Which examples were removed or reassigned
-- Updated split sizes
-- Version bump for cleaned dataset
-
----
-
-## 9) Enterprise expectations (what serious teams do)
+## 8) Enterprise expectations
 
 - They maintain a **dataset registry** where every example is logged with split assignment, hash, source, and access controls
-- They run **hash-based deduplication** across train/dev/eval before any data is used, and re-check after every dataset update
-- They **version and lock** eval sets — once eval v1.0 is deployed, it's immutable and read-only
+- They run **hash-based deduplication** across train/dev/eval before any data is used and after every update
+- They **version and lock** eval sets — once deployed, immutable and read-only
 - They enforce **deterministic replay** by pinning random seeds, model versions, prompt versions, and tool response mocks
 - They implement **holdout rotation** for long-lived products where eval sets risk burnout
-- They treat **contamination audits** as a mandatory pre-release gate — no ship without a clean audit
-- They track **eval data provenance** so they can trace any example back to its source and verify separation
+- They treat **contamination audits** as a mandatory pre-release gate
+- They track **eval data provenance** so they can trace any example back to its source
 
 ---
 
-## 10) Ready-to-use templates
+## 9) Interview Q&A
 
-### 10.1 Dataset registry schema
+**Q: How do you prevent data contamination in your eval pipeline?**
+A: I enforce strict train/dev/eval separation with hash-based deduplication — no example appears in multiple splits. I also hash prompt templates, few-shot examples, and RAG corpus chunks against the eval set. Contamination audits run before every major release.
 
-```yaml
-example_id: sha256_hash_of_input_output
-split: train | dev | eval
-source: prod_log | expert_written | synthetic
-channel: chat | rag | agent | voice
-risk_tier: 0 | 1 | 2 | 3
-slice_labels:
-  language: en-US
-  tenant: acme_corp
-  intent: billing_dispute
-difficulty: easy | normal | hard | adversarial
-creation_date: 2026-01-15
-dataset_version: v3.2
-lock_status: unlocked | locked
-access_permissions: [eng, eval_team]
-contamination_checked: yes
-last_audit_date: 2026-01-20
-```
+**Q: How do you ensure eval reproducibility?**
+A: I pin everything — random seeds, model versions, prompt versions, retriever snapshots, and tool response mocks for agent evals. Every eval run has a config file that locks all variables. Given the same config, I can reproduce any eval from the last 24 months.
 
-### 10.2 Eval run config template
-
-```yaml
-eval_run_id: 2026-01-29_v4.0
-eval_dataset_version: v3.2
-eval_dataset_size: 1500
-
-model_config:
-  provider: openai
-  model_id: gpt-4.5-turbo-2026-01-10
-  temperature: 0.7
-  max_tokens: 2048
-  random_seed: 42
-
-prompt_config:
-  template_version: v2.3
-  few_shot_examples: none
-  system_message_version: v1.1
-
-retriever_config:
-  vector_store_snapshot: 2026-01-28_prod_snapshot
-  top_k: 5
-  rerank_enabled: true
-  rerank_model: cohere-rerank-v3
-
-tool_config:
-  tool_response_mode: replay  # replay | live
-  tool_response_tape: eval_run_2026-01-20_tool_tape.json
-  tools:
-    - name: booking_tool
-      version: v1.3
-    - name: search_tool
-      version: v2.0
-
-reproducibility:
-  random_seed: 42
-  numpy_seed: 42
-  python_hash_seed: 0
-  deterministic_mode: true
-```
-
-### 10.3 Contamination check checklist
-
-```markdown
-## Pre-Release Contamination Audit Checklist
-
-**Eval Dataset:** v___
-**Audit Date:** ___
-**Auditor:** ___
-
-### 1. Training Data Checks
-- [ ] All training examples hashed (SHA-256)
-- [ ] Collision check vs. eval set: ___ collisions found
-- [ ] Collisions resolved: removed from training / removed from eval
-- [ ] Fuzzy dedup (>95% similarity): ___ near-matches found
-- [ ] Near-matches reviewed: ___ removed, ___ approved
-
-### 2. Fine-Tuning Data Checks
-- [ ] All fine-tuning examples hashed
-- [ ] Collision check vs. eval set: ___ collisions found
-- [ ] Collisions resolved
-
-### 3. Prompt Template Checks
-- [ ] All prompt templates versioned and hashed
-- [ ] Few-shot examples checked against eval: ___ overlaps found
-- [ ] Overlaps resolved: prompt updated / eval examples removed
-
-### 4. RAG Corpus Checks (if applicable)
-- [ ] All document chunks hashed
-- [ ] Eval queries checked against chunk text: ___ matches found
-- [ ] Eval answers checked against chunk text: ___ matches found
-- [ ] Matches resolved: chunks removed from corpus / eval cases updated
-
-### 5. Synthetic Data Checks
-- [ ] Synthetic generation prompts reviewed
-- [ ] Generator did not see eval data: verified
-- [ ] Synthetic examples deduplicated against eval: ___ overlaps found
-
-### 6. Reproducibility Checks
-- [ ] Random seeds documented for all stochastic operations
-- [ ] Model version pinned (no auto-updates)
-- [ ] Prompt version pinned
-- [ ] Retriever snapshot locked
-- [ ] Tool schemas versioned (agent evals)
-- [ ] Tool response mocks recorded (agent evals)
-
-### 7. Access Control Checks
-- [ ] Eval data stored in restricted directory/database
-- [ ] Read-only access enforced for eval set
-- [ ] Write access limited to: [list roles]
-- [ ] Access audit log reviewed: ___ accesses in last 30 days
-
-### 8. Documentation
-- [ ] Contamination audit report written
-- [ ] Dataset version bumped if changes made
-- [ ] Changelog updated
-- [ ] Leadership notified if significant contamination found
-
-**Audit Result:** PASS / FAIL
-**Notes:** ___
-```
-
-### 10.4 Holdout rotation plan template
-
-```yaml
-holdout_rotation_schedule:
-  rotation_frequency: quarterly
-  holdout_sets:
-    - id: holdout_A
-      size: 500
-      creation_date: 2025-10-01
-      active_quarters: [Q1_2026, Q4_2026]
-    - id: holdout_B
-      size: 500
-      creation_date: 2025-11-01
-      active_quarters: [Q2_2026]
-    - id: holdout_C
-      size: 500
-      creation_date: 2025-12-01
-      active_quarters: [Q3_2026]
-
-  usage_rules:
-    - Active holdout is used for release gate evals only
-    - Inactive holdouts can be used for dev/experimentation
-    - Once a holdout is used for release decision, lock for that quarter
-    - Refresh all holdouts annually with new production data
-
-  Q1_2026:
-    eval_holdout: holdout_A
-    dev_data: [holdout_B, holdout_C, new_prod_sample]
-
-  Q2_2026:
-    eval_holdout: holdout_B
-    dev_data: [holdout_A, holdout_C, new_prod_sample]
-```
+**Q: What do you do when holdout data gets stale?**
+A: I implement holdout rotation — quarterly swapping which set is held for final eval vs used for dev iteration. I also refresh all holdouts annually with new production data to keep them aligned with real-world patterns.
 
 ---
 
-## 11) Interview-ready talking points
-
-> "I enforce strict train/dev/eval separation with hash-based deduplication — no example appears in multiple splits."
-
-> "I treat contamination as the silent killer of eval credibility — great metrics mean nothing if the model memorized the test."
-
-> "I maintain a dataset registry where every example is logged with split assignment, provenance, and contamination check status."
-
-> "I version and lock eval sets — once deployed, they're immutable and read-only to prevent accidental optimization."
-
-> "I ensure deterministic replay by pinning random seeds, model versions, prompt versions, and tool response mocks for agent evals."
-
-> "I run contamination audits before every major release — checking training data, prompt templates, RAG corpus, and synthetic generation against eval examples."
-
-> "For RAG systems, I hash document chunks and verify no eval queries or answers appear verbatim in the retrieval corpus."
-
-> "I implement holdout rotation for long-lived products — rotating which set is 'burned' for dev vs. held for final eval."
-
-> "I track eval data access with audit logs and enforce role-based permissions — only eval platform admins can modify holdout sets."
-
-> "When we update prompts, I re-run previous model versions with new prompts to isolate prompt impact from model regression."
+*Next: Chapter 5.5 covers privacy and sanitization — how to remove PII from eval datasets without destroying the signal you need.*
