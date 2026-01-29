@@ -52,6 +52,14 @@ export const coreSections: CoreSection[] = [
           { id: "3.6", title: "Practical Coverage Math", slug: "3-6" },
         ],
       },
+      {
+        id: "4",
+        title: "Chapter 4",
+        slug: "ch4",
+        subchapters: [
+          { id: "4.1", title: "Ground Truth Per Task Type", slug: "4-1" },
+        ],
+      },
     ],
   },
   {
