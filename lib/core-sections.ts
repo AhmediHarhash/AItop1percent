@@ -36,6 +36,7 @@ export const coreSections: CoreSection[] = [
           { id: "2.2", title: "Rubrics Humans Can Score Consistently", slug: "2-2" },
           { id: "2.3", title: "Good vs Bad Patterns", slug: "2-3" },
           { id: "2.4", title: "Uncertainty, Refusal & Safety Scoring", slug: "2-4" },
+          { id: "2.5", title: "Enterprise Scorecards", slug: "2-5" },
         ],
       },
     ],
