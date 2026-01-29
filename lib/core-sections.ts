@@ -46,7 +46,7 @@ export const coreSections: CoreSection[] = [
     id: "03",
     path: "01-eval-strategy",
     title: "Evaluation Strategy & Operating Model",
-    summary: "Defines how quality is measured and when it is safe to ship.",
+    summary: "The evaluation bible — defines quality, measurement, and shipping discipline across all AI systems.",
     phase: "Foundations",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -267,7 +267,7 @@ export const coreSections: CoreSection[] = [
     id: "07",
     path: "09-rag-evals",
     title: "RAG Foundations & Evaluation",
-    summary: "Validates retrieval quality and grounding behavior.",
+    summary: "Builds and evaluates retrieval-augmented generation systems end to end.",
     phase: "Core Building Blocks",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -277,7 +277,7 @@ export const coreSections: CoreSection[] = [
     id: "08",
     path: "08-agent-evals",
     title: "Agent Architecture & Evaluation",
-    summary: "Measures multi-step agent performance and failure modes.",
+    summary: "Designs and evaluates multi-step agent systems that take real-world actions.",
     phase: "Core Building Blocks",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -303,22 +303,22 @@ export const coreSections: CoreSection[] = [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
-  // Phase 3: Data & Human Systems,
   {
     id: "11",
-    path: "03-dataset-design",
-    title: "Dataset Design",
-    summary: "Builds the evaluation datasets that make quality visible.",
-    phase: "Data & Human Systems",
+    path: "11-fine-tuning",
+    title: "Fine-Tuning & Model Adaptation",
+    summary: "When to fine-tune, data requirements, safety checks, evaluation gating, and ROI.",
+    phase: "Core Building Blocks",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
+  // Phase 3: Data & Human Systems (implementation, not theory — Section 3 owns eval strategy),
   {
     id: "12",
-    path: "04-labeling-annotation",
-    title: "Labeling & Annotation",
-    summary: "Creates reliable labels and resolves ambiguity at scale.",
+    path: "03-dataset-design",
+    title: "Dataset Engineering & Pipelines",
+    summary: "Builds, validates, and maintains evaluation datasets at production scale.",
     phase: "Data & Human Systems",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -326,9 +326,9 @@ export const coreSections: CoreSection[] = [
   },
   {
     id: "13",
-    path: "06-human-evals",
-    title: "Human Evaluation Systems",
-    summary: "Designs expert reviews that are consistent and defensible.",
+    path: "04-labeling-annotation",
+    title: "Labeling & Annotation Operations",
+    summary: "Runs labeling programs — tooling, workforce, quality control, and cost management.",
     phase: "Data & Human Systems",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -336,30 +336,30 @@ export const coreSections: CoreSection[] = [
   },
   {
     id: "14",
-    path: "07-automated-evals",
-    title: "Automated Evaluation Systems",
-    summary: "Scales evaluation with reliable automated checks.",
+    path: "06-human-evals",
+    title: "Human Review Infrastructure",
+    summary: "Builds the systems and processes that make expert review consistent and scalable.",
     phase: "Data & Human Systems",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
-  // Phase 4: Production Engineering,
   {
     id: "15",
-    path: "24-security-abuse-prevention",
-    title: "Security & Abuse Prevention",
-    summary: "Defends against prompt injection and tool abuse.",
-    phase: "Production Engineering",
+    path: "07-automated-evals",
+    title: "Automated Eval Pipelines",
+    summary: "Engineers the automated evaluation infrastructure — judges, runners, and CI integration.",
+    phase: "Data & Human Systems",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
+  // Phase 4: Production Engineering (runtime ops — references Section 3 for eval methods),
   {
     id: "16",
-    path: "11-production-monitoring",
-    title: "Production Monitoring & Drift",
-    summary: "Detects regressions and failures after release.",
+    path: "24-security-abuse-prevention",
+    title: "Security & Abuse Prevention",
+    summary: "Defends against prompt injection, tool abuse, and adversarial attacks in production.",
     phase: "Production Engineering",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -367,9 +367,9 @@ export const coreSections: CoreSection[] = [
   },
   {
     id: "17",
-    path: "12-regression-testing",
-    title: "Regression Testing & Release Gates",
-    summary: "Prevents quality from degrading when models or prompts change.",
+    path: "11-production-monitoring",
+    title: "Production Monitoring & Observability",
+    summary: "Runtime telemetry, drift detection, alerting, and incident response for live AI systems.",
     phase: "Production Engineering",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -377,9 +377,9 @@ export const coreSections: CoreSection[] = [
   },
   {
     id: "18",
-    path: "25-deployment-runtime-control",
-    title: "Deployment & Runtime Control",
-    summary: "Controls rollouts, configs, and runtime safeguards.",
+    path: "12-regression-testing",
+    title: "Regression Testing & Release Gates",
+    summary: "CI/CD integration, golden set automation, and deployment gating infrastructure.",
     phase: "Production Engineering",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -387,9 +387,19 @@ export const coreSections: CoreSection[] = [
   },
   {
     id: "19",
+    path: "25-deployment-runtime-control",
+    title: "Deployment & Runtime Control",
+    summary: "Rollout strategies, feature flags, canary deployments, and runtime safeguards.",
+    phase: "Production Engineering",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "20",
     path: "23-reliability-failure-recovery",
     title: "Reliability, Failure & Recovery",
-    summary: "Designs fallbacks and resilience for production systems.",
+    summary: "Fallback chains, circuit breakers, graceful degradation, and resilience patterns.",
     phase: "Production Engineering",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -397,20 +407,30 @@ export const coreSections: CoreSection[] = [
   },
   // Phase 5: Specialized Modalities,
   {
-    id: "20",
+    id: "21",
     path: "10-voice-realtime-evals",
     title: "Voice & Real-Time Systems",
-    summary: "Ensures low latency and reliable conversation under pressure.",
+    summary: "Builds and evaluates low-latency voice and real-time AI systems.",
     phase: "Specialized Modalities",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
-    id: "21",
+    id: "22",
     path: "14-red-teaming",
     title: "Red-Teaming & Adversarial Testing",
-    summary: "Finds the failures users and attackers will exploit.",
+    summary: "Finds the failures users and attackers will exploit before they do.",
+    phase: "Specialized Modalities",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "23",
+    path: "23-multilingual",
+    title: "Internationalization & Multilingual Systems",
+    summary: "Locale routing, translation strategy, multilingual eval slices, cultural safety, and regional compliance.",
     phase: "Specialized Modalities",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -418,7 +438,7 @@ export const coreSections: CoreSection[] = [
   },
   // Phase 6: Scale & Economics,
   {
-    id: "22",
+    id: "24",
     path: "26-system-cost-engineering",
     title: "System Cost Engineering",
     summary: "Keeps inference cost aligned with business reality.",
@@ -428,7 +448,7 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "23",
+    id: "25",
     path: "15-cost-quality-tradeoffs",
     title: "Cost-Quality Tradeoffs",
     summary: "Optimizes quality without destroying margins or latency.",
@@ -438,10 +458,20 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "24",
+    id: "26",
     path: "18-scaling-evals",
     title: "Scaling Evaluation Systems",
-    summary: "Expands evaluation coverage without losing signal.",
+    summary: "Scales eval infrastructure — pipelines, tooling, compute, and platform ops.",
+    phase: "Scale & Economics",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "27",
+    path: "27-global-infra",
+    title: "Global Infrastructure & Kubernetes at Scale",
+    summary: "Multi-region deployment, data residency, edge/CDN, failover, and tenancy isolation.",
     phase: "Scale & Economics",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
@@ -449,20 +479,30 @@ export const coreSections: CoreSection[] = [
   },
   // Phase 7: Enterprise & Leadership,
   {
-    id: "25",
+    id: "28",
     path: "16-multi-tenant-evals",
     title: "Multi-Tenant & Customer-Specific Evals",
-    summary: "Adapts evaluation to customer-specific expectations.",
+    summary: "Adapts evaluation to customer-specific expectations at scale.",
     phase: "Enterprise & Leadership",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
-    id: "26",
+    id: "29",
     path: "17-enterprise-governance",
     title: "Enterprise Governance, Org Design & Compliance",
-    summary: "Connects evals to policy, audit, risk controls, and team accountability.",
+    summary: "Connects evals to policy, audit, risk controls, team structure, and accountability.",
+    phase: "Enterprise & Leadership",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "30",
+    path: "30-pricing",
+    title: "Pricing, Packaging & Unit Economics",
+    summary: "Profit improvement, margins, SLAs, cost-to-serve, and contract pricing for AI products.",
     phase: "Enterprise & Leadership",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
