@@ -59,6 +59,7 @@ export const coreSections: CoreSection[] = [
         subchapters: [
           { id: "4.1", title: "Ground Truth Per Task Type", slug: "4-1" },
           { id: "4.2", title: "Handling Ambiguity & Multiple Correct Answers", slug: "4-2" },
+          { id: "4.3", title: "Source-of-Truth Rules", slug: "4-3" },
         ],
       },
     ],
