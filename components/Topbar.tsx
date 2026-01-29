@@ -2,6 +2,7 @@
 
 import { usePathname } from "next/navigation";
 import FocusToggle from "./FocusToggle";
+import ThemeToggle from "./ThemeToggle";
 import { coreSections } from "../lib/core-sections";
 
 function getLabel(pathname: string) {
@@ -24,6 +25,7 @@ export default function Topbar() {
     <div className="topbar">
       <div className="topbar-title">{label}</div>
       <div className="topbar-actions">
+        <ThemeToggle />
         <FocusToggle />
       </div>
     </div>
