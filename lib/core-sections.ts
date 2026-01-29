@@ -64,6 +64,14 @@ export const coreSections: CoreSection[] = [
           { id: "4.5", title: "Preventing Label Rot", slug: "4-5" },
         ],
       },
+      {
+        id: "5",
+        title: "Chapter 5",
+        slug: "ch5",
+        subchapters: [
+          { id: "5.1", title: "Data Sources", slug: "5-1" },
+        ],
+      },
     ],
   },
   {
