@@ -13,9 +13,12 @@ function ChapterItem({
   sectionPath: string;
 }) {
   const pathname = usePathname() || "/";
-  const [open, setOpen] = useState(false);
   const hasSubs = chapter.subchapters && chapter.subchapters.length > 0;
   const chapterHref = `/core/${sectionPath}/${chapter.slug}`;
+  const isChildActive = hasSubs && chapter.subchapters!.some(
+    (sub) => pathname === `/core/${sectionPath}/${sub.slug}`
+  );
+  const [open, setOpen] = useState(isChildActive);
 
   if (hasSubs) {
     return (
