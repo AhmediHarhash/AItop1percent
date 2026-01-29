@@ -358,8 +358,8 @@ export const coreSections: CoreSection[] = [
   {
     id: "16",
     path: "24-security-abuse-prevention",
-    title: "Security & Abuse Prevention",
-    summary: "Defends against prompt injection, tool abuse, and adversarial attacks in production.",
+    title: "AI Security — From Prompt Injection to Infrastructure Defense",
+    summary: "Full-stack AI security: OWASP LLM & Agentic Top 10, prompt injection, model theft, data poisoning, supply chain attacks, zero trust, SOC 2, ISO 27001/42001, EU AI Act, and NIST AI frameworks.",
     phase: "Production Engineering",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
