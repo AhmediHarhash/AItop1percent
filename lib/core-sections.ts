@@ -1,13 +1,13 @@
 export type SubChapter = {
   id: string;
   title: string;
-  anchor: string;
+  slug: string;
 };
 
 export type Chapter = {
   id: string;
   title: string;
-  anchor: string;
+  slug: string;
   subchapters?: SubChapter[];
 };
 
@@ -26,15 +26,15 @@ export const coreSections: CoreSection[] = [
     title: "Eval Strategy & Operating Model",
     summary: "Defines how quality is measured and when it is safe to ship.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
       {
         id: "2",
         title: "Chapter 2",
-        anchor: "chapter-2",
+        slug: "ch2",
         subchapters: [
-          { id: "2.1", title: "Task-Specific Definitions of \"Good\"", anchor: "21-task-specific-definitions-of-good-chat-rag-agents-voice" },
-          { id: "2.2", title: "Rubrics Humans Can Score Consistently", anchor: "22-rubrics-humans-can-score-consistently" },
-          { id: "2.3", title: "Good vs Bad Patterns", anchor: "23-good-vs-bad-patterns-examples" },
+          { id: "2.1", title: "Task-Specific Definitions of \"Good\"", slug: "2-1" },
+          { id: "2.2", title: "Rubrics Humans Can Score Consistently", slug: "2-2" },
+          { id: "2.3", title: "Good vs Bad Patterns", slug: "2-3" },
         ],
       },
     ],
@@ -45,7 +45,7 @@ export const coreSections: CoreSection[] = [
     title: "Ground Truth & What Good Looks Like",
     summary: "Clarifies what correctness means and how to agree on it.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -54,7 +54,7 @@ export const coreSections: CoreSection[] = [
     title: "Dataset Design",
     summary: "Builds the evaluation datasets that make quality visible.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -63,7 +63,7 @@ export const coreSections: CoreSection[] = [
     title: "Labeling & Annotation",
     summary: "Creates reliable labels and resolves ambiguity at scale.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -72,7 +72,7 @@ export const coreSections: CoreSection[] = [
     title: "Quality Dimensions & Metrics",
     summary: "Turns quality into measurable dimensions and thresholds.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -81,7 +81,7 @@ export const coreSections: CoreSection[] = [
     title: "Human Evaluation Systems",
     summary: "Designs expert reviews that are consistent and defensible.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -90,7 +90,7 @@ export const coreSections: CoreSection[] = [
     title: "Automated Evaluation Systems",
     summary: "Scales evaluation with reliable automated checks.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -99,7 +99,7 @@ export const coreSections: CoreSection[] = [
     title: "Agent Evaluation",
     summary: "Measures multi-step agent performance and failure modes.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -108,7 +108,7 @@ export const coreSections: CoreSection[] = [
     title: "RAG Evaluation",
     summary: "Validates retrieval quality and grounding behavior.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -117,7 +117,7 @@ export const coreSections: CoreSection[] = [
     title: "Voice & Real-Time Evaluation",
     summary: "Ensures low latency and reliable conversation under pressure.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -126,7 +126,7 @@ export const coreSections: CoreSection[] = [
     title: "Production Monitoring",
     summary: "Detects regressions and failures after release.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -135,7 +135,7 @@ export const coreSections: CoreSection[] = [
     title: "Regression Testing",
     summary: "Prevents quality from degrading when models or prompts change.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -144,7 +144,7 @@ export const coreSections: CoreSection[] = [
     title: "Release Gates",
     summary: "Defines quality thresholds required to ship.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -153,7 +153,7 @@ export const coreSections: CoreSection[] = [
     title: "Red-Teaming & Adversarial Testing",
     summary: "Finds the failures users and attackers will exploit.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -162,7 +162,7 @@ export const coreSections: CoreSection[] = [
     title: "Cost vs Quality Tradeoffs",
     summary: "Optimizes quality without destroying margins or latency.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -171,7 +171,7 @@ export const coreSections: CoreSection[] = [
     title: "Multi-Tenant / Customer-Specific Evals",
     summary: "Adapts evaluation to customer-specific expectations.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -180,7 +180,7 @@ export const coreSections: CoreSection[] = [
     title: "Enterprise Governance & Compliance",
     summary: "Connects evals to policy, audit, and risk controls.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -189,7 +189,7 @@ export const coreSections: CoreSection[] = [
     title: "Scaling Evals",
     summary: "Expands evaluation coverage without losing signal.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -198,7 +198,7 @@ export const coreSections: CoreSection[] = [
     title: "Eval Team & Org Design",
     summary: "Designs ownership, workflows, and accountability.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -207,7 +207,7 @@ export const coreSections: CoreSection[] = [
     title: "Model Selection & Routing",
     summary: "Chooses the right model for each task and tier.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -216,7 +216,7 @@ export const coreSections: CoreSection[] = [
     title: "Prompt & Tool Architecture",
     summary: "Structures prompts and tools for reliability and control.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -225,7 +225,7 @@ export const coreSections: CoreSection[] = [
     title: "Memory & Context Management",
     summary: "Balances recall, privacy, and context budgets.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -234,7 +234,7 @@ export const coreSections: CoreSection[] = [
     title: "Reliability & Failure Recovery",
     summary: "Designs fallbacks and resilience for production systems.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -243,7 +243,7 @@ export const coreSections: CoreSection[] = [
     title: "Security & Abuse Prevention",
     summary: "Defends against prompt injection and tool abuse.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -252,7 +252,7 @@ export const coreSections: CoreSection[] = [
     title: "Deployment & Runtime Control",
     summary: "Controls rollouts, configs, and runtime safeguards.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
@@ -261,7 +261,7 @@ export const coreSections: CoreSection[] = [
     title: "System Cost Engineering",
     summary: "Keeps inference cost aligned with business reality.",
     chapters: [
-      { id: "1", title: "Chapter 1", anchor: "chapter-1" },
+      { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
 ];

@@ -12,49 +12,63 @@ function ChapterItem({
   chapter: Chapter;
   sectionPath: string;
 }) {
+  const pathname = usePathname() || "/";
   const [open, setOpen] = useState(false);
   const hasSubs = chapter.subchapters && chapter.subchapters.length > 0;
+  const chapterHref = `/core/${sectionPath}/${chapter.slug}`;
 
-  return (
-    <div className="nav-chapter">
-      <a
-        href={`/core/${sectionPath}#${chapter.anchor}`}
-        className="nav-chapter-link"
-        onClick={(e) => {
-          if (hasSubs) {
-            e.preventDefault();
-            setOpen(!open);
-          }
-        }}
-      >
-        <span className="nav-chapter-title">{chapter.title}</span>
-        {hasSubs && (
+  if (hasSubs) {
+    return (
+      <div className="nav-chapter">
+        <button
+          className="nav-chapter-link"
+          onClick={() => setOpen(!open)}
+          type="button"
+        >
+          <span className="nav-chapter-title">{chapter.title}</span>
           <span className={`nav-chevron ${open ? "nav-chevron-open" : ""}`}>
             &#9656;
           </span>
+        </button>
+        {open && (
+          <div className="nav-subchapters">
+            {chapter.subchapters!.map((sub) => {
+              const subHref = `/core/${sectionPath}/${sub.slug}`;
+              const isActive = pathname === subHref;
+              return (
+                <Link
+                  key={sub.id}
+                  href={subHref}
+                  className={`nav-sub-link ${isActive ? "nav-sub-active" : ""}`}
+                >
+                  <span className="nav-sub-id">{sub.id}</span>
+                  <span className="nav-sub-title">{sub.title}</span>
+                </Link>
+              );
+            })}
+          </div>
         )}
-      </a>
-      {hasSubs && open && (
-        <div className="nav-subchapters">
-          {chapter.subchapters!.map((sub) => (
-            <a
-              key={sub.id}
-              href={`/core/${sectionPath}#${sub.anchor}`}
-              className="nav-sub-link"
-            >
-              <span className="nav-sub-id">{sub.id}</span>
-              <span className="nav-sub-title">{sub.title}</span>
-            </a>
-          ))}
-        </div>
-      )}
+      </div>
+    );
+  }
+
+  const isActive = pathname === chapterHref;
+  return (
+    <div className="nav-chapter">
+      <Link
+        href={chapterHref}
+        className={`nav-chapter-link ${isActive ? "nav-chapter-active" : ""}`}
+      >
+        <span className="nav-chapter-title">{chapter.title}</span>
+      </Link>
     </div>
   );
 }
 
 function SectionItem({ section }: { section: CoreSection }) {
   const pathname = usePathname() || "/";
-  const isActive = pathname === `/core/${section.path}`;
+  const sectionBase = `/core/${section.path}`;
+  const isActive = pathname.startsWith(sectionBase);
   const [expanded, setExpanded] = useState(isActive);
   const hasChapters = section.chapters && section.chapters.length > 0;
 
@@ -67,7 +81,7 @@ function SectionItem({ section }: { section: CoreSection }) {
         }}
       >
         <Link
-          href={`/core/${section.path}`}
+          href={sectionBase}
           className="nav-link-inner"
           onClick={(e) => e.stopPropagation()}
         >
