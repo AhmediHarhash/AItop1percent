@@ -49,10 +49,10 @@ export const coreSections: CoreSection[] = [
     summary: "The evaluation bible — defines quality, measurement, and shipping discipline across all AI systems.",
     phase: "Foundations",
     chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
+      { id: "1", title: "Chapter 1 — Eval Strategy & Operating Model", slug: "ch1" },
       {
         id: "2",
-        title: "Chapter 2",
+        title: "Chapter 2 — Quality Definitions & Scoring",
         slug: "ch2",
         subchapters: [
           { id: "2.1", title: "Task-Specific Definitions of \"Good\"", slug: "2-1" },
@@ -65,7 +65,7 @@ export const coreSections: CoreSection[] = [
       },
       {
         id: "3",
-        title: "Chapter 3",
+        title: "Chapter 3 — Task Taxonomy & Coverage",
         slug: "ch3",
         subchapters: [
           { id: "3.1", title: "Build a Task Taxonomy", slug: "3-1" },
@@ -79,7 +79,7 @@ export const coreSections: CoreSection[] = [
       },
       {
         id: "4",
-        title: "Chapter 4",
+        title: "Chapter 4 — Ground Truth & Gold Standards",
         slug: "ch4",
         subchapters: [
           { id: "4.1", title: "Ground Truth Per Task Type", slug: "4-1" },
@@ -92,7 +92,7 @@ export const coreSections: CoreSection[] = [
       },
       {
         id: "5",
-        title: "Chapter 5",
+        title: "Chapter 5 — Dataset Design & Engineering",
         slug: "ch5",
         subchapters: [
           { id: "5.1", title: "Data Sources", slug: "5-1" },
