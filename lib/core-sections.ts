@@ -21,11 +21,31 @@ export type CoreSection = {
 };
 
 export const coreSections: CoreSection[] = [
-  // Phase 1: Foundations
+  // Phase 1: Foundations,
   {
     id: "01",
+    path: "01-ai-product-reality",
+    title: "AI Product Reality & Risk Tiers",
+    summary: "Maps AI product types to risk levels and sets the stage for everything that follows.",
+    phase: "Foundations",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "02",
+    path: "02-problem-framing",
+    title: "Problem Framing & Task Taxonomy",
+    summary: "Decomposes AI problems into evaluable tasks with clear success criteria.",
+    phase: "Foundations",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "03",
     path: "01-eval-strategy",
-    title: "Eval Strategy & Operating Model",
+    title: "Evaluation Strategy & Operating Model",
     summary: "Defines how quality is measured and when it is safe to ship.",
     phase: "Foundations",
     chapters: [
@@ -212,19 +232,29 @@ export const coreSections: CoreSection[] = [
       },
     ],
   },
-  // Phase 2: Core Building Blocks
   {
-    id: "02",
-    path: "20-model-selection-routing",
-    title: "Model Selection & Routing",
-    summary: "Chooses the right model for each task and tier.",
-    phase: "Core Building Blocks",
+    id: "04",
+    path: "02-ground-truth",
+    title: "Ground Truth & What Good Looks Like",
+    summary: "Clarifies what correctness means and how to agree on it.",
+    phase: "Foundations",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
-    id: "03",
+    id: "05",
+    path: "05-quality-metrics",
+    title: "Quality Dimensions & Metrics",
+    summary: "Turns quality into measurable dimensions and thresholds.",
+    phase: "Foundations",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  // Phase 2: Core Building Blocks,
+  {
+    id: "06",
     path: "21-prompt-tool-architecture",
     title: "Prompt & Tool Architecture",
     summary: "Structures prompts and tools for reliability and control.",
@@ -234,7 +264,37 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "04",
+    id: "07",
+    path: "09-rag-evals",
+    title: "RAG Foundations & Evaluation",
+    summary: "Validates retrieval quality and grounding behavior.",
+    phase: "Core Building Blocks",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "08",
+    path: "08-agent-evals",
+    title: "Agent Architecture & Evaluation",
+    summary: "Measures multi-step agent performance and failure modes.",
+    phase: "Core Building Blocks",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "09",
+    path: "20-model-selection-routing",
+    title: "Model Selection & Routing",
+    summary: "Chooses the right model for each task and tier.",
+    phase: "Core Building Blocks",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  {
+    id: "10",
     path: "22-memory-context-management",
     title: "Memory & Context Management",
     summary: "Balances recall, privacy, and context budgets.",
@@ -243,19 +303,9 @@ export const coreSections: CoreSection[] = [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
-  // Phase 3: Data & Human Systems
+  // Phase 3: Data & Human Systems,
   {
-    id: "05",
-    path: "02-ground-truth",
-    title: "Ground Truth & What Good Looks Like",
-    summary: "Clarifies what correctness means and how to agree on it.",
-    phase: "Data & Human Systems",
-    chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
-    ],
-  },
-  {
-    id: "06",
+    id: "11",
     path: "03-dataset-design",
     title: "Dataset Design",
     summary: "Builds the evaluation datasets that make quality visible.",
@@ -265,7 +315,7 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "07",
+    id: "12",
     path: "04-labeling-annotation",
     title: "Labeling & Annotation",
     summary: "Creates reliable labels and resolves ambiguity at scale.",
@@ -275,17 +325,7 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "08",
-    path: "05-quality-metrics",
-    title: "Quality Dimensions & Metrics",
-    summary: "Turns quality into measurable dimensions and thresholds.",
-    phase: "Data & Human Systems",
-    chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
-    ],
-  },
-  {
-    id: "09",
+    id: "13",
     path: "06-human-evals",
     title: "Human Evaluation Systems",
     summary: "Designs expert reviews that are consistent and defensible.",
@@ -295,7 +335,7 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "10",
+    id: "14",
     path: "07-automated-evals",
     title: "Automated Evaluation Systems",
     summary: "Scales evaluation with reliable automated checks.",
@@ -304,21 +344,21 @@ export const coreSections: CoreSection[] = [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
-  // Phase 4: Production Engineering
+  // Phase 4: Production Engineering,
   {
-    id: "11",
-    path: "23-reliability-failure-recovery",
-    title: "Reliability & Failure Recovery",
-    summary: "Designs fallbacks and resilience for production systems.",
+    id: "15",
+    path: "24-security-abuse-prevention",
+    title: "Security & Abuse Prevention",
+    summary: "Defends against prompt injection and tool abuse.",
     phase: "Production Engineering",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
-    id: "12",
+    id: "16",
     path: "11-production-monitoring",
-    title: "Production Monitoring",
+    title: "Production Monitoring & Drift",
     summary: "Detects regressions and failures after release.",
     phase: "Production Engineering",
     chapters: [
@@ -326,9 +366,9 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "13",
+    id: "17",
     path: "12-regression-testing",
-    title: "Regression Testing",
+    title: "Regression Testing & Release Gates",
     summary: "Prevents quality from degrading when models or prompts change.",
     phase: "Production Engineering",
     chapters: [
@@ -336,17 +376,7 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "14",
-    path: "13-release-gates",
-    title: "Release Gates",
-    summary: "Defines quality thresholds required to ship.",
-    phase: "Production Engineering",
-    chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
-    ],
-  },
-  {
-    id: "15",
+    id: "18",
     path: "25-deployment-runtime-control",
     title: "Deployment & Runtime Control",
     summary: "Controls rollouts, configs, and runtime safeguards.",
@@ -355,31 +385,21 @@ export const coreSections: CoreSection[] = [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
-  // Phase 5: Specialized Modalities
   {
-    id: "16",
-    path: "08-agent-evals",
-    title: "Agent Evaluation",
-    summary: "Measures multi-step agent performance and failure modes.",
-    phase: "Specialized Modalities",
+    id: "19",
+    path: "23-reliability-failure-recovery",
+    title: "Reliability, Failure & Recovery",
+    summary: "Designs fallbacks and resilience for production systems.",
+    phase: "Production Engineering",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
+  // Phase 5: Specialized Modalities,
   {
-    id: "17",
-    path: "09-rag-evals",
-    title: "RAG Evaluation",
-    summary: "Validates retrieval quality and grounding behavior.",
-    phase: "Specialized Modalities",
-    chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
-    ],
-  },
-  {
-    id: "18",
+    id: "20",
     path: "10-voice-realtime-evals",
-    title: "Voice & Real-Time Evaluation",
+    title: "Voice & Real-Time Systems",
     summary: "Ensures low latency and reliable conversation under pressure.",
     phase: "Specialized Modalities",
     chapters: [
@@ -387,7 +407,7 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "19",
+    id: "21",
     path: "14-red-teaming",
     title: "Red-Teaming & Adversarial Testing",
     summary: "Finds the failures users and attackers will exploit.",
@@ -396,27 +416,7 @@ export const coreSections: CoreSection[] = [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
-  // Phase 6: Scale & Economics
-  {
-    id: "20",
-    path: "18-scaling-evals",
-    title: "Scaling Evals",
-    summary: "Expands evaluation coverage without losing signal.",
-    phase: "Scale & Economics",
-    chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
-    ],
-  },
-  {
-    id: "21",
-    path: "15-cost-quality-tradeoffs",
-    title: "Cost vs Quality Tradeoffs",
-    summary: "Optimizes quality without destroying margins or latency.",
-    phase: "Scale & Economics",
-    chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
-    ],
-  },
+  // Phase 6: Scale & Economics,
   {
     id: "22",
     path: "26-system-cost-engineering",
@@ -427,21 +427,31 @@ export const coreSections: CoreSection[] = [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
-  // Phase 7: Enterprise & Leadership
   {
     id: "23",
-    path: "24-security-abuse-prevention",
-    title: "Security & Abuse Prevention",
-    summary: "Defends against prompt injection and tool abuse.",
-    phase: "Enterprise & Leadership",
+    path: "15-cost-quality-tradeoffs",
+    title: "Cost-Quality Tradeoffs",
+    summary: "Optimizes quality without destroying margins or latency.",
+    phase: "Scale & Economics",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
     ],
   },
   {
     id: "24",
+    path: "18-scaling-evals",
+    title: "Scaling Evaluation Systems",
+    summary: "Expands evaluation coverage without losing signal.",
+    phase: "Scale & Economics",
+    chapters: [
+      { id: "1", title: "Chapter 1", slug: "ch1" },
+    ],
+  },
+  // Phase 7: Enterprise & Leadership,
+  {
+    id: "25",
     path: "16-multi-tenant-evals",
-    title: "Multi-Tenant / Customer-Specific Evals",
+    title: "Multi-Tenant & Customer-Specific Evals",
     summary: "Adapts evaluation to customer-specific expectations.",
     phase: "Enterprise & Leadership",
     chapters: [
@@ -449,20 +459,10 @@ export const coreSections: CoreSection[] = [
     ],
   },
   {
-    id: "25",
-    path: "17-enterprise-governance",
-    title: "Enterprise Governance & Compliance",
-    summary: "Connects evals to policy, audit, and risk controls.",
-    phase: "Enterprise & Leadership",
-    chapters: [
-      { id: "1", title: "Chapter 1", slug: "ch1" },
-    ],
-  },
-  {
     id: "26",
-    path: "19-eval-org-design",
-    title: "Eval Team & Org Design",
-    summary: "Designs ownership, workflows, and accountability.",
+    path: "17-enterprise-governance",
+    title: "Enterprise Governance, Org Design & Compliance",
+    summary: "Connects evals to policy, audit, risk controls, and team accountability.",
     phase: "Enterprise & Leadership",
     chapters: [
       { id: "1", title: "Chapter 1", slug: "ch1" },
