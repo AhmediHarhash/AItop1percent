@@ -1,0 +1,608 @@
+# Chapter 5.6 — De-duplication & Near-Duplicate Control (Anti-Gaming)
+
+**What we're doing here:**
+If your eval dataset contains duplicates or near-duplicates, your metrics lie.
+
+You think you have 5000 test cases, but you actually have 2000 unique scenarios tested 2.5 times each. Your coverage map has phantom entries. Your quality scores are artificially inflated by repetition. And worst of all: your team may accidentally overfit to the patterns they see repeatedly, gaming the eval without realizing it.
+
+In 2026, de-duplication is not "nice to have" — it's a fundamental dataset hygiene requirement for any enterprise evaluation program.
+
+**Enterprise outcome:**
+An eval dataset where every case is meaningfully distinct, near-duplicates are controlled, cross-split contamination is prevented, and anti-gaming rotation strategies protect the eval from overfitting.
+
+---
+
+## 1) Mechanics: why duplicates poison evaluation
+
+### 1.1 The duplicate data problem
+
+Most teams discover duplication too late:
+- They sample from production logs, which naturally contain repeated queries
+- They generate synthetic variants that accidentally produce paraphrases
+- They merge datasets from multiple sources without checking overlap
+- They copy cases across slices, changing only the language or tenant label
+
+The result: a 5000-case dataset that looks comprehensive but only contains 2000–3000 truly unique test scenarios.
+
+**What goes wrong:**
+- **Inflated coverage** — you think you test 50 intents, but 20 of them are duplicates of 10 core intents
+- **Biased metrics** — repeated cases get overweighted, skewing aggregate scores
+- **Wasted labeling budget** — you pay annotators to label the same scenario multiple times
+- **False confidence** — passing the same test repeatedly doesn't prove robustness
+
+### 1.2 The anti-gaming problem
+
+Even when teams remove exact duplicates, a subtler problem remains: **eval overfitting**.
+
+When developers can see the eval set (or a large portion of it), they naturally optimize for what they see:
+- They tune prompts to handle the specific phrasing in the eval
+- They fix edge cases that appear in the eval but ignore similar cases that don't
+- They unconsciously memorize eval patterns and solutions
+
+This isn't malicious — it's human nature. But it breaks the eval's ability to measure **generalization**.
+
+**The 2026 enterprise standard:**
+Serious teams rotate their eval datasets, maintain hidden holdouts, and treat eval visibility as a security boundary.
+
+---
+
+## 2) Types of duplication (and how to detect each)
+
+### 2.1 Exact duplicates
+
+**Definition:** Identical text after normalization (lowercasing, whitespace removal, punctuation standardization).
+
+**Examples:**
+- "What are your hours?" and "what are your hours?" (case difference)
+- "Check my balance" and "Check my balance  " (trailing space)
+- Production logs sampled from two different time windows with overlapping queries
+
+**Detection method:** Hash-based exact deduplication
+- Normalize text (lowercase, strip whitespace, remove punctuation if appropriate)
+- Compute hash (MD5 or SHA-256)
+- Group by hash, keep first occurrence
+
+**2026 tooling:**
+Most eval platforms now include built-in exact dedup as a default preprocessing step.
+
+---
+
+### 2.2 Near-duplicates (paraphrases)
+
+**Definition:** Different surface text, but semantically equivalent or trivially different.
+
+**Examples:**
+- "What time do you open?" and "When do you open?"
+- "I need to reset my password" and "I want to reset my password"
+- "Book a flight to NYC" and "Book a flight to New York City"
+
+**Why this matters:**
+If 30% of your dataset is paraphrases of the same 100 core queries, you're not measuring 1000 scenarios — you're measuring 100 scenarios with style variations. That inflates scores and hides coverage gaps.
+
+**Detection method:** N-gram overlap + MinHash
+- Compute character or word n-grams (3-grams to 5-grams)
+- Use MinHash or SimHash to estimate Jaccard similarity
+- Flag pairs with similarity > threshold (typically 0.7–0.85)
+
+**Human review required:**
+Automated near-dup detection produces false positives. Always sample flagged pairs and confirm before removing.
+
+---
+
+### 2.3 Semantic duplicates (different surface, same test intent)
+
+**Definition:** Different phrasing and structure, but testing the exact same capability or edge case.
+
+**Examples:**
+- "What's the return policy?" and "How do I return an item?" — both test return policy knowledge
+- "My account is locked" and "I can't log in because my account is disabled" — both test account recovery flow
+- Two different multi-step agent scenarios that ultimately test the same tool sequence and constraints
+
+**Why this is harder:**
+These cases aren't textually similar, so n-gram methods miss them. But from an evaluation perspective, they're redundant — passing both doesn't prove more capability than passing one.
+
+**Detection method:** Embedding-based similarity (2026 standard)
+- Encode each case using a sentence embedding model (e.g., sentence-transformers, OpenAI embeddings, Voyage embeddings)
+- Compute cosine similarity between embeddings
+- Flag pairs with similarity > threshold (typically 0.85–0.92 for semantic dedup)
+- Review flagged clusters manually — semantic similarity doesn't guarantee functional redundancy
+
+**When to keep semantic near-duplicates:**
+- If they test different slices (language, tier, tenant)
+- If they test different difficulty levels (one easy, one adversarial variant)
+- If they represent different user personas or contexts
+
+**When to remove them:**
+- If they're in the same slice and difficulty bucket
+- If they were created by blind paraphrasing without strategic intent
+
+---
+
+### 2.4 Cross-split duplicates (train/dev/test contamination)
+
+**Definition:** The same case appears in multiple dataset splits (training, development, test).
+
+**Why this is critical:**
+If a case appears in both your training data (for fine-tuning or few-shot prompting) and your test set, the model has seen the answer. Your eval no longer measures generalization — it measures memorization.
+
+**How it happens:**
+- Production logs sampled over overlapping time periods
+- Synthetic generation that produces similar outputs for training and test
+- Manual case creation where the same expert writes examples for both sets
+
+**Detection method:**
+- Run exact + near-dup + embedding similarity across all splits
+- Flag any case that appears in more than one split
+- Remove from test/holdout (never remove from train — you need the data)
+
+**Enterprise rule (non-negotiable):**
+Test sets and holdouts must be fully disjoint from training and few-shot prompt examples. Zero tolerance for leakage.
+
+---
+
+## 3) LLM-assisted semantic deduplication (2026 technique)
+
+For high-stakes datasets, embedding similarity isn't always enough. You need human-level judgment of "does this test the same thing?"
+
+**Method:** LLM-as-judge for duplicate detection
+1. Use embedding similarity to find candidate pairs (e.g., cosine > 0.80)
+2. For each candidate pair, prompt an LLM:
+   ```
+   You are evaluating whether two test cases are functionally redundant.
+
+   Case A: [text]
+   Case B: [text]
+
+   Question: Do these two cases test the exact same capability, constraint, or edge case?
+   Answer with: DUPLICATE | VARIANT | DISTINCT
+
+   If VARIANT, explain what is meaningfully different.
+   ```
+3. Keep cases marked DISTINCT or VARIANT
+4. For DUPLICATE, keep the higher-quality or earlier-created case
+
+**When to use this:**
+- Tier 2–3 datasets (high-stakes, worth the cost)
+- Safety/red-team suites (where subtle differences matter)
+- When you're deduplicating 10,000+ cases and can't manually review all pairs
+
+**Cost control:**
+- Only run on candidate pairs flagged by cheaper methods (embedding similarity)
+- Use a small, fast model (not Opus) for initial pass, reserve expensive models for borderline cases
+
+---
+
+## 4) Anti-gaming strategies (preventing eval overfitting)
+
+### 4.1 Why teams accidentally game their own evals
+
+It's not intentional. It happens because:
+- Developers see the eval cases during debugging
+- They fix specific failures without generalizing
+- They tune prompts to the visible eval phrasing
+- They add logic for edge cases that happen to be in the eval but miss similar real-world cases
+
+Over time, the model/prompt becomes **overfit to the eval set**, and scores inflate without real quality improvement.
+
+**The signal:**
+Your eval scores improve, but production quality stays flat or gets worse. Or: you pass the eval, ship, and immediately see new failure modes that should have been caught.
+
+### 4.2 Rotation strategies (periodically refresh the eval set)
+
+**Definition:** Periodically swap out a portion of the eval dataset with new cases, keeping the rest stable for trend tracking.
+
+**How it works:**
+- Maintain a core stable set (30–50%) for regression and trend analysis
+- Rotate the remaining 50–70% on a fixed cadence (monthly, quarterly, or per release)
+- Draw new cases from fresh production logs, updated expert cases, or adversarial red-team exercises
+
+**Benefits:**
+- Prevents memorization and overfitting
+- Keeps eval aligned with current production distribution
+- Forces the team to solve problems generally, not just fix specific eval cases
+
+**Default rotation cadence (2026 recommendations):**
+- **High-velocity products** (weekly releases): rotate 30% monthly
+- **Standard products** (bi-weekly to monthly releases): rotate 50% quarterly
+- **Safety/red-team suites**: rotate 70% quarterly (adversarial tactics evolve fast)
+
+**What stays stable:**
+- Anchor cases (gold examples that define quality)
+- Incident cases (regressions you must never repeat)
+- Cross-version benchmarks (for longitudinal comparison)
+
+---
+
+### 4.3 Hidden holdout (the subset developers never see)
+
+**Definition:** A portion of the eval set that is never shown to developers, only run in CI or by the eval team.
+
+**How it works:**
+- Designate 20–30% of your eval set as "hidden holdout"
+- Developers see scores on the visible set only
+- The hidden set is run automatically in CI, but individual case results are not exposed
+- At release gates, both visible and hidden scores must pass
+
+**Benefits:**
+- Provides an unbiased measure of generalization
+- Catches overfitting (visible scores high, hidden scores low = overfit)
+- Protects against unconscious gaming
+
+**Enterprise default:**
+Every Tier 2+ product should maintain a hidden holdout. It's the single most effective anti-gaming control.
+
+**Practical challenge:**
+Developers will want access to debug failures. Solution:
+- For hidden set failures, provide aggregate error categories (e.g., "10% failed on multi-constraint RAG"), not specific cases
+- Release a small sample of hidden cases periodically (e.g., 10% every quarter) to help teams improve, then replace them with new hidden cases
+
+---
+
+## 5) Knobs & defaults (what you actually set)
+
+### 5.1 Deduplication thresholds
+
+| Method | Threshold | What it catches | False positive risk |
+|---|---|---|---|
+| Exact (hash) | 100% match | Identical text | Very low |
+| N-gram (MinHash) | 0.70–0.85 | Near-duplicates, paraphrases | Medium (review needed) |
+| Embedding (cosine) | 0.85–0.92 | Semantic duplicates | High (always review) |
+| LLM-as-judge | N/A | Functional redundancy | Low (but slow + costly) |
+
+**Recommendation:**
+- Run exact dedup first (always, no review needed)
+- Run n-gram or embedding similarity on the remainder
+- Review flagged pairs manually or via LLM
+- For Tier 2+ datasets, use LLM-assisted review on borderline cases
+
+### 5.2 Deduplication frequency
+
+- **On dataset creation:** Always
+- **On dataset merge:** Always (when combining sources)
+- **On dataset expansion:** Run incremental dedup (new cases vs existing cases)
+- **Periodic audit:** Quarterly (production logs may introduce new duplicates over time)
+
+### 5.3 Rotation and holdout parameters
+
+| Parameter | Default | High-stakes product |
+|---|---|---|
+| Stable core (%) | 40% | 30% |
+| Rotated set (%) | 40% | 40% |
+| Hidden holdout (%) | 20% | 30% |
+| Rotation cadence | Quarterly | Monthly |
+
+**Adjust rotation percentage based on:**
+- Release velocity (faster releases = faster rotation)
+- Dataset size (larger datasets can rotate more cases while keeping stable trends)
+- Failure pattern evolution (if production keeps showing new edge cases, rotate more aggressively)
+
+---
+
+## 6) Failure modes (symptoms + root causes + fixes)
+
+### 6.1 "We have 5000 cases but scores feel inflated"
+
+**Symptoms:**
+- High eval scores (90%+) but production quality is mediocre
+- Aggregate metrics don't match slice-level reality
+- Coverage map shows many intents, but some are trivially similar
+
+**Root causes:**
+- Dataset contains many near-duplicates
+- Duplicate cases overweight certain intents or slices
+- No deduplication was run during dataset construction
+
+**Fix:**
+1. Run embedding-based similarity analysis across the full dataset
+2. Cluster similar cases (cosine > 0.85)
+3. Sample clusters and manually review — are they truly distinct tests?
+4. Remove redundant cases, keeping the highest-quality or most realistic instance per cluster
+5. Re-run metrics — expect scores to drop (this is good; it's now honest)
+
+---
+
+### 6.2 "Near-duplicate clusters are biasing slice scores"
+
+**Symptoms:**
+- One language or slice has suspiciously high scores
+- Drilling into cases, you see 10+ paraphrases of the same core query
+- Aggregate score is dominated by a few repeated patterns
+
+**Root causes:**
+- Synthetic generation created many paraphrases
+- Production sampling over-sampled a popular query
+- No slice-level dedup check was performed
+
+**Fix:**
+1. Run dedup separately per slice
+2. Cap the number of near-duplicate variants per intent (e.g., max 3 paraphrases)
+3. Rebalance slices to ensure similar difficulty and diversity distribution
+4. Track "unique intent coverage" per slice, not just raw case count
+
+---
+
+### 6.3 "Dedup removed too much — we lost important variants"
+
+**Symptoms:**
+- After dedup, certain edge cases or variants disappeared
+- Dataset now lacks difficulty diversity (lost adversarial paraphrases)
+- Slice coverage dropped below target
+
+**Root causes:**
+- Dedup threshold was too aggressive (e.g., cosine > 0.80 for semantic dedup)
+- Didn't distinguish between "redundant test" and "strategic variant"
+- Automated dedup ran without human review
+
+**Fix:**
+1. Before dedup, label cases with strategic intent: is this a "style variant" or a "coverage essential"?
+2. Protect cases labeled as coverage-essential, adversarial, or cross-slice
+3. Run dedup only on cases marked as "general" or "normal difficulty"
+4. Always review flagged pairs — never auto-delete high-similarity pairs without inspection
+
+---
+
+### 6.4 "Scores improved but production quality didn't — we're overfitting to the eval"
+
+**Symptoms:**
+- Eval scores trending upward
+- Production metrics flat or declining
+- New releases pass eval but immediately show regressions in the wild
+
+**Root causes:**
+- No eval rotation — team is optimizing for a static set
+- No hidden holdout — developers can see and fix all eval cases
+- Prompt tuning is overfitting to visible eval phrasing
+
+**Fix:**
+1. Implement rotation: swap 30–50% of eval cases quarterly
+2. Create hidden holdout (20–30% of dataset, never exposed to developers)
+3. Track visible vs hidden scores separately — divergence = overfitting
+4. Supplement eval with fresh production monitoring (Chapter 11)
+
+---
+
+### 6.5 "Cross-split contamination — test cases leaked into training data"
+
+**Symptoms:**
+- Model performance on test set is unrealistically high
+- Eval scores don't match real-world benchmarks
+- When you check, you find overlap between fine-tuning data and test set
+
+**Root causes:**
+- Dataset splits were created carelessly
+- Production logs were sampled over overlapping time periods for train and test
+- Synthetic generation produced the same examples for both splits
+
+**Fix:**
+1. Run exact + near-dup + embedding dedup across all splits
+2. Remove any overlapping cases from test/holdout (keep them in train if needed for quality)
+3. Implement split hygiene checks in your dataset pipeline (automated cross-split validation)
+4. For future datasets, create test/holdout first, then train (prevents accidental leakage)
+
+---
+
+## 7) Debug playbook: detecting and fixing duplication
+
+Run this workflow when building a new dataset or auditing an existing one:
+
+### Step 1: Exact dedup (always, no exceptions)
+```
+for each case:
+  normalized_text = lowercase(strip_whitespace(case.text))
+  hash = sha256(normalized_text)
+  if hash in seen_hashes:
+    flag as duplicate
+  else:
+    add to seen_hashes
+```
+
+Remove exact duplicates automatically. No review needed.
+
+---
+
+### Step 2: Near-dup detection (n-gram or embedding)
+```
+for each case:
+  embedding = embed(case.text)
+  for each existing_case:
+    similarity = cosine(embedding, existing_case.embedding)
+    if similarity > threshold:
+      flag pair for review
+```
+
+Threshold recommendations:
+- 0.90+ for high-confidence duplicates
+- 0.85–0.90 for probable duplicates (review required)
+- 0.75–0.85 for "check manually" zone
+
+---
+
+### Step 3: Manual or LLM review of flagged pairs
+For each flagged pair:
+- Are they testing the same capability? → Remove one
+- Are they strategic variants (different difficulty, slice, or constraint)? → Keep both
+- Are they paraphrases with no added value? → Remove one
+
+---
+
+### Step 4: Cross-split validation
+```
+for each case in test_set:
+  if case in train_set (exact or near-dup match):
+    CRITICAL ERROR — remove from test
+```
+
+---
+
+### Step 5: Cluster analysis (for large datasets)
+For datasets > 5000 cases:
+- Run clustering on embeddings (k-means or HDBSCAN)
+- Inspect large clusters (20+ cases)
+- If a cluster is all paraphrases of the same core scenario, keep 2–3 best examples, remove the rest
+
+---
+
+## 8) Enterprise expectations (what serious teams do)
+
+- They run deduplication as part of every dataset build and merge operation — it's automated, not optional
+- They maintain exact dedup + near-dup + cross-split validation in CI pipelines
+- They track "unique intent coverage" separately from raw case count
+- They implement eval rotation (30–50% quarterly) to prevent overfitting
+- They maintain hidden holdouts (20–30% of dataset) that developers never see
+- They monitor visible vs hidden scores — divergence triggers an overfitting investigation
+- They treat cross-split contamination as a critical bug, not a warning
+- They use LLM-assisted dedup for Tier 2+ datasets where subtle functional differences matter
+
+---
+
+## 9) Ready-to-use templates
+
+### 9.1 Deduplication pipeline config (pseudocode)
+
+```yaml
+dedup_pipeline:
+  stages:
+    - name: exact_dedup
+      method: hash
+      normalization:
+        lowercase: true
+        strip_whitespace: true
+        remove_punctuation: false
+      action: auto_remove
+
+    - name: near_dup_detection
+      method: embedding
+      model: sentence-transformers/all-MiniLM-L6-v2
+      similarity_threshold: 0.87
+      action: flag_for_review
+
+    - name: cross_split_validation
+      compare:
+        - test vs train
+        - test vs few_shot_examples
+        - holdout vs all_other_splits
+      similarity_threshold: 0.85
+      action: critical_error_if_found
+
+    - name: cluster_analysis
+      min_cluster_size: 10
+      embedding_model: same_as_above
+      action: flag_large_clusters_for_review
+
+review_workflow:
+  flagged_pairs:
+    - human_review: required
+    - llm_assist: optional (for Tier 2+)
+    - keep_both_if:
+        - different_slice
+        - different_difficulty
+        - different_risk_tier
+    - remove_one_if:
+        - same_slice_and_difficulty
+        - paraphrase_with_no_strategic_value
+
+output:
+  deduplicated_dataset: dataset_v2_deduped.jsonl
+  dedup_report:
+    - exact_duplicates_removed: N
+    - near_duplicates_reviewed: N
+    - near_duplicates_removed: N
+    - cross_split_violations: N (must be 0)
+    - unique_intent_coverage: N
+```
+
+---
+
+### 9.2 Similarity threshold decision table
+
+| Use case | Method | Threshold | Review required |
+|---|---|---|---|
+| Remove exact matches | Hash | 100% | No |
+| Remove obvious paraphrases | N-gram (MinHash) | 0.80+ | Sample review |
+| Detect semantic similarity | Embedding (cosine) | 0.87–0.92 | Yes, always |
+| Cross-split contamination check | Embedding (cosine) | 0.85+ | Auto-reject if found |
+| LLM-assisted dedup (Tier 2+) | LLM-as-judge | N/A | LLM decides, human spot-checks |
+
+**Guidance:**
+- Start conservative (higher threshold = fewer flagged pairs)
+- Manually review 50–100 pairs to calibrate
+- Adjust threshold based on false positive rate (target: under 10% false positives)
+
+---
+
+### 9.3 Rotation and holdout strategy (template)
+
+```yaml
+dataset_structure:
+  total_size: 5000 cases
+
+  stable_core:
+    size: 2000 cases (40%)
+    purpose: regression tracking, trend analysis
+    includes:
+      - anchor_cases
+      - incident_cases
+      - cross_version_benchmarks
+    rotation: never (only add, never remove)
+
+  rotated_set:
+    size: 2000 cases (40%)
+    purpose: production alignment, coverage expansion
+    rotation_cadence: quarterly
+    rotation_percent: 50% per rotation (1000 cases swapped)
+    sources:
+      - fresh production logs
+      - updated expert cases
+      - new adversarial packs
+
+  hidden_holdout:
+    size: 1000 cases (20%)
+    purpose: anti-gaming, generalization test
+    visibility: never shown to developers
+    run_in: CI only
+    results_reporting:
+      - aggregate_score: visible
+      - per_case_details: hidden
+      - error_categories: visible (e.g., "RAG citation failures: 15%")
+    rotation_cadence: quarterly (after visible scores stabilize)
+
+anti_gaming_controls:
+  - track visible_score vs holdout_score separately
+  - alert if divergence > 10 percentage points (signals overfitting)
+  - periodic release of 10% of holdout cases to help debugging (then replace)
+  - strict access control: only eval team can view holdout case details
+```
+
+---
+
+### 9.4 Dedup audit checklist (run quarterly)
+
+```
+[ ] Run exact dedup — confirm 0 hash collisions
+[ ] Run near-dup detection — review flagged pairs, confirm removal decisions logged
+[ ] Cross-split validation — confirm 0 contamination between train/test/holdout
+[ ] Cluster analysis — inspect any cluster > 20 cases, confirm intentional diversity
+[ ] Unique intent coverage check — compare to coverage map, flag gaps
+[ ] Slice-level dedup check — confirm no slice has >2x duplicates vs others
+[ ] Rotation executed (if due) — confirm stable core unchanged, rotated set refreshed
+[ ] Holdout integrity — confirm no accidental exposure, access logs reviewed
+[ ] Document findings — update dataset version notes with dedup changes
+```
+
+---
+
+## 10) Interview-ready talking points
+
+> "I run exact dedup via hash, near-dup via embeddings, and cross-split validation to prevent contamination."
+
+> "A 5000-case dataset with 40% duplicates is really a 3000-case dataset with inflated scores — I track unique intent coverage, not just raw count."
+
+> "I rotate 30–50% of the eval set quarterly to prevent overfitting and keep it aligned with production."
+
+> "I maintain a hidden holdout (20–30% of cases) that developers never see — it's the best anti-gaming control."
+
+> "When visible scores are high but holdout scores lag, that's overfitting. I track the gap and investigate when it exceeds 10 points."
+
+> "I use LLM-as-judge for Tier 2+ dedup: embedding similarity finds candidates, LLM decides if they're functionally redundant."
+
+> "Cross-split contamination is a critical bug. If test cases leak into training data, the eval measures memorization, not capability."

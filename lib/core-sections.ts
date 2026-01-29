@@ -71,6 +71,12 @@ export const coreSections: CoreSection[] = [
         subchapters: [
           { id: "5.1", title: "Data Sources", slug: "5-1" },
           { id: "5.2", title: "Dataset Formats", slug: "5-2" },
+          { id: "5.3", title: "Balancing & Difficulty", slug: "5-3" },
+          { id: "5.4", title: "Splits & Holdouts", slug: "5-4" },
+          { id: "5.5", title: "Privacy & Sanitization", slug: "5-5" },
+          { id: "5.6", title: "De-duplication & Near-Duplicate Control", slug: "5-6" },
+          { id: "5.7", title: "Dataset QA", slug: "5-7" },
+          { id: "5.8", title: "Versioning, Lineage & Registry", slug: "5-8" },
         ],
       },
     ],
