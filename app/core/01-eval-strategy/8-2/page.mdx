@@ -1,0 +1,632 @@
+---
+title: "8.2 — Trajectory & Action Trace Evaluation"
+description: "How to evaluate the full sequence of actions an agent takes, not just the final output"
+---
+
+# 8.2 — Trajectory & Action Trace Evaluation
+
+A junior surgeon completes an appendectomy successfully. The patient recovers. But when the attending reviews the OR video, they see something troubling: the surgeon made an unnecessary incision, nicked a blood vessel, cauterized it, then proceeded correctly. The outcome was fine. The patient will never know. But the attending knows this surgeon cannot operate unsupervised.
+
+In traditional software, we judge programs by their outputs. In agent systems, **the path matters as much as the destination**. An agent that deletes your production database, panics, restores from backup, and delivers the right answer is not the same as an agent that carefully queries read replicas. Both produce correct results. Only one should run in production.
+
+This chapter is about evaluating **trajectories**: the full sequence of reasoning steps, tool calls, observations, and decisions an agent makes. Not just "did it work," but "did it work the right way."
+
+---
+
+## What Is a Trajectory?
+
+A **trajectory** is the ordered sequence of steps an agent executes from receiving a task to producing a final answer. In the **ReAct** framework (Reasoning + Acting), each step is a tuple:
+
+```yaml
+- thought: "I need to check the user's account balance"
+  action: query_database
+  parameters:
+    table: accounts
+    user_id: 12345
+  observation: "Balance: $423.18"
+
+- thought: "Balance is sufficient for the transaction"
+  action: process_payment
+  parameters:
+    user_id: 12345
+    amount: 50.00
+  observation: "Payment successful. New balance: $373.18"
+```
+
+Each cycle contains:
+- **Thought**: The agent's internal reasoning or plan
+- **Action**: The tool or function it chooses to invoke
+- **Observation**: The result or feedback from that action
+
+The full trajectory is the chain of these cycles from start to finish. Think of it as the agent's "transcript" or "audit log" for a single task.
+
+---
+
+## Why Trajectories Matter More Than Outcomes
+
+Imagine two agents booking a flight:
+
+**Agent A**:
+1. Search flights SFO to NYC
+2. Filter by price and departure time
+3. Select best option
+4. Confirm booking
+
+**Agent B**:
+1. Search flights SFO to NYC
+2. Book the first result
+3. Realize it's a red-eye with three layovers
+4. Cancel booking
+5. Search again with filters
+6. Book correct flight
+
+Both agents deliver a confirmed ticket. But Agent B wasted money on a cancellation fee, triggered fraud alerts, and confused the user with duplicate confirmation emails. **Outcome-only evaluation** would rate them equally. **Trajectory evaluation** reveals Agent B is flawed.
+
+Why trajectory matters:
+
+**1. Intermediate harm.** The agent might make destructive, expensive, or privacy-violating actions mid-task, even if it "fixes" them later. Deleting files, exposing PII, charging credit cards, sending emails—these actions have consequences even if ultimately reversed.
+
+**2. Efficiency.** An agent that takes twenty steps instead of five wastes time, tokens, and API calls. In production, this multiplies costs and latency.
+
+**3. Reasoning quality.** Sloppy reasoning that stumbles into the right answer by luck will fail on harder tasks. Clean reasoning generalizes.
+
+**4. User trust.** Users watching an agent flail and backtrack lose confidence, even if it eventually succeeds. A smooth, logical trajectory builds trust.
+
+**5. Debugging.** When an agent fails, the trajectory tells you *where* it went wrong. Outcome-only evals just say "it failed."
+
+Trajectory evaluation is how you distinguish a competent agent from a lucky one.
+
+---
+
+## Dimensions of Trajectory Correctness
+
+Evaluating a trajectory is not binary. You assess it across multiple dimensions:
+
+### 1. Tool Selection
+Did the agent call the **right tools** for the task? If the task requires searching a database, did it use the search tool, or did it try to hallucinate an answer?
+
+### 2. Tool Ordering
+Did the agent call tools in a **logical sequence**? You cannot charge a credit card before verifying the account exists. You cannot send a confirmation email before completing the booking. Some orderings are strictly wrong; others are suboptimal.
+
+### 3. Parameter Correctness
+Did the agent pass **correct parameters** to each tool? Right user ID, right query filters, right file path. A trajectory can fail if the agent calls the right tool with the wrong arguments.
+
+### 4. Error Handling
+When a tool call fails, did the agent **handle the error gracefully**? Did it retry with adjusted parameters, fall back to an alternative tool, or inform the user? Or did it panic and hallucinate?
+
+### 5. Efficiency
+Did the agent achieve the goal in a **reasonable number of steps**? No redundant queries, no unnecessary loops, no backtracking unless required by new information.
+
+### 6. Safety
+Did the agent avoid **harmful intermediate actions**? No destructive operations (delete, drop, overwrite) unless explicitly required. No privacy leaks. No unauthorized access attempts.
+
+A perfect trajectory scores well on all six dimensions. Most real trajectories trade off between them—an agent might take extra steps (efficiency hit) to be more cautious (safety gain).
+
+---
+
+## Trajectory Scoring Approaches
+
+There are three main strategies for scoring trajectories, each with different strictness levels:
+
+### Gold Trajectory Comparison (Strict)
+
+You define a **reference trajectory**—the "correct" sequence of steps for the task. You compare the agent's trajectory to the gold standard step-by-step.
+
+**Scoring**: Exact match (1.0), partial match with edit distance (0.0 to 1.0), or no match (0.0).
+
+**Example**:
+```yaml
+Gold trajectory:
+  1. search_database(user_id=123)
+  2. calculate_discount(price=100, tier=gold)
+  3. apply_payment(user_id=123, amount=85)
+
+Agent trajectory:
+  1. search_database(user_id=123)
+  2. calculate_discount(price=100, tier=gold)
+  3. apply_payment(user_id=123, amount=85)
+
+Score: 1.0 (exact match)
+```
+
+**When to use**: High-stakes, deterministic tasks where there is one correct path. Medical protocols, financial transactions, regulated workflows.
+
+**Drawback**: Too rigid. Punishes valid alternative paths. Hard to scale—requires hand-authoring gold trajectories for every task.
+
+### Constraint Satisfaction (Flexible)
+
+You define **rules** the trajectory must satisfy, but not the exact sequence. For example:
+- Must call `verify_account` before `charge_card`
+- Must not call `delete_file` unless user confirms
+- Must retrieve data before summarizing it
+
+**Scoring**: Count how many constraints the trajectory satisfies. Aggregate into a score (e.g., 8/10 constraints met = 0.8).
+
+**Example**:
+```yaml
+Constraints:
+  - Must call search_database before calculate_discount
+  - Must not call apply_payment more than once
+  - Total steps should be fewer than ten
+
+Agent trajectory:
+  1. search_database(user_id=123)
+  2. search_database(user_id=123)  # redundant, but not wrong
+  3. calculate_discount(price=100, tier=gold)
+  4. apply_payment(user_id=123, amount=85)
+
+Score: 3/3 constraints met (redundant call is inefficient but allowed)
+```
+
+**When to use**: Most agent tasks. Allows flexibility while enforcing critical ordering and safety rules.
+
+**Drawback**: Requires careful constraint design. Too few constraints and you miss real issues; too many and you over-constrain.
+
+### Outcome-Only (Loose)
+
+You ignore the trajectory entirely and judge only the **final result**. Did the agent achieve the goal? If yes, 1.0. If no, 0.0.
+
+**When to use**: Exploratory tasks where many paths are valid. Research, brainstorming, open-ended Q&A. Or when you genuinely do not care about efficiency or intermediate steps.
+
+**Drawback**: Misses harmful intermediate actions, inefficiency, poor reasoning. Fine for prototyping; dangerous for production.
+
+**Recommendation**: Start with outcome-only to establish a baseline. Add constraint satisfaction as you identify failure modes. Reserve gold trajectory comparison for the highest-stakes 10% of tasks.
+
+---
+
+## Logging and Tracing Infrastructure
+
+You cannot evaluate what you do not capture. Every agent system needs **comprehensive tracing** of trajectories.
+
+### What to Log at Each Step
+
+For every action in the trajectory, record:
+
+- **Thought**: The agent's reasoning or plan (if available)
+- **Action**: Tool or function name
+- **Input parameters**: Full serialized arguments
+- **Output**: Tool response or observation
+- **Latency**: Time taken for the tool call
+- **Token usage**: Prompt and completion tokens (if LLM call)
+- **Timestamp**: When the step occurred
+- **Status**: Success, error, timeout
+- **Error details**: Stack trace or error message if failed
+
+Example trace entry:
+```yaml
+step_id: 3
+timestamp: 2026-01-15T14:32:18Z
+thought: "User requested flight search, need to query travel API"
+action: search_flights
+input:
+  origin: SFO
+  destination: NYC
+  date: 2026-02-10
+  passengers: 1
+output:
+  flights: [...]
+  count: 47
+latency_ms: 823
+tokens:
+  prompt: 0
+  completion: 0
+status: success
+```
+
+Store traces in structured format (JSON, Protobuf) for easy querying and analysis.
+
+### Tracing Platforms (2026 Landscape)
+
+**LangSmith** (LangChain): Purpose-built for LLM agent tracing. Automatic instrumentation for LangChain agents. Visualizes trajectories as graphs. Supports filtering, search, and comparison. Strong for development and debugging.
+
+**Maxim** (Braintrust): Unified eval and tracing platform. Integrates trajectory logging with eval datasets. Good for teams running large-scale eval suites. Supports custom trajectory metrics.
+
+**Galileo**: Observability for LLM systems. Traces agent steps, embeddings, retrieval calls. Built-in trajectory anomaly detection. Useful for catching unusual agent behavior in production.
+
+**Arize Phoenix**: Open-source tracing and observability. Integrates with OpenTelemetry. Good for teams that need full control over trace storage and analysis. Self-hosted or cloud.
+
+**Weights & Biases**: General ML platform with LLM tracing add-on. Best if you are already using W&B for model training. Traces stored alongside model metrics.
+
+Most platforms support **OpenTelemetry** standards for spans and traces, making it easier to switch or combine tools.
+
+**Recommendation**: Use LangSmith or Arize Phoenix for development. Add Galileo or Maxim for production monitoring. Ensure all platforms ingest from a common trace format so you can compare results.
+
+---
+
+## Trajectory Length as a Metric
+
+**Shorter is generally better.** An agent that solves a task in three steps is more efficient than one that takes ten. Shorter trajectories mean:
+- Lower latency
+- Lower cost (fewer LLM calls, fewer tool invocations)
+- Lower risk (fewer chances for something to go wrong)
+- Better user experience (faster results)
+
+But **not always**. Sometimes thoroughness requires more steps:
+
+**Scenario 1: Verification**. A financial agent might intentionally add extra steps to double-check a calculation before executing a trade. The extra steps reduce risk.
+
+**Scenario 2: User interaction**. A customer service agent might ask clarifying questions (extra steps) to ensure it understands the user's intent before acting.
+
+**Scenario 3: Exploration**. A research agent might query multiple sources to triangulate an answer, even if a single source would suffice. The extra steps improve accuracy.
+
+Track **trajectory length** as a metric, but contextualize it:
+
+- **Absolute length**: Total number of steps (mean, median, 95th percentile across tasks)
+- **Normalized length**: Steps per task difficulty (harder tasks should have longer trajectories)
+- **Efficiency ratio**: Actual steps divided by minimum required steps (if known)
+
+Set **trajectory length budgets** for different task types. If an agent consistently exceeds the budget, investigate whether it is over-thinking, looping, or genuinely being thorough.
+
+---
+
+## Comparing Trajectories Across Runs
+
+Run the same task multiple times. The agent will often produce **different trajectories** due to:
+- Non-deterministic LLM sampling (temperature greater than zero)
+- Tool output variability (APIs return different results over time)
+- Stochastic tool selection (if the agent uses random exploration)
+
+How do you assess whether both trajectories are valid?
+
+### Trajectory Clustering
+
+Collect trajectories for the same task across many runs. Cluster them by similarity (e.g., using sequence alignment or embeddings). Clusters represent different "strategies" the agent uses.
+
+**Example**: For "book a flight," you might find:
+- Cluster A: Search, filter, book (direct path)
+- Cluster B: Search, book, cancel, search again, book (exploratory path)
+- Cluster C: Search, ask user for preferences, search again, book (clarification path)
+
+Evaluate each cluster separately. Cluster A is efficient. Cluster B is flawed. Cluster C is thorough but slower. You can decide to penalize Cluster B while accepting both A and C.
+
+### Outcome-Consistent Trajectories
+
+Two trajectories are **outcome-consistent** if they produce the same final result. If both succeed, both are valid (under outcome-only evaluation). If one succeeds and one fails, the failing trajectory is wrong.
+
+But outcome-consistency does not guarantee both are equally good. You still need to compare efficiency, safety, and intermediate actions.
+
+### Canonical Trajectory
+
+For each task, identify a **canonical trajectory**—the most common or most efficient path. Flag runs that deviate significantly from the canonical path for manual review. This helps you catch rare failure modes without evaluating every single run.
+
+**Recommendation**: Cluster trajectories by task. Evaluate a few runs from each cluster. Use the canonical trajectory as a baseline for automated eval, but allow valid alternatives.
+
+---
+
+## Partial Trajectory Evaluation
+
+Some agent tasks produce **very long trajectories**—hundreds or thousands of steps. Evaluating the entire trajectory is expensive and slow. Instead, evaluate **sub-sequences**:
+
+### Windowed Evaluation
+
+Break the trajectory into fixed-size windows (e.g., 10 steps each). Evaluate each window independently. Aggregate scores.
+
+**Example**: 100-step trajectory → 10 windows of 10 steps → evaluate each window → average scores.
+
+**Benefit**: Parallelizable. You can evaluate multiple windows simultaneously.
+
+**Drawback**: Misses long-range dependencies (e.g., an action in step 5 that causes a failure in step 50).
+
+### Critical Path Evaluation
+
+Identify the **critical steps**—actions that directly contribute to the final outcome. Ignore "filler" steps like status checks or logging. Evaluate only the critical path.
+
+**Example**: Agent makes 30 steps, but only 8 are critical tool calls. Evaluate those 8.
+
+**Benefit**: Focuses on high-impact actions. Efficient.
+
+**Drawback**: Requires identifying critical steps, which may be task-specific.
+
+### Sampling
+
+Randomly sample a fixed number of steps from the trajectory. Evaluate the sample. Use it as a proxy for overall trajectory quality.
+
+**Benefit**: Fast. Works for arbitrarily long trajectories.
+
+**Drawback**: High variance. You might miss critical failures if you sample the wrong steps.
+
+**Recommendation**: Use critical path evaluation when you can define critical steps. Use windowed evaluation when you cannot. Reserve full trajectory evaluation for debugging and spot-checking.
+
+---
+
+## Trajectory-Level LLM Judge
+
+Just as you can use an LLM to judge final outputs (see Chapter 7.2), you can use an **LLM-as-a-Judge** to evaluate entire trajectories.
+
+**How it works**:
+1. Collect the full trajectory (thoughts, actions, observations)
+2. Serialize it into a readable format (YAML, JSON, or natural language summary)
+3. Prompt an LLM judge: "Evaluate this agent's reasoning and actions. Did it make logical decisions? Did it use tools correctly? Did it handle errors well?"
+4. The judge returns a score (1-5) and justification
+
+**Example prompt**:
+```yaml
+You are evaluating an agent's trajectory for the task: "Book a flight from SFO to NYC on Feb 10."
+
+Trajectory:
+- Step 1: Thought: "I need to search for flights." Action: search_flights(origin=SFO, destination=NYC, date=2026-02-10). Observation: Found 47 flights.
+- Step 2: Thought: "I should filter by price." Action: filter_flights(max_price=500). Observation: 12 flights remain.
+- Step 3: Thought: "I'll book the cheapest option." Action: book_flight(flight_id=ABC123). Observation: Booking confirmed.
+
+Evaluate the trajectory on:
+1. Tool selection (did the agent use the right tools?)
+2. Reasoning quality (were the agent's thoughts logical?)
+3. Efficiency (did the agent take unnecessary steps?)
+4. Error handling (did the agent handle failures well?)
+
+Provide a score from 1 (very poor) to 5 (excellent) and explain your reasoning.
+```
+
+**Benefits**:
+- Flexible: Works for any task without hand-crafted rules
+- Contextual: The judge can assess nuanced reasoning humans would catch but rule-based systems miss
+- Scalable: One judge model can evaluate all trajectory types
+
+**Drawbacks**:
+- Expensive: Each trajectory evaluation requires a long prompt and a multi-hundred token response
+- Noisy: LLM judges are not perfectly reliable (agreement rates ~80-90% with humans)
+- Opaque: Hard to debug why the judge scored a trajectory a certain way
+
+**Recommendation**: Use trajectory-level LLM judges for **qualitative debugging** and **spot-checking**. Use rule-based or constraint-based scoring for high-volume automated eval. Reserve human review for the 5% of cases where LLM judges and rule-based scores disagree.
+
+See Chapter 7.2 for more on LLM judge design, and Chapter 7.8 for multi-stage eval pipelines that combine rule-based and LLM-based scoring.
+
+---
+
+## Visualizing Trajectories
+
+Raw trajectory logs are hard for humans to parse. Visualization makes them debuggable.
+
+### Timeline View
+
+Display the trajectory as a horizontal timeline, with each step as a node. Color-code by action type (tool call, LLM reasoning, user interaction). Show latency and token usage on hover.
+
+**Use case**: Debugging slow agents. Identify which steps take the longest.
+
+### Graph View
+
+Represent the trajectory as a directed graph. Nodes are states (observations), edges are actions. Branch when the agent explores multiple paths.
+
+**Use case**: Understanding decision trees. See where the agent considered alternatives.
+
+### Diff View
+
+Compare two trajectories side-by-side. Highlight where they diverge. Useful for A/B testing prompts or models.
+
+**Use case**: Evaluating prompt changes. See how the trajectory shifts with different instructions.
+
+### Narrative Summary
+
+Use an LLM to generate a human-readable summary of the trajectory: "The agent first searched the database, then applied a discount, then processed the payment. It completed the task in three efficient steps with no errors."
+
+**Use case**: Reporting to non-technical stakeholders. Summaries are easier to review than raw logs.
+
+**Tooling**: LangSmith and Arize Phoenix both provide built-in timeline and graph visualizations. For custom visualizations, export traces to JSON and use D3.js or Plotly.
+
+**Recommendation**: Provide timeline views for engineers debugging agents. Provide narrative summaries for product managers reviewing agent behavior. Use diff views for A/B tests.
+
+---
+
+## Failure Modes to Avoid
+
+### 1. Ignoring Intermediate Steps
+
+Some teams only log the final output, not the trajectory. This makes debugging impossible. You have no visibility into *why* the agent failed or *how* it succeeded.
+
+**Fix**: Instrument every agent call to log full trajectories. Make trace IDs easy to search and correlate.
+
+### 2. Insufficient Detail
+
+Logging "called search_database" is not enough. You need the **input parameters** and **output** to diagnose issues. If a query returns zero results, was it because the agent queried the wrong table, used the wrong filters, or the data genuinely does not exist?
+
+**Fix**: Log inputs, outputs, latency, and status for every step. Include error messages and stack traces when available.
+
+### 3. Overly Strict Trajectory Comparison
+
+Requiring exact step-by-step match to a gold trajectory punishes valid alternative paths. An agent that queries two databases in parallel instead of sequentially may be faster, but strict comparison will penalize it.
+
+**Fix**: Use constraint satisfaction instead of exact matching. Define what must happen (e.g., "must verify account before charging") but allow flexibility in how.
+
+### 4. Not Comparing Across Runs
+
+Evaluating a single trajectory tells you whether *that run* was good. It does not tell you whether the agent is *consistently* good. An agent that succeeds 8 out of 10 times is flaky, even if the 8 successful trajectories look perfect.
+
+**Fix**: Run each task at least 5-10 times. Track trajectory diversity and success rate. Flag high-variance agents for investigation.
+
+### 5. No Human Review Loop
+
+Automated trajectory scoring catches obvious issues (wrong tools, missing steps). It misses subtle issues like awkward reasoning, unnecessarily verbose thinking, or technically correct but socially inappropriate actions.
+
+**Fix**: Sample 5-10% of trajectories for human review. Use human feedback to refine automated scoring rules.
+
+### 6. Logging Without Analyzing
+
+Teams collect millions of traces but never analyze them. Logs sit in S3, unused.
+
+**Fix**: Set up dashboards for trajectory length, success rate, and tool usage. Run weekly reviews of anomalous trajectories. Make trace analysis part of your sprint retrospectives.
+
+---
+
+## Real-World Example: Customer Service Agent
+
+**Task**: Handle a customer complaint about a delayed shipment.
+
+**Agent A Trajectory**:
+1. Thought: "User is unhappy about shipment delay. I should check order status."
+2. Action: `query_order_status(order_id=789)`
+3. Observation: "Order 789 shipped on Jan 10, estimated delivery Jan 15. Current status: in transit."
+4. Thought: "Shipment is delayed by 3 days. I should apologize and offer a discount."
+5. Action: `generate_apology_email(order_id=789, discount=10%)`
+6. Observation: "Email sent. Discount code: SORRY10."
+7. Thought: "Issue resolved."
+8. Action: `close_ticket(ticket_id=456)`
+
+**Agent B Trajectory**:
+1. Thought: "User mentioned shipment delay. Let me check."
+2. Action: `query_order_status(order_id=789)`
+3. Observation: "Order 789 shipped on Jan 10, estimated delivery Jan 15. Current status: in transit."
+4. Thought: "Shipment is late. I should cancel the order and refund."
+5. Action: `cancel_order(order_id=789)`
+6. Observation: "Order canceled. Refund issued."
+7. Thought: "Wait, maybe I should have asked first."
+8. Action: `send_message_to_user(message="I canceled your order. Hope that's okay!")`
+
+**Evaluation**:
+
+**Agent A**: Correct trajectory. Checked status, acknowledged the delay, offered compensation, closed ticket. Efficient (8 steps) and appropriate.
+
+**Agent B**: Wrong trajectory. Canceled an in-transit order without user consent. Even though the agent "resolved" the issue (customer gets a refund), the intermediate action (canceling the order) was harmful. The customer may have preferred to wait. The company loses a sale.
+
+Outcome-only eval might score Agent B as successful (ticket closed, customer contacted). Trajectory eval reveals the flaw.
+
+---
+
+## Enterprise Trajectory Evaluation Standards
+
+In regulated industries (healthcare, finance, legal), trajectory evaluation is not optional—it is a **compliance requirement**. Auditors want to see:
+
+### 1. Audit Logs
+Every agent action must be logged with timestamps, user IDs, and justifications. Logs must be tamper-proof and retained for 7+ years.
+
+### 2. Trajectory Review Gates
+High-stakes decisions (loan approvals, medical diagnoses, legal filings) require **human review of the trajectory** before the final action is executed. The agent proposes a plan, a human approves it, then the agent executes.
+
+### 3. Explainability
+The agent must explain *why* it took each step. This requires logging thoughts/reasoning at every stage. If an agent denies a loan, the trajectory must show which data points influenced the decision and why.
+
+### 4. Bias and Fairness Checks
+Trajectories must be analyzed for demographic bias. If the agent queries different data sources or applies different thresholds for different user groups, that is flagged as potential discrimination.
+
+### 5. Rollback Capabilities
+If a trajectory is later found to be flawed (e.g., the agent acted on incorrect data), the system must support **trajectory rollback**: undoing all actions in the trace and re-running with corrected data.
+
+**Recommendation**: If you are building agents for regulated industries, design your tracing infrastructure from day one to support audit logs, explainability, and rollback. Retrofit is expensive.
+
+---
+
+## Trajectory Evaluation Checklist
+
+Before deploying an agent to production, ensure:
+
+- [ ] Every agent step is logged with action, input, output, latency, and status
+- [ ] Traces are stored in a queryable format (JSON, database, or tracing platform)
+- [ ] You have defined success criteria for trajectories (gold path, constraints, or outcome-only)
+- [ ] You have run at least 5-10 trajectories per task type and reviewed for consistency
+- [ ] You have visualizations or dashboards for trajectory length, tool usage, and error rates
+- [ ] You have spot-checked 5-10% of trajectories with human reviewers
+- [ ] You have set up alerts for anomalous trajectories (too long, unusual tool sequences, repeated errors)
+- [ ] You have a process for updating trajectory evals as the agent evolves
+
+---
+
+## When to Use Trajectory Evaluation
+
+**Always**:
+- Agents that take destructive actions (delete, modify, send, charge)
+- Agents handling sensitive data (PII, financial, medical)
+- Multi-step workflows where intermediate errors compound
+- Regulated industries requiring audit trails
+
+**Sometimes**:
+- Agents with long tasks where outcome-only eval is too coarse
+- Debugging flaky agents (trajectory analysis reveals inconsistency)
+- A/B testing prompts or models (trajectory diff shows behavioral changes)
+
+**Rarely**:
+- Single-step agents (no trajectory to evaluate)
+- Purely generative tasks where there is no "correct" path (creative writing, brainstorming)
+- Prototypes where you are iterating fast and only care about outcomes
+
+**Recommendation**: Default to trajectory evaluation for production agents. Use outcome-only eval only for prototyping or low-stakes tasks.
+
+---
+
+## Trajectory Evaluation Template
+
+```yaml
+task_id: "book_flight_sfo_nyc_001"
+agent_id: "travel_agent_v2.3"
+timestamp: "2026-01-15T14:30:00Z"
+
+trajectory:
+  - step: 1
+    thought: "User wants to book a flight. I need to search available flights."
+    action: search_flights
+    input:
+      origin: SFO
+      destination: NYC
+      date: "2026-02-10"
+      passengers: 1
+    output:
+      flights: 47
+      cheapest: $287
+    latency_ms: 820
+    status: success
+
+  - step: 2
+    thought: "Too many options. I should filter by price and departure time."
+    action: filter_flights
+    input:
+      max_price: 400
+      preferred_time: "morning"
+    output:
+      flights: 12
+    latency_ms: 120
+    status: success
+
+  - step: 3
+    thought: "User did not specify preferences. I'll book the cheapest option."
+    action: book_flight
+    input:
+      flight_id: "UA4521"
+      user_id: 12345
+    output:
+      confirmation: "ABC123DEF"
+      price: $287
+    latency_ms: 1500
+    status: success
+
+evaluation:
+  outcome: "success"
+  trajectory_length: 3
+  efficiency_score: 1.0  # optimal length for this task
+  tool_selection_score: 1.0  # all tools correct
+  parameter_correctness_score: 1.0  # all params valid
+  error_handling_score: "N/A"  # no errors occurred
+  safety_score: 1.0  # no harmful actions
+  overall_score: 1.0
+
+notes: "Clean trajectory. Agent followed standard booking workflow. No issues."
+```
+
+Use this template to structure your trajectory logs. Extend it with task-specific fields as needed.
+
+---
+
+## Interview Q&A: Trajectory Evaluation
+
+**Q1: We are evaluating an agent that writes code. Should we evaluate the trajectory or just the final code output?**
+
+Evaluate both, but weight trajectory differently depending on the task. For a simple "write a function to sort a list" task, outcome-only eval is fine—either the code works or it does not. But for complex tasks like "debug this 500-line module," the trajectory matters. Did the agent methodically test hypotheses, or did it randomly change lines until something worked? An agent that gets lucky once will fail on harder bugs. Trajectory evaluation catches this. Also, if the agent uses external tools (running tests, searching docs, querying APIs), those steps should absolutely be evaluated—an agent that runs `rm -rf /` then writes correct code is not acceptable.
+
+**Q2: Our agent sometimes takes 5 steps to solve a task, sometimes 20 steps. Both succeed. Is the 20-step trajectory bad?**
+
+Not necessarily. First, check if the task difficulty varied—harder tasks should take more steps. Second, analyze what the extra steps did. If the agent is doing redundant work (querying the same API multiple times with identical parameters), that is inefficient and should be penalized. If the agent is being thorough (checking multiple sources, verifying results, asking clarifying questions), the extra steps may be justified. Third, compare cost and latency. If the 20-step trajectory costs five times more and takes three times longer, that is a real problem even if the outcome is correct. Track trajectory length as a metric, set budgets per task type, and investigate outliers.
+
+**Q3: How do we handle non-deterministic trajectories? Running the same task twice gives different action sequences.**
+
+This is expected if your agent uses temperature greater than zero or if tool outputs change over time. The question is whether both trajectories are valid. Cluster trajectories for the same task and evaluate each cluster. If one cluster consistently fails or produces unsafe actions, investigate why the agent sometimes follows that path. You may need to adjust prompts or constrain tool usage. If both clusters succeed and are safe, accept the variance—but track it. High trajectory variance can confuse users or make debugging harder. Consider lowering temperature or adding more explicit instructions to reduce variance if it is a problem.
+
+**Q4: We have trajectories with hundreds of steps. Evaluating all of them is too expensive. What should we do?**
+
+Use partial trajectory evaluation. Option one: critical path evaluation—identify the 10-20 steps that directly contribute to the outcome (e.g., database writes, API calls, final decision) and evaluate only those. Option two: windowed evaluation—break the trajectory into chunks of 10-20 steps and evaluate each chunk. Option three: sampling—randomly sample a fixed number of steps and evaluate those. For debugging, use full trajectory evaluation on a small sample (5-10 runs). For large-scale eval, use partial methods. Also, invest in better tracing infrastructure—tools like LangSmith and Arize can automatically flag anomalous steps, reducing the amount you need to manually review.
+
+**Q5: Can we use an LLM to evaluate trajectories automatically, or do we need humans?**
+
+You can use an LLM-as-a-Judge to evaluate trajectories at scale (see Chapter 7.2). The LLM reads the full trajectory and scores it based on criteria you define (tool correctness, reasoning quality, efficiency, safety). This works well for catching obvious issues and provides qualitative feedback. However, LLM judges are not perfect—they have ~80-90% agreement with humans. Use them for broad coverage, but spot-check with human reviewers. Also, combine LLM judges with rule-based checks (e.g., "must call verify_account before charge_card"). Rules catch deterministic errors quickly; LLM judges catch nuanced reasoning problems. For highest-stakes tasks, always have a human review the trajectory before the agent's actions are committed.
+
+---
+
+## Bridge to Chapter 8.3
+
+You now know how to evaluate the **trajectory**—the sequence of actions an agent takes. But what about the tools themselves? Did the agent call the right functions with the right parameters? Chapter 8.3 covers **Tool Use Correctness**: how to evaluate whether an agent correctly selects, invokes, and interprets the results of external tools and APIs.

@@ -1,0 +1,1118 @@
+---
+title: "9.5 — End-to-End RAG Evaluation"
+subtitle: "How to evaluate the complete RAG pipeline as an integrated system"
+part: "Chapter 9: RAG Evaluation"
+---
+
+# 9.5 — End-to-End RAG Evaluation
+
+A manufacturing plant ran perfectly on paper. The casting department reported 98% quality. The machining line hit 97% precision. The assembly team showed 99% accuracy. But the finished products kept failing customer inspections at a 40% rate. The CEO demanded answers. An engineer walked the entire production line and discovered the problem: the casting tolerances were technically correct, but they were incompatible with the machining specifications. Each department optimized for its own metrics without considering how their output affected the next stage. Perfect components, broken system.
+
+Your RAG pipeline faces the same trap. You measure retrieval precision at 0.92. Generation faithfulness scores 0.95. Context relevance looks excellent. Every component dashboard glows green. Yet users report that half their questions get incomplete or wrong answers. You optimized each stage independently, but the **integrated system** is what users experience. A retrieval component that finds perfectly relevant documents for the wrong interpretation of the query still produces wrong answers. A generation model that faithfully synthesizes the retrieved context still fails if that context was incomplete.
+
+End-to-end RAG evaluation measures what actually matters: **is the final answer correct, complete, and useful?** This chapter shows you how to evaluate the complete pipeline as a system, diagnose failures when components interact, and ensure that your RAG application delivers the quality users need.
+
+---
+
+## Why End-to-End Evaluation Matters
+
+Component metrics lie by omission. You can achieve high retrieval recall (90% of relevant documents retrieved) and high generation faithfulness (95% of statements grounded in context) yet still deliver a wrong answer because:
+
+- The retrieval model interpreted the query differently than the user intended
+- The top-ranked documents were relevant but missing a critical detail
+- The context assembly truncated the section containing the answer
+- The generation model chose to emphasize the wrong aspect of the retrieved information
+- The response format was correct but not what the user needed
+
+Real example from a legal RAG system: A user asked "What are the filing deadlines for patent appeals?" The retrieval component found eight highly relevant documents about patent appeal procedures, scoring 0.94 on relevance. The generation model faithfully summarized those documents, scoring 0.96 on faithfulness. The final answer listed general appeal procedures but missed the specific deadline because it was mentioned in a footnote in the ninth-ranked document that didn't make it into the context window. **Component metrics: excellent. User experience: failure.**
+
+**End-to-end evaluation** measures the entire chain:
+
+1. Query understanding and formulation
+2. Document retrieval and ranking
+3. Context assembly and truncation
+4. Prompt construction
+5. Generation
+6. Response formatting
+
+The metric is simple: **Did the user get the right answer?** Everything else is a proxy.
+
+This doesn't mean component metrics are useless. They're essential for debugging and optimization. But they're **necessary, not sufficient.** You need both component-level diagnostics and system-level validation. When end-to-end metrics drop, component metrics tell you where to look. When component metrics are high but end-to-end metrics are low, you know you have an **integration problem**.
+
+---
+
+## Answer Correctness: The Ultimate Metric
+
+The most fundamental end-to-end metric is **answer correctness**: Is the final answer factually accurate compared to the ground truth?
+
+For factual questions with definitive answers, this is straightforward:
+
+```yaml
+Query: "What is the maximum contribution limit for 401(k) in 2026?"
+Ground Truth: "$24,000 for individuals under 50, $31,000 for those 50 and older"
+RAG Output: "$23,500 for individuals under 50, $31,000 for those 50 and older"
+Correctness: 0.5 (one value correct, one wrong)
+```
+
+The RAG system retrieved the right documents and generated a well-formatted response, but it cited outdated information. **Wrong is wrong.**
+
+For more complex questions, correctness becomes multidimensional:
+
+```yaml
+Query: "How does our company handle employee stock options during acquisitions?"
+Ground Truth Answer: "Options typically vest immediately upon acquisition (accelerated vesting clause in Section 4.2). Employees can either exercise immediately or participate in the acquirer's stock plan if offered. Cash-out value is calculated using the 409A valuation from within 90 days of the acquisition date."
+
+RAG Output: "Employee stock options are subject to accelerated vesting in acquisition scenarios. The specific handling depends on the acquisition agreement terms."
+
+Analysis:
+  - Factually correct: Yes (both statements are true)
+  - Complete: No (missing exercise options and valuation methodology)
+  - Useful: Partially (confirms accelerated vesting but lacks actionable detail)
+
+Correctness Score: 0.6
+```
+
+The answer wasn't *wrong*, but it was **incomplete enough to be misleading**. The employee reading this doesn't know what choices they have or how their options will be valued.
+
+Measuring answer correctness requires:
+
+**Ground truth answers.** For each test query, you need a known-correct answer. This is expensive to create (see Ch 3 on dataset design) but essential. You cannot evaluate correctness without knowing what correct looks like.
+
+**Scoring rubric.** Binary right/wrong works for simple factual questions. For complex questions, you need a rubric that captures partial correctness:
+
+- 1.0: Completely correct and complete
+- 0.75: Correct but missing minor details
+- 0.5: Partially correct or incomplete
+- 0.25: Contains some correct information but mostly wrong
+- 0.0: Completely incorrect
+
+**Automated scoring with LLM judges** (covered in Ch 7). For scale, you need automated evaluation. Modern LLM judges can compare RAG outputs against ground truth answers with reasonable accuracy:
+
+```yaml
+Judge Prompt: |
+  Compare the RAG system's answer against the ground truth answer.
+  Evaluate factual correctness on a 0-1 scale.
+
+  Query: {query}
+  Ground Truth: {ground_truth}
+  RAG Answer: {rag_output}
+
+  Score 1.0 if all facts are correct and complete.
+  Score 0.5-0.9 if mostly correct but incomplete or imprecise.
+  Score 0.0-0.4 if significantly incorrect or misleading.
+
+  Provide the score and brief justification.
+```
+
+The judge compares semantic meaning, not string matching. "The limit is $24,000" and "Individuals can contribute up to $24,000" get the same score even though the text differs.
+
+Validate your LLM judge against human ratings on a sample set (see Ch 6 on human evaluation). If the judge agrees with human raters 85% or more of the time on your domain, it's production-ready.
+
+---
+
+## Answer Completeness
+
+Correctness alone isn't enough. An answer can be factually accurate yet **incomplete** in ways that make it unusable.
+
+Consider this query for a medical RAG system: "What are the side effects of atorvastatin?"
+
+**Response A:** "Common side effects include muscle pain and digestive issues."
+
+**Response B:** "Common side effects include muscle pain (10-15% of patients), digestive issues like nausea and diarrhea (5-8%), headaches (3-5%), and elevated liver enzymes (1-2%). Rare but serious side effects include rhabdomyolysis (muscle breakdown) which requires immediate medical attention. Most side effects are mild and resolve within a few weeks."
+
+Both are correct. Response A would score 1.0 on correctness. But Response B is **complete** in a way that Response A isn't. It provides severity, frequency, and context that a patient or healthcare provider needs.
+
+**Answer completeness** measures whether the response covers all aspects necessary to fully answer the query:
+
+```yaml
+Completeness Criteria:
+  - Does it address all sub-questions implied by the query?
+  - Does it provide necessary context and caveats?
+  - Does it include quantitative details when relevant?
+  - Does it mention important exceptions or edge cases?
+  - Would a user need to ask follow-up questions to get actionable information?
+```
+
+Incompleteness is often the result of **retrieval failures**. The retrieval component found documents about muscle pain and digestive issues but missed the document containing frequency data and serious side effects. The generation model can only work with what it's given.
+
+Sometimes it's a **generation failure**. All the necessary information was in the retrieved context, but the generation model chose to summarize too aggressively or misunderstood which details were important.
+
+Measuring completeness:
+
+**Ground truth aspect coverage.** For each query, define the **key aspects** that a complete answer must cover:
+
+```yaml
+Query: "How do I submit a reimbursement request?"
+Required Aspects:
+  - Where to submit (portal, email, form location)
+  - What information is required (receipts, approval, cost center)
+  - Processing timeline
+  - Approval workflow
+  - Payment method
+
+RAG Output Analysis:
+  - Portal location: Covered
+  - Required information: Covered (receipts, approval)
+  - Timeline: Missing
+  - Workflow: Partially covered (mentions manager approval, not finance review)
+  - Payment method: Missing
+
+Completeness: 0.6 (3 of 5 aspects fully covered)
+```
+
+**LLM judge for completeness:**
+
+```yaml
+Judge Prompt: |
+  Evaluate whether the RAG answer completely addresses all aspects of the query.
+  Compare against the ground truth to identify missing information.
+
+  Query: {query}
+  Ground Truth: {ground_truth}
+  RAG Answer: {rag_output}
+
+  Score 1.0 if the answer is comprehensive and requires no follow-up.
+  Score 0.5-0.9 if mostly complete but missing some details.
+  Score 0.0-0.4 if significant gaps exist.
+
+  List any missing aspects and provide completeness score.
+```
+
+In production, **user follow-up questions** are a signal of incompleteness (see Ch 11 on monitoring). If 40% of users ask a second question immediately after receiving an answer, your responses are probably incomplete.
+
+---
+
+## Response Quality Beyond Correctness
+
+A correct, complete answer can still be **low quality** in ways that frustrate users:
+
+- **Poor structure:** A wall of text with no paragraphs or bullet points
+- **Wrong tone:** Overly formal for a casual product question, or too casual for a compliance question
+- **Inappropriate length:** Three paragraphs when a one-sentence answer would suffice, or vice versa
+- **Lack of examples:** Abstract descriptions when a concrete example would clarify
+- **Missing citations:** Claims without source attribution in domains where provenance matters
+
+These are the same **output quality dimensions** covered in Chapter 2 (ground truth evaluation). RAG outputs are LLM outputs; they need the same quality standards.
+
+**Structure and formatting:**
+
+```yaml
+Good:
+  "To reset your password:
+   1. Go to Settings > Security
+   2. Click 'Reset Password'
+   3. Check your email for the confirmation link
+   4. Follow the link and create a new password
+
+   The link expires after 24 hours."
+
+Poor:
+  "You can reset your password by going to Settings and clicking on Security and then clicking Reset Password and then checking your email for a confirmation link and following that link to create a new password but the link expires after 24 hours so you should do it quickly."
+```
+
+Same information, drastically different usability.
+
+**Appropriate tone and formality:**
+
+A customer asking "How do I return a product?" expects a friendly, helpful tone. A legal team asking "What are our indemnification obligations under Section 7.3?" expects precise, formal language. Your RAG system should match the tone to the domain and query type.
+
+**Length appropriateness:**
+
+```yaml
+Query: "What's the capital of France?"
+Good: "Paris"
+Poor: "The capital of France is Paris, which is located in the north-central part of the country along the Seine River. It has been the capital since the 12th century and is known for landmarks like the Eiffel Tower and the Louvre Museum."
+```
+
+The verbose answer is correct and complete, but it's **more than the user asked for**. Conversely, a query like "Explain our data retention policy" needs a comprehensive answer, not a one-sentence summary.
+
+**Measuring response quality:**
+
+**Structured quality rubrics** (from Ch 2):
+
+```yaml
+Quality Dimensions:
+  Structure:
+    - Clear paragraphs or bullet points (1-5 scale)
+  Tone:
+    - Appropriate formality for domain (1-5 scale)
+  Length:
+    - Appropriate detail level (1-5 scale)
+  Clarity:
+    - Easy to understand, no jargon where unnecessary (1-5 scale)
+  Citations:
+    - Proper source attribution where expected (1-5 scale)
+```
+
+**LLM judges for quality:**
+
+```yaml
+Judge Prompt: |
+  Evaluate the quality of this RAG response beyond factual correctness.
+  Consider structure, tone, length, and clarity.
+
+  Query: {query}
+  RAG Answer: {rag_output}
+
+  Rate each dimension on 1-5 scale:
+  - Structure: Is it well-organized and scannable?
+  - Tone: Is it appropriate for this query type?
+  - Length: Is the detail level appropriate?
+  - Clarity: Is it easy to understand?
+
+  Provide scores and brief justification.
+```
+
+**Human quality spot-checks** (Ch 6). Sample 50-100 RAG responses per week and have domain experts rate quality. Track trends over time.
+
+In production, **user engagement metrics** signal quality: dwell time on the answer, copy/paste actions, rating clicks, and abandonment rates (see Ch 11).
+
+---
+
+## Building the End-to-End Eval Dataset
+
+To evaluate RAG end-to-end, you need **evaluation triples**:
+
+```yaml
+Eval Triple:
+  - Query: The user's question or request
+  - Ground Truth Answer: The correct, complete answer
+  - Relevant Documents: The documents that contain the information needed to answer (optional but valuable for debugging)
+```
+
+This is different from the retrieval eval dataset (Ch 9.2), which only needed query-document pairs. For end-to-end evaluation, you need the **expected output**, not just the expected input processing.
+
+**Creating ground truth answers:**
+
+**Option 1: Human expert authoring.** Domain experts write the correct answer for each test query. This is the gold standard but expensive. Budget 15-30 minutes per answer for complex domains.
+
+**Option 2: Extract from existing high-quality content.** If you have an FAQ, documentation, or support ticket resolution database, extract query-answer pairs. Validate that the answers are still current and complete.
+
+**Option 3: Generate with LLM, validate with humans.** Use a strong LLM (GPT-4, Claude 3.5) to generate candidate answers based on the full document corpus, then have humans review and edit. This is faster than authoring from scratch but still ensures quality.
+
+**Dataset size targets:**
+
+- **Smoke test set:** 20-30 queries covering core use cases. Run this on every pipeline change.
+- **Comprehensive eval set:** 200-500 queries covering the distribution of user queries. Run weekly or before releases.
+- **Domain coverage set:** Queries stratified by topic, difficulty, and document type. Ensures no blind spots.
+
+**Maintaining the dataset over time:**
+
+Your corpus changes. Documents are added, updated, removed. Answers that were correct last month may be outdated now.
+
+- **Periodic review:** Every quarter, have experts review 10-20% of ground truth answers for currency.
+- **Production mining:** When users downvote answers or ask follow-ups, add those queries to your eval set with correct answers.
+- **Triggered updates:** When critical documents are updated, identify affected eval queries and update ground truth.
+
+**Storing and versioning:**
+
+```yaml
+# eval_dataset.yaml
+version: "2026-01-15"
+queries:
+  - id: "q001"
+    query: "What is the maximum 401(k) contribution for 2026?"
+    ground_truth_answer: "$24,000 for individuals under 50, $31,000 for those 50 and older"
+    relevant_doc_ids: ["doc_245", "doc_1893"]
+    domain: "benefits"
+    difficulty: "easy"
+
+  - id: "q002"
+    query: "How does accelerated vesting work in acquisition scenarios?"
+    ground_truth_answer: "Options typically vest immediately upon acquisition (Section 4.2 accelerated vesting clause). Employees can either exercise immediately or participate in the acquirer's stock plan if offered. Cash-out value uses the 409A valuation from within 90 days of the acquisition date."
+    relevant_doc_ids: ["doc_782", "doc_783", "doc_1205"]
+    domain: "equity"
+    difficulty: "hard"
+```
+
+Track the dataset in version control. When you update ground truth answers, commit with clear notes about what changed and why.
+
+---
+
+## Automated End-to-End Scoring
+
+At scale, you need **automated scoring** of RAG outputs against ground truth. Manual review doesn't scale past a few dozen queries.
+
+**The RAGAS framework** (Retrieval Augmented Generation Assessment) provides a standard approach for end-to-end RAG evaluation using LLM judges. The core metric is **answer correctness**, which combines semantic similarity and factual accuracy:
+
+```yaml
+RAGAS Answer Correctness:
+  1. Extract factual claims from ground truth answer
+  2. Extract factual claims from RAG output
+  3. Compare claim overlap (how many ground truth claims are in the output?)
+  4. Check for hallucinations (claims in output not supported by ground truth)
+  5. Combine into single score
+
+Formula:
+  Answer Correctness = (TP / (TP + FP + FN))
+
+  Where:
+    TP = True Positives (correct claims in output)
+    FP = False Positives (incorrect claims in output)
+    FN = False Negatives (missing claims from ground truth)
+```
+
+Implementation with an LLM judge:
+
+```yaml
+Step 1 - Extract claims from ground truth:
+Prompt: |
+  Extract the key factual claims from this answer as a bullet list.
+  Ground Truth: {ground_truth}
+
+Output:
+  - Maximum contribution is $24,000 for under 50
+  - Maximum contribution is $31,000 for 50 and older
+  - These are 2026 limits
+
+Step 2 - Extract claims from RAG output:
+Prompt: |
+  Extract the key factual claims from this answer as a bullet list.
+  RAG Output: {rag_output}
+
+Output:
+  - Maximum contribution is $23,500 for under 50
+  - Maximum contribution is $31,000 for 50 and older
+
+Step 3 - Compare and score:
+Prompt: |
+  Compare these claim sets. Identify:
+  - Matching claims (TP)
+  - Incorrect claims in output (FP)
+  - Missing claims from ground truth (FN)
+
+  Ground Truth Claims: {gt_claims}
+  Output Claims: {output_claims}
+
+Analysis:
+  TP: 1 (50+ limit correct)
+  FP: 1 (under 50 limit wrong)
+  FN: 2 (under 50 correct value missing, year context missing)
+
+  Score: 1 / (1 + 1 + 2) = 0.25
+```
+
+**Alternative: Semantic similarity scoring.** Use embedding models to compute similarity between ground truth and RAG output:
+
+```yaml
+Semantic Similarity Approach:
+  1. Embed ground truth answer
+  2. Embed RAG output
+  3. Compute cosine similarity
+  4. Threshold: >0.85 = correct, 0.7-0.85 = partial, below 0.7 = incorrect
+```
+
+This is faster but less precise than claim-based comparison. It may give high scores to fluent but incorrect answers. Use it for quick checks; use claim-based comparison for authoritative evaluation.
+
+**Hybrid approach (recommended):**
+
+```yaml
+End-to-End Score = weighted combination of:
+  - Answer Correctness (RAGAS claim-based): 40%
+  - Semantic Similarity: 20%
+  - Completeness (aspect coverage): 20%
+  - Quality (structure, tone, length): 20%
+```
+
+Different weights for different use cases. Customer support might weight completeness higher. Legal compliance might weight correctness at 70%.
+
+**Regression detection:**
+
+Run your automated eval suite on every significant pipeline change. Track scores over time:
+
+```yaml
+Eval Run: 2026-01-15
+  Answer Correctness: 0.82 (500 queries)
+  Completeness: 0.76
+  Quality: 0.88
+
+Eval Run: 2026-01-16 (after chunking change)
+  Answer Correctness: 0.79 (-0.03) ← REGRESSION
+  Completeness: 0.74 (-0.02)
+  Quality: 0.89 (+0.01)
+
+Action: Investigate chunking change impact on retrieval coverage
+```
+
+Set **regression thresholds.** If answer correctness drops more than 0.05 or completeness drops more than 0.03, block the deployment and investigate (see Ch 13 on release gates).
+
+---
+
+## Component Attribution in End-to-End Failures
+
+When an end-to-end test fails (wrong or incomplete answer), you need to know **which component caused the failure**. Was it retrieval, context assembly, generation, or something else?
+
+**Failure diagnosis process:**
+
+**Step 1: Check retrieval recall.** Were the relevant documents retrieved at all?
+
+```yaml
+Query: "What is the PTO rollover policy?"
+Ground Truth Relevant Docs: ["doc_432", "doc_433"]
+Retrieved Docs: ["doc_891", "doc_892", "doc_432"]
+
+Analysis:
+  - doc_432 was retrieved (rank 3)
+  - doc_433 was NOT retrieved
+
+Diagnosis: Retrieval recall failure. The system missed a critical document.
+```
+
+If relevant documents weren't retrieved, the failure is in the **retrieval component**. Check query processing, index coverage, and ranking algorithm.
+
+**Step 2: Check retrieval ranking.** Were relevant documents retrieved but ranked too low to make it into the context?
+
+```yaml
+Retrieved Docs (top 10):
+  1. doc_891 (not relevant)
+  2. doc_892 (not relevant)
+  3. doc_432 (relevant) ← retrieved
+  4. doc_901 (not relevant)
+  ...
+  9. doc_433 (relevant) ← retrieved but rank 9
+
+Context Window: Uses top 5 documents
+
+Analysis:
+  - Both relevant documents were retrieved
+  - doc_433 ranked too low to be included in context
+
+Diagnosis: Retrieval ranking failure. The ranker didn't prioritize the right documents.
+```
+
+If relevant documents were retrieved but ranked poorly, the failure is in the **ranking model or scoring function**. Check relevance scoring, reranking, or diversity mechanisms.
+
+**Step 3: Check context assembly.** Were relevant documents included in the final prompt context?
+
+```yaml
+Retrieved Docs Passed to Generator:
+  - doc_891
+  - doc_892
+  - doc_432 (relevant, complete content)
+  - doc_901
+  - doc_909
+
+Analysis:
+  - doc_432 was included in context
+  - Content was not truncated
+
+Diagnosis: Retrieval worked. Move to generation analysis.
+```
+
+If relevant content was truncated or dropped during context assembly, the failure is in **context windowing or prompt construction**. Check token limits, chunking boundaries, and context packing logic.
+
+**Step 4: Check generation faithfulness.** Did the generator use the retrieved context correctly?
+
+```yaml
+Retrieved Context (doc_432):
+  "PTO rolls over up to 80 hours into the next calendar year. Hours beyond 80 are forfeited unless approved by HR."
+
+RAG Output:
+  "PTO rolls over into the next year, but there may be limits."
+
+Analysis:
+  - The correct information was in the context
+  - The generator failed to extract the specific 80-hour limit
+  - Output is vague and incomplete
+
+Diagnosis: Generation failure. The model didn't synthesize the details.
+```
+
+If the context contained the answer but the output was wrong or incomplete, the failure is in the **generation model or prompt**. Check generation temperature, prompt instructions, or model capability.
+
+**Step 5: Check for hallucination.** Did the generator add information not in the context?
+
+```yaml
+Retrieved Context:
+  "PTO rolls over up to 80 hours into the next calendar year."
+
+RAG Output:
+  "PTO rolls over up to 80 hours. Unused hours can be cashed out in December."
+
+Analysis:
+  - The 80-hour limit is correct
+  - The cash-out claim is NOT in the retrieved context
+
+Diagnosis: Hallucination failure. The generator fabricated information.
+```
+
+If the output contains claims not grounded in the retrieved context, the failure is **hallucination** (see Ch 9.1 on faithfulness).
+
+**Automated component attribution:**
+
+Build a **diagnostic eval pipeline** that runs these checks automatically:
+
+```yaml
+End-to-End Failure Detected: Query q042
+  Answer Correctness: 0.2
+
+Running Diagnostic Checks:
+  ✓ Relevant documents retrieved: 2/2 (doc_432, doc_433)
+  ✗ Relevant documents in top 5: 1/2 (doc_433 at rank 9)
+  ✓ Context assembly: No truncation
+  - Generation faithfulness: Not applicable (missing context)
+
+Root Cause: Retrieval ranking failure
+Recommendation: Review scoring for query type "policy questions"
+```
+
+This dramatically speeds up debugging. Instead of manually tracing through logs, you get a **structured diagnosis** pointing to the specific component and likely fix.
+
+---
+
+## A/B Testing for RAG
+
+RAG systems have many **configuration choices**:
+
+- Chunking strategy (fixed-size, semantic, hierarchical)
+- Retrieval model (sparse, dense, hybrid)
+- Reranking approach (cross-encoder, LLM-based, none)
+- Top-k threshold (how many documents to retrieve)
+- Context window size (how much text to pass to the generator)
+- Generation model (GPT-4, Claude 3.5, Llama 3)
+- Prompt template and instructions
+
+How do you choose? **A/B testing** lets you compare configurations **end-to-end** on real queries.
+
+**Offline A/B testing (eval set):**
+
+Run two configurations on your eval dataset and compare end-to-end metrics:
+
+```yaml
+Configuration A: Current Production
+  Chunking: Fixed 512 tokens
+  Retrieval: Dense (OpenAI embeddings)
+  Top-k: 10
+  Reranking: None
+  Generator: GPT-4
+
+Configuration B: Proposed Change
+  Chunking: Semantic (sentence grouping)
+  Retrieval: Hybrid (BM25 + dense)
+  Top-k: 20
+  Reranking: Cross-encoder
+  Generator: GPT-4
+
+Eval Results (500 queries):
+                      Config A    Config B    Δ
+  Answer Correctness:   0.82        0.87      +0.05 ✓
+  Completeness:         0.76        0.81      +0.05 ✓
+  Quality:              0.88        0.87      -0.01
+  Avg Latency:          1.2s        2.1s      +0.9s ✗
+
+Decision: Config B improves correctness and completeness significantly, but latency increase is concerning. Run production A/B test with 10% traffic to validate latency impact on user satisfaction.
+```
+
+Offline A/B testing is **fast and safe**. You can test radical changes without exposing users to potential degradation.
+
+**Online A/B testing (production):**
+
+Deploy both configurations to production and **randomly assign** user queries to each variant. Measure both end-to-end quality and user behavior:
+
+```yaml
+Production A/B Test: Semantic Chunking
+  Duration: 2 weeks
+  Traffic Split: 90% Control (Config A), 10% Treatment (Config B)
+
+Metrics:
+                          Control    Treatment    Δ         p-value
+  User Rating (1-5):        3.8        4.1       +0.3      p<0.01 ✓
+  Thumbs Up Rate:          62%        68%        +6%       p<0.05 ✓
+  Follow-up Question Rate: 28%        22%        -6%       p<0.05 ✓
+  Avg Latency:             1.1s       2.0s       +0.9s     p<0.001 ✗
+  Abandonment Rate:        12%        15%        +3%       p=0.08
+
+Analysis:
+  - Quality improvements are real and significant
+  - Latency increase impacts abandonment (borderline significant)
+  - Net: Positive but need to optimize latency before full rollout
+
+Decision: Roll forward to 50% traffic while engineering team optimizes reranking latency. Target: bring latency under 1.5s before 100% rollout.
+```
+
+Online A/B testing measures **what users actually care about**, not just what your eval dataset predicts. Users might tolerate higher latency for better answers, or they might abandon. You won't know until you test.
+
+**What to A/B test:**
+
+- **Major architecture changes:** Switching retrieval models, adding reranking, changing chunking strategy
+- **Prompt variations:** Different instructions, examples, or formatting
+- **Context window changes:** Using more or fewer documents, different truncation strategies
+- **Model upgrades:** New generation model versions
+
+**What NOT to A/B test in production:**
+
+- Unvalidated changes that might produce harmful or incorrect outputs
+- Changes that significantly increase cost without offline validation of benefit
+- Changes that could violate compliance or security requirements
+
+Always run offline eval first. Only A/B test in production after you've validated that the change improves quality metrics and doesn't introduce unacceptable risks.
+
+---
+
+## User Satisfaction as End-to-End Signal
+
+The best end-to-end metric is **what users tell you**. Explicit and implicit feedback signals reveal quality issues that automated metrics miss.
+
+**Explicit feedback:**
+
+**Thumbs up/down:** The simplest signal. After each RAG response, offer a rating mechanism. Track the percentage of positive ratings over time.
+
+```yaml
+Production Metrics (Last 7 Days):
+  Total Queries: 12,450
+  Responses with Ratings: 3,820 (30.7% engagement)
+  Thumbs Up: 2,610 (68.3%)
+  Thumbs Down: 1,210 (31.7%)
+
+Trend: Thumbs up rate dropped from 72% to 68% over the last 3 days.
+Action: Investigate recent changes. Identify queries with negative ratings.
+```
+
+Low engagement with the rating mechanism? That's also a signal. Users only rate when they have strong feelings (very good or very bad). Low engagement means users are neutral.
+
+**Detailed feedback forms:** For thumbs down, ask why:
+
+```yaml
+Why wasn't this helpful?
+  - Wrong information (38%)
+  - Incomplete answer (29%)
+  - Too vague (15%)
+  - Incorrect format (10%)
+  - Other (8%)
+```
+
+This tells you **which quality dimension** is failing. High "incomplete" responses? Your completeness problem is real. High "too vague"? Your generation prompts may need more specific instructions.
+
+**Follow-up question rate:** If users immediately ask another question after receiving an answer, the first answer was probably incomplete or unclear.
+
+```yaml
+Queries with Immediate Follow-up (within 30 seconds):
+  Overall: 22%
+  Topic: Benefits → 35% (high, investigate)
+  Topic: Engineering docs → 15% (acceptable)
+  Topic: Company policies → 28% (high)
+```
+
+High follow-up rates indicate incomplete or confusing answers. Drill into specific queries to understand the gaps.
+
+**Implicit feedback:**
+
+**Dwell time:** How long do users spend reading the answer? Very short dwell time (less than 3 seconds on a long answer) suggests they immediately recognized it was wrong or irrelevant. Very long dwell time relative to answer length suggests confusion.
+
+**Copy/paste actions:** Users copying text from the answer signal that they found it useful. Track copy rate as a positive signal.
+
+**Link clicks:** If your RAG responses include citations or source links, track click-through rate. High CTR suggests users want to verify or learn more. Low CTR suggests they trust the answer or find it complete.
+
+**Abandonment:** Users who receive an answer and then leave the product entirely. High abandonment after specific query types suggests those answers are failing.
+
+**Refinement searches:** Users who reformulate their question multiple times before getting a satisfactory answer. This indicates the RAG system isn't understanding the query or isn't providing the needed information.
+
+```yaml
+User Session Example:
+  Query 1: "employee benefits"
+  Result: Generic overview, no specific information
+  User Action: Refine search
+
+  Query 2: "health insurance options"
+  Result: List of plans
+  User Action: Refine search
+
+  Query 3: "PPO vs HMO coverage differences"
+  Result: Detailed comparison table
+  User Action: Copy text, end session (satisfied)
+
+Analysis: Took 3 queries to get the answer. The first two were too vague or the system didn't understand the user's intent. Opportunity: Better query clarification or more specific initial results.
+```
+
+**Building a feedback loop:**
+
+Collect user feedback → Identify failing queries → Add to eval dataset → Fix and validate → Deploy → Monitor impact
+
+```yaml
+Week 1: User feedback shows 35% negative rating on benefits queries
+Week 2: Sample 50 negative-rated benefits queries, identify patterns
+Week 3: Add 30 benefits queries to eval dataset with ground truth answers
+Week 4: Improve retrieval for benefits domain (add domain-specific reranking)
+Week 5: Validate improvement on eval set (correctness +0.08)
+Week 6: Deploy to production, monitor benefits query ratings
+Week 7: Benefits query thumbs up rate improves from 65% to 78%
+```
+
+This is **continuous improvement** driven by actual user experience (see Ch 11 on production monitoring).
+
+---
+
+## End-to-End Latency
+
+Users expect **fast answers**. A correct, complete answer that takes 15 seconds to generate is a failure for most use cases. End-to-end latency is part of the quality equation.
+
+**Latency budget:**
+
+```yaml
+User Expectation: Answer within 2 seconds
+
+Latency Budget Breakdown:
+  Query processing: 50ms
+  Retrieval (initial): 200ms
+  Reranking: 400ms
+  Context assembly: 50ms
+  Generation (streaming): 800ms (first token in 200ms)
+  Formatting and display: 100ms
+
+  Total: 1,600ms ✓ (within budget)
+```
+
+Each component has a **latency target**. If retrieval takes 500ms, you've blown the budget before generation even starts.
+
+**Streaming generation:** Don't wait for the full response before showing anything. Stream tokens to the user as they're generated. This reduces **perceived latency** dramatically. First token in 200ms feels fast even if the full response takes 1.5 seconds.
+
+**Latency-quality tradeoffs:**
+
+Reranking improves answer quality but adds latency. More documents in the context improve completeness but increase generation time. A larger, better generation model produces higher quality but is slower.
+
+**Measure the tradeoff:**
+
+```yaml
+Configuration: No Reranking
+  Answer Correctness: 0.80
+  Avg Latency: 1.1s
+
+Configuration: Cross-Encoder Reranking
+  Answer Correctness: 0.85
+  Avg Latency: 1.8s
+
+Configuration: LLM-Based Reranking
+  Answer Correctness: 0.88
+  Avg Latency: 3.2s ✗ (exceeds budget)
+
+Decision: Use cross-encoder reranking. The 0.05 improvement in correctness is worth the 0.7s latency increase. LLM reranking is too slow for production despite better quality.
+```
+
+**Latency percentiles matter:** Average latency hides the worst cases. Track P50, P95, and P99:
+
+```yaml
+Latency Distribution:
+  P50 (median): 1.2s ✓
+  P95: 2.8s ✗ (5% of users wait nearly 3 seconds)
+  P99: 4.5s ✗ (1% of users wait over 4 seconds)
+```
+
+If your P95 or P99 latencies are unacceptable, you have a **tail latency problem**. Investigate:
+
+- Are complex queries taking much longer than simple ones?
+- Are there retrieval timeouts or retries?
+- Is generation latency spiking for long outputs?
+
+**Latency optimization strategies:**
+
+**Caching:** Cache embeddings for common queries, cache retrieval results for popular documents, cache full responses for identical queries (if freshness allows).
+
+**Parallel retrieval:** If you're using multiple retrieval methods (BM25 + dense), run them in parallel, not sequentially.
+
+**Async generation:** Start streaming generation as soon as you have enough context. Don't wait for all reranking to finish if you can start with the top-ranked documents.
+
+**Model optimization:** Use smaller, faster models for non-critical paths. A faster reranking model with slightly lower accuracy may be the right tradeoff.
+
+**Infrastructure:** Use faster hardware (GPUs for embedding and reranking), optimize network hops, colocate components to reduce inter-service latency.
+
+Track latency as a **first-class metric** alongside correctness and completeness. A RAG system that's slow is a system users won't adopt, no matter how accurate.
+
+---
+
+## 2026 State of the Art: End-to-End RAG Evaluation
+
+The patterns that define modern end-to-end RAG evaluation:
+
+**RAGAS and similar frameworks** have become standard for automated end-to-end scoring. Answer correctness, faithfulness, and completeness metrics are built into major evaluation platforms (Arize, LangSmith, Braintrust). You don't need to build your own LLM judge infrastructure from scratch anymore.
+
+**Continuous end-to-end monitoring** in production. Real-time dashboards track answer correctness (via LLM judges sampling 5-10% of production queries), user ratings, follow-up rates, and latency. Alerts fire when metrics degrade beyond thresholds (see Ch 11).
+
+**Automated regression suites** run on every commit. CI/CD pipelines block deployments if end-to-end eval scores drop more than acceptable thresholds (see Ch 12, Ch 13). This prevents quality regressions from reaching production.
+
+**Production A/B testing platforms** make online experimentation standard practice. Launching a new chunking strategy or retrieval model without A/B testing is considered reckless. Major platforms (Statsig, Eppo, LaunchDarkly) now support RAG-specific metrics (answer quality, retrieval precision, generation faithfulness) alongside behavioral metrics (engagement, conversion, retention).
+
+**Component attribution diagnostics** are automated. When an end-to-end failure occurs, diagnostic systems automatically trace the failure to retrieval, ranking, context assembly, or generation, providing specific remediation recommendations.
+
+**User feedback loops** are tightly integrated. Negative ratings automatically trigger inclusion of that query in the eval dataset (with human-authored ground truth), ensuring the eval set continuously reflects real user pain points.
+
+**Hybrid eval approaches** combining automated LLM judges (for scale) and human expert review (for accuracy) are standard. 90-95% of eval is automated; 5-10% is sampled for human validation to ensure judge quality.
+
+**End-to-end latency SLOs** (Service Level Objectives) are contractual. Teams commit to P95 latency targets (e.g., 2 seconds) and monitor compliance. Latency regressions are treated as seriously as correctness regressions.
+
+The industry has learned that **component metrics are necessary but not sufficient**. You can't ship a RAG system with high retrieval precision and generation faithfulness but low answer correctness and expect users to be satisfied. End-to-end evaluation is not optional; it's the final gate.
+
+---
+
+## Common End-to-End Evaluation Failures
+
+**Failure Mode 1: Green component metrics, red end-to-end metrics.**
+
+You're measuring retrieval recall (high) and generation faithfulness (high), but answer correctness is low. The components work in isolation but fail when integrated.
+
+Fix: Add end-to-end answer correctness as a primary metric. Use component metrics for debugging, not as release gates.
+
+**Failure Mode 2: Small, unrepresentative eval dataset.**
+
+Your eval set has 30 queries, all simple factual questions. In production, 60% of queries are complex, multi-hop questions. Your eval scores are high, but production user ratings are low.
+
+Fix: Build a comprehensive eval dataset (200-500 queries) stratified by complexity, domain, and query type. Continuously add production queries with negative ratings.
+
+**Failure Mode 3: Stale ground truth answers.**
+
+Your eval dataset was created a year ago. The corpus has changed significantly, but ground truth answers haven't been updated. Your eval scores look bad even though the RAG system is working correctly with current information.
+
+Fix: Schedule quarterly ground truth reviews. Trigger reviews when critical documents are updated. Track eval dataset version alongside code version.
+
+**Failure Mode 4: Automated scoring without validation.**
+
+You deployed an LLM judge to score answer correctness, but you never validated it against human ratings. The judge is systematically biased (e.g., prefers longer answers regardless of correctness). Your scores are misleading.
+
+Fix: Validate LLM judges against human expert ratings on a sample (100+ queries). Require 85%+ agreement before trusting automated scores. Revalidate quarterly.
+
+**Failure Mode 5: Ignoring latency in eval.**
+
+Your eval suite measures correctness and completeness but not latency. You deploy a change that improves correctness by 5% but doubles latency. Users abandon the product.
+
+Fix: Include latency in your eval dashboard. Set latency thresholds (P95, P99) and block deployments that exceed them without explicit approval.
+
+**Failure Mode 6: No component attribution when failures occur.**
+
+End-to-end tests fail, but you can't tell whether it was retrieval, ranking, context assembly, or generation. You waste hours manually tracing through logs.
+
+Fix: Build automated diagnostic pipelines that run component checks when end-to-end tests fail. Output a structured diagnosis (retrieval recall failure, ranking failure, hallucination, etc.) with suggested remediation.
+
+**Failure Mode 7: Offline eval diverges from production behavior.**
+
+Your offline eval shows 85% answer correctness, but production user ratings are at 65%. The eval dataset doesn't reflect the actual distribution or difficulty of production queries.
+
+Fix: Continuously backfill your eval dataset with real production queries (especially those with negative ratings). Periodically audit whether the eval set represents production query distribution.
+
+---
+
+## Enterprise Expectations
+
+In regulated or high-stakes domains, end-to-end evaluation carries additional requirements:
+
+**Audit trails for eval results.** Every eval run must be logged with dataset version, model configuration, scores, and human review samples. Regulators or auditors may ask: "How did you validate this system before deploying to customers?"
+
+**Human validation of automated scores.** Automated LLM judges are not sufficient alone. A sample (5-10%) of eval results must be reviewed by human experts to validate automated scoring accuracy. This must be documented and repeated quarterly.
+
+**Stratified eval datasets.** You must demonstrate that your eval covers all critical domains, user segments, and edge cases. A generic sample of queries isn't enough; you need evidence that you tested compliance queries, sensitive topics, and high-risk scenarios.
+
+**Release gates based on end-to-end metrics.** Deployments require explicit approval if answer correctness drops below threshold (e.g., 0.80) or if user ratings drop more than 3 percentage points in A/B tests (see Ch 13 on release gates).
+
+**User consent for A/B testing.** In some regulated industries (healthcare, finance), you may need user consent or ethics review before running A/B tests that could expose users to lower-quality answers.
+
+**Continuous monitoring and alerting.** Production end-to-end metrics (answer correctness via sampled LLM judges, user ratings, follow-up rates) must be monitored in real time with alerts for degradation (see Ch 11).
+
+End-to-end evaluation is where **product quality meets compliance**. You're not just measuring retrieval precision; you're validating that the system delivers correct, complete, safe answers to real users. The stakes are high, and the evaluation rigor must match.
+
+---
+
+## Simple End-to-End Eval Template
+
+```yaml
+# End-to-End RAG Evaluation Report
+Date: 2026-01-29
+Configuration: Production v2.3
+Eval Dataset: core_queries_v2026-01-15 (500 queries)
+
+## Metrics Summary
+Answer Correctness: 0.84 (target: >0.80) ✓
+  - Factually correct: 88%
+  - Partially correct: 10%
+  - Incorrect: 2%
+
+Completeness: 0.79 (target: >0.75) ✓
+  - Fully complete: 68%
+  - Mostly complete: 23%
+  - Incomplete: 9%
+
+Response Quality: 0.87 (target: >0.85) ✓
+  - Structure: 4.2/5
+  - Tone: 4.5/5
+  - Length appropriateness: 4.3/5
+  - Clarity: 4.4/5
+
+Latency:
+  - P50: 1.2s (target: <2.0s) ✓
+  - P95: 2.1s (target: <3.0s) ✓
+  - P99: 3.8s (target: <5.0s) ✓
+
+## Failure Analysis (80 failed queries)
+Root Causes:
+  - Retrieval recall failure: 35 queries (44%)
+  - Retrieval ranking failure: 22 queries (28%)
+  - Generation incompleteness: 15 queries (19%)
+  - Hallucination: 8 queries (10%)
+
+Top Failing Domains:
+  - Multi-step procedures: 28 queries
+  - Edge cases/exceptions: 19 queries
+  - Recent document updates: 15 queries
+
+## Recommendations
+1. Improve retrieval for multi-step procedure queries (add query expansion)
+2. Update ground truth for 15 queries affected by recent doc changes
+3. Investigate hallucination pattern (all 8 cases in benefits domain)
+4. Reduce P99 latency (investigate timeout cases)
+
+## Comparison to Previous Run (2026-01-22)
+Answer Correctness: 0.82 → 0.84 (+0.02) ✓
+Completeness: 0.77 → 0.79 (+0.02) ✓
+Quality: 0.86 → 0.87 (+0.01)
+P95 Latency: 2.3s → 2.1s (-0.2s) ✓
+
+Status: Improved on all metrics. Approved for production deployment.
+```
+
+Run this report weekly or after every significant configuration change. Track trends over time to ensure continuous improvement.
+
+---
+
+## Interview Questions on End-to-End RAG Evaluation
+
+**Q1: Your RAG system has 92% retrieval precision and 95% generation faithfulness, but users give it a 60% thumbs-up rate. What's wrong and how do you diagnose it?**
+
+High component metrics with low user satisfaction indicates an **integration problem**. Component metrics measure individual stages; user satisfaction measures the complete experience. Possible issues:
+
+1. **Retrieval ranking problem:** Relevant documents are retrieved but ranked too low to make it into the context. Check whether ground-truth relevant documents are in the top-k passed to the generator.
+
+2. **Completeness failure:** Each individual response is faithful to its context, but responses are systematically incomplete because retrieval isn't finding all necessary documents. Run completeness evaluation against ground truth answers to confirm.
+
+3. **Response quality issues:** Answers are correct but poorly formatted, wrong tone, or inappropriate length. Sample negative-rated queries and conduct human quality review on structure, clarity, and tone.
+
+4. **Latency problems:** Users are frustrated by slow responses even if content is good. Check P95 and P99 latency distributions.
+
+Diagnostic approach: Sample 50-100 queries with negative user ratings. For each, manually trace through retrieval results, context assembly, and generation output. Look for patterns: Are relevant documents being retrieved? Is the ranking putting them in context? Is the generator using the context properly? Is the response format appropriate? Build a categorized failure analysis to identify the root cause distribution.
+
+**Q2: You're building an end-to-end eval dataset for a legal RAG system. What goes into each evaluation example, and how do you ensure the dataset stays current?**
+
+Each eval example needs:
+
+**Query:** The user's question exactly as asked. Include natural variations in phrasing, typos, and ambiguity that real users exhibit.
+
+**Ground truth answer:** The correct, complete answer written or validated by legal experts. Must include all key points, caveats, and sources. Should be at the appropriate detail level for the query type.
+
+**Relevant documents (optional but valuable):** The specific documents or sections that contain the information needed to answer. Useful for diagnosing retrieval failures.
+
+**Metadata:** Domain (contracts, IP, employment, etc.), difficulty level (simple factual, complex reasoning, multi-hop), expected answer length, and any special handling requirements.
+
+Keeping the dataset current:
+
+**Quarterly expert review:** Every quarter, legal experts review 10-20% of ground truth answers for accuracy and currency. Laws change, precedents shift, internal policies update.
+
+**Triggered updates:** When critical legal documents are updated (new regulations, policy changes), identify all eval queries that reference those documents and review their ground truth answers.
+
+**Production mining:** When users give negative ratings or ask follow-up questions, add those queries to the eval set with expert-authored ground truth. This ensures the eval reflects actual user challenges.
+
+**Version control:** Track the eval dataset in git with clear versioning (date-based or semantic). When ground truth changes, document why in the commit message.
+
+Target size: 200-500 queries for comprehensive evaluation, stratified across domains, difficulty levels, and document types to ensure no blind spots.
+
+**Q3: Your answer correctness score is 0.82, but when you sample 50 queries and have humans review them, the human-rated correctness is 0.74. What's happening and what do you do?**
+
+Your automated scoring (likely an LLM judge) is **systematically biased** and overestimates quality. Common causes:
+
+**Judge bias toward verbosity:** The judge may give higher scores to longer, more detailed answers even if they contain errors. Fluent but incorrect responses score well.
+
+**Semantic similarity without fact-checking:** If using embedding-based similarity, the judge might rate answers as correct if they're semantically similar to ground truth, even if key facts differ (e.g., "$23,500" vs "$24,000").
+
+**Judge doesn't catch subtle errors:** The judge may miss edge cases, incorrect units, or outdated information that human experts catch.
+
+**Ground truth ambiguity:** If ground truth answers are vague or incomplete, the judge may be lenient in matching them.
+
+What to do:
+
+**Investigate the 50-query sample:** Identify specific queries where the judge and humans disagreed. Look for patterns (query types, domains, failure modes).
+
+**Refine the judge prompt:** Make it more specific about what constitutes correctness. Add instructions to check specific facts, numbers, dates. Provide examples of incorrect answers that should score low.
+
+**Switch to claim-based evaluation:** Instead of semantic similarity, extract factual claims from both ground truth and RAG output, then compare claim overlap (RAGAS approach). This is more precise.
+
+**Validate the judge again:** After refinements, validate on another 50-100 queries against human ratings. Require 85%+ agreement before trusting the judge for automated eval.
+
+**Use human review as ground truth for judge training:** If you're using a fine-tuned model as a judge, use human ratings as training data to improve alignment.
+
+Until the judge is validated, **don't rely on automated scores alone**. Use them for trend detection, but make release decisions based on human-validated samples.
+
+**Q4: You run an A/B test comparing two RAG configurations. Configuration B has 5% higher answer correctness but 40% higher latency. How do you decide whether to ship it?**
+
+This is a **latency-quality tradeoff**. The decision depends on:
+
+**User tolerance for latency:** What's the actual user impact of the latency increase? If Configuration A returns answers in 1.2 seconds and Configuration B takes 1.7 seconds, most users won't notice. If A is 2 seconds and B is 3 seconds, users may abandon.
+
+Check **abandonment rate and user ratings in the A/B test**. If Configuration B's higher latency drives abandonment up, the quality improvement doesn't matter—users aren't waiting for the answer.
+
+**Use case criticality:** For a customer support chatbot where speed is critical, 40% higher latency may be unacceptable even with better quality. For a legal research tool where accuracy matters more than speed, the tradeoff may be worth it.
+
+**Can you optimize latency?** If Configuration B's improvements come from a component (e.g., reranking, better retrieval model) that can be optimized, deploy the quality improvement and assign the engineering team to bring latency down. Measure whether latency can be reduced by caching, parallelization, or model optimization.
+
+Decision framework:
+
+1. **Check user behavior in A/B test:** If abandonment rate increases or user ratings don't improve despite better correctness, **don't ship**. Users value speed over the incremental quality gain.
+
+2. **If user ratings improve despite latency:** Users are willing to wait for better answers. **Ship to 50%** traffic while working on latency optimization. Set a target (e.g., "reduce latency to within 20% of baseline within 4 weeks") before going to 100%.
+
+3. **If latency increase is small (below 20%) and quality gain is significant (above 5%):** Ship. The quality improvement justifies the latency cost.
+
+4. **If latency increase is large (above 50%) or pushes you above SLO:** Don't ship until you optimize. Correctness matters, but a slow system that users abandon is a failed system.
+
+Always measure both **quality and behavior**. Quality metrics tell you if the system is better; behavioral metrics tell you if users care.
+
+**Q5: An end-to-end test fails with answer correctness of 0.3. Walk me through your debugging process to identify which component failed.**
+
+**Step 1: Check retrieval recall.** Were the ground-truth relevant documents retrieved at all?
+
+Query the retrieval component with the test query. Compare the retrieved document IDs against the ground truth relevant document IDs from the eval dataset.
+
+If relevant documents **weren't retrieved:** Retrieval recall failure. Check query processing (embedding, keyword extraction), index coverage (are those documents indexed?), and retrieval algorithm (sparse, dense, hybrid).
+
+If relevant documents **were retrieved:** Move to Step 2.
+
+**Step 2: Check retrieval ranking.** Were relevant documents ranked high enough to be included in the context?
+
+Look at the ranked retrieval results. Check whether ground-truth documents are in the top-k that get passed to the generator (e.g., top 5 or top 10).
+
+If relevant documents **were retrieved but ranked too low:** Retrieval ranking failure. Check the scoring function, reranker (if any), or diversity mechanisms that may have deprioritized relevant results.
+
+If relevant documents **are in the top-k:** Move to Step 3.
+
+**Step 3: Check context assembly.** Were relevant documents fully included in the prompt, or were they truncated?
+
+Examine the actual prompt sent to the generation model. Check whether the text from relevant documents is present and complete.
+
+If relevant content **was truncated or dropped:** Context assembly failure. Check token limits, chunking boundaries, or context packing logic.
+
+If relevant content **is complete in the prompt:** Move to Step 4.
+
+**Step 4: Check generation faithfulness.** Did the generator correctly synthesize the information in the context?
+
+Read the context and the RAG output side by side. Check whether the answer is grounded in the retrieved text.
+
+If the answer **contradicts or ignores the context:** Generation failure. The model failed to extract or synthesize correctly. Check generation prompt instructions, model temperature, or model capability.
+
+If the answer **adds information not in the context:** Hallucination failure. Check faithfulness (Ch 9.1). May need to adjust prompt to emphasize grounding or use a more conservative generation model.
+
+**Step 5: Check completeness.** Did the context contain all necessary information to answer completely?
+
+Even if the generator used the context faithfully, the answer may be incomplete if the context itself was incomplete.
+
+Compare the retrieved context against the ground truth answer. Check whether all key aspects are present in the retrieved documents.
+
+If **context was incomplete:** This is a retrieval coverage problem. The system didn't retrieve all the necessary documents. Loop back to retrieval recall and ranking diagnostics.
+
+Output a structured diagnosis: "Retrieval ranking failure: ground truth document doc_432 was retrieved at rank 9 but only top 5 documents were used in context."
+
+This systematic process quickly isolates the failing component and points to specific remediation.
+
+---
+
+## Bridge to Chapter 9.6
+
+End-to-end evaluation tells you whether your RAG system works as an integrated whole, but when failures occur, you need to zoom into specific components. The most impactful component decisions in RAG are often the earliest ones: **how you chunk documents and build your index**.
+
+Chunking determines what granularity of information your retrieval system can find. Chunk too large, and you dilute relevance scores with irrelevant text. Chunk too small, and you fragment context across multiple pieces. Indexing determines how you represent those chunks for retrieval: embeddings, keywords, metadata, or hybrid.
+
+Chapter 9.6 covers **Chunking and Indexing Evaluation**—how to evaluate and optimize the foundational decisions that determine whether your RAG system can find the right information in the first place.
+

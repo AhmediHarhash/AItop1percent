@@ -1,0 +1,821 @@
+---
+title: "8.4 — Planning Quality & Goal Decomposition"
+subtitle: "Evaluating the Agent's Blueprint Before the Build"
+---
+
+# Planning Quality & Goal Decomposition
+
+I was debugging an agent that consistently failed at "book a business trip for the team." The execution logs showed it trying to book flights, hotels, and rental cars — all the right tools. But the sequence was chaos: it booked a rental car before checking if flights were available, reserved hotels in the wrong city, and sent confirmation emails before payments cleared.
+
+The problem wasn't tool selection. It wasn't model capability. The agent's **plan** was fundamentally broken, but we'd only been evaluating whether tasks eventually completed. We were measuring the destination, not the map.
+
+That's when we learned: **planning is a separate evaluation dimension**. An agent can create a brilliant plan but execute it poorly. Or execute perfectly but follow a terrible plan. You need to evaluate both independently.
+
+In 2026, most production agents generate multi-step plans before acting. They decompose "book a trip" into sub-goals, order them logically, choose tools appropriately, and adapt when circumstances change. If you're not evaluating planning quality explicitly, you're flying blind on half of what makes agents work or fail.
+
+---
+
+## Why Planning Deserves Its Own Eval Track
+
+When agents first became mainstream in 2023, we treated them like black boxes: give input, get output, measure success. But production taught us that agents fail in two distinct ways.
+
+**Execution failures:** The plan is sound, but tools break, APIs time out, or the model makes errors during individual steps. These are implementation problems.
+
+**Planning failures:** The agent chooses the wrong sequence of actions, skips necessary steps, includes unnecessary ones, or selects inappropriate tools. The execution might be flawless, but the blueprint was bad from the start.
+
+If you only evaluate end outcomes, you conflate these failure modes. Your metrics say "agent failed to book the trip," but they don't tell you whether it was a bad plan or bad execution. This makes debugging impossible and improvement random.
+
+### The independence principle
+
+Here's the key insight: **planning quality and execution quality are orthogonal dimensions**.
+
+You can have:
+- **Good plan, good execution:** Agent succeeds (the happy path)
+- **Good plan, bad execution:** Agent had the right idea but tools failed, APIs returned errors, or individual steps broke
+- **Bad plan, good execution:** Agent perfectly executed a flawed strategy — books hotel before confirming flights, processes payment before verifying availability
+- **Bad plan, bad execution:** Complete failure, but you need to know which part to fix first
+
+Only by evaluating planning separately can you diagnose which dimension is the bottleneck. Maybe your agent is choosing excellent plans but your tool infrastructure is unreliable. Or maybe tools work great but the planning logic needs work. You can't fix what you can't measure.
+
+### Production impact
+
+When an agent books a flight to Boston instead of Austin because it planned poorly, that's not a tool failure. It's a **decision failure**. The user cares about the outcome, but you care about the root cause.
+
+In our trip-booking agent, once we started logging and evaluating plans independently, we discovered that 60% of failures were planning errors: wrong ordering, missing steps, inefficient paths. Execution was fine. We'd been optimizing the wrong thing.
+
+This mirrors Chapter 3.7's insight on agentic decomposition: composite workflows need per-step AND end-to-end evaluation. Planning quality is the per-step evaluation of the agent's decision-making before execution begins.
+
+---
+
+## What Makes a Plan Good
+
+Before you can evaluate plans, you need criteria. What separates a good plan from a bad one?
+
+### Completeness — all necessary steps included
+
+A complete plan contains every action required to achieve the goal. Nothing critical is missing.
+
+**Example:** "Book a flight" requires:
+1. Search availability for requested route and dates
+2. Select a flight that fits constraints (time, price, airline preference)
+3. Verify seat availability
+4. Process payment
+5. Confirm booking
+6. Send confirmation to user
+
+If the agent's plan skips "verify seat availability" or "confirm booking," it's incomplete. The plan might partially work, but edge cases will break it.
+
+**How to test completeness:**
+- Compare agent plans to **gold reference plans** for known tasks
+- Define **required step checklists** for each goal type
+- Track whether agents skip critical steps in execution traces
+
+Common completeness failures:
+- Skipping validation steps (check eligibility before proceeding)
+- Missing error handling (what if payment fails?)
+- Forgetting notification steps (confirm to user, update records)
+- Omitting cleanup or rollback steps
+
+### Efficiency — no unnecessary steps
+
+An efficient plan achieves the goal with minimal actions. It doesn't waste resources on irrelevant or redundant steps.
+
+**Example:** A user asks "What's the weather in Paris?"
+
+**Inefficient plan:**
+1. Search for Paris, France location coordinates
+2. Get current time in Paris
+3. Fetch weather forecast
+4. Translate forecast to user's language
+5. Format response
+
+**Efficient plan:**
+1. Fetch weather for Paris
+2. Format response
+
+Steps 1, 2, and 4 are unnecessary if the weather API accepts city names, already returns local time context, and responds in English (the user's language).
+
+**How to test efficiency:**
+- Count tool calls and steps
+- Flag plans that exceed a threshold (e.g., more than 10 steps for simple goals)
+- Compare agent plans to expert plans — how much longer is the agent's path?
+
+Common efficiency failures:
+- Redundant searches (calling the same API twice with identical parameters)
+- Unnecessary data gathering (fetching information not used in later steps)
+- Over-decomposition (breaking simple tasks into too many micro-steps)
+
+### Correct ordering — dependencies respected
+
+A well-ordered plan executes steps in logical sequence, respecting dependencies. Step B can't run until Step A provides its required input.
+
+**Example:** "Refund a customer's order"
+
+**Correct order:**
+1. Verify order exists
+2. Check refund eligibility (time window, return policy)
+3. Process refund to original payment method
+4. Update order status to "refunded"
+5. Send confirmation email
+
+**Incorrect order (violates dependencies):**
+1. Process refund to original payment method ← can't do this without verifying order exists
+2. Verify order exists
+3. Send confirmation email ← sent before checking eligibility or processing refund
+4. Check refund eligibility
+5. Update order status
+
+A plan with broken dependencies will fail during execution, or worse, execute in a way that corrupts state (refund processed but later discovered to be ineligible).
+
+**How to test ordering:**
+- Define dependency graphs for tasks: Step X requires output from Step Y
+- Verify agent plans honor these dependencies
+- Inject failures at step N and verify downstream steps don't execute
+
+Common ordering failures:
+- Charging payment before confirming user intent
+- Sending notifications before actions complete
+- Writing data before validating it
+- Deleting records before backing them up
+
+### Appropriate tool selection
+
+A good plan chooses the right tools for each sub-task. Using the wrong tool — even if it technically works — is a planning failure.
+
+**Example:** "Find the cheapest flight to London"
+
+**Appropriate tool selection:**
+1. Use `search_flights(destination="London", sort_by="price")` to get options
+2. Use `book_flight(flight_id=cheapest)` to complete booking
+
+**Inappropriate tool selection:**
+1. Use `get_all_flights()` to fetch entire flight database (millions of records)
+2. Use LLM to manually scan and compare prices ← inefficient, error-prone
+3. Use `book_flight(flight_id=...)` to book
+
+The agent achieved the goal, but the plan is wasteful and slow. Tool selection is part of planning quality.
+
+**How to test tool selection:**
+- Define preferred tools for task types (search tasks use search tools, not exhaustive list-and-filter)
+- Flag plans that use deprecated or inefficient tools when better options exist
+- Verify tool parameters are appropriate (don't fetch 1000 results when you need 5)
+
+Common tool selection failures:
+- Using generalized tools when specialized ones exist
+- Choosing slow tools when fast equivalents are available
+- Selecting tools with high cost when cheaper alternatives work
+- Calling LLM for tasks solvable by deterministic code
+
+---
+
+## Plan Evaluation Methods
+
+You've defined what good plans look like. Now: how do you evaluate whether an agent's plan meets those criteria?
+
+### Gold plan comparison
+
+The simplest approach: for each goal, define a **reference plan** (the ideal decomposition). Score how closely the agent's plan matches.
+
+**When this works:**
+- Routine workflows with established best practices (customer support scripts, common transactions)
+- High-risk tasks where deviation is unacceptable (medical protocols, financial compliance)
+- Tasks with clear optimal paths
+
+**How to score:**
+- **Exact match:** Agent plan must match reference plan step-for-step (strict, brittle)
+- **Step overlap:** Count how many steps from reference plan appear in agent plan, in any order
+- **Edit distance:** Measure how many insertions/deletions/reorderings are needed to transform agent plan into reference plan
+
+**Limitations:**
+- Assumes one correct plan exists (often false — multiple valid approaches)
+- Penalizes creative or novel solutions that work but differ from reference
+- Requires manual authoring of reference plans for every task
+
+**Enterprise practice:** Use gold plan comparison for Tier 2-3 workflows where consistency and compliance matter more than flexibility. For exploratory tasks, this approach is too rigid.
+
+### Constraint satisfaction
+
+Instead of prescribing the exact plan, define **constraints** the plan must satisfy. The agent can choose any plan that meets them.
+
+**Types of constraints:**
+
+**Must-include steps:**
+- "Plan must verify user identity before processing refund"
+- "Plan must check inventory before confirming order"
+
+**Must-not-include steps:**
+- "Plan must not call deprecated payment API"
+- "Plan must not send notifications before actions complete"
+
+**Ordering constraints:**
+- "Step X must occur before Step Y"
+- "Steps A and B can occur in any order, but both must precede Step C"
+
+**Resource constraints:**
+- "Plan must complete in fewer than 8 tool calls"
+- "Plan must not exceed $0.10 in API costs"
+
+**When this works:**
+- Flexible workflows where multiple valid approaches exist
+- Safety-critical systems where you need boundaries but not micromanagement
+- Tasks where efficiency matters (resource budgets)
+
+**How to score:**
+- Binary: plan satisfies all constraints (pass) or violates at least one (fail)
+- Partial credit: score based on percentage of constraints satisfied
+
+**Advantages:**
+- Allows agent creativity within safe boundaries
+- Easier to author than full reference plans
+- Adapts to novel situations better than rigid templates
+
+### Outcome-based evaluation
+
+Don't evaluate the plan at all — only verify the **outcome**. If the agent achieves the goal, the plan was good enough, regardless of how it got there.
+
+**When this works:**
+- Exploratory or creative tasks (research, analysis, content generation)
+- Low-risk workflows where efficiency doesn't matter
+- Tasks with no established best practice
+
+**How to evaluate:**
+- Did the agent achieve the goal? (binary)
+- How efficiently did it achieve the goal? (tool call count, time, cost)
+- Did it violate any safety constraints along the way?
+
+**Limitations:**
+- No insight into **why** the agent succeeded or failed
+- Can't catch inefficient plans that happen to work
+- Doesn't help improve planning logic — you only know if outcomes are good
+
+**Enterprise default:** Outcome-based for Tier 0-1 tasks. For Tier 2-3, combine with constraint satisfaction to balance flexibility and safety.
+
+---
+
+## Dynamic vs Fixed Planning
+
+Agents plan in different ways. Your evaluation approach must match the planning paradigm.
+
+### Fixed plans — predetermined workflows
+
+The agent doesn't decide **how** to decompose the goal. The system provides a fixed workflow: "For goal X, always execute steps A, B, C in that order."
+
+**Example:** Customer service escalation protocol is fixed:
+1. Gather issue details
+2. Search knowledge base
+3. If solution found, provide it; else escalate to human
+4. Log interaction
+
+The agent fills in parameters (which issue, which solution), but the structure is predetermined.
+
+**Evaluation approach:**
+- Verify agent executes all steps in correct order
+- Check that parameters are filled correctly
+- Test error handling (what if step 2 finds nothing?)
+
+**Advantages:**
+- Predictable behavior
+- Easy to audit and validate
+- High compliance with regulations
+
+**Disadvantages:**
+- Inflexible — can't adapt to novel situations
+- Requires manual workflow definition for every task type
+
+**When to use:** High-stakes, regulated workflows (medical protocols, financial transactions, legal processes). Chapter 3.7's Tier 2-3 composite workflows often use fixed plans.
+
+### Dynamic plans — model-generated decomposition
+
+The agent sees the goal and generates a plan on the fly. Each goal instance might produce a different plan.
+
+**Example:** User says "Plan my wedding." The agent:
+1. Breaks goal into sub-goals (venue, catering, invitations, photography, etc.)
+2. Orders them logically (book venue first, then catering based on venue capacity)
+3. Chooses tools for each sub-goal
+4. Adapts if constraints emerge (budget reduced, date changed)
+
+The system didn't hard-code a wedding planning workflow. The model decided the decomposition.
+
+**Evaluation approach:**
+- Compare plan to reference plans or constraints
+- Verify plan completeness, efficiency, ordering
+- Test across diverse goals — does planning generalize?
+
+**Advantages:**
+- Handles novel situations without manual workflow authoring
+- Adapts to user-specific constraints and preferences
+- Scales to open-ended tasks
+
+**Disadvantages:**
+- Less predictable — plan quality varies
+- Harder to audit and debug
+- Risk of unsafe or inefficient plans
+
+**When to use:** Exploratory tasks, low-risk workflows, or systems designed for flexibility over compliance.
+
+### Hybrid approaches — structured flexibility
+
+Modern agents often blend fixed and dynamic planning. The high-level structure is fixed, but the agent fills in details dynamically.
+
+**Example:** "Book a trip" has fixed structure:
+1. Transportation (dynamic: choose flights vs trains vs driving based on distance)
+2. Accommodation (dynamic: hotels vs Airbnb based on duration and budget)
+3. Activities (dynamic: plan based on user interests)
+
+The agent doesn't reinvent the top-level flow, but decides the specifics.
+
+**Evaluation approach:**
+- Verify fixed structure is followed
+- Evaluate dynamic sub-plans with constraint satisfaction or outcome-based methods
+- Test adaptation — does agent choose appropriate options for different contexts?
+
+---
+
+## Re-Planning and Adaptive Planning
+
+A static plan that never changes is brittle. Real-world execution involves failures, new information, and changing circumstances. **Re-planning** is the ability to revise the plan mid-execution.
+
+### When re-planning matters
+
+**Scenario 1: Tool failure**
+- Plan: Book flight A, then hotel B
+- Execution: Flight A sold out
+- Re-plan: Find alternative flight C, re-check hotel availability for new arrival time
+
+**Scenario 2: New information**
+- Plan: Buy product X based on price Y
+- Execution: User mentions budget constraint that makes Y too expensive
+- Re-plan: Search for cheaper alternatives, adjust plan to fit budget
+
+**Scenario 3: Goal clarification**
+- Plan: Book dinner reservation for 2
+- Execution: User says "actually, make it for 4 people"
+- Re-plan: Cancel initial search, re-execute with updated parameters
+
+Without re-planning, agents fail rigidly: "I can't complete your request because my plan didn't account for this." With re-planning, they adapt gracefully.
+
+### Evaluating re-planning ability
+
+**Test cases for re-planning:**
+
+**Forced failures:** Inject errors mid-execution (API returns 404, tool times out) and verify agent creates a new plan that works around the failure.
+
+**Information updates:** Midway through execution, provide new constraints (budget reduced, timeline extended) and verify agent revises the plan.
+
+**Goal changes:** User modifies the goal after plan creation ("actually, change the destination") — does the agent regenerate the plan or stubbornly proceed with the old one?
+
+**Partial completion:** Agent completes steps 1-3 of a 7-step plan, then step 4 fails. Does it re-plan steps 5-7 to bypass step 4, or does it give up?
+
+**Scoring re-planning:**
+- **Does the agent detect when re-planning is needed?** (failure awareness)
+- **Does the revised plan address the new situation?** (plan quality)
+- **Does the agent avoid repeating failed actions?** (doesn't loop)
+- **Does it communicate changes to the user?** (transparency)
+
+### Re-planning failure modes
+
+**Infinite re-planning loops:** Agent keeps revising the plan without making progress. Every attempt fails, triggers re-plan, which fails again. Set a **re-plan budget** (max 3 re-plans per task) to prevent this.
+
+**Over-correction:** New plan is too conservative (skips necessary steps) or too aggressive (tries risky alternatives).
+
+**State loss:** Agent re-plans but forgets progress already made — starts from scratch instead of resuming.
+
+**Lack of re-planning:** Agent detects failure but doesn't adapt — just reports "task failed" without trying alternatives.
+
+---
+
+## Plan Granularity — Too Detailed vs Too Abstract
+
+Plans can be too fine-grained (brittle, micromanaged) or too high-level (vague, unexecutable). Finding the right granularity is critical.
+
+### Too detailed — brittle plans
+
+**Example:** "Send an email"
+
+**Over-detailed plan:**
+1. Open email client API connection
+2. Authenticate with credentials
+3. Create new message object
+4. Set "To" field to recipient address
+5. Set "Subject" field to subject text
+6. Set "Body" field to message content
+7. Attach file A
+8. Attach file B
+9. Verify attachments uploaded
+10. Click send button
+11. Wait for send confirmation
+12. Close API connection
+
+This plan is rigid. If the API changes, the plan breaks. If attachments are optional, the plan wastes steps. It's over-specified.
+
+**Problems:**
+- Fragile to implementation changes
+- Inefficient (too many micro-steps)
+- Hard for agents to generate and reason about
+- Execution takes longer
+
+### Too abstract — vague plans
+
+**Example:** "Plan a trip"
+
+**Under-detailed plan:**
+1. Handle transportation
+2. Arrange accommodation
+3. Done
+
+This plan is useless. What does "handle transportation" mean? Book flights? Rent a car? Walk? The agent has no guidance on how to decompose further.
+
+**Problems:**
+- Execution is ambiguous
+- No ordering or dependency information
+- Can't evaluate completeness or correctness
+- Agent will likely fail or make bad choices
+
+### The right level — actionable abstraction
+
+**Good plan granularity:**
+
+Each step is:
+- **Actionable:** Clear what needs to be done
+- **Self-contained:** Can be executed independently
+- **Verifiable:** You can tell if it succeeded or failed
+
+**Example:** "Book a business trip"
+
+**Well-scoped plan:**
+1. Search flights for requested route and dates
+2. Select and book flight within budget
+3. Search hotels near destination
+4. Select and book hotel for trip duration
+5. Send itinerary confirmation to user
+
+Each step is concrete enough to execute (uses specific tools, has clear inputs/outputs) but abstract enough to allow flexibility (agent chooses which flight, which hotel).
+
+**How to evaluate granularity:**
+
+**Step count:** 3-7 steps for typical tasks (from Chapter 3.7). Fewer than 3 is likely too abstract. More than 10 is likely too detailed.
+
+**Abstraction layers:** Plans should decompose goals into sub-goals, not into API calls. "Book flight" is a good sub-goal. "Set flight_id field in booking object" is too low-level.
+
+**Adaptability:** Can the plan handle variation? If one hotel is unavailable, can the agent choose another, or does the plan break?
+
+---
+
+## Goal Decomposition Quality
+
+When agents face complex goals, they break them into sub-goals. **Decomposition quality** is a key dimension of planning.
+
+### What is good decomposition?
+
+**Correct sub-goals:** Each sub-goal is necessary and contributes to the overall goal.
+
+**Complete sub-goals:** All necessary sub-goals are present. Nothing critical is missing.
+
+**Properly ordered sub-goals:** Sub-goals respect dependencies. You don't book hotels before booking flights if hotel location depends on airport choice.
+
+**Appropriate granularity:** Sub-goals are neither too broad (unhelpful) nor too narrow (micromanagement).
+
+### Example: Decomposing "Organize a conference"
+
+**Good decomposition:**
+1. Secure venue (date, capacity, location)
+2. Arrange catering (based on attendee count)
+3. Book speakers (based on conference theme)
+4. Handle registration and ticketing
+5. Plan logistics (A/V equipment, signage, staff)
+6. Market the event (website, emails, social media)
+
+This is **complete** (all necessary sub-goals), **ordered** (venue before catering, since catering depends on venue capacity), and **actionable** (each sub-goal can be further decomposed into concrete tasks).
+
+**Bad decomposition:**
+1. Plan everything
+2. Execute everything
+3. Wrap up
+
+This is **useless** — too abstract. Or:
+
+1. Find venue options
+2. Email venue A
+3. Email venue B
+4. Email venue C
+5. Compare responses
+6. Choose venue
+7. Draft contract
+8. Sign contract
+9. ... (200 steps later)
+
+This is **too detailed** — brittle and overwhelming.
+
+### Evaluating decomposition
+
+**Compare to reference decompositions:** For known task types, define canonical sub-goal structures. Score agent decompositions based on overlap.
+
+**Constraint-based checks:**
+- "Must include at least 4 sub-goals for complex tasks"
+- "Must not exceed 10 sub-goals for typical tasks"
+- "Sub-goal X must appear before sub-goal Y"
+
+**Hierarchical completeness:** Does the decomposition form a valid **hierarchical task network**? Each sub-goal should be decomposable into actions, and actions should trace back to the root goal.
+
+**Test with execution:** Does the decomposition lead to successful task completion? If agents fail frequently with a certain decomposition pattern, the pattern is flawed.
+
+---
+
+## Plan Verbalization — Explaining the Plan
+
+Modern agents often **verbalize** their plans before executing: "Here's what I'm going to do: first X, then Y, finally Z." This serves two purposes:
+
+**Transparency:** Users understand what to expect.
+
+**Verification:** Users can catch planning errors before execution ("Wait, don't book the hotel before the flight is confirmed!").
+
+### Evaluating plan verbalization quality
+
+**Clarity:** Is the plan explanation understandable? Does it use plain language, not jargon or internal IDs?
+
+**Accuracy:** Does the verbalized plan match the actual execution plan? Or does the agent say one thing and do another?
+
+**Completeness:** Are all major steps mentioned, or are critical steps omitted from the explanation?
+
+**Conciseness:** Is the plan explanation appropriately detailed? Not a 500-word essay for a 3-step task.
+
+### Plan-execution alignment
+
+A major failure mode: **the agent verbalizes one plan, then executes a different one**.
+
+**Example:**
+- Agent says: "I'll search for flights, then book the cheapest option."
+- Agent does: Searches flights, books the first result (not the cheapest).
+
+This erodes user trust. The explanation was a lie, even if unintentional.
+
+**How to test alignment:**
+- Parse the verbalized plan into steps
+- Parse the execution trace into steps
+- Compute similarity or exact match
+- Flag cases where verbalized plan and executed plan diverge
+
+**Causes of misalignment:**
+- Model generates plan description, but execution uses different logic (two separate prompts, inconsistent)
+- Plan changes mid-execution (re-planning) but agent doesn't communicate the change
+- Agent hallucinates a plan description that sounds good but doesn't match its actual capabilities
+
+**Fix:** Use structured planning where the same internal plan representation drives both verbalization and execution. Don't let the model free-text a plan description — generate it from the actual plan object.
+
+---
+
+## Evaluating Plans With LLM Judges
+
+For complex plans, manual evaluation is slow. **LLM-as-judge** (Chapter 7.2) can assess plan quality at scale.
+
+### Prompting a judge to evaluate plans
+
+**Example prompt:**
+
+```
+You are evaluating the quality of an agent's plan to achieve a user goal.
+
+User Goal: Book a roundtrip flight from San Francisco to Tokyo for March 15-22.
+
+Agent's Plan:
+1. Search flights SFO to NRT departing March 15
+2. Search flights NRT to SFO departing March 22
+3. Select cheapest option for each leg
+4. Book both flights
+5. Send confirmation to user
+
+Evaluate the plan on these criteria:
+- Completeness: Does it include all necessary steps?
+- Efficiency: Are there unnecessary steps?
+- Ordering: Are steps in logical order?
+- Tool selection: Are appropriate tools chosen?
+
+Provide a score (0-10) and brief justification for each criterion.
+```
+
+The judge (a strong model like GPT-4, Claude Opus) scores each dimension and explains its reasoning.
+
+### Advantages of LLM judges for planning
+
+**Scalability:** Evaluate thousands of plans without human reviewers.
+
+**Nuance:** LLMs can assess plan quality semantically, not just structurally (better than regex or keyword checks).
+
+**Adaptability:** Works for novel tasks where you don't have reference plans.
+
+### Limitations
+
+**Inconsistency:** LLM judges vary in scoring. Same plan might get different scores on different runs (Chapter 7.2 discusses calibration).
+
+**Lack of ground truth:** For novel tasks, even the judge might not know what a good plan is.
+
+**Cost:** Evaluating every plan with an LLM costs money. Use sampling or rules-based pre-filtering.
+
+**Supervision:** LLM judges need human spot-checks to verify they're grading correctly. They can hallucinate or apply criteria inconsistently.
+
+---
+
+## 2026 Patterns in Planning Evaluation
+
+The last few years have seen planning become a first-class concern in agent architectures.
+
+### Tree-of-thought planning
+
+Instead of generating one plan, agents generate **multiple candidate plans** and evaluate them before choosing.
+
+**Process:**
+1. Agent generates 3-5 possible plans for the goal
+2. Each plan is scored (by heuristic, model judge, or lightweight simulator)
+3. Agent selects the highest-scoring plan
+4. Executes the chosen plan
+
+**Evaluation implications:**
+- You evaluate not just the final plan, but the **candidate generation process** (are diverse, high-quality candidates generated?)
+- You evaluate the **selection criteria** (does the agent choose the best plan from candidates?)
+
+**When this works:** Complex, high-stakes tasks where planning quality determines success. Medical diagnosis, financial planning, legal strategy.
+
+**Cost tradeoff:** Generating and scoring multiple plans is expensive (more LLM calls). Only worthwhile when planning failures are costly.
+
+### Plan verification agents
+
+A second agent **verifies** the plan before execution.
+
+**Process:**
+1. Planning agent generates a plan
+2. Verification agent checks it against constraints, dependencies, safety rules
+3. If verification fails, planning agent revises
+4. Once verified, execution proceeds
+
+**Evaluation implications:**
+- The verifier acts as an automated evaluator, catching plan errors before execution
+- You evaluate the **verifier's accuracy** (does it correctly identify bad plans? does it flag good plans as bad?)
+
+**When this works:** Safety-critical domains where bad plans have high costs. Autonomous vehicles, medical procedures, financial transactions.
+
+### Hierarchical task networks in LLM agents
+
+Agents use **hierarchical planning**: top-level goals decompose into sub-goals, which decompose into actions.
+
+**Structure:**
+- Level 0 (goal): "Book a trip"
+- Level 1 (sub-goals): "Book flight," "Book hotel," "Arrange transportation"
+- Level 2 (actions): "Search flights," "Select flight," "Complete booking"
+
+**Evaluation implications:**
+- Evaluate each level independently (is the top-level decomposition correct? are the action-level plans correct?)
+- Verify **decomposition consistency** (do sub-plans actually achieve the sub-goals?)
+- Test **hierarchical re-planning** (if a low-level action fails, does the agent re-plan at the appropriate level?)
+
+**Advantages:**
+- Modular evaluation (easier to debug which level is failing)
+- Better handling of complexity (large tasks broken into manageable pieces)
+
+**When this works:** Complex, long-running tasks (project management, research, multi-day workflows).
+
+---
+
+## Failure Modes and Enterprise Expectations
+
+### Common planning failures in production
+
+**Incomplete plans — missing critical steps**
+
+Symptom: Agent skips validation, error handling, or cleanup steps.
+
+Root cause: Model doesn't consider edge cases or assumes best-case execution.
+
+Fix: Add "must-include" constraints for critical step types. Test with failure injection.
+
+**Inefficient plans — unnecessary or redundant steps**
+
+Symptom: Agent makes redundant API calls, fetches data it doesn't use, over-decomposes simple tasks.
+
+Root cause: Model over-thinks or doesn't optimize for efficiency.
+
+Fix: Add step count budgets. Penalize plans that exceed efficiency thresholds. Use few-shot examples of efficient plans in prompts.
+
+**Incorrect ordering — dependency violations**
+
+Symptom: Agent books hotel before confirming flights, sends notifications before completing actions, deletes data before backing it up.
+
+Root cause: Model doesn't understand task dependencies or reasoning is shallow.
+
+Fix: Define explicit dependency graphs for workflows. Use chain-of-thought prompting to make reasoning explicit. Test with scenarios where wrong ordering causes failures.
+
+**Poor tool selection — using wrong tools**
+
+Symptom: Agent uses slow/expensive tools when fast/cheap ones exist, calls LLMs for tasks solvable by code, selects deprecated tools.
+
+Root cause: Model isn't aware of tool capabilities or cost tradeoffs.
+
+Fix: Provide tool selection guidelines in system prompts. Penalize plans that use inappropriate tools. Test with tasks where clear tool preferences exist.
+
+**No re-planning — brittle execution**
+
+Symptom: Agent fails when first plan doesn't work, doesn't adapt to new information or failures.
+
+Root cause: Agent lacks re-planning logic or doesn't recognize when re-planning is needed.
+
+Fix: Build re-planning into agent architecture. Test with failure injection and information updates. Require agents to propose alternative plans when blocked.
+
+### Enterprise expectations for planning evaluation
+
+**Auditability:** Plans must be logged and versioned. For regulated industries, you need to show why the agent chose plan X over plan Y.
+
+**Reproducibility:** Given the same goal and context, the agent should generate similar plans. Excessive variation signals instability.
+
+**Compliance:** Plans must satisfy regulatory constraints (data handling, approval workflows, legal requirements). Use constraint satisfaction to enforce.
+
+**Cost control:** Plans must stay within cost budgets (API call limits, time budgets). Expensive plans trigger alerts even if correct.
+
+**Human oversight:** For high-risk tasks, plans require human approval before execution. Evaluation verifies this gate is respected.
+
+**Graceful degradation:** When planning fails, agents must escalate or fall back, not proceed with broken plans.
+
+---
+
+## Template: Plan Evaluation Rubric
+
+```yaml
+plan_evaluation_rubric:
+  task: book_business_trip
+  version: 1.0
+
+  criteria:
+    completeness:
+      required_steps:
+        - search_transportation
+        - book_transportation
+        - search_accommodation
+        - book_accommodation
+        - send_confirmation
+      scoring: binary  # all required steps present = pass
+
+    efficiency:
+      max_steps: 8
+      max_tool_calls: 12
+      scoring: threshold  # exceed max = fail
+
+    ordering:
+      dependencies:
+        - book_transportation -> must_occur_after: search_transportation
+        - book_accommodation -> must_occur_after: book_transportation
+        - send_confirmation -> must_occur_after: [book_transportation, book_accommodation]
+      scoring: binary  # all dependencies satisfied = pass
+
+    tool_selection:
+      preferred_tools:
+        search_transportation: [flight_search_api, train_search_api]
+        book_transportation: [booking_api]
+        search_accommodation: [hotel_search_api]
+      forbidden_tools:
+        - deprecated_booking_api
+      scoring: binary  # use preferred tools, avoid forbidden = pass
+
+  overall_scoring:
+    method: all_must_pass  # plan fails if any criterion fails
+
+  re_planning:
+    test_scenarios:
+      - inject_failure_at_step: book_transportation
+        expected_behavior: generate_alternative_plan
+      - update_constraint_mid_execution: reduce_budget
+        expected_behavior: revise_plan_to_fit_budget
+```
+
+---
+
+## Interview Questions and Answers
+
+**Q1: How do you evaluate whether an agent's plan is good before it executes?**
+
+I evaluate plans against four criteria: completeness (all necessary steps included), efficiency (no unnecessary steps), correct ordering (dependencies respected), and appropriate tool selection. For routine workflows, I compare agent plans to gold reference plans or check constraint satisfaction — required steps, forbidden steps, ordering rules. For exploratory tasks, I use outcome-based evaluation: did the plan lead to goal achievement? I also test re-planning ability by injecting failures mid-execution and verifying the agent adapts. In high-risk scenarios, I use LLM judges to score plans on these dimensions before execution.
+
+---
+
+**Q2: What's the difference between evaluating the plan and evaluating the execution, and why does it matter?**
+
+Planning is deciding what to do; execution is actually doing it. They fail independently. An agent might create a brilliant plan but fail because APIs are down (execution failure). Or it might perfectly execute a terrible plan that books hotels before confirming flights (planning failure). If you only evaluate outcomes, you can't tell which is broken. Evaluating planning separately lets you diagnose root causes: maybe the agent is making smart decisions but tools are unreliable, or tools are fine but planning logic needs improvement. This separation is critical for focused iteration and debugging in production systems.
+
+---
+
+**Q3: How do you handle dynamic planning where agents generate different plans for the same goal?**
+
+I use constraint satisfaction rather than gold plan comparison. Instead of prescribing one correct plan, I define boundaries: must-include steps (verify payment method), must-not-include steps (use deprecated API), ordering constraints (charge after confirmation), and resource budgets (max 10 tool calls). As long as the plan satisfies these constraints, it passes. I also track plan diversity: if the agent generates wildly different plans for identical inputs, that signals instability. For creative tasks, I use outcome-based evaluation: the plan is good if it achieves the goal safely and efficiently, regardless of the specific path taken.
+
+---
+
+**Q4: How do you test an agent's ability to re-plan when circumstances change mid-execution?**
+
+I inject failures and information updates during execution. Force a tool call to fail and verify the agent creates an alternative plan instead of giving up. Update constraints midway (user reduces budget) and verify the agent revises the plan. Change the goal partway through (user says "actually, change the destination") and verify the agent regenerates the plan rather than continuing with the old one. I also test partial completion: if the agent completes 3 of 7 steps and step 4 fails, does it re-plan steps 5-7 to work around the failure? I score re-planning on detection (does the agent notice re-planning is needed?), quality (is the new plan sound?), and communication (does it explain changes to the user?).
+
+---
+
+**Q5: What are the biggest failure modes in agent planning, and how do you catch them in evaluation?**
+
+The most common failures are incomplete plans (missing critical steps like validation or error handling), inefficient plans (redundant or unnecessary steps), wrong ordering (dependency violations like charging before confirming), and poor tool selection (using slow or deprecated tools). I catch these with constraint-based checks: required step lists, max step budgets, dependency graphs, and tool preference rules. Another major failure is lack of re-planning — agents that don't adapt when plans break. I test this with failure injection: force errors and verify the agent creates alternatives. Finally, plan-execution drift: the agent says it will do X but actually does Y. I catch this by comparing verbalized plans to execution traces and flagging misalignment.
+
+---
+
+Planning quality is the blueprint evaluation for agent systems. A bad plan executed perfectly is still a failure. In the next chapter, **8.5 — Error Recovery & Robustness**, we'll cover how agents handle execution failures, retry logic, graceful degradation, and the eval techniques that ensure agents fail safely when things go wrong.

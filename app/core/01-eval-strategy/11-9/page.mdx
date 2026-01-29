@@ -1,0 +1,610 @@
+---
+title: "11.9 — Cost Monitoring in Production AI"
+part: "Chapter 11"
+chapter: "Production Monitoring"
+version: "1.0.0"
+---
+
+# Cost Monitoring in Production AI
+
+A friend launched an AI coding assistant for their SaaS product. They estimated costs carefully: average query needs 2,000 input tokens, 500 output tokens, maybe 10,000 users trying it once a day. At GPT-4 pricing, that's roughly $500/month. Reasonable.
+
+Three weeks later: $47,000 bill.
+
+What happened? A single customer integrated the feature into their CI pipeline. Every git push triggered 200 queries. Each query hit the maximum context window because they hadn't implemented context pruning. One user, completely within the product's intended use, generated 90% of the month's costs. The founder had no alerting, no per-user limits, no cost tracking beyond the total bill.
+
+This is the AI cost problem. Traditional software scales predictably—more users means more compute, but you control the resources. AI costs scale with behavior you don't control: how verbose users are, how many retries happen, how long the model decides to respond, whether someone accidentally creates an infinite loop. You're renting intelligence by the token, and tokens are consumed in ways that are fundamentally harder to predict than CPU cycles.
+
+**Cost monitoring** isn't an afterthought for production AI. It's a first-class system requirement, as critical as latency monitoring or error tracking. You need to know what you're spending, where it's going, when it's spiking, and how to stop it before it bankrupts you. This chapter covers the engineering discipline of keeping AI costs visible, predictable, and under control.
+
+---
+
+## The $47,000 Wake-Up Call
+
+Let's dissect that $47,000 bill. The startup was using GPT-4 at the 2024 pricing: roughly $30 per million input tokens, $60 per million output tokens. Their initial estimate assumed:
+
+- 10,000 users
+- 1 query per user per day
+- 2,000 input tokens per query
+- 500 output tokens per query
+
+Daily cost: 10,000 queries times 2,000 input tokens equals 20 million input tokens, which costs $600. Plus 10,000 queries times 500 output tokens equals 5 million output tokens, which costs $300. Total: $900/day, about $27,000/month.
+
+Wait, that's already way higher than $500. First mistake: they underestimated usage. But okay, let's say they meant 1,000 users. That gets to $2,700/month. Still not $500, but closer.
+
+What actually happened:
+
+- 1 power user running 200 queries per push, 50 pushes per day: 10,000 queries
+- Context window not pruned, hitting 120,000 tokens per query (the maximum at the time)
+- Average output length: 4,000 tokens because the model was writing full code files
+
+Daily cost from this one user: 10,000 queries times 120,000 input tokens equals 1.2 billion input tokens, which costs $36,000. Plus 10,000 queries times 4,000 output tokens equals 40 million output tokens, which costs $2,400. Total: $38,400 per day.
+
+They caught it after three days. Bill: $115,200. Negotiated down to $47,000 after explaining to OpenAI that they had no rate limits in place and this was accidental overuse.
+
+The lesson: **AI costs scale with token consumption, and token consumption scales with user behavior in ways that are hard to predict**. You need monitoring that tells you what's happening token-by-token, user-by-user, feature-by-feature.
+
+---
+
+## Token Economics: The Unit of AI Cost
+
+Every AI model charges per token. A **token** is roughly 4 characters of text, or about 0.75 words in English. "Hello, world!" is 4 tokens. A typical paragraph is 100-200 tokens. A full page of text is 500-1,000 tokens.
+
+Costs break into two categories:
+
+- **Input tokens**: what you send to the model (prompt, context, examples)
+- **Output tokens**: what the model generates (response)
+
+Output tokens are typically 2-3 times more expensive than input tokens because generation requires more compute than processing. For GPT-4 in 2024, input tokens cost $30 per million, output tokens cost $60 per million.
+
+For Claude 3.5 Sonnet in 2026, input tokens cost $3 per million, output tokens cost $15 per million. For GPT-4o mini, input tokens cost $0.15 per million, output tokens cost $0.60 per million. The pricing varies wildly by model tier.
+
+Your cost per interaction depends on:
+
+1. **Model choice**: GPT-4o mini is 200 times cheaper than GPT-4 Turbo
+2. **Input length**: how much context you send
+3. **Output length**: how much the model generates
+4. **Number of calls**: multi-turn conversations, retries, tool use cycles
+5. **Caching**: some providers charge less for cached context
+
+A single user query might trigger:
+
+- Initial API call: 10,000 input tokens, 500 output tokens
+- Tool use: 3 additional calls with 12,000 input tokens total, 300 output tokens total
+- Retry after validation failure: 1 call with 10,500 input tokens, 500 output tokens
+
+Total: 32,500 input tokens, 1,300 output tokens. At GPT-4 pricing, that's roughly $0.98 input plus $0.08 output equals $1.06 per interaction. If you have 10,000 interactions per day, that's $10,600 daily, or $318,000 per month.
+
+**The fundamental unit of AI cost is the interaction**, not the user or the session. You need to track cost per interaction to understand what you're actually spending.
+
+---
+
+## Cost Per Interaction: Instrumentation
+
+To track cost per interaction, you need to instrument every API call and aggregate by some identifier. Most teams use a **request ID** or **session ID** that flows through the entire interaction.
+
+Basic instrumentation:
+
+```yaml
+request_id: "req_abc123"
+timestamp: "2026-01-15T14:32:11Z"
+model: "gpt-4o"
+input_tokens: 10000
+output_tokens: 500
+input_cost: 0.30
+output_cost: 0.03
+total_cost: 0.33
+user_id: "user_xyz"
+feature: "code_assistant"
+```
+
+You emit this log entry for every API call. Then you aggregate by request_id to get the total cost of the interaction. Group by user_id to see per-user costs. Group by feature to see per-feature costs.
+
+Most AI observability platforms do this automatically. **LangSmith**, **Helicone**, **Braintrust**, and **Weights & Biases** all provide per-request cost tracking with automatic token counting and pricing lookups. You configure your API key through their proxy, and they log every call with cost data.
+
+Example LangSmith setup:
+
+```yaml
+LANGCHAIN_TRACING_V2: "true"
+LANGCHAIN_API_KEY: "your_key"
+LANGCHAIN_PROJECT: "production"
+```
+
+Every LangChain call gets traced, costs are calculated automatically, and you see dashboards showing cost over time, broken down by user, model, or custom tags.
+
+If you're not using an observability platform, you need to build this yourself. The challenge is that token counts aren't always known until after the API call completes. Some providers return token counts in the response metadata. Others require you to estimate using a tokenizer library.
+
+OpenAI returns usage data:
+
+```yaml
+usage:
+  prompt_tokens: 10000
+  completion_tokens: 500
+  total_tokens: 10500
+```
+
+You multiply by the pricing for your model tier and log the result. Anthropic, Cohere, and other providers have similar response formats.
+
+The key insight: **you must log cost data synchronously with every API call**. Waiting until the end of the month to analyze your bill is too late. You need real-time visibility.
+
+---
+
+## Cost Attribution: Where Is the Money Going?
+
+Once you're logging cost per request, the next question is **attribution**: which features, users, or workflows are driving your costs?
+
+Common attribution dimensions:
+
+- **User ID**: which users are most expensive?
+- **Feature**: is it the chatbot, the code assistant, the summarization tool?
+- **Model**: how much are you spending on GPT-4 versus GPT-4o mini?
+- **Endpoint**: which API endpoints consume the most tokens?
+- **Time of day**: are costs spiking at certain hours?
+- **Geography**: are certain regions more expensive due to localization or language?
+
+A real example from a customer support AI startup:
+
+- Total monthly cost: $82,000
+- 65% from a single enterprise customer using the "deep analysis" feature
+- 20% from internal testing and development environments (oops)
+- 10% from the chatbot feature used by 5,000 SMB customers
+- 5% from batch summarization jobs
+
+The enterprise customer's deep analysis feature was generating 50,000-token reports for every support ticket. The product team thought this feature was rarely used. Turned out one customer had integrated it into their internal workflow and was running it 2,000 times per day.
+
+Cost attribution revealed two problems:
+
+1. The most expensive feature was unmonetized—they were losing money on every use
+2. Internal dev environments were consuming 20% of the budget because engineers were testing with full production context
+
+Fixes:
+
+- Introduced usage-based pricing for deep analysis: $0.50 per report
+- Added per-user rate limits: 100 reports per day max
+- Switched dev environments to GPT-4o mini and synthetic test data
+
+Monthly cost dropped to $31,000. Revenue from the deep analysis feature: $15,000/month.
+
+**Cost attribution turns your bill from a black box into a product decision tool**. You see what's expensive and decide: charge for it, optimize it, or deprecate it.
+
+---
+
+## Cost Anomaly Detection: Catching Spikes Early
+
+Even with good instrumentation, costs can spike unexpectedly. You need **anomaly detection** to catch problems before they become disasters.
+
+Common cost anomalies:
+
+1. **Prompt injection causing long outputs**: an attacker or confused user tricks the model into generating massive responses
+2. **Retry loops**: a bug causes the system to retry failed requests indefinitely
+3. **Context window bloat**: a feature starts including too much context without pruning
+4. **Traffic spikes**: legitimate usage surge from a viral post or new customer
+5. **Model downgrade failure**: a fallback to a more expensive model gets stuck on
+
+Example: a chatbot that normally generates 200-token responses suddenly starts generating 8,000-token responses. Why? A user discovered that typing "Explain in extreme detail with examples" triggered verbose mode. They shared this on Reddit. Suddenly 500 users are doing it.
+
+Without monitoring, you don't notice until the bill arrives. With monitoring, you see:
+
+- Average output tokens per request: normally 200, suddenly 8000
+- Cost per request: normally $0.02, suddenly $0.48
+- Total hourly spend: normally $50, suddenly $1,200
+
+Alert triggers: "Hourly spend exceeded $500, threshold is $100."
+
+You investigate, find the prompt injection pattern, and add output length limits. Crisis averted.
+
+**Anomaly detection strategies:**
+
+1. **Threshold alerts**: trigger when hourly/daily spend exceeds a fixed threshold
+2. **Rate-of-change alerts**: trigger when spend increases by more than X percent compared to the previous hour/day
+3. **Per-user alerts**: trigger when a single user exceeds a cost threshold
+4. **Per-feature alerts**: trigger when a feature's cost spikes unexpectedly
+5. **Statistical anomalies**: use standard deviation or percentile-based detection to catch unusual patterns
+
+Most teams start with simple threshold alerts and add sophistication over time. A good starting point:
+
+- Alert if hourly spend exceeds 2 times the historical average
+- Alert if any single user exceeds $50 in an hour
+- Alert if average output tokens per request exceeds 2 times the historical average
+
+These catch the most common disasters: runaway costs from a single user, retry loops, and context bloat.
+
+---
+
+## Budget Guardrails: Preventing Overruns
+
+Monitoring tells you when costs are high. **Guardrails** prevent them from going higher.
+
+Common guardrails:
+
+1. **Per-user rate limits**: max queries per minute/hour/day
+2. **Per-user cost limits**: max spend per user per day
+3. **Per-feature cost limits**: max spend per feature per day
+4. **Global cost limits**: max total spend per day/week/month
+5. **Output length limits**: max tokens per response
+
+When a limit is hit, you have choices:
+
+- **Hard failure**: return an error to the user ("You've exceeded your daily limit")
+- **Graceful degradation**: switch to a cheaper model or shorter context
+- **Queuing**: defer the request until the next time window
+- **Monetization**: prompt the user to upgrade to a paid tier
+
+The worst option is hard failure with a generic error. Users get frustrated, and you lose trust. Better options:
+
+- "You've used your daily quota of 100 queries. Upgrade to Pro for unlimited access."
+- "This feature is temporarily using a faster, lower-cost model to stay within your budget."
+- "Your query is queued and will process within the next hour."
+
+A real example from a legal AI tool:
+
+- Free tier: 20 queries per day, GPT-4o mini only
+- Pro tier: 200 queries per day, GPT-4o for complex queries
+- Enterprise tier: unlimited queries, GPT-4 Turbo for all requests
+
+When a free user hits 20 queries, the UI shows: "You've reached your daily limit. Upgrade to Pro for 200 queries per day and access to more powerful models."
+
+When a Pro user hits 200 queries, the system switches to GPT-4o mini and shows a banner: "You've used your Pro quota. Remaining queries today will use our fast model. Upgrade to Enterprise for unlimited access to premium models."
+
+This approach keeps users engaged while controlling costs. Free users are nudged to upgrade. Pro users get degraded service instead of hard errors. Enterprise users never hit limits.
+
+**Guardrails are product features, not just cost controls**. They shape user behavior, create monetization opportunities, and protect your margins.
+
+---
+
+## Cost-Quality Correlation: Are You Spending Wisely?
+
+Monitoring cost without monitoring quality is incomplete. You need to track both and understand the relationship.
+
+Questions to answer:
+
+1. Are you spending more for better quality, or just spending more?
+2. When you optimize for cost, how much does quality drop?
+3. What's the cost-quality frontier for your use case?
+
+The **cost-quality frontier** is the set of configurations that give you the best quality for a given cost, or the lowest cost for a given quality. It's the Pareto frontier of AI performance.
+
+Example: a customer support chatbot tracks:
+
+- Cost per interaction
+- User satisfaction score (thumbs up/down)
+- Response accuracy (human eval on a sample)
+
+They test multiple model configurations:
+
+| Configuration               | Cost per interaction | Satisfaction | Accuracy |
+|-----------------------------|---------------------|--------------|----------|
+| GPT-4 Turbo, 32k context    | $0.85               | 4.6/5        | 94%      |
+| GPT-4o, 16k context         | $0.42               | 4.5/5        | 92%      |
+| GPT-4o mini, 8k context     | $0.08               | 4.1/5        | 85%      |
+| GPT-4o mini, 4k context     | $0.04               | 3.8/5        | 78%      |
+
+The cost-quality frontier:
+
+- GPT-4o mini at 4k context is cheapest but lowest quality
+- GPT-4o mini at 8k context is 2x more expensive but significantly better
+- GPT-4o at 16k context is 5x more expensive but only slightly better than GPT-4o mini at 8k
+- GPT-4 Turbo is 10x more expensive than GPT-4o mini at 8k context but only marginally better
+
+The optimal choice depends on your priorities. If you're optimizing for satisfaction and can afford it, use GPT-4o at 16k context. If you're optimizing for cost while maintaining acceptable quality, use GPT-4o mini at 8k context.
+
+The key insight: **you can't optimize cost without measuring quality**. Every cost reduction is a potential quality reduction. You need to quantify the trade-off.
+
+This ties to **Chapter 15 (Cost-Quality Tradeoffs)** and **Chapter 26 (System Cost Engineering)**, which go deeper on optimization strategies. The monitoring discipline is to continuously track both dimensions and alert when the relationship breaks—for example, if cost increases but quality doesn't improve, something is wrong.
+
+---
+
+## Model Cost Optimization: The Tactical Layer
+
+Once you understand your cost-quality frontier, you can optimize tactically. Common strategies:
+
+**1. Model routing**
+
+Use cheaper models for simple queries, expensive models for complex ones. Route based on:
+
+- Query length: short queries to mini models
+- Query complexity: use a classifier to predict difficulty
+- User tier: free users get mini models, paid users get full models
+- Confidence: if the cheap model is uncertain, escalate to the expensive model
+
+Example routing logic:
+
+```yaml
+if query_length under 100 tokens:
+  use gpt-4o-mini
+else if user_tier == "enterprise":
+  use gpt-4-turbo
+else if query_complexity under 0.5:
+  use gpt-4o
+else:
+  use gpt-4-turbo
+```
+
+**2. Prompt caching**
+
+Some providers (Anthropic, OpenAI) offer caching for repeated context. If you're sending the same system prompt or knowledge base context repeatedly, caching can reduce input token costs by 90%.
+
+Anthropic's prompt caching example:
+
+```yaml
+system_prompt: "You are a helpful assistant with access to the following documentation..." (50,000 tokens)
+cache_control: "ephemeral"
+```
+
+First call: pays for 50,000 input tokens. Subsequent calls within 5 minutes: pays for 0 cached tokens, only the new user query tokens.
+
+Cost reduction: from $0.15 per call to $0.01 per call.
+
+**3. Context pruning**
+
+Don't send the entire conversation history every time. Prune to:
+
+- Last N turns
+- Most relevant turns (using embedding similarity)
+- Summarized history plus recent turns
+
+Example: a chatbot that normally sends 20 turns of history (15,000 tokens) switches to sending the last 5 turns plus a summary (5,000 tokens). Cost drops by 66%.
+
+**4. Output length limits**
+
+Set max_tokens to prevent runaway generation. If you expect 200-token responses, set max_tokens to 500. This prevents the model from generating a 5,000-token essay when a short answer would suffice.
+
+**5. Batch processing**
+
+If you have non-realtime workloads (summarization, classification), use batch APIs or queue requests to run during off-peak hours. Some providers offer discounts for batch processing.
+
+All of these tactics require monitoring to measure impact. You deploy a change, watch cost and quality metrics, and decide whether to keep it.
+
+---
+
+## Infrastructure Cost: Beyond API Calls
+
+AI costs aren't just model API calls. The full picture includes:
+
+- **Model API costs**: the biggest line item
+- **Observability tools**: LangSmith, Helicone, Datadog
+- **Storage**: logs, embeddings, conversation history
+- **Compute**: self-hosted models, embedding generation, vector databases
+- **Human review**: labeling, red teaming, QA
+- **Data pipelines**: ETL for training data, eval datasets
+
+A typical breakdown for a production AI system:
+
+- 70% model API costs
+- 10% observability and monitoring tools
+- 8% vector database and storage
+- 7% human review and labeling
+- 5% compute for self-hosted components
+
+Teams often optimize model API costs and ignore the other 30%. But if you're spending $100k/month, that other 30% is $30k—worth optimizing.
+
+Example: a team paying $5,000/month for LangSmith could switch to self-hosted Langfuse (open-source) and reduce that to $500/month in infrastructure costs. Trade-off: more engineering time to maintain it.
+
+Another example: a team storing full conversation logs in a relational database, costing $2,000/month in storage. They switch to S3 with intelligent tiering, reducing costs to $200/month. Trade-off: slower access for ad-hoc queries.
+
+**Infrastructure cost optimization is a continuous process**. You monitor where the money goes, identify high-cost components, and decide whether to optimize, replace, or accept the cost.
+
+---
+
+## 2026 Patterns: Modern Cost Monitoring Tools
+
+By 2026, cost monitoring has matured significantly. Here's what the best teams are using:
+
+**1. Per-request cost tracking in observability platforms**
+
+LangSmith, Helicone, Braintrust, and Weights & Biases all provide automatic cost tracking. You route API calls through their proxy or SDK, and they log token counts, calculate costs, and provide dashboards.
+
+Helicone example:
+
+```yaml
+HELICONE_API_KEY: "your_key"
+OPENAI_API_BASE: "https://oai.hconeai.com/v1"
+```
+
+Every OpenAI call goes through Helicone. You see real-time cost dashboards, per-user breakdowns, and alerts.
+
+**2. Automated model routing for cost optimization**
+
+Tools like **Martian** and **Portkey** provide intelligent routing: send each request to the cheapest model that meets your quality threshold. They use your eval data to learn which models work for which queries.
+
+Example: Martian routes:
+
+- Simple queries (classification, short answers) to GPT-4o mini
+- Medium queries (summarization, Q&A) to GPT-4o
+- Complex queries (code generation, reasoning) to GPT-4 Turbo
+
+It measures quality on each route and optimizes the routing policy over time. Typical cost reduction: 40-60% with minimal quality loss.
+
+**3. Cost-aware prompt engineering**
+
+Prompt optimization tools like **PromptLayer** and **HumanLoop** now show cost-per-prompt alongside quality metrics. When you test prompt variations, you see:
+
+- Version A: 92% accuracy, $0.15 per request
+- Version B: 93% accuracy, $0.42 per request
+- Version C: 91% accuracy, $0.08 per request
+
+You choose based on your cost-quality priorities. This makes cost a first-class concern in prompt engineering, not an afterthought.
+
+**4. LLM cost dashboards**
+
+Custom dashboards in Grafana, Datadog, or internal BI tools show:
+
+- Cost over time (hourly, daily, weekly)
+- Cost by feature, user, model
+- Cost anomalies and alerts
+- Cost-quality correlation charts
+- Budget burn rate and forecasts
+
+Teams review these dashboards weekly, just like they review error rates and latency. Cost is a production SLI (service level indicator), not just a finance concern.
+
+**5. Predictive cost modeling**
+
+Advanced teams build models to predict monthly costs based on current usage trends. If you're on track to spend $200k this month but your budget is $120k, you get an alert on day 10, not day 30.
+
+Predictive models use:
+
+- Historical usage patterns
+- Seasonality (weekday versus weekend, start of month versus end)
+- Growth trends (new user signups, feature launches)
+- Planned changes (model upgrades, new features)
+
+This lets you adjust before costs spiral.
+
+---
+
+## Failure Modes: When Cost Monitoring Breaks
+
+Even with good monitoring, things go wrong. Common failure modes:
+
+**1. Monitoring lag**
+
+Your dashboard shows yesterday's costs, but the spike happened today. By the time you see it, you've already burned the budget. Solution: real-time streaming of cost data, not batch updates.
+
+**2. Attribution gaps**
+
+Some costs aren't attributed to any user or feature. Maybe they're internal testing, or requests without proper tagging. You see $10k in "unknown" costs and can't optimize them. Solution: enforce tagging on all requests, use default tags for untagged requests.
+
+**3. Alert fatigue**
+
+You set aggressive thresholds and get alerts every hour. You start ignoring them. Then a real anomaly happens and you miss it. Solution: tune thresholds carefully, use rate-of-change alerts instead of absolute thresholds, escalate severe alerts to PagerDuty.
+
+**4. Optimization whack-a-mole**
+
+You optimize one feature, costs drop, then another feature spikes. You're constantly reacting. Solution: implement global guardrails and per-feature budgets, not just ad-hoc fixes.
+
+**5. Quality blind spots**
+
+You aggressively cut costs and metrics look fine, but user satisfaction drops. Your quality metrics were lagging indicators or not measuring the right thing. Solution: include real-time quality signals (user feedback, error rates) in cost optimization decisions.
+
+The meta-lesson: **cost monitoring is a system, not a set of tools**. It requires instrumentation, dashboards, alerts, attribution, guardrails, and a process for acting on the data. Any missing piece creates a blind spot.
+
+---
+
+## Enterprise Expectations: What CFOs Want to Know
+
+When you sell AI products to enterprises, CFOs and procurement teams ask:
+
+1. How do you control costs? (They want to hear about guardrails and rate limits)
+2. What's our worst-case spend? (They want a ceiling, not "it depends")
+3. Can we get a cost forecast before signing? (They want predictability)
+4. How do you prevent cost spikes from one user affecting others? (They want isolation)
+5. What's included in the cost versus billed separately? (They want transparency)
+
+Enterprises don't want usage-based pricing with unbounded costs. They want:
+
+- Fixed-tier pricing (up to X queries per month)
+- Cost caps (never exceeds $Y per month)
+- Predictable unit economics (cost per user, per seat)
+
+If you're building a multi-tenant AI system, you need **per-tenant cost isolation**. One tenant's runaway usage shouldn't affect another tenant's budget or performance. This is covered more in **Chapter 16 (Multi-Tenant Evals)** and **Chapter 17 (Enterprise Governance)**.
+
+For enterprise sales, your cost monitoring becomes a product feature. You show dashboards during demos: "Here's how we track costs in real-time. Here's how we prevent overruns. Here's your guaranteed ceiling."
+
+This is the difference between selling to startups (who tolerate unpredictability) and enterprises (who demand control).
+
+---
+
+## Template: Cost Monitoring Dashboard
+
+Here's a minimal cost dashboard spec:
+
+```yaml
+dashboard: "AI Cost Monitoring"
+
+widgets:
+  - title: "Total Spend Today"
+    metric: sum(cost)
+    time_range: today
+    alert_threshold: 5000
+
+  - title: "Spend Over Time"
+    chart: line
+    metric: sum(cost)
+    group_by: hour
+    time_range: 7d
+
+  - title: "Cost by Feature"
+    chart: bar
+    metric: sum(cost)
+    group_by: feature
+    time_range: 30d
+
+  - title: "Cost by Model"
+    chart: pie
+    metric: sum(cost)
+    group_by: model
+    time_range: 30d
+
+  - title: "Top 10 Users by Cost"
+    table: true
+    metric: sum(cost)
+    group_by: user_id
+    sort: desc
+    limit: 10
+    time_range: 7d
+
+  - title: "Cost per Interaction"
+    chart: line
+    metric: avg(cost)
+    group_by: hour
+    time_range: 7d
+
+  - title: "Cost Anomalies"
+    alerts:
+      - condition: "hourly_cost exceeds 2x avg_hourly_cost"
+        severity: warning
+      - condition: "hourly_cost exceeds 5x avg_hourly_cost"
+        severity: critical
+      - condition: "single_user_cost exceeds 100 in 1 hour"
+        severity: critical
+```
+
+This dashboard gives you visibility into total spend, trends, attribution, and anomalies. It's the minimum viable cost monitoring setup.
+
+---
+
+## Practical Next Steps
+
+If you're building production AI and don't have cost monitoring:
+
+1. **Instrument every API call** with token counts and costs. Log to a structured format (JSON, metrics database).
+2. **Set up a basic dashboard** showing daily spend, spend by feature, and spend by user. Use Grafana, Datadog, or your observability platform.
+3. **Implement threshold alerts** for hourly and daily spend. Start with generous thresholds and tighten over time.
+4. **Add per-user rate limits** to prevent any single user from burning your budget. Start with high limits and lower based on data.
+5. **Track cost alongside quality** in your eval system. Make cost a first-class metric in your optimization decisions.
+
+Within a month, you'll have visibility and control. You'll catch cost spikes early, understand what's expensive, and make informed trade-offs.
+
+Without cost monitoring, you're flying blind. With it, you treat AI spend like any other engineering resource: measurable, optimizable, and under control.
+
+---
+
+## Interview Q&A: Cost Monitoring in Production AI
+
+**Q: How do you prevent a single user from running up massive costs?**
+
+A: Per-user rate limits and cost caps. Set a maximum cost per user per day—say, $50. When they hit it, you either degrade service (switch to a cheaper model), queue their requests, or prompt them to upgrade to a higher tier. The key is graceful degradation: don't just throw an error, give them a path forward. Also monitor for patterns: if a user consistently hits limits, investigate whether they're using the product as intended or if there's a bug. Some teams use adaptive limits based on user tier or behavior: free users get 20 queries per day, paid users get 500. This aligns cost control with your monetization strategy.
+
+**Q: What's the difference between cost monitoring and cost optimization?**
+
+A: Monitoring is about visibility: knowing what you're spending, where it's going, when it spikes. Optimization is about reducing costs while maintaining quality. You need monitoring first—you can't optimize what you don't measure. Good monitoring tells you which features, models, or users are expensive. Then optimization is deciding: switch to a cheaper model, prune context, add caching, set output limits, or charge for the feature. Monitoring is continuous and defensive (preventing overruns). Optimization is periodic and strategic (improving margins). Both are necessary, but monitoring is the foundation.
+
+**Q: How do you set a realistic AI budget for a new product?**
+
+A: Start with a bottom-up estimate: cost per interaction times expected interactions. Break it down: input tokens, output tokens, model choice, number of API calls per interaction. Then multiply by expected daily active users and queries per user. Add a 2-3x buffer because your estimates will be wrong. Test in staging with realistic usage patterns before going to production. Set conservative rate limits initially, then relax them as you understand actual usage. Monitor daily spend and compare to your estimate—adjust your model as data comes in. Most teams underestimate by 3-10x on first launch because they don't account for context length, retries, or power users. The buffer is there to absorb surprises while you learn.
+
+**Q: Should cost monitoring be part of your observability stack or separate?**
+
+A: Integrated into your observability stack. Cost is a production metric like latency, error rate, or throughput. You want to correlate cost spikes with traffic patterns, errors, or code deploys. If you monitor cost separately, you lose that correlation. Tools like LangSmith, Helicone, Datadog, and Weights & Biases treat cost as a first-class metric alongside performance and quality. You see it in the same dashboards, alert on it the same way, and analyze it in the same queries. Separating cost from observability creates silos and slows down debugging. When costs spike, you want to immediately see: was it a traffic surge? A retry loop? A new deployment? That requires integrated data.
+
+**Q: What's the relationship between cost monitoring and Chapter 15 on cost-quality tradeoffs?**
+
+A: Chapter 15 is about the strategic trade-offs: when to use expensive models, how to balance quality and cost, finding the Pareto frontier. Cost monitoring (this chapter) is the operational discipline that makes those decisions possible. You need monitoring to measure the trade-offs: if you switch from GPT-4 to GPT-4o, does cost drop without hurting quality? Monitoring gives you the data. Chapter 15 gives you the frameworks for analyzing that data and making decisions. Think of it as: this chapter is the instrumentation and dashboards, Chapter 15 is the decision-making process. You can't do Chapter 15 without this chapter's monitoring, and this chapter's data is only useful if you apply Chapter 15's frameworks. They're complementary—monitoring is the "how to measure," cost-quality tradeoffs is the "how to optimize."
+
+---
+
+## What's Next
+
+You've instrumented costs, built dashboards, and set guardrails. You know what you're spending and can prevent disasters. But there's another production concern that's equally critical and often overlooked: **data governance**. What data are you logging? Who can access it? How long do you retain it? Are you compliant with GDPR, HIPAA, or SOC 2?
+
+**Chapter 11.10 (Data Governance in Monitoring)** covers how to handle sensitive data in production AI systems—logging without leaking PII, retention policies, access controls, and compliance requirements. Cost is one dimension of production risk. Data governance is another. Both are necessary for enterprise-grade AI systems.

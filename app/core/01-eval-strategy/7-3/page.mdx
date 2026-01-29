@@ -1,0 +1,506 @@
+---
+title: "7.3 — LLM-as-Judge: Calibration & Bias Correction"
+sectionTitle: "Chapter 7: Automated Evaluation"
+chapterNumber: 7
+sectionNumber: 3
+---
+
+# LLM-as-Judge: Calibration & Bias Correction
+
+**A brilliant surgeon with no depth perception is more dangerous than no surgeon at all.** In 2025, a Series B fintech deployed an LLM judge to evaluate customer support responses. The judge consistently scored verbose, jargon-heavy replies at 8.5/10 while rating concise, helpful answers at 6/10. The team shipped hundreds of prompt iterations based on these scores. Three months later, customer satisfaction had dropped 23%. The judge wasn't broken—it was uncalibrated. It rewarded what sounded sophisticated, not what actually helped users.
+
+An uncalibrated LLM judge is worse than no judge at all. Random errors you can detect. Systematic bias you trust until it destroys your product.
+
+---
+
+## Why Calibration Is Non-Negotiable
+
+**Calibration** means your LLM judge's scores align with human judgment at a statistically reliable level. Without it, you're optimizing toward an AI's preferences, not your users' needs.
+
+The risk isn't that the judge gets some answers wrong—humans do too. The risk is **false confidence**. When an LLM judge consistently scores outputs, teams trust the trend. They adjust prompts, tune models, make production decisions. If that judge has a verbosity bias, you'll systematically make your product wordier. If it has a position bias, you'll pick the wrong variant in A/B tests.
+
+**Uncalibrated judges create measurement error that looks like signal.** You're navigating by a compass that's 30 degrees off—every step takes you further from your destination.
+
+This chapter covers how to calibrate LLM judges against human judgment, detect and correct systematic biases, and maintain calibration as models evolve.
+
+---
+
+## The Calibration Dataset: Your Ground Truth
+
+Before an LLM judge evaluates anything in production, it must prove itself against a **calibration dataset**—a human-labeled gold set that represents the task you're automating.
+
+### Minimum viable calibration set
+
+For most tasks, you need **200-500 human-labeled examples** that cover:
+
+- **Quality spectrum**: excellent, good, mediocre, poor, terrible outputs
+- **Edge cases**: ambiguous responses, partial successes, creative solutions that bend instructions
+- **Common failure modes**: hallucinations, irrelevant answers, formatting errors
+- **Task variations**: if you're judging "helpfulness" across customer support, sales, and technical docs, calibrate on all three
+
+If your task is safety-critical (content moderation, medical advice, financial recommendations), raise the bar to **500-1000 examples** with multiple human raters per example to ensure reliability.
+
+### Label quality matters more than quantity
+
+Your calibration set is only as good as the human labels. Apply the same rigor from Chapter 6.3:
+
+- **Multiple raters** for subjective tasks (3-5 raters per example)
+- **Clear rubrics** so human raters agree (target inter-rater reliability Kappa above 0.7)
+- **Disagreement resolution** through discussion or expert adjudication
+- **Regular audits** to catch rater drift
+
+If your human labels are noisy, calibration is impossible. You're comparing the judge to randomness.
+
+---
+
+## Agreement Metrics: Measuring Judge-Human Alignment
+
+Once you have a gold set, run your LLM judge on the same examples and measure agreement.
+
+### Cohen's Kappa for categorical judgments
+
+If your judge assigns discrete labels (good/bad, safe/unsafe, correct/incorrect), use **Cohen's Kappa**. It measures agreement beyond chance.
+
+**Kappa formula**: (observed agreement - expected agreement) / (1 - expected agreement)
+
+- **Kappa = 1.0**: perfect agreement
+- **Kappa = 0.6-0.8**: substantial agreement (acceptable for most tasks)
+- **Kappa = 0.4-0.6**: moderate agreement (risky, needs improvement)
+- **Kappa below 0.4**: poor agreement (judge not ready)
+
+Example: You have 300 customer support responses labeled good/mediocre/poor by humans. Your LLM judge evaluates the same 300. Compute Kappa. If it's 0.72, the judge is substantially aligned. If it's 0.54, investigate what the judge is getting wrong.
+
+### Correlation for numeric scores
+
+If your judge outputs continuous scores (1-10 ratings, 0-100 quality scores), measure **Pearson or Spearman correlation** with human scores.
+
+- **Pearson**: linear relationship between judge and human scores
+- **Spearman**: rank-order relationship (useful if judge scale differs from human scale)
+
+Target correlation **above 0.75** for production use. Below 0.6 means the judge is unreliable.
+
+### Exact match rate for high-stakes tasks
+
+In safety-critical scenarios (content moderation, policy violation detection), measure **exact match rate**: percentage of examples where judge and human assign the same label.
+
+For binary decisions (safe/unsafe, compliant/non-compliant), target **90%+ exact match** on your calibration set.
+
+---
+
+## What "Good Enough" Looks Like
+
+**Calibration thresholds by task type:**
+
+| Task Type | Minimum Kappa | Minimum Correlation | Acceptable Error Rate |
+|-----------|---------------|---------------------|----------------------|
+| Content quality (helpfulness, clarity) | 0.65 | 0.70 | 15-20% |
+| Safety and moderation | 0.80 | 0.85 | 5-10% |
+| Factual correctness | 0.70 | 0.75 | 10-15% |
+| Style and tone | 0.60 | 0.65 | 20-25% |
+| Creative writing | 0.55 | 0.60 | 25-30% |
+
+**Below Kappa 0.6, the judge isn't ready.** You're automating unreliable judgment. Better to use a smaller human eval (Chapter 6) until you improve the judge.
+
+**Above Kappa 0.8, you have high confidence.** The judge can handle the majority of evaluations, with human spot-checks (Chapter 6.8 hybrid eval).
+
+In practice, most well-designed LLM judges for content quality achieve **Kappa 0.65-0.75**. Safety judges can reach **0.80-0.85** with careful prompt engineering. Subjective creative tasks rarely exceed **Kappa 0.60**.
+
+---
+
+## Known LLM Judge Biases
+
+Even well-calibrated judges have systematic biases. Identifying and correcting them is the difference between a useful judge and a misleading one.
+
+### Verbosity bias
+
+**LLM judges prefer longer responses**, even when brevity is better. A 50-word answer and a 200-word answer with identical content will score differently—the longer one wins.
+
+**Why it happens**: LLMs are trained on internet text where longer content often correlates with higher quality (detailed articles vs. short comments). Judges internalize this pattern.
+
+**Detection**: Create matched pairs—same content, different lengths. Ask the judge to score both. If the longer version consistently wins, you have verbosity bias.
+
+**Correction**:
+- **Explicit prompt instructions**: "Ignore response length. A concise answer is not worse than a verbose one."
+- **Length normalization**: Divide score by response length, or explicitly ask "Is this response unnecessarily long?"
+- **Rubric emphasis**: "Award points only for relevant information. Penalize redundancy."
+
+### Position bias
+
+In pairwise comparisons (Chapter 7.2), **judges prefer the first option**, regardless of quality. If you ask "Which response is better, A or B?" the judge picks A more often than it should.
+
+**Why it happens**: LLMs have primacy bias—they anchor on earlier context. The first response sets the frame for evaluation.
+
+**Detection**: Run the same pairwise comparison twice, swapping A and B positions. If the judge flips its decision, you have position bias.
+
+**Correction**:
+- **Position randomization**: For each comparison, randomly assign which response is A vs. B. Average results across both orderings.
+- **Prompt framing**: "Evaluate each response independently before comparing. Don't let order influence your judgment."
+- **Double evaluation**: Score A-then-B and B-then-A, then reconcile.
+
+### Self-preference bias
+
+**Judges prefer outputs from their own model family.** A GPT-4 judge rates GPT-4 outputs higher than Claude outputs of equivalent quality. A Claude judge does the reverse.
+
+**Why it happens**: Models recognize patterns in their own outputs—vocabulary, structure, reasoning style—and subconsciously reward them.
+
+**Detection**: Evaluate outputs from multiple model families with a judge from one family. If the judge consistently favors its own family, you have self-preference bias.
+
+**Correction**:
+- **Use a third-party judge**: If you're comparing GPT-4 vs. Claude, use a Gemini judge (or vice versa)
+- **Multi-judge consensus**: Use judges from all families and average scores (see 2026 patterns below)
+- **Blind evaluation**: Strip model-specific artifacts (formatting, style markers) before judging
+
+### Sycophancy bias
+
+**Judges agree with confident-sounding responses**, even when they're wrong. If a response says "Absolutely, this is correct because..." vs. "I think this might be...", the judge favors the confident one.
+
+**Why it happens**: Confidence is linguistically correlated with correctness in training data. Judges learn this heuristic.
+
+**Detection**: Create pairs where one response is confident but wrong, the other uncertain but right. If the judge picks the wrong one, you have sycophancy bias.
+
+**Correction**:
+- **Rubric focus on correctness**: "Evaluate factual accuracy independently from tone. Confidence does not imply correctness."
+- **Uncertainty normalization**: Ask the judge to ignore hedging language when scoring
+
+### Style bias
+
+**Judges prefer certain writing patterns**—formal over casual, structured over freeform, technical over accessible. Even when the task calls for casual tone, the judge may reward formality.
+
+**Why it happens**: Training data skew. Academic papers and professional writing are over-represented in LLM pretraining.
+
+**Detection**: Create style-matched pairs with identical content but different tones. If the judge consistently favors one style, you have style bias.
+
+**Correction**:
+- **Style-blind prompts**: "Evaluate content quality, not writing style. Informal language is not lower quality."
+- **Task-specific rubrics**: If the task is customer support, explicitly state "Friendly, conversational tone is appropriate."
+
+---
+
+## Bias Detection Methods: Systematic Testing
+
+To find biases before they corrupt your eval pipeline:
+
+### 1. Controlled pair testing
+
+Create **matched pairs** that isolate one variable (length, position, style) while keeping content identical. Run the judge on 50-100 pairs per bias type.
+
+Example for verbosity bias:
+
+- **Short version**: "The bug is caused by null pointer exception in line 47."
+- **Long version**: "After thorough analysis of the error logs and careful examination of the stack trace, I can confirm that the underlying issue stems from a null pointer exception that occurs at line 47 of the source code."
+
+If the judge consistently scores the long version higher, verbosity bias is present.
+
+### 2. Position swap testing
+
+For pairwise comparisons, run every eval twice with swapped positions. Measure **decision flip rate**. If it's above 20%, position bias is significant.
+
+### 3. Cross-model testing
+
+Evaluate outputs from multiple model families (GPT, Claude, Gemini, Llama) with your judge. Measure **average score by model family**. If one family consistently scores 10%+ higher, self-preference bias is present.
+
+### 4. Confidence vs. correctness
+
+Label 100 responses as confident-correct, confident-incorrect, uncertain-correct, uncertain-incorrect. Measure judge accuracy in each category. If it's significantly lower for uncertain-correct, sycophancy bias is present.
+
+---
+
+## Bias Correction: Prompt Engineering & Normalization
+
+Once you've detected biases, correct them through prompt design and score normalization.
+
+### Debiasing prompts
+
+**Explicit anti-bias instructions** in your judge prompt:
+
+```yaml
+system: |
+  You are evaluating responses for helpfulness.
+
+  Scoring criteria:
+  - Focus on content, not length. Concise answers are often better.
+  - Ignore response position. Evaluate each independently.
+  - Do not favor formal or technical language unless required.
+  - Confidence is not correctness. Verify claims, don't trust tone.
+
+  Assign scores 1-5 based solely on how well the response
+  answers the user's question.
+```
+
+**Chain-of-thought debiasing**: Ask the judge to explicitly check for bias before scoring:
+
+```yaml
+user: |
+  Response A: {response_a}
+  Response B: {response_b}
+
+  Before comparing, ask yourself:
+  - Am I favoring the longer response?
+  - Am I anchoring on whichever I read first?
+  - Am I rewarding confidence over correctness?
+
+  Now, which response is more helpful?
+```
+
+### Position randomization
+
+For pairwise comparisons, **run each comparison twice** with swapped positions. If the judge picks A when it's first and B when it's first, average the two runs or flag for human review.
+
+### Score normalization
+
+**Length normalization**: If you detect verbosity bias, divide the judge's score by response length (words or tokens), then rescale:
+
+```
+normalized_score = (raw_score / word_count) * average_word_count
+```
+
+**Model family normalization**: If you're comparing outputs from GPT, Claude, and Gemini, measure the judge's average score for each family on a neutral dataset. Subtract the family-specific bias from each score.
+
+---
+
+## Ongoing Calibration: Drift and Recalibration
+
+**Judge performance drifts when models update.** GPT-4 in January 2026 is not the same as GPT-4 in January 2025. Prompt sensitivity, reasoning patterns, biases—all shift.
+
+### Recalibration schedule
+
+- **Quarterly recalibration**: Re-run your judge on the calibration dataset every 3 months. Measure Kappa/correlation. If it drops by more than 0.05, investigate.
+- **Post-model-update recalibration**: When your judge model updates (GPT-4.5 to GPT-5, Claude Opus 3 to Opus 4), recalibrate immediately. Biases and scoring patterns may have changed.
+- **Post-prompt-change recalibration**: If you modify your judge prompt (add criteria, change rubric), recalibrate. Small wording changes can shift scores by 10-15%.
+
+### Drift detection
+
+Monitor **judge-human agreement on new gold examples** added to your calibration set. If agreement drops below your threshold (e.g., Kappa falls from 0.72 to 0.64), recalibrate or revise the judge.
+
+---
+
+## Meta-Evaluation: Evaluating the Evaluator
+
+**Who watches the watchmen?** Track your judge's performance over time with meta-evaluation.
+
+### Monthly judge audits
+
+Select **50-100 new examples** each month. Get human labels. Compare to judge labels. Measure:
+
+- **Agreement rate** (Kappa or correlation)
+- **Precision and recall** for each category (if categorical)
+- **Mean absolute error** for numeric scores
+
+If any metric degrades, investigate. Common causes:
+
+- **Task drift**: The types of responses being evaluated have shifted (e.g., more creative tasks, fewer factual tasks)
+- **Model drift**: The judge model has updated
+- **Prompt drift**: Someone tweaked the judge prompt without testing
+
+### Judge performance dashboard
+
+Track judge reliability as a production metric:
+
+- **Daily agreement rate** on sampled human-judged examples
+- **Bias metrics** (average score by length quartile, by model family)
+- **Decision flip rate** for pairwise comparisons
+
+Alert when any metric crosses a threshold.
+
+---
+
+## Multilingual Calibration Gaps
+
+**LLM judges are much weaker for non-English.** Research from 2025 shows:
+
+- **High-resource languages** (Spanish, French, German): Kappa 0.60-0.70 (vs. 0.75+ for English)
+- **Mid-resource languages** (Hindi, Arabic, Turkish): Kappa 0.40-0.55
+- **Low-resource languages** (Swahili, Quechua, Yoruba): Kappa 0.10-0.32
+
+The gap is worst for subjective tasks like creativity and tone. Factual correctness is slightly better.
+
+### Implications for global products
+
+If you're deploying an LLM judge for non-English languages:
+
+- **Raise calibration requirements**: Demand Kappa above 0.70 even if that means more human eval in the loop
+- **Language-specific calibration sets**: Don't assume calibration transfers across languages
+- **Hybrid eval for low-resource languages**: Use LLM judges for triage (flag obviously bad responses), humans for final scoring
+
+In 2026, **multilingual specialized judges** are emerging (e.g., judges fine-tuned on multilingual calibration data), but they're still experimental.
+
+---
+
+## Domain-Specific Calibration Gaps
+
+**Law, medicine, and finance show pronounced LLM-human alignment gaps**, even in English.
+
+### Legal reasoning
+
+LLM judges struggle with:
+
+- **Precedent interpretation**: Judges may miss subtle distinctions between cases
+- **Jurisdictional variation**: What's correct in one jurisdiction is wrong in another
+- **Statutory construction**: Reading statutes requires specialized training
+
+**Kappa for legal judgment tasks**: typically 0.50-0.60, even with carefully designed prompts.
+
+### Medical advice
+
+LLM judges fail on:
+
+- **Diagnosis accuracy**: Judges may not catch harmful recommendations
+- **Contraindication detection**: Missing drug interactions, allergies, comorbidities
+- **Evidence-based medicine**: Judges may not know current clinical guidelines
+
+**Do not use LLM judges for medical safety evaluation** without extensive human oversight. Target Kappa above 0.85, or use human experts exclusively.
+
+### Financial compliance
+
+LLM judges miss:
+
+- **Regulatory nuance**: Financial regulations are dense and context-dependent
+- **Risk assessment**: Judges may not understand portfolio implications
+- **Fiduciary responsibility**: Legal standards for financial advice are strict
+
+For financial compliance, **human expert review is mandatory**. LLM judges can assist with flagging potential issues, but final decisions require lawyers and compliance officers.
+
+---
+
+## 2026 Patterns: Specialized Judges and Multi-Judge Consensus
+
+The field is moving beyond general-purpose LLM judges toward **trained specialized judges**.
+
+### RISE-Judge: SFT + DPO for evaluation
+
+**RISE-Judge** (2025) fine-tunes a judge model with:
+
+- **Supervised fine-tuning (SFT)** on human-labeled evaluation examples
+- **Direct preference optimization (DPO)** to align judge preferences with human preferences
+
+Results: **Kappa 0.78-0.82** on general-purpose tasks, 0.85+ on narrow domains (e.g., customer support quality).
+
+Process:
+
+1. Collect 5000-10000 human-labeled evaluations
+2. Fine-tune a base model (LLaMA, Mistral) on these labels
+3. Use DPO to further align the judge's scoring behavior
+
+Cost: High upfront (data collection, training), but lower per-eval cost than API-based judges.
+
+### Constitutional AI evaluation
+
+**Constitutional AI** (Anthropic) uses a set of principles (constitution) to guide evaluation. Instead of a single score, the judge evaluates alignment with each principle.
+
+Example constitution for customer support:
+
+- Helpfulness: Does this answer the user's question?
+- Harmlessness: Does this avoid giving harmful advice?
+- Honesty: Does this avoid making up information?
+- Tone: Is this respectful and empathetic?
+
+Each principle gets a subscore. Combined scores are more interpretable and less biased than a single holistic score.
+
+### Multi-judge consensus
+
+To reduce self-preference and style bias, **use judges from multiple model families** and aggregate scores.
+
+Example setup:
+
+- **GPT-4.5 judge**: Scores all responses 1-10
+- **Claude Opus 4 judge**: Scores all responses 1-10
+- **Gemini 2.5 Pro judge**: Scores all responses 1-10
+
+Final score = median or mean of three judges.
+
+**Benefits**: Biases partially cancel out. If GPT-4 favors GPT-4 outputs and Claude favors Claude outputs, the median is more neutral.
+
+**Cost**: 3x per-eval cost. Worth it for high-stakes decisions (final pre-launch eval, safety review).
+
+---
+
+## Failure Modes and Enterprise Expectations
+
+### Common calibration failures
+
+**Overconfident calibration**: Measuring Kappa on 50 examples and declaring the judge reliable. **Minimum 200-500 examples** for statistical confidence.
+
+**Task mismatch**: Calibrating on factual Q&A, then using the judge for creative writing. **Recalibrate for each task type.**
+
+**Static calibration**: Calibrating once in January 2025, still using the same judge in January 2026. **Recalibrate quarterly.**
+
+**Ignoring bias**: Achieving Kappa 0.75 but ignoring 30% verbosity bias. **Test for biases even when overall agreement is high.**
+
+### Enterprise calibration standards
+
+In regulated industries (finance, healthcare, legal), enterprises demand:
+
+- **Kappa above 0.80** for production deployment
+- **Bias audits** every quarter with published results
+- **Human oversight** for all judge decisions that affect users (compliance, content moderation)
+- **Explainability**: Judges must provide reasoning, not just scores
+- **Recalibration after any model update** with written sign-off from legal/compliance
+
+If your judge doesn't meet these standards, you'll be blocked from deploying automated evaluation.
+
+---
+
+## Minimal Calibration Workflow Template
+
+```yaml
+calibration_workflow:
+  1_create_gold_set:
+    - Collect 300-500 examples covering quality spectrum and edge cases
+    - Get human labels with clear rubrics (3-5 raters for subjective tasks)
+    - Measure inter-rater reliability (target Kappa above 0.7)
+
+  2_run_judge:
+    - Evaluate the same 300-500 examples with your LLM judge
+    - Record judge scores and reasoning
+
+  3_measure_agreement:
+    - Categorical tasks: Compute Cohen's Kappa
+    - Numeric tasks: Compute Pearson/Spearman correlation
+    - High-stakes tasks: Compute exact match rate
+    - Target: Kappa above 0.65 (general), 0.80 (safety)
+
+  4_detect_biases:
+    - Verbosity bias: Test with matched short/long pairs
+    - Position bias: Test with swapped pairwise comparisons
+    - Self-preference bias: Test across model families
+    - Sycophancy bias: Test confident-wrong vs. uncertain-right
+
+  5_correct_biases:
+    - Add debiasing instructions to judge prompt
+    - Use position randomization for pairwise evals
+    - Apply score normalization (length, model family)
+
+  6_ongoing_monitoring:
+    - Recalibrate quarterly or after model updates
+    - Track judge-human agreement on new monthly samples
+    - Alert if Kappa drops by more than 0.05
+```
+
+---
+
+## Interview Questions
+
+**Q1: We calibrated our LLM judge on 100 examples and got a Kappa of 0.68. Is that good enough to deploy?**
+
+The Kappa is in the acceptable range for general tasks, but **100 examples is too small** for statistical confidence. You need at least 200-500 examples to ensure the measured Kappa is stable. With only 100 examples, you could have gotten lucky—your sample might not represent edge cases, task variations, or common failure modes. Before deploying, expand your calibration set to 300-500 examples and remeasure. If Kappa stays above 0.65, you're ready. If it drops below 0.60, the judge needs improvement.
+
+**Q2: Our judge works great for English but performs poorly for Spanish (Kappa 0.45 vs. 0.72). What should we do?**
+
+This is a known **multilingual calibration gap**. LLM judges are systematically weaker for non-English, especially for subjective tasks. Options: (1) **Use a hybrid eval** for Spanish—let the judge flag obviously bad responses, but use human raters for final scoring. (2) **Collect a larger Spanish calibration set** (500-1000 examples) and test whether adding Spanish-specific debiasing instructions improves Kappa. (3) **Wait for multilingual specialized judges** (e.g., fine-tuned on multilingual data) to mature—these are emerging in 2026 but not yet production-ready. For now, **don't deploy an LLM judge with Kappa below 0.60**. Higher human eval costs are better than unreliable automation.
+
+**Q3: We detected verbosity bias—the judge scores long responses 15% higher than short ones with identical content. How do we fix this?**
+
+Three approaches: (1) **Prompt-level correction**—add explicit instructions: "Ignore response length. A concise answer is not worse than a verbose one. Penalize unnecessary words." (2) **Length normalization**—divide the judge's score by word count, then rescale to your target range. This mechanically removes the length advantage. (3) **Controlled pair testing in your rubric**—include examples in your judge prompt showing a short response beating a long one, so the judge learns the pattern. Test all three approaches on your calibration set and measure which reduces the bias most (aim to get the 15% gap down to 5% or less). Then **recalibrate to confirm** the fix didn't break other aspects of the judge.
+
+**Q4: How often should we recalibrate our LLM judge?**
+
+**Quarterly recalibration** is the baseline—run your judge on the calibration dataset every 3 months and measure Kappa/correlation. If it drops by more than 0.05, investigate and fix. Also recalibrate **immediately after model updates**—when GPT-4.5 becomes GPT-5, your judge's behavior may shift. And recalibrate **after any prompt changes**, even small ones—wording tweaks can shift scores by 10-15%. Finally, track **judge-human agreement on new monthly samples** (50-100 examples). If you see drift between quarterly recalibrations, move to monthly or continuous monitoring. The cost of recalibration is low (just re-running the judge on your gold set). The cost of uncaught drift is high (weeks of bad eval data).
+
+**Q5: For our safety evaluation, we need Kappa above 0.80 but we're stuck at 0.72. What are our options?**
+
+You're in the zone where **general-purpose LLM judges hit their ceiling**. Options: (1) **Improve your rubric and prompt**—add more specific criteria, show example edge cases, use chain-of-thought to guide the judge's reasoning. Test variations systematically on your calibration set. (2) **Use a specialized judge**—models fine-tuned for safety evaluation (like RISE-Judge with SFT + DPO on safety data) can reach Kappa 0.80-0.85. This requires investment in training data and compute. (3) **Multi-judge consensus**—use 3-5 judges from different model families and aggregate their scores. This reduces individual biases and can lift Kappa by 0.05-0.10. (4) **Hybrid eval**—use the LLM judge for initial triage (flag risky content), then **human experts for final decisions**. For high-stakes safety, Kappa 0.72 may not be good enough for full automation—you need humans in the loop.
+
+---
+
+**Next**: Chapter 7.4 — Reference-Based Scoring, where you'll learn how to judge outputs against gold reference answers using semantic similarity, factual overlap, and structured comparison rubrics.
+

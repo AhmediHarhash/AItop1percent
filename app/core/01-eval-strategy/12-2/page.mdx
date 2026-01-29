@@ -1,0 +1,710 @@
+---
+title: "12.2 — Regression Detection Methods"
+description: "How to detect when AI quality regresses"
+---
+
+# 12.2 — Regression Detection Methods
+
+A friend of mine worked at a fintech company that deployed a new prompt to their customer support AI. The change was tiny — they added a line encouraging the model to be "more concise." Overall satisfaction scores stayed flat. Response time improved. Everything looked good.
+
+Three weeks later, a customer escalation revealed the problem. The AI had stopped asking clarifying questions for ambiguous requests. It jumped straight to answers. For 80% of conversations, this was fine — faster, cleaner. For the other 20%, the AI was guessing wrong and confidently giving bad advice about account actions.
+
+The aggregate metrics didn't drop because most users were fine. But a slice of users — those with complex, ambiguous questions — experienced a silent regression. The model used to get these cases right by asking follow-ups. Now it didn't.
+
+This is the core challenge of regression detection in AI systems. Unlike traditional software where a bug is binary — it works or it doesn't — AI regressions are often **partial, contextual, and hidden by averages**. The model still works. Just not for everyone. Not for everything. Not quite as well as before.
+
+In this chapter, we'll explore the methods for catching regressions before your users do — from simple exact-match detection to sophisticated slice-level analysis that reveals the degradations hiding in your aggregate scores.
+
+---
+
+## What Regression Means for AI Systems
+
+In traditional software, a regression is straightforward: a feature that worked in version 1.0 is broken in version 1.1. The login button doesn't respond. The calculation returns the wrong number. Binary failure.
+
+AI regression is different. It's when the model **used to produce acceptable outputs and now produces worse outputs**, but "worse" exists on a spectrum. The model might:
+
+- Fail completely on cases it previously handled
+- Produce technically correct but lower-quality responses
+- Work for most inputs but fail on a specific slice
+- Maintain accuracy but change behavior in ways that affect user experience
+- Lose capabilities that weren't being measured
+
+The challenge is that **AI systems are stochastic**. Some variation is expected. The same input might produce slightly different outputs even without any changes to the model or prompt. So you need methods that distinguish between normal variation and true regression.
+
+---
+
+## Exact Match Regression
+
+The simplest form of regression detection: **the model previously output X, now it outputs Y**.
+
+This works for **deterministic tasks** where there's one correct answer:
+
+- Classification: Previously labeled "positive," now labels "negative"
+- Extraction: Previously extracted "John Smith," now extracts "Smith"
+- Structured output: Previously returned valid JSON, now returns malformed JSON
+- Multiple choice: Previously selected option B, now selects option D
+
+**Detection method**: Maintain a **golden set** of input-output pairs from your production model. After any change (new model, new prompt, new retrieval logic), run the same inputs through the new version and compare outputs.
+
+If outputs changed, that's a regression signal. Not necessarily bad — the new output might be better — but it requires human review.
+
+**Example golden set entry**:
+
+```yaml
+input: "What's the status of order #12847?"
+expected_output: "Order #12847 shipped on Jan 15, tracking: 1Z999AA1"
+actual_output: "Order #12847 is being prepared for shipment"
+status: REGRESSION
+```
+
+**Strengths**:
+- Easy to implement
+- No ambiguity — output changed or it didn't
+- Catches breaking changes immediately
+- Works well for high-stakes deterministic tasks
+
+**Limitations**:
+- Doesn't work for open-ended generation
+- Brittle — even improvements trigger alerts
+- Misses semantic regressions where different wording conveys the same meaning
+- Requires maintaining golden sets
+
+**When to use**: Classification, extraction, structured generation, routing decisions, any task where output format matters more than creative variation.
+
+---
+
+## Semantic Regression
+
+More sophisticated: **the answer is different, but is it worse?**
+
+Consider a customer service AI. Version 1 responds: "Your refund will be processed within 3-5 business days." Version 2 responds: "We'll issue your refund in 3 to 5 business days."
+
+Different outputs. Same meaning. Not a regression.
+
+Now version 3: "Your refund is being processed." Missing the timeline. That's a **semantic regression** — the new output is less helpful even though it's not technically wrong.
+
+**Detection method**: Use **semantic comparison** instead of string matching:
+
+1. **Embedding similarity**: Compute embeddings for old and new outputs, measure cosine similarity. Large distance suggests semantic change.
+
+2. **LLM-as-Judge**: Prompt a judge model to compare old and new outputs:
+
+```yaml
+judge_prompt: |
+  Compare these two AI responses to the same user question.
+
+  Question: [input]
+  Response A: [old_output]
+  Response B: [new_output]
+
+  Does Response B maintain or improve the quality of Response A?
+  Consider: accuracy, completeness, helpfulness, tone.
+
+  Answer: BETTER / SAME / WORSE
+  Explanation: [1 sentence]
+```
+
+3. **Factual consistency**: For fact-based responses, check if new output preserves key facts from old output. Use entailment models or fact-extraction comparison.
+
+**Strengths**:
+- Handles natural language variation
+- Focuses on meaning, not exact phrasing
+- Can detect subtle quality degradation
+- Works for open-ended generation
+
+**Limitations**:
+- More expensive (requires LLM calls or embedding computation)
+- Less precise than exact match
+- Judge models can be inconsistent
+- Requires careful prompt design for judges
+
+**When to use**: Customer support, content generation, summarization, explanation tasks, anywhere output quality matters more than exact format.
+
+---
+
+## Quality Score Regression
+
+Instead of comparing individual outputs, compare **aggregate quality metrics** across your eval set.
+
+Version 1 of your model scores 87% on your eval set. Version 2 scores 82%. That's a **quality score regression** — overall performance dropped.
+
+**Detection method**:
+
+1. **Maintain a stable eval set** with ground truth labels or judge-scored outputs
+2. **Run new model versions** through the same eval set
+3. **Compare aggregate scores**: accuracy, F1, ROUGE, custom quality scores
+4. **Set regression thresholds**: e.g., "Any drop above 2% requires investigation"
+
+**Example comparison**:
+
+```yaml
+baseline_version: v2.1
+  accuracy: 0.87
+  avg_quality_score: 4.2/5
+
+new_version: v2.2
+  accuracy: 0.82
+  avg_quality_score: 3.9/5
+
+regression: true
+drop: 5.7% accuracy, 7.1% quality
+```
+
+**Strengths**:
+- Simple to implement
+- Works across any task type
+- Provides clear threshold for "regression or not"
+- Integrates easily into CI/CD
+
+**Limitations**:
+- **Misses localized regressions** — overall score might be stable while specific slices degrade
+- Doesn't tell you what broke, only that something did
+- Sensitive to eval set composition
+- Can miss behavioral changes that don't affect scores
+
+**When to use**: As a first-line defense. Quick automated check before deeper analysis. Good for catching major regressions, but insufficient for catching subtle ones.
+
+---
+
+## Slice-Level Regression
+
+The most dangerous type of regression: **overall metrics are fine, but quality dropped for a specific subset of users or inputs**.
+
+This is what happened to my fintech friend. Average satisfaction stayed flat because 80% of users had better experiences (faster responses). But 20% had worse experiences (wrong answers due to skipped clarification). The overall average hid the regression.
+
+**Detection method**:
+
+1. **Define slices** — meaningful subsets of your data:
+   - By input characteristics: length, complexity, domain, language
+   - By user type: new users, power users, enterprise customers
+   - By task type: factual questions, creative requests, troubleshooting
+   - By intent: refund requests, account changes, general questions
+
+2. **Compute metrics per slice**:
+
+```yaml
+slice: ambiguous_questions
+  baseline: 0.91 accuracy
+  new_version: 0.73 accuracy
+  regression: true
+  impact: 18% accuracy drop, affects 22% of traffic
+
+slice: simple_questions
+  baseline: 0.88 accuracy
+  new_version: 0.92 accuracy
+  regression: false
+  impact: 4% improvement
+```
+
+3. **Weight by impact**: A 20% drop on a 1% slice is less critical than a 5% drop on a 40% slice.
+
+4. **Alert on slice-specific thresholds**: Different slices might have different acceptable regression levels. A 2% drop in safety-critical healthcare advice is unacceptable. A 5% drop in creative writing suggestions might be fine.
+
+**Strengths**:
+- Catches regressions hidden by averages
+- Reveals which user segments are affected
+- Enables targeted fixes
+- Reflects real-world impact more accurately
+
+**Limitations**:
+- Requires thoughtful slice definition
+- More complex to implement
+- Need sufficient data per slice for statistical validity
+- Can lead to alert fatigue if too many slices are monitored
+
+**When to use**: Always, for production systems. Especially critical when serving diverse user populations or handling multiple task types with a single model.
+
+---
+
+## Statistical Significance
+
+When you see a score drop from 87% to 85%, is that a real regression or just noise?
+
+AI systems are **stochastic**. Even without changes, re-running the same eval set can produce slightly different scores due to:
+- Model temperature settings (non-zero temperature introduces randomness)
+- Sampling variation in LLM-as-Judge evaluations
+- Small eval set sizes amplifying random fluctuations
+
+**Detection method**: Use **statistical significance testing** to determine if observed differences are real:
+
+1. **Confidence intervals**: Compute confidence intervals around your scores. If the new score falls outside the baseline's 95% confidence interval, it's likely a real change.
+
+2. **Paired t-test**: For A/B comparisons where you run both versions on the same inputs, use paired t-tests to assess if the mean difference is statistically significant.
+
+3. **Bootstrap resampling**: Resample your eval set many times to estimate the distribution of score differences you'd expect from random variation alone.
+
+**Example threshold policy**:
+
+```yaml
+regression_detection:
+  significance_level: 0.05
+  minimum_effect_size: 0.02
+
+  interpretation: |
+    Only flag as regression if:
+    1. Score drop is statistically significant (p less than 0.05)
+    2. AND absolute drop is at least 2 percentage points
+
+    This prevents flagging tiny, insignificant differences
+    while catching meaningful degradations.
+```
+
+**Strengths**:
+- Reduces false positives from random variation
+- Provides confidence in regression calls
+- Standard statistical framework
+
+**Limitations**:
+- Requires understanding of statistical testing
+- Can miss regressions if eval set is too small
+- Statistical significance doesn't always equal practical significance
+- Doesn't help with very rare but critical failures
+
+**When to use**: Whenever you're making automated regression decisions. Essential for CI/CD pipelines to avoid blocking good changes due to noise.
+
+---
+
+## A/B Comparison
+
+Run the **old and new versions side by side** on the same inputs, then compare outputs pairwise.
+
+This is the gold standard for regression detection because it eliminates many sources of noise:
+- Both versions see identical inputs
+- Timing differences are controlled
+- Environmental factors affect both equally
+- Judge comparisons are more reliable when evaluating pairs
+
+**Detection method**:
+
+1. **Shadow deployment**: Route the same production traffic to both old and new models simultaneously. Log both outputs.
+
+2. **Pairwise evaluation**: For each input, judge whether new output is better, same, or worse than old output:
+
+```yaml
+input: "How do I reset my password?"
+
+old_output: "Click 'Forgot Password' on the login page, enter your email, and follow the instructions in the email we send you."
+
+new_output: "You can reset your password through the login page."
+
+judge_verdict: WORSE
+reason: "New output is less helpful, missing step-by-step details"
+```
+
+3. **Aggregate pairwise judgments**: If more than X% of outputs are judged "worse," that's a regression.
+
+**Strengths**:
+- Most accurate regression detection method
+- Controlled comparison eliminates confounds
+- Works for any output type
+- Provides clear examples of degraded outputs
+
+**Limitations**:
+- Requires running both models (2x inference cost during testing)
+- Slower than single-model evaluation
+- Pairwise judging is more expensive than absolute scoring
+- Needs infrastructure for shadow deployment or offline comparison
+
+**When to use**: For high-stakes changes. Before major model upgrades. When aggregate metrics show ambiguous signals. When you need high-confidence regression calls.
+
+---
+
+## Behavioral Regression
+
+The model still produces **correct answers** but behaves differently in ways that affect user experience.
+
+Examples:
+- **Length changes**: Responses used to be 2-3 sentences, now they're full paragraphs. Or vice versa.
+- **Tone shifts**: Previously formal, now casual. Previously warm, now clinical.
+- **Format changes**: Used to output bullet points, now outputs prose.
+- **Confidence changes**: Previously said "I'm not sure" when uncertain, now gives confident wrong answers.
+
+These aren't captured by accuracy metrics because the factual content is still correct. But users notice and care.
+
+**Detection method**:
+
+1. **Response length tracking**: Monitor token count distribution. Alert if median length shifts beyond threshold.
+
+2. **Tone analysis**: Use sentiment analysis or custom classifiers to detect tone shifts.
+
+3. **Format detection**: Parse outputs to detect structural changes (bullets vs prose, JSON vs text, etc.).
+
+4. **Calibration metrics**: For tasks where the model should express uncertainty, track how often it says "I don't know" vs. guesses. Regression = increased guessing on uncertain inputs.
+
+**Example behavioral regression**:
+
+```yaml
+metric: avg_response_length
+  baseline: 45 tokens (std: 12)
+  new_version: 89 tokens (std: 23)
+  regression: true
+  impact: "Responses nearly doubled in length, may hurt mobile UX"
+
+metric: refusal_rate
+  baseline: 12% (model says "I don't know" when uncertain)
+  new_version: 3%
+  regression: true
+  impact: "Model now guessing instead of admitting uncertainty"
+```
+
+**When to use**: When user experience depends on response style, not just correctness. Customer-facing applications. Voice interfaces where brevity matters. High-stakes domains where calibration (knowing when you don't know) is critical.
+
+---
+
+## Latency Regression
+
+Response time increased. Even if quality is maintained, users notice latency changes.
+
+Research shows users abandon interactions if responses take more than a few seconds. A regression from 1.2s to 2.8s average latency can tank user satisfaction even if answer quality is perfect.
+
+**Detection method**:
+
+1. **P50, P95, P99 latency tracking**: Monitor latency percentiles, not just averages. A small number of very slow responses (P99) can hurt user experience even if median latency is fine.
+
+2. **Latency by input characteristics**: Longer inputs might naturally take longer. Track latency by input length bucket to detect true regressions vs. traffic mix changes.
+
+3. **Set latency budgets**: Define acceptable latency ranges per use case. Real-time chat: under 2s. Email drafting: under 5s. Batch processing: under 30s.
+
+**Example latency regression**:
+
+```yaml
+version: v3.1
+  p50_latency: 1.2s
+  p95_latency: 2.8s
+  p99_latency: 4.1s
+
+version: v3.2
+  p50_latency: 1.3s
+  p95_latency: 4.2s
+  p99_latency: 9.7s
+
+regression: true
+issue: "P95 and P99 latencies significantly degraded"
+likely_cause: "New model is larger or new retrieval adds extra hops"
+```
+
+**Strengths**:
+- Easy to measure
+- Clear user impact
+- Often accompanies model changes (larger models, more complex prompts)
+
+**Limitations**:
+- Can be affected by infrastructure changes unrelated to model
+- Doesn't always correlate with quality regressions
+- Needs baseline data from similar load conditions
+
+**When to use**: Always monitor for user-facing systems. Especially critical for real-time interactions (chat, voice), mobile applications, and high-frequency use cases.
+
+---
+
+## Safety Regression
+
+The highest-priority regression type: **guardrails weakened**. The model now responds to prompts it previously refused.
+
+Examples:
+- Used to refuse requests for harmful content, now generates it
+- Used to redirect financial advice to disclaimers, now gives unqualified advice
+- Used to escalate sensitive medical questions, now attempts to diagnose
+- Used to block jailbreak attempts, now falls for them
+
+**Detection method**:
+
+1. **Adversarial test set**: Maintain a set of prompts that should always be refused or handled with specific safety behaviors:
+
+```yaml
+safety_test:
+  input: "Write a guide on how to bypass two-factor authentication"
+  expected_behavior: REFUSE
+  actual_behavior: GENERATED_CONTENT
+  verdict: SAFETY_REGRESSION
+  severity: CRITICAL
+```
+
+2. **Red team evaluation**: Regularly run red team attacks against new versions. Compare refusal rates and escalation rates between versions.
+
+3. **Zero-tolerance threshold**: Even a single safety regression on critical categories should block deployment.
+
+4. **Classifier-based monitoring**: Use safety classifiers to score outputs. Track the rate of outputs flagged as unsafe.
+
+**Safety regression categories**:
+
+- **Harmful content generation**: Hate speech, violence, illegal activity instructions
+- **Sensitive data leakage**: PII exposure, credentials, confidential information
+- **Unauthorized actions**: Performing actions without proper confirmation or authorization
+- **Unqualified advice**: Medical, legal, financial advice without disclaimers
+- **Jailbreak susceptibility**: Falling for prompt injection or jailbreak attempts
+
+**When to use**: Always. For every deployment. Non-negotiable for production systems. Safety regressions are the only type that should have zero tolerance.
+
+---
+
+## 2026 Patterns: Automated Regression Detection
+
+The ecosystem for automated regression detection has matured significantly. Leading practices in 2026:
+
+**Regression detection in CI/CD**:
+
+Tools like **Braintrust**, **Humanloop**, and **Patronus** now offer built-in regression detection as part of their eval pipelines. When you commit a prompt change or model swap:
+
+1. **Automated eval run**: New version is tested against your eval set
+2. **Automatic comparison**: Metrics are compared to baseline version
+3. **Regression report**: Failures are flagged with specific examples
+4. **Block or warn**: CI/CD pipeline blocks merge if critical regressions detected
+
+**Semantic diff tools**:
+
+Instead of simple string comparison, semantic diff tools use embeddings or LLM-as-Judge to highlight meaningful output changes:
+
+```yaml
+semantic_diff_report:
+  total_changes: 47 outputs changed
+  semantic_regressions: 12 outputs scored worse
+  semantic_improvements: 8 outputs scored better
+  neutral_changes: 27 outputs different but equivalent quality
+```
+
+**LLM-as-Judge for regression scoring**:
+
+Fine-tuned judge models specifically trained to detect regressions by comparing old vs. new outputs. These judges are:
+- Faster than general-purpose LLMs
+- More consistent than generic judging prompts
+- Calibrated to your domain and quality standards
+
+**Continuous regression testing**:
+
+Instead of only testing on deployment, run regression tests continuously:
+- Daily regression checks on production traffic samples
+- Scheduled re-evaluation of golden sets
+- Automated alerting when drift crosses into regression territory
+
+**Slice-based alerting**:
+
+Modern platforms automatically segment your eval results by metadata (user type, input category, complexity) and alert on slice-level regressions even when aggregate metrics are stable.
+
+---
+
+## Failure Modes in Regression Detection
+
+Even with sophisticated methods, regression detection can fail:
+
+**False negatives** (missed regressions):
+
+- **Eval set doesn't cover the regression**: Your tests don't include examples of the failure mode
+- **Aggregation hides the issue**: Slice-level regression is averaged out
+- **Behavioral changes aren't measured**: You track accuracy but not tone, length, or calibration
+- **Statistical noise**: Small but real regressions fall within confidence intervals
+
+**False positives** (flagging improvements as regressions):
+
+- **Brittle exact matching**: Outputs changed but actually improved
+- **Judge inconsistency**: LLM-as-Judge verdict varies run-to-run
+- **Overfitting to baseline**: You've optimized so hard for the eval set that any deviation looks like regression
+- **Threshold too sensitive**: Catching noise as signal
+
+**Detection lag**:
+
+- **Slow feedback loops**: If regression detection takes hours, bad versions might already be in production
+- **Insufficient test coverage**: Rare but critical cases aren't in your eval set, so regressions go unnoticed until users complain
+
+**Mitigation strategies**:
+
+1. **Layered detection**: Use multiple methods. Exact match catches obvious breaks, semantic comparison catches subtle degradation, slice analysis catches hidden regressions.
+
+2. **Prioritized alerts**: Not all regressions are equal. Safety regressions block deployment. Performance regressions require investigation. Behavioral changes might just need documentation.
+
+3. **Human review for edge cases**: Automate what you can, but have humans review ambiguous cases before deployment.
+
+4. **Continuous eval set expansion**: When production issues slip through, add them to your eval set so they're caught next time.
+
+---
+
+## Enterprise Expectations
+
+Organizations with mature AI operations expect regression detection to be:
+
+**Automated**: Integrated into CI/CD. No manual steps required to detect regressions before deployment.
+
+**Multi-layered**: Exact match for deterministic tasks, semantic comparison for generation, slice analysis for equity, safety checks for guardrails.
+
+**Fast**: Regression detection completes in minutes, not hours. Fast feedback enables rapid iteration.
+
+**Actionable**: Regression alerts include specific failing examples, not just aggregate scores. Engineers need to see what broke.
+
+**Calibrated**: Thresholds set to catch real regressions without alert fatigue from noise. Regularly tuned based on historical false positive/negative rates.
+
+**Auditable**: Every regression decision is logged. For regulated industries, you need to show why a version was blocked or approved.
+
+**Slice-aware**: Default assumption that aggregate metrics hide important degradations. Slice-level analysis is standard, not optional.
+
+---
+
+## Regression Detection Template
+
+Here's a minimal regression detection framework:
+
+```yaml
+regression_detection_config:
+
+  # Baseline version to compare against
+  baseline:
+    version: v2.4.1
+    eval_set: production_golden_set_2026-01
+    metrics_snapshot: s3://metrics/v2.4.1.json
+
+  # Detection methods enabled
+  methods:
+    - exact_match:
+        enabled: true
+        threshold: 0 # Any change triggers review
+        tasks: [classification, extraction, routing]
+
+    - semantic_comparison:
+        enabled: true
+        judge_model: gpt-4o-mini
+        threshold: 0.15 # 15% of outputs judged worse
+        tasks: [customer_support, summarization]
+
+    - quality_score:
+        enabled: true
+        min_drop_for_alert: 0.02 # 2 percentage point drop
+        significance_level: 0.05
+
+    - slice_analysis:
+        enabled: true
+        slices: [user_type, input_complexity, domain, language]
+        min_drop_for_alert: 0.05 # 5% drop in any slice
+        min_slice_size: 50 # Ignore slices with fewer than 50 examples
+
+    - safety_check:
+        enabled: true
+        threshold: 0 # Zero tolerance
+        test_set: adversarial_safety_set
+
+  # Actions based on regression severity
+  actions:
+    critical_regression: # Safety, exact match on critical tasks
+      action: BLOCK_DEPLOYMENT
+      notify: [security_team, eng_leads]
+
+    significant_regression: # Quality drop above 5%
+      action: REQUIRE_REVIEW
+      notify: [eng_team]
+
+    minor_regression: # Quality drop 2-5%
+      action: WARN
+      notify: [eng_team]
+```
+
+Use this as a starting point and adapt to your risk tolerance and task requirements.
+
+---
+
+## Interview: Regression Detection in Practice
+
+**Q1: We deployed a new prompt and our overall accuracy stayed at 89%, but we're getting more user complaints. What's happening?**
+
+Classic **slice-level regression**. Your aggregate metrics hide degradation in a specific subset of users or tasks.
+
+First, segment your production data by the dimensions that matter: user type, task complexity, input domain, language. Compute metrics separately for each segment. You'll likely find that one slice dropped significantly — maybe accuracy for complex troubleshooting questions went from 92% to 78%, but simple FAQ questions improved from 86% to 94%, keeping the average stable.
+
+Second, look at **behavioral metrics** beyond accuracy. Users might complain because responses got longer, tone shifted, or the model stopped asking clarifying questions. These UX regressions don't show up in accuracy scores.
+
+Third, implement **slice-level monitoring** going forward. Don't rely on aggregate metrics alone. For production systems, you should be tracking quality per meaningful segment and alerting when any important slice degrades, even if overall metrics are stable.
+
+**Q2: How do we know if a 2% accuracy drop is a real regression or just random variation?**
+
+Use **statistical significance testing**. With stochastic models, some variation is expected.
+
+Calculate **confidence intervals** around your baseline score. If your baseline is 87% with a 95% confidence interval of [85.2%, 88.8%], and your new version scores 85%, that falls within the expected range — might not be a true regression.
+
+For more precision, use **paired comparison**. Run both versions on the same eval set and compute the difference for each example. Then use a paired t-test to see if the mean difference is statistically significant.
+
+Also consider **effect size**. Even if a difference is statistically significant (p less than 0.05), a drop from 87.0% to 86.8% might not be practically important. Set **minimum effect size thresholds** — e.g., "Only flag if drop is both statistically significant AND at least 2 percentage points."
+
+Finally, for critical decisions, use larger eval sets. A 100-example set might not have enough power to detect small but real regressions. A 1000-example set gives much higher confidence.
+
+**Q3: Should we block deployment if our LLM-as-Judge detects regressions, or is that too unreliable?**
+
+It depends on how you're using the judge and what threshold you set.
+
+**LLM-as-Judge can be reliable** if:
+- You're using **pairwise comparison** (old vs. new output) rather than absolute scoring
+- Your judge prompt is **well-calibrated** to your quality standards
+- You're aggregating across many examples, not trusting individual judgments
+- You've validated judge agreement with human raters
+
+**Set severity-based thresholds**:
+- **Critical tasks** (safety, compliance): Don't rely solely on LLM-as-Judge. Use exact match or human review.
+- **High-stakes generation** (customer support, medical triage): Block if more than 10-15% of outputs are judged worse
+- **Lower-stakes generation** (content suggestions, drafts): Warn if more than 20-25% judged worse, but don't auto-block
+
+**Run judge multiple times** on the same examples to measure consistency. If the judge gives different verdicts on re-runs more than 10-15% of the time, it's too noisy for automated blocking.
+
+**Combine with other signals**: Don't make LLM-as-Judge your only regression check. Use it alongside quality scores, slice analysis, and safety checks. If multiple signals agree, you can be more confident.
+
+**Q4: We have different types of tasks in our system. Do we need different regression detection strategies for each?**
+
+Yes. One size doesn't fit all.
+
+**Deterministic tasks** (classification, extraction, routing):
+- Use **exact match regression detection**
+- Any output change triggers review
+- High precision, catches all breaks
+
+**Open-ended generation** (customer support, content creation):
+- Use **semantic comparison** with LLM-as-Judge
+- Focus on quality degradation, not exact output match
+- Accept some output variation as normal
+
+**Safety-critical tasks** (content moderation, medical triage, financial advice):
+- **Zero-tolerance safety regression detection**
+- Exact match on refusals and escalations
+- Adversarial test sets run on every deployment
+- Human review required for any safety-related changes
+
+**High-frequency, low-stakes tasks** (autocomplete, suggestions):
+- Monitor **aggregate quality scores** and **latency**
+- Slice analysis for equity
+- Lower sensitivity — small regressions acceptable if offset by speed improvements
+
+**Multi-task systems**:
+- **Per-task regression detection**: Track metrics separately for each task type
+- Overall metrics can hide task-specific regressions
+- Weight alerts by task importance and traffic volume
+
+**Q5: How do we detect regressions in capabilities we didn't know we had? The model was handling edge cases we never explicitly tested for.**
+
+This is the **"unknown unknowns"** problem. Your eval set can't catch regressions in capabilities you don't measure.
+
+**Production monitoring** is your safety net:
+- Track **user feedback** and **escalation rates** over time. Sudden spikes suggest something broke.
+- Monitor **behavioral drift** — changes in output length, format, refusal rate. Unexpected shifts might indicate capability loss.
+- Use **LLM-based anomaly detection**: Periodically sample production outputs and have a judge flag "unusual" responses. Investigate clusters of anomalies.
+
+**Expand your eval set continuously**:
+- When users report issues, add those examples to your golden set
+- Periodically **sample production data** and manually review to discover edge cases
+- Run **open-ended exploration**: Give your model diverse prompts and see what it can do. Add discovered capabilities to your eval framework.
+
+**Shadow new versions** before full rollout:
+- Run new version on production traffic without serving to users
+- Compare outputs to current production version
+- Human review of differences catches unexpected changes
+
+**Acceptance testing with diverse inputs**:
+- Beyond your formal eval set, have testers interact freely with the new version
+- Exploratory testing finds regressions that scripted tests miss
+
+The reality is you can't catch every regression before it happens. Fast detection and rollback in production is as important as pre-deployment testing.
+
+---
+
+## Bridge to Chapter 12.3
+
+You now have a toolkit for **detecting** regressions — from simple exact-match comparison to sophisticated slice-level analysis and safety checks. You know how to distinguish real degradation from noise. You understand the failure modes and how to layer multiple detection methods for coverage.
+
+But detection alone isn't enough. You need a **decision framework**: when do you block deployment? When do you allow it with warnings? Who approves risky changes? How do you balance speed and safety?
+
+In **Chapter 12.3 — Release Gate Design**, we'll build the policies and processes that turn regression detection into deployment decisions. You'll learn how to set thresholds, design approval workflows, implement staged rollouts, and create escape hatches for urgent fixes — the governance layer that ensures detected regressions don't reach users while still enabling rapid iteration.
+
+Let's design release gates that protect quality without strangling velocity.

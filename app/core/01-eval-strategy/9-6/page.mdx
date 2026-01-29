@@ -1,0 +1,874 @@
+---
+title: "9.6 — Chunking & Indexing Evaluation"
+subtitle: "How to evaluate whether your document chunking and indexing strategy supports good retrieval"
+description: "Why the way you split and index documents determines the ceiling for RAG quality—and how to measure it"
+---
+
+# 9.6 — Chunking & Indexing Evaluation
+
+I once watched a support team spend three months building a RAG system for their internal knowledge base. They fine-tuned embeddings, optimized retrieval algorithms, crafted perfect prompts. Launch day came. The system failed spectacularly.
+
+Not because retrieval was broken. Retrieval worked exactly as designed. The problem was upstream: their chunking strategy split every document at exactly 512 tokens, with no consideration for meaning. An important troubleshooting procedure got split mid-sentence across three chunks. The first chunk said "When the system crashes, immediately check the logs." The second chunk, buried in the 400th result, said "Do not restart the server until you've backed up the transaction log." The third chunk said "Failure to follow this order will result in data loss."
+
+Retrieval dutifully returned the first chunk. A support engineer followed the advice. They restarted the server. They lost a day's worth of customer transactions.
+
+The post-mortem didn't blame the model. It didn't blame the embeddings. It blamed **chunking**—the invisible foundation of every RAG system. The way you split documents into chunks determines what retrieval can possibly find. No amount of prompt engineering or model selection can fix retrieval that's searching broken chunks.
+
+By 2026, the industry learned a hard lesson: **chunking is not a preprocessing step you do once and forget. It's a design decision that must be evaluated just as rigorously as retrieval and generation.**
+
+This chapter is about how to evaluate whether your chunking and indexing strategy supports good retrieval—before your users discover it doesn't.
+
+---
+
+## Why Chunking Matters for Evaluation
+
+Here's the brutal truth about RAG systems: **Your retrieval quality ceiling is set by chunking, not by the retriever.**
+
+You can have the best embedding model, the most sophisticated reranking, the perfect top-k tuning. If your chunks are badly formed—split in the middle of critical information, missing necessary context, bloated with irrelevant text—retrieval will return garbage.
+
+Think of it this way. You're building a library. Chunking is how you decide to divide books into sections. Do you split every 50 pages, regardless of where chapter breaks fall? Do you keep chapters intact? Do you split at section boundaries?
+
+**Fixed-size splitting (50 pages each):** Chapter 3 ends on page 47. Pages 48-50 are the start of Chapter 4. Your first chunk contains the ending of one topic and the beginning of an unrelated topic. A user searching for Chapter 4's content gets irrelevant results because the chunk is contaminated with Chapter 3.
+
+**Semantic splitting (chapter boundaries):** Each chunk is a complete chapter. Clean topic boundaries. But Chapter 2 is 200 pages long. When a user searches for a specific detail from Chapter 2, the retriever returns the entire chapter—200 pages of context—most of it irrelevant. Your LLM drowns in noise.
+
+The trade-off is unavoidable. And **you can't optimize it by guessing.** You must measure.
+
+When we talk about evaluating chunking, we're really asking: **Does the way we've divided documents allow the retriever to find complete, relevant, uncontaminated information for the questions users actually ask?**
+
+That's not a one-time question. It's a continuous evaluation loop.
+
+---
+
+## The Goldilocks Problem: Chunk Size Trade-Offs
+
+Every RAG system faces the Goldilocks problem: chunks that are too small lose context, chunks that are too large dilute relevance.
+
+**Chunks too small:**
+
+Imagine chunking every document at 128 tokens. A user asks: "What are the eligibility requirements for the refund policy?" The refund policy spans 600 tokens. It's now split across five chunks:
+
+- Chunk 1: "Refunds are available for purchases within 30 days..."
+- Chunk 2: "...provided the item is unused and in original packaging..."
+- Chunk 3: "...Exceptions apply to digital products and custom orders..."
+- Chunk 4: "...To request a refund, contact support with your order number..."
+- Chunk 5: "...Processing takes 5-7 business days after approval..."
+
+Retrieval returns Chunk 1. The LLM generates an answer: "Refunds are available for purchases within 30 days." Technically true. Incomplete. Misleading. The user doesn't learn about the packaging requirement, the digital product exception, or the process.
+
+The information exists in the knowledge base. But it's **fragmented**. Unless retrieval returns all five chunks—and the LLM successfully synthesizes them—the answer will be partial.
+
+**Chunks too large:**
+
+Now imagine chunking at 2048 tokens. The refund policy is 600 tokens, but it's part of a larger "Customer Policies" document (8000 tokens). You chunk the entire document into four 2048-token chunks.
+
+The refund policy appears in Chunk 2, buried among:
+- Privacy policy (500 tokens)
+- Refund policy (600 tokens)
+- Shipping policy (400 tokens)
+- Warranty policy (548 tokens)
+
+Retrieval returns Chunk 2 because "refund" appears 15 times. But the chunk also contains 1448 tokens of unrelated policy text. The LLM now has to parse through shipping and warranty policies to extract refund information. **Relevance is diluted.** Worse, the LLM might hallucinate by mixing policies: "Refunds are available within the warranty period" (wrong—it conflated refund and warranty timelines).
+
+The Goldilocks problem has no universal solution. **The right chunk size depends on your content structure and query patterns.**
+
+For FAQ documents with short, self-contained questions and answers, 256-512 tokens might be ideal. For technical manuals with complex procedures, 1024-1536 tokens might be necessary to preserve procedural coherence. For legal documents where precision matters, you might chunk by section boundaries regardless of token count.
+
+**How to evaluate chunk size empirically:**
+
+1. **Define your eval set:** 100-200 test queries with known good answers (Chapter 5.1 on dataset design).
+
+2. **Create multiple chunking strategies:** Split your corpus at 256, 512, 1024, and 2048 tokens. Keep everything else constant (same embeddings, same retrieval algorithm, same top-k).
+
+3. **Measure retrieval metrics per strategy:**
+   - **Answer recall:** What percentage of eval queries retrieve chunks containing the answer? (Chapter 9.2)
+   - **Chunk completeness:** For queries where the answer is retrieved, does the chunk contain the *complete* answer, or is it fragmented?
+   - **Noise ratio:** What percentage of retrieved tokens are irrelevant to the query?
+
+4. **Measure end-to-end quality:** Run each chunking strategy through your full RAG pipeline and measure answer quality (Chapter 9.5).
+
+5. **Identify the knee of the curve:** Plot chunk size vs. quality. There's usually a sweet spot—a chunk size where answer recall and completeness are high, and noise is manageable. Smaller than that, you get fragmentation. Larger, you get dilution.
+
+This isn't a one-time analysis. As your content evolves—new document types, new query patterns—re-evaluate. Chunk size optimization is continuous.
+
+By 2026, teams stopped treating chunk size as a magic number (512! 1024!) and started treating it as a **measurable, domain-specific parameter.**
+
+---
+
+## Evaluating Chunk Boundaries: Information Integrity
+
+The most insidious chunking failures don't come from wrong chunk size. They come from **bad boundaries**—splits that slice through semantically coherent units.
+
+Consider this procedure from a medical knowledge base:
+
+**Original text:**
+"To administer insulin, first verify the patient's blood glucose level is above 70 mg/dL. If below 70, do not administer insulin; provide glucose tablets instead. Once verified, clean the injection site with an alcohol swab, wait for it to dry, then inject at a 90-degree angle."
+
+**Fixed-size chunking (split at 50 tokens, mid-sentence):**
+
+**Chunk 1:** "To administer insulin, first verify the patient's blood glucose level is above 70 mg/dL. If below 70, do not administer insulin; provide glucose"
+
+**Chunk 2:** "tablets instead. Once verified, clean the injection site with an alcohol swab, wait for it to dry, then inject at a 90-degree angle."
+
+A nurse searches: "How do I administer insulin?" Retrieval returns Chunk 1. The nurse reads: "verify blood glucose above 70, if below 70 do not administer insulin, provide glucose." Stops there. Doesn't see the word "tablets" or the injection instructions. Potentially dangerous.
+
+This is an **information integrity failure**. The chunk boundary split a critical instruction mid-thought. The first chunk is misleading without the second.
+
+**How to detect information integrity failures:**
+
+**1. Boundary coherence check:**
+
+For a sample of chunks (100-200), manually review:
+- Does the chunk start mid-sentence? (Red flag)
+- Does the chunk end mid-sentence? (Red flag)
+- Does the chunk end mid-paragraph but the next sentence is causally dependent on this one? (Example: Chunk ends with "Follow these steps:" and the steps are in the next chunk. Red flag.)
+
+Track the **incoherence rate**: percentage of chunks that fail coherence checks.
+
+If above 10%, your chunking strategy is splitting meaning. This is fixable.
+
+**2. Completeness evaluation:**
+
+For your eval set queries, measure:
+- **Single-chunk sufficiency:** What percentage of queries can be correctly answered from a single retrieved chunk, without needing additional chunks?
+- If single-chunk sufficiency is below 60%, you're likely fragmenting answers across chunks. Either increase chunk size or improve chunk boundaries to keep coherent units together.
+
+**3. Semantic boundary analysis:**
+
+Modern chunking strategies (2026) use **semantic splitting**—algorithms that identify natural breakpoints in meaning rather than splitting at fixed token counts.
+
+For example:
+- Split at paragraph boundaries
+- Split at section headings (Markdown ##, HTML h2 tags)
+- Split when topic shift is detected (using sentence embeddings to measure semantic similarity between consecutive sentences)
+
+**Evaluate semantic chunking vs. fixed-size:**
+
+Create two versions of your index:
+- **Version A:** Fixed-size chunking at your current token limit
+- **Version B:** Semantic chunking (split at paragraph or section boundaries, with a maximum chunk size as a backstop)
+
+Run your eval set through both. Measure:
+- Retrieval recall (how often does the right chunk appear in top-k?)
+- Answer quality (end-to-end RAG performance)
+- Chunk coherence (manual review of boundary quality)
+
+In most domains—technical docs, policies, support articles—semantic chunking outperforms fixed-size. **But only measurement tells you for sure.**
+
+By 2026, **semantic chunking is the default** for new RAG systems. LangChain, LlamaIndex, and Anthropic's Contextual Retrieval all recommend boundary-aware splitting. Teams that still use fixed-size chunking do so intentionally, with evidence that it works for their use case.
+
+---
+
+## Overlap Evaluation: Redundancy vs. Recall
+
+Here's a common pattern in 2024-2025 RAG implementations: **overlapping chunks.**
+
+The idea: if you split documents at fixed boundaries, important information near boundaries might get split. Solution: create overlapping chunks. If Chunk 1 is tokens 0-512 and Chunk 2 is tokens 512-1024, add overlap—Chunk 1 becomes tokens 0-512, Chunk 2 becomes tokens 400-912.
+
+The last 112 tokens of Chunk 1 are repeated in the first 112 tokens of Chunk 2. Now, information near the boundary appears in both chunks. **Boundary loss problem solved, right?**
+
+Not quite. Overlap creates a new problem: **redundancy.**
+
+When a user asks a question, retrieval might return both Chunk 1 and Chunk 2 because they share content. Your top-5 results now contain duplicate information. You've wasted 2 of your 5 retrieval slots on redundant text. Worse, the LLM now sees the same information twice, which can lead to overemphasis—the model treats duplicated content as more important, even though it's an artifact of chunking.
+
+**The overlap trade-off:**
+- **No overlap:** Risk splitting information at boundaries, losing coherence.
+- **High overlap (e.g., 50% overlap):** Risk retrieving redundant chunks, wasting context window and distorting relevance.
+
+**How to evaluate overlap empirically:**
+
+**1. Retrieval diversity check:**
+
+For your eval set, retrieve top-5 or top-10 chunks per query. Measure:
+- **Unique information ratio:** What percentage of retrieved tokens are unique (not duplicated across chunks)?
+- If below 70%, you have significant redundancy.
+
+**2. Overlap ablation study:**
+
+Create multiple versions of your index with different overlap settings:
+- 0% overlap (no overlap)
+- 25% overlap (128 tokens for 512-token chunks)
+- 50% overlap (256 tokens for 512-token chunks)
+
+Run your eval set. Measure:
+- **Retrieval recall:** Does overlap improve the chance of retrieving relevant chunks?
+- **Answer quality:** Does overlap improve end-to-end RAG quality?
+- **Redundancy rate:** How often do you retrieve chunks with significant content duplication?
+
+**Typical findings (industry patterns by 2026):**
+
+- For **fixed-size chunking**, 10-20% overlap often improves recall without excessive redundancy.
+- For **semantic chunking** (split at natural boundaries), overlap is often unnecessary—boundaries are already aligned with meaning, so there's less risk of splitting critical info.
+- For **short chunks** (below 256 tokens), overlap is risky—you end up with mostly duplicated content.
+
+**The 2026 consensus:** If you're using fixed-size chunking, test overlap. If you're using semantic chunking, start without overlap and add it only if retrieval recall is low.
+
+Don't cargo-cult overlap because a tutorial recommended it. **Measure whether it helps your use case.**
+
+---
+
+## Semantic Chunking vs. Fixed-Size: The Empirical Comparison
+
+By 2026, the debate is settled: **semantic chunking beats fixed-size chunking in most domains.** But "most" is not "all," and **you need evidence for your domain.**
+
+**What is semantic chunking?**
+
+Instead of splitting at fixed token counts, split where **meaning shifts**. Common approaches:
+
+**1. Structural boundaries:** Split at section headings, paragraph breaks, list items. Most document formats (Markdown, HTML, reStructuredText) have explicit structure. Use it.
+
+**2. Similarity-based splitting:** Compute sentence embeddings for consecutive sentences. When similarity drops below a threshold (indicating topic shift), split. This is how modern semantic chunkers like LlamaIndex's `SemanticSplitterNodeParser` work.
+
+**3. LLM-based splitting:** Use a small, fast LLM to identify logical breakpoints: "Where should this document be split to preserve meaning?" Expensive but effective for complex documents.
+
+**How to compare semantic vs. fixed-size for your use case:**
+
+**1. Create two indices:**
+- **Index A:** Fixed-size chunking at your target token count (e.g., 512 tokens, 10% overlap)
+- **Index B:** Semantic chunking (split at paragraph boundaries, max 1024 tokens per chunk)
+
+**2. Run retrieval eval:**
+
+Use your eval set (100-200 queries, Chapter 5). For each index, measure:
+- **Recall at k:** Percentage of queries where the correct answer appears in top-5 retrieved chunks.
+- **Mean Reciprocal Rank (MRR):** How highly ranked is the correct chunk?
+- **Precision at k:** Percentage of retrieved chunks that are actually relevant.
+
+**3. Run end-to-end RAG eval:**
+
+Feed retrieved chunks into your LLM. Measure answer quality (faithfulness, relevance, completeness—Chapter 9.5).
+
+**4. Manual review:**
+
+Review 50 random chunks from each index. Score:
+- Coherence (does the chunk read as a complete thought?)
+- Completeness (does the chunk contain all info needed to answer questions about its topic?)
+- Cleanliness (is the chunk free of irrelevant text?)
+
+**Expected results (based on 2026 industry patterns):**
+
+**For structured documents** (technical docs, policies, manuals with clear sections): Semantic chunking typically improves recall by 10-20% and answer quality by 15-25% compared to fixed-size.
+
+**For unstructured documents** (chat logs, freeform notes, transcripts): Fixed-size chunking may perform comparably, because there aren't natural semantic boundaries to exploit.
+
+**For short-form content** (FAQs, Slack messages): Both strategies converge—documents are already small, so chunking strategy matters less.
+
+**The decision matrix:**
+
+- **Content is structured + queries are specific:** Semantic chunking.
+- **Content is unstructured + queries are broad:** Fixed-size may suffice.
+- **Content is highly technical + precision matters:** Semantic chunking with manual boundary tuning.
+- **Content updates frequently + you need simplicity:** Fixed-size (easier to automate, less brittle).
+
+**Don't rely on defaults.** Run the comparison. Let your eval set tell you which strategy wins.
+
+By 2026, **most modern RAG platforms default to semantic chunking** but provide fixed-size as a fallback. The onus is on teams to validate the default works for their domain.
+
+---
+
+## Metadata and Enrichment Evaluation
+
+Chunks aren't just text. They carry **metadata**—information about the chunk's source, context, and properties. Metadata can make or break retrieval quality.
+
+Consider a knowledge base with 10,000 support articles, written over 5 years. A user asks: "How do I reset my password?" Your retriever returns:
+
+**Chunk A** (from 2021): "To reset your password, email support at support@example.com."
+**Chunk B** (from 2025): "To reset your password, click 'Forgot Password' on the login page."
+
+Chunk A is outdated. The process changed in 2023. But if chunks don't carry metadata about **when they were written** or **when they were last updated**, your retriever can't prioritize recent information.
+
+**Common metadata fields for chunks:**
+
+- **Source document:** Which file/article/page did this chunk come from?
+- **Section/heading:** Which section of the document is this chunk from?
+- **Creation date / last updated date:** When was this information published or revised?
+- **Author / team:** Who wrote this? (Useful for trust/authority signals)
+- **Document type:** Is this a policy, a tutorial, a troubleshooting guide, an FAQ?
+- **Topic tags:** What topics does this chunk cover? (Manually tagged or auto-generated)
+- **Permissions:** Who can access this chunk? (Critical for multi-tenant RAG systems, Chapter 16)
+
+**Why metadata matters for retrieval:**
+
+**1. Filtering:** A user asks a question in the context of "Mobile app, iOS." Metadata allows you to filter chunks: only retrieve from documents tagged "iOS" or "mobile."
+
+**2. Ranking:** Two chunks match the query. One is from a document updated yesterday, the other from 2020. Metadata lets you boost recent chunks.
+
+**3. Attribution:** When the LLM cites sources, metadata provides the document title, author, and date—building user trust.
+
+**How to evaluate metadata quality:**
+
+**1. Metadata coverage check:**
+
+For a sample of chunks (100-500), verify:
+- What percentage of chunks have complete metadata (all required fields populated)?
+- What percentage of chunks have accurate metadata (spot-check: does the "source document" field actually match the source)?
+
+If coverage is below 90%, your ingestion pipeline is dropping metadata. Fix it before evaluating retrieval.
+
+**2. Metadata-based filtering eval:**
+
+If your system supports metadata filtering (it should), test it:
+
+Create eval queries that require filtering:
+- "How do I reset my password on iOS?" (Should filter to iOS-tagged chunks)
+- "What's the latest refund policy?" (Should filter to policy docs updated in the last year)
+
+Measure:
+- **Filter precision:** Of chunks returned, what percentage match the filter criteria?
+- **Filter recall:** Of chunks that should match the filter, what percentage were retrieved?
+
+If filter precision below 95%, your metadata tagging is incorrect. If filter recall below 80%, your retrieval logic isn't using metadata effectively.
+
+**3. Metadata-boosted ranking eval:**
+
+If your system uses metadata for ranking (e.g., boost recent chunks, boost higher-authority sources), test whether it improves quality:
+
+**Version A:** Retrieval without metadata boosting (pure semantic similarity).
+**Version B:** Retrieval with metadata boosting (recent chunks ranked higher, authoritative sources ranked higher).
+
+Run your eval set. Measure:
+- Does metadata boosting improve answer correctness?
+- Does it improve answer freshness?
+
+**Typical findings (2026):**
+
+For time-sensitive domains (support docs, policies, product info), **date-based boosting improves answer quality by 10-30%**—recent information is usually more correct.
+
+For domains with variable source quality (e.g., internal wikis where some pages are carefully maintained and others are outdated), **authority-based boosting improves quality significantly.**
+
+For static domains (academic papers, historical records), metadata boosting may not help—temporal and authority signals are less relevant.
+
+**The 2026 pattern:** Metadata is no longer optional. Modern RAG systems treat chunks as **structured objects** (text + metadata), not raw strings. Platforms like LangChain, LlamaIndex, and Weaviate all support metadata filtering and boosting natively.
+
+If your chunks don't carry metadata, you're leaving retrieval quality on the table.
+
+---
+
+## Embedding Quality Evaluation
+
+Chunking determines **what** you retrieve. Embeddings determine **how well** you can find it.
+
+An **embedding** is a vector representation of a chunk's semantic meaning. When a user asks "How do I reset my password?", the query is embedded into a vector, and the retriever finds chunks whose vectors are closest (cosine similarity, dot product, etc.).
+
+If embeddings don't accurately capture meaning, retrieval fails—even if chunks are perfectly formed.
+
+**How embeddings can fail:**
+
+**1. Domain mismatch:** You're using a general-purpose embedding model (e.g., OpenAI `text-embedding-ada-002`, trained on internet text) for a specialized domain (legal contracts, medical records). The model doesn't understand domain-specific terminology. "Consideration" in legal text means something different than in everyday language, but the embedding doesn't capture that.
+
+**2. Query-document mismatch:** User queries are short and question-like ("How do I reset my password?"). Chunks are long and declarative ("To reset your password, navigate to the settings page and click..."). The embedding model wasn't trained to match questions to procedures, so similarity scores are low.
+
+**3. Lack of semantic nuance:** Embeddings conflate similar-sounding but distinct concepts. "Reset password" and "Change password" might have high similarity, but in your system, they're different procedures with different steps.
+
+**How to evaluate embedding quality:**
+
+**1. Known-pair similarity test:**
+
+Create a set of **known similar and dissimilar pairs**:
+
+**Similar pairs** (should have high embedding similarity):
+- "How do I reset my password?" and "Password reset instructions"
+- "Refund policy for digital products" and "Can I get a refund for an ebook?"
+
+**Dissimilar pairs** (should have low embedding similarity):
+- "How do I reset my password?" and "What are your shipping rates?"
+- "Refund policy for digital products" and "How do I change my email address?"
+
+Compute embeddings for each text. Measure cosine similarity. Verify:
+- **Similar pairs have similarity above 0.7** (or your chosen threshold)
+- **Dissimilar pairs have similarity below 0.5**
+
+If this fails—similar pairs have low similarity, or dissimilar pairs have high similarity—your embedding model is not capturing the semantic distinctions that matter for your domain.
+
+**2. Retrieval error analysis:**
+
+When retrieval fails (you run your eval set and some queries don't retrieve the correct chunks), analyze **why**:
+
+- Compute the embedding similarity between the query and the correct chunk (the chunk you know should be retrieved).
+- If similarity is below 0.6, it's an **embedding problem**—the model doesn't recognize the query and chunk as similar.
+- If similarity is above 0.6 but the chunk wasn't retrieved, it's a **ranking problem**—other chunks scored higher.
+
+Track the **embedding failure rate**: percentage of retrieval failures where query-chunk similarity is below threshold.
+
+If above 20%, consider:
+- **Fine-tuning embeddings** on your domain (using contrastive learning with query-chunk pairs)
+- **Switching to a domain-specific embedding model** (e.g., medical embeddings for healthcare, legal embeddings for law)
+- **Using a more capable embedding model** (as of 2026, models like Cohere `embed-v3`, OpenAI `text-embedding-3-large`, and open-source `gte-large-en-v1.5` outperform older models)
+
+**3. Embedding model comparison:**
+
+Create multiple indices, each using a different embedding model:
+- OpenAI `text-embedding-3-small`
+- OpenAI `text-embedding-3-large`
+- Cohere `embed-english-v3.0`
+- Voyage AI `voyage-2`
+- Open-source `gte-Qwen2-7B-instruct` (2026 state-of-the-art open-source)
+
+Run your eval set through each. Measure retrieval recall, MRR, and end-to-end answer quality.
+
+**Typical findings (2026):**
+
+- **Larger embedding models** (1024-3072 dimensions) generally outperform smaller models (384-768 dimensions), but at higher cost and latency.
+- **Domain-specific fine-tuning** improves retrieval recall by 15-30% for specialized domains.
+- **Multilingual models** (if your content is multilingual) are essential—don't use English-only embeddings for non-English text.
+
+**The 2026 best practice:** Don't assume your embedding model is good enough. **Evaluate it empirically.** Run the known-pair test, analyze retrieval errors, and compare models on your eval set.
+
+Embeddings are the invisible foundation of RAG. A 10% improvement in embedding quality often translates to a 20% improvement in answer quality.
+
+---
+
+## Index Freshness: Detecting Stale Content
+
+Here's a failure mode that doesn't show up in offline evals: **stale content.**
+
+You launch your RAG system in January. The index contains all your documentation, current as of January 1. By June, 30% of your documentation has been updated—new product features, policy changes, deprecated procedures. But **the index hasn't been updated.** Users ask about the new features. Retrieval returns old information. The LLM generates answers based on outdated chunks.
+
+This is the **index freshness problem.** Your chunks were perfect in January. By June, they're wrong.
+
+**How to evaluate index freshness:**
+
+**1. Update lag tracking:**
+
+For every document in your knowledge base, track:
+- **Last modified date (source):** When was the source document last updated?
+- **Last indexed date (chunk):** When was this chunk last re-indexed?
+- **Update lag:** The time difference between source modification and chunk indexing.
+
+Compute:
+- **Median update lag:** Half of your chunks are indexed within X hours/days of source updates.
+- **Percentage of stale chunks:** Percentage of chunks where update lag exceeds your staleness threshold (e.g., greater than 7 days).
+
+If median lag is above 24 hours, your indexing pipeline is too slow. If stale chunk percentage is above 10%, a significant portion of your index is outdated.
+
+**2. Retrieval freshness check:**
+
+For your eval set, identify queries that depend on **recent information**:
+- "What's the latest pricing for the Pro plan?" (Answer changes monthly)
+- "How do I use the new dashboard feature?" (Feature added last week)
+
+Retrieve chunks. Verify:
+- **Are retrieved chunks from the most recent version of the source document?**
+- **Do retrieved chunks reflect current information, or outdated information?**
+
+Track the **freshness failure rate**: percentage of time-sensitive queries where retrieval returns stale information.
+
+If above 5%, your users are getting wrong answers due to outdated chunks.
+
+**3. Missing content detection:**
+
+New documents added to the knowledge base should appear in the index quickly. Test:
+- Add a new document to your knowledge base (e.g., a new FAQ article).
+- Wait X hours (where X is your target indexing SLA—ideally under 1 hour).
+- Query for content from that document.
+- Verify the new chunks are retrievable.
+
+Track **indexing latency**: time from document creation to searchability.
+
+If above your SLA, diagnose:
+- Is your ingestion pipeline running on schedule?
+- Are there bottlenecks (slow embedding API, slow vector DB writes)?
+- Are you rate-limited by your embedding provider?
+
+**The 2026 pattern:** Mature RAG systems have **continuous indexing**—documents are re-indexed automatically when updated, typically within minutes. Platforms like Pinecone, Weaviate, and Qdrant support incremental updates (re-index changed chunks without rebuilding the entire index).
+
+**Teams still batch-indexing nightly are behind the curve.** If your documentation changes daily, your index should update daily—or faster.
+
+**For production RAG systems, index freshness is a critical metric.** Track it. Alert on it. Treat stale content as a bug.
+
+---
+
+## The Chunking-Retrieval Feedback Loop
+
+Here's the insight that separates good RAG teams from great ones: **chunking and retrieval are not independent. They're a feedback loop.**
+
+**The failure pattern:**
+
+You design a chunking strategy (512 tokens, fixed-size). You launch. Retrieval works okay for most queries. But for 15% of queries, retrieval fails—correct chunks aren't in the top-10.
+
+You analyze the failures. The common thread: **all failing queries require information that's split across multiple chunks.** Your chunking strategy fragmented the answer.
+
+You could fix this by improving retrieval (increase top-k, add reranking). Or you could **fix the root cause: change the chunking strategy** to keep that information together.
+
+**The feedback loop:**
+
+1. **Retrieval fails on a query.**
+2. **You diagnose: is it a chunking problem (answer is fragmented) or a retrieval problem (answer exists in a single chunk, but retrieval didn't find it)?**
+3. If chunking problem: **Adjust chunk boundaries or chunk size to preserve the fragmented information.**
+4. If retrieval problem: **Tune retrieval (embeddings, ranking, top-k).**
+5. **Re-evaluate.**
+
+This loop is continuous. As your content changes, as your query patterns evolve, chunking and retrieval must co-evolve.
+
+**How to diagnose chunking vs. retrieval failures:**
+
+For each retrieval failure in your eval set:
+
+**Step 1:** Identify the chunk(s) that contain the correct answer.
+
+**Step 2:** Check: does a **single chunk** contain the complete answer, or is the answer **fragmented across multiple chunks**?
+
+**Step 3:**
+- If **single chunk contains the answer**, compute the query-chunk similarity. If similarity is high (above 0.6) but the chunk wasn't retrieved, it's a ranking problem—other chunks scored higher. Tune ranking.
+- If similarity is low (below 0.6), it's an **embedding problem**. The model doesn't recognize the query and chunk as similar. Consider fine-tuning embeddings or switching models.
+- If **answer is fragmented across chunks**, it's a **chunking problem.** The chunk boundaries split the answer. Adjust chunking to preserve the answer in a single chunk (increase chunk size, switch to semantic boundaries, or manually tune boundaries for critical documents).
+
+**Tracking the diagnostic breakdown:**
+
+For your eval set failures, categorize:
+- X% are chunking problems (answer fragmented)
+- Y% are embedding problems (low similarity)
+- Z% are ranking problems (high similarity, but not top-k)
+
+This tells you **where to focus optimization effort.**
+
+If 60% of failures are chunking problems, optimizing your reranking algorithm won't help. You need to fix chunking.
+
+**The 2026 best practice:** Treat chunking as a **tunable parameter**, not a one-time decision. When retrieval quality plateaus, revisit chunking.
+
+Teams that iterate on chunking based on retrieval eval feedback outperform teams that "set it and forget it."
+
+---
+
+## Multi-Modal Chunking: Beyond Plain Text
+
+In 2026, RAG systems increasingly handle **multi-modal content**—documents with tables, images, charts, code blocks, and structured data.
+
+Plain-text chunking strategies fail here.
+
+**Example: A technical manual with a troubleshooting table.**
+
+**Original document:**
+"If the system displays Error Code 301, refer to the table below for resolution steps."
+
+**Table:**
+
+| Error Code | Cause | Resolution |
+|---|---|---|
+| 301 | Network timeout | Check firewall settings |
+| 302 | Invalid credentials | Reset API key |
+
+**Fixed-size text chunking:** The table is converted to plain text or Markdown, then split. If the chunk boundary falls mid-table, you get:
+
+**Chunk 1:** "If the system displays Error Code 301, refer to the table below. Error Code | Cause"
+
+**Chunk 2:** "| Resolution | 301 | Network timeout | Check firewall settings | 302 | Invalid credentials"
+
+Neither chunk is useful. The table is fragmented and unreadable.
+
+**How to handle multi-modal content in chunking:**
+
+**1. Preserve structural units:**
+
+Don't split tables, code blocks, or images from their captions. Treat them as atomic units.
+
+**Chunk boundaries should respect:**
+- Tables (don't split rows)
+- Code blocks (don't split functions)
+- Images + captions (keep together)
+- Lists (keep list items together)
+
+Modern chunkers (LlamaIndex, LangChain) support **structure-aware splitting**—they parse Markdown/HTML structure and avoid splitting within structural elements.
+
+**2. Extract and enrich:**
+
+For tables and images, **extract the information** and add it to the chunk's metadata or text.
+
+**Example:**
+- **Table to text:** Convert the table to a structured text format: "Error 301: Network timeout. Resolution: Check firewall settings."
+- **Image to text:** Use OCR or image-to-text models to extract text from diagrams, screenshots, charts. Include extracted text in the chunk.
+- **Code to docstring:** If chunking code documentation, include the function signature and docstring in the chunk, not just the narrative text.
+
+**3. Multi-modal embeddings:**
+
+As of 2026, **multi-modal embedding models** (e.g., OpenAI CLIP, Google PaLI, Cohere multi-modal embeddings) can embed images and text into the same vector space. A user query "How do I configure the firewall?" can retrieve both text chunks and relevant diagrams.
+
+If your documentation includes important diagrams or screenshots, consider:
+- **Embedding images separately** and retrieving them alongside text chunks.
+- **Using multi-modal embeddings** to unify text and image retrieval.
+
+**How to evaluate multi-modal chunking:**
+
+**1. Structure preservation check:**
+
+For documents with tables/images/code, manually review:
+- Are tables kept intact, or split mid-row?
+- Are code blocks kept intact, or split mid-function?
+- Are images + captions together, or separated?
+
+Track the **structure violation rate**. If above 5%, your chunking is breaking critical structures.
+
+**2. Multi-modal retrieval eval:**
+
+For queries that require visual information ("Show me the network diagram for the firewall configuration"), measure:
+- **Are relevant images retrieved?**
+- **Are captions and images kept together?**
+- **Does the LLM have enough context from the image (via caption or extracted text) to answer the query?**
+
+**The 2026 landscape:**
+
+Multi-modal RAG is still maturing. Most production systems (as of early 2026) handle text well, tables adequately, and images poorly. The teams with the best multi-modal RAG:
+
+- Use structure-aware chunkers (LlamaIndex `SemanticSplitterNodeParser`, LangChain `MarkdownHeaderTextSplitter`)
+- Extract text from tables and images (via OCR, table parsing, or multi-modal LLMs)
+- Evaluate multi-modal content separately (create eval sets specifically for "queries requiring tables" and "queries requiring images")
+
+**If your docs are text-only, skip this.** But if you're chunking technical manuals, scientific papers, or design docs with diagrams—multi-modal chunking evaluation is critical.
+
+---
+
+## 2026 Advanced Patterns: Late Chunking, Contextual Retrieval, Parent-Child Strategies
+
+By 2026, the chunking landscape includes several advanced techniques that go beyond naive fixed-size or semantic splitting.
+
+**1. Late chunking (Jina AI, 2025)**
+
+Traditional chunking: Split documents into chunks, then embed each chunk independently.
+
+**Problem:** Context is lost. A chunk that says "Follow these steps" makes no sense without knowing what process it's part of.
+
+**Late chunking:** Embed the **entire document** as a sequence, then split after embedding. The embeddings carry context from surrounding text.
+
+**Example:** A document has three sections. Traditional chunking embeds each section independently. Late chunking embeds the whole document, producing contextual embeddings for each token, then extracts section-level embeddings that incorporate context from the entire document.
+
+**Evaluation:** Compare retrieval quality (late chunking vs. traditional chunking) on your eval set. Jina AI's research showed 5-10% improvement in retrieval recall for technical documents.
+
+**2. Contextual retrieval (Anthropic, 2024)**
+
+**Problem:** Chunks lack context about where they came from. A chunk says "The password reset flow was updated in version 2.3." But it doesn't say what product, what section, what document.
+
+**Contextual retrieval:** Before embedding, **prepend each chunk with context** from the document:
+
+**Original chunk:** "The password reset flow was updated in version 2.3."
+
+**Contextualized chunk:** "This is from the Mobile App User Guide, Authentication section. The password reset flow was updated in version 2.3."
+
+The contextualized chunk is embedded. Now, a query "How do I reset my password in the mobile app?" has higher similarity—because "mobile app" is explicitly in the chunk.
+
+**Evaluation:** Create two indices (with and without contextualization). Measure retrieval recall and answer quality. Anthropic's published results showed **10-20% improvement in recall** for knowledge bases with many similar-sounding documents.
+
+**3. Parent-child chunk strategies (LlamaIndex, 2025)**
+
+**Problem:** You want small chunks for precise retrieval, but large chunks for context when generating answers.
+
+**Solution:** Create **two chunk sizes**:
+- **Child chunks:** Small (256 tokens), used for retrieval. High precision.
+- **Parent chunks:** Large (1024 tokens), used for generation. High context.
+
+**Workflow:**
+1. User asks a question.
+2. Retrieve the most relevant **child chunks** (small, precise).
+3. For each retrieved child, fetch its **parent chunk** (large, contextual).
+4. Pass parent chunks to the LLM for generation.
+
+This gives you the best of both worlds—precise retrieval, rich context for generation.
+
+**Evaluation:**
+
+Create three retrieval strategies:
+- Small chunks only (256 tokens for retrieval and generation)
+- Large chunks only (1024 tokens for retrieval and generation)
+- Parent-child (retrieve 256, generate from 1024)
+
+Measure:
+- Retrieval precision (are retrieved chunks relevant?)
+- Answer completeness (does the LLM have enough context?)
+
+**Typical result:** Parent-child outperforms both extremes—better precision than large-chunk retrieval, better completeness than small-chunk generation.
+
+**4. Adaptive chunk sizing (Emerging, 2026)**
+
+**Idea:** Not all documents should be chunked the same way. FAQs can be small chunks (one question-answer pair per chunk). Technical procedures need large chunks (entire procedure together). Policies might need medium chunks (one section per chunk).
+
+**Adaptive chunking:** Use **document metadata or content analysis** to determine chunk size per document type.
+
+**Evaluation:** Compare adaptive chunking (different sizes per doc type) vs. uniform chunking (one size for all). Measure retrieval quality across document types.
+
+**Early results (2026):** Adaptive chunking improves retrieval quality for heterogeneous knowledge bases (mixed content types) but adds complexity. Use it if your knowledge base is diverse.
+
+**The 2026 recommendation:** If you're building a new RAG system in 2026, start with **semantic chunking** (split at natural boundaries, 512-1024 tokens max). If retrieval quality is insufficient, experiment with **contextual retrieval** (prepend context) and **parent-child strategies** (retrieve small, generate from large). These are the proven, production-ready techniques.
+
+Late chunking and adaptive chunking are promising but less mature. Use them if you have evidence that standard approaches aren't working.
+
+---
+
+## Failure Modes in Chunking Evaluation
+
+When teams evaluate chunking, they make predictable mistakes. Here are the most common failure modes in 2026:
+
+**1. Evaluating chunking in isolation, not end-to-end.**
+
+The team measures chunk coherence, completeness, and boundary quality. Chunks look great. But retrieval still fails, because the **embeddings don't capture the meaning** or **ranking logic is broken.**
+
+**Fix:** Always evaluate chunking as part of the full retrieval pipeline. Measure retrieval recall and end-to-end answer quality, not just chunk quality in isolation.
+
+**2. Using toy eval sets.**
+
+The team tests chunking on 10-20 hand-written queries. Chunking looks fine. In production, users ask 1,000 types of questions, and chunking fails for 200 of them.
+
+**Fix:** Build a representative eval set (100-200 queries, covering diverse query types, Chapter 5). Evaluate chunking on the full set.
+
+**3. Ignoring multi-modal content.**
+
+The knowledge base has tables, code, and images. The team chunks as if it's plain text. Tables get fragmented, code blocks are split mid-function, images are separated from captions.
+
+**Fix:** Identify multi-modal content in your corpus. Use structure-aware chunkers. Evaluate tables and images separately.
+
+**4. Not re-evaluating as content evolves.**
+
+The team sets chunk size in January based on the initial knowledge base. By June, content has doubled, document types have changed, new query patterns have emerged. But chunking strategy hasn't been revisited.
+
+**Fix:** Re-evaluate chunking quarterly (or when content structure changes significantly). Track retrieval quality over time. If it degrades, chunking may need adjustment.
+
+**5. Cargo-culting chunk size.**
+
+The team reads a blog post that says "512 tokens is the optimal chunk size." They chunk everything at 512 tokens without measuring.
+
+**Fix:** Chunk size is domain-specific. Test 256, 512, 1024, and measure which works for your content and queries.
+
+**6. Not tracking index freshness.**
+
+The team evaluates chunking on the initial index. The index gets stale. Retrieval quality drops. The team blames the model, not realizing 20% of chunks are outdated.
+
+**Fix:** Track index freshness (update lag, stale chunk percentage). Set up continuous re-indexing for updated documents.
+
+**7. Over-engineering chunking.**
+
+The team implements late chunking, contextual retrieval, parent-child, adaptive sizing, and semantic splitting—all at once. The system is complex, slow, and hard to debug. They don't know which technique is helping.
+
+**Fix:** Start simple (semantic chunking, fixed max size). Measure. Add complexity only if needed, and **add one technique at a time** so you can measure its impact.
+
+If your team hits these failure modes, you're in good company. The best teams iterate quickly, measure constantly, and avoid premature optimization.
+
+---
+
+## Enterprise Expectations for Chunking Evaluation
+
+By 2026, enterprises deploying production RAG systems have baseline expectations for chunking evaluation. If you're building a RAG system for a regulated industry or large-scale deployment, this is the standard:
+
+**Pre-launch:**
+
+1. **Chunk size ablation study:** Test at least three chunk sizes (e.g., 256, 512, 1024). Measure retrieval recall and answer quality. Document the chosen chunk size and the reasoning.
+
+2. **Boundary quality audit:** Manually review 100-200 chunks. Score coherence, completeness, and boundary cleanliness. Ensure coherence rate is above 90%.
+
+3. **Metadata coverage check:** Verify greater than 95% of chunks have complete metadata (source, date, section, topic).
+
+4. **Embedding quality eval:** Run known-pair similarity tests. Ensure similar pairs have similarity above 0.7, dissimilar pairs below 0.5. If this fails, switch embeddings or fine-tune.
+
+5. **Multi-modal content review:** If the knowledge base includes tables, images, or code, verify they're handled correctly (structure preserved, not fragmented).
+
+6. **Index freshness baseline:** Document the indexing SLA (time from document update to searchability). Set up monitoring for update lag and stale chunk percentage.
+
+**Post-launch:**
+
+1. **Monthly retrieval eval:** Re-run your eval set monthly. Track retrieval recall and answer quality. Alert if either drops below threshold.
+
+2. **Quarterly chunking review:** As content and query patterns evolve, re-evaluate chunk size and boundaries. Adjust if necessary.
+
+3. **Continuous index monitoring:** Track index freshness daily. Alert if stale chunk percentage exceeds 10%.
+
+4. **Failure mode analysis:** When retrieval fails in production, diagnose whether it's chunking, embeddings, or ranking. Feed failures back into eval set.
+
+This is the baseline. Mature teams go further—A/B testing chunking strategies in production, fine-tuning embeddings per domain, implementing parent-child chunking for precision-context trade-offs.
+
+If your evaluation program is less rigorous than this, you're behind the 2026 curve.
+
+---
+
+## Template: Chunking Evaluation Spec
+
+When you evaluate chunking, document your approach. Here's a lean template:
+
+```yaml
+chunking_eval_spec:
+  knowledge_base: "Customer Support Documentation"
+  version: "2.0"
+  eval_date: "2026-01-15"
+
+  chunking_strategy:
+    method: "semantic" # or "fixed_size"
+    max_chunk_size: 1024 # tokens
+    overlap: 0 # tokens (for fixed_size) or None (for semantic)
+    boundary_type: "paragraph" # paragraph, section, sentence
+    preserve_structure: true # tables, code, lists kept intact
+
+  embedding_model:
+    provider: "OpenAI"
+    model: "text-embedding-3-large"
+    dimensions: 3072
+
+  metadata_fields:
+    - source_document
+    - section_heading
+    - last_updated
+    - document_type
+    - topic_tags
+
+  evaluation_tests:
+    1_chunk_size_ablation:
+      description: "Compare 256, 512, 1024 token chunks"
+      eval_set: "support_queries_v2.jsonl" # 150 queries
+      metrics:
+        - recall_at_5
+        - answer_quality (faithfulness, relevance)
+      result: "1024 tokens optimal (recall 0.82, quality 0.88)"
+
+    2_boundary_quality:
+      description: "Manual review of chunk coherence"
+      sample_size: 200
+      metrics:
+        - coherence_rate (no mid-sentence splits)
+        - completeness_rate (chunk contains full thought)
+      result: "Coherence 94%, completeness 89%"
+
+    3_metadata_coverage:
+      description: "Check metadata completeness"
+      sample_size: 500
+      result: "97% coverage (all required fields populated)"
+
+    4_embedding_quality:
+      description: "Known-pair similarity test"
+      similar_pairs: 50
+      dissimilar_pairs: 50
+      result: "Similar avg 0.78, dissimilar avg 0.32 (PASS)"
+
+    5_index_freshness:
+      description: "Track update lag"
+      result: "Median lag 2 hours, stale chunk % 3%"
+
+  recommendations:
+    - "Current chunking strategy (semantic, 1024 max) performs well."
+    - "Monitor index freshness weekly; set alert if stale % exceeds 10%."
+    - "Consider parent-child strategy for long troubleshooting procedures (test in Q2)."
+```
+
+Use this template to document your chunking eval. Version it. Update it when you re-evaluate.
+
+---
+
+## Interview Questions: Chunking and Indexing Evaluation
+
+**Q1: Why is chunking considered the foundation of RAG quality, and how does it set a ceiling for retrieval performance?**
+
+**A:** Chunking determines what retrieval can possibly find. If you split documents badly—fragmenting information across chunks, mixing unrelated topics in the same chunk, or losing context at boundaries—no amount of tuning embeddings or ranking will fix it. A perfect retriever searching broken chunks will still return garbage. Think of it like building a library: if you split books mid-chapter, mix pages from different topics together, and remove chapter headings, even the best librarian can't help patrons find what they need. The chunking strategy sets the ceiling for retrieval quality. You can't retrieve a complete, coherent answer if the answer is fragmented across five chunks. Chunking must be evaluated just as rigorously as retrieval and generation because it's the invisible foundation of the entire RAG pipeline.
+
+**Q2: How do you empirically determine the right chunk size for a knowledge base, and what trade-offs are you navigating?**
+
+**A:** Chunk size is a Goldilocks problem—too small and you fragment information, too large and you dilute relevance. To find the right size, I run an ablation study: chunk the same corpus at 256, 512, 1024, and 2048 tokens, keeping embeddings and retrieval logic constant. Then I measure retrieval recall (how often the correct chunk appears in top-k), chunk completeness (what percentage of queries can be answered from a single chunk without needing additional chunks), and noise ratio (how much irrelevant text is in retrieved chunks). I also measure end-to-end answer quality. Typically, there's a sweet spot—a chunk size where recall and completeness are high, and noise is manageable. Smaller chunks fragment answers; larger chunks introduce irrelevant context that confuses the LLM. The right size depends on content structure and query patterns, so I let the eval set tell me. And I re-evaluate quarterly as content evolves.
+
+**Q3: What is semantic chunking, and how do you evaluate whether it's better than fixed-size chunking for your use case?**
+
+**A:** Semantic chunking splits documents at natural meaning boundaries—paragraph breaks, section headings, or topic shifts—rather than at fixed token counts. The idea is to preserve coherent units of meaning. To evaluate whether it beats fixed-size chunking for my use case, I create two indices: one with fixed-size chunks (e.g., 512 tokens with 10% overlap) and one with semantic chunks (split at paragraphs, max 1024 tokens). I run the same eval set through both and measure retrieval recall, answer quality, and boundary coherence (manual review of chunk boundaries). For structured documents—technical docs, policies, manuals with clear sections—semantic chunking typically improves recall by 10-20% because it keeps related information together and avoids splitting mid-thought. For unstructured content like chat logs, the difference is smaller. I don't assume semantic is always better; I measure. And if semantic chunking wins, I track boundary quality over time to ensure it stays robust as content changes.
+
+**Q4: How do you evaluate whether embeddings are accurately capturing the semantic meaning of your chunks, and what do you do if they're not?**
+
+**A:** I run a known-pair similarity test. I create a set of known similar pairs—questions and their correct answers, related concepts—and known dissimilar pairs—unrelated topics. I compute embeddings and measure cosine similarity. Similar pairs should score above 0.7; dissimilar pairs below 0.5. If this fails—similar pairs have low similarity, or dissimilar pairs score high—the embeddings aren't capturing the distinctions that matter for my domain. I also analyze retrieval failures: for queries where retrieval failed, I check the query-chunk similarity for the correct chunk. If similarity is below 0.6, it's an embedding problem—the model doesn't recognize the query and chunk as related. When embeddings fail, I consider fine-tuning on domain-specific query-chunk pairs, switching to a domain-specific model (medical, legal, etc.), or upgrading to a more capable general-purpose model. I don't assume embeddings are good enough; I test them empirically and optimize if needed.
+
+**Q5: What is the chunking-retrieval feedback loop, and how do you use retrieval failures to improve chunking?**
+
+**A:** Chunking and retrieval are interdependent. When retrieval fails, I diagnose whether it's a chunking problem or a retrieval problem. For each failure, I identify the chunk that should have been retrieved. If the answer is fragmented across multiple chunks, it's a chunking problem—my chunk boundaries split the information. I adjust chunking (increase chunk size, switch to semantic boundaries, or manually tune boundaries for critical documents). If the answer exists in a single chunk but retrieval didn't find it, I check query-chunk similarity. If similarity is low, it's an embedding problem—I fine-tune or switch models. If similarity is high but the chunk wasn't in top-k, it's a ranking problem—I tune ranking or increase k. I track the diagnostic breakdown: what percentage of failures are chunking vs. embeddings vs. ranking? This tells me where to focus optimization effort. Chunking isn't a one-time decision; it's a tunable parameter I revisit based on retrieval eval feedback.
+
+---
+
+In Chapter 9.7, we'll explore **Multi-Source and Hybrid Retrieval Evaluation**—how to evaluate RAG systems that pull information from multiple knowledge bases, combine structured and unstructured data, and blend vector search with keyword search or metadata filtering. You'll learn how to measure retrieval quality when answers require synthesizing information from multiple sources, and how to debug the unique failure modes of hybrid retrieval architectures. Let's go deeper.

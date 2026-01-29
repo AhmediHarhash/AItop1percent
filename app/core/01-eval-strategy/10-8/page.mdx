@@ -1,0 +1,517 @@
+# Chapter 10.8 — Voice AI in Production: Monitoring & Quality Signals
+
+A customer calls your support line. The voice AI picks up. Three seconds of silence. The customer says "hello?" Another two seconds. Then: "Sorry, I didn't catch that."
+
+The customer hangs up.
+
+Your logs show: latency = 450ms, ASR confidence = 0.94, response generated successfully, TTS completed. Everything "worked."
+
+But the call failed.
+
+This is the gap between traditional monitoring and voice AI monitoring. In text systems, you log requests and responses. In voice systems, the experience lives in timing, tone, silence, and emotional trajectory. Your monitoring must capture what humans feel, not just what the system did.
+
+By 2026, production voice AI monitoring has evolved into a discipline of its own. The best teams treat voice quality as a real-time signal stream, not a batch analytics problem.
+
+This chapter is your guide to monitoring voice AI in production: what to measure, when to alert, how to catch failures before customers churn, and how to build observability into real-time audio pipelines.
+
+---
+
+## Why Voice Monitoring Is Different From Text Monitoring
+
+In text systems, you can log every request and response. You can replay the conversation. You can run batch evals overnight.
+
+In voice systems, the data is audio. The experience is timing. The failure modes are silence, interruptions, and emotional escalation.
+
+**Voice monitoring requires:**
+
+- **Real-time signal capture:** Latency, ASR confidence, barge-in events, silence duration — these happen live, in milliseconds. You can't wait for batch logs.
+- **Audio storage decisions:** Do you keep full recordings? Redacted transcripts? Metadata only? Retention policies are harder with voice (compliance, storage cost, PII).
+- **Experience-level metrics:** It's not enough to know "the system responded." You need to know: did the caller feel heard? Did the conversation flow naturally? Did they accomplish the goal?
+- **Multi-component pipelines:** Voice AI is ASR + reasoning + TTS + telephony. A failure in any component breaks the experience. Your monitoring must instrument every stage.
+
+The shift: from "did the system work?" to "did the caller have a good experience?"
+
+---
+
+## Call-Level Metrics: The Foundation of Voice Quality
+
+Every voice AI call generates a set of **call-level metrics**. These are the first layer of production monitoring.
+
+**Standard call metrics:**
+
+- **Call duration:** How long the call lasted (seconds or minutes). Short calls may indicate abandonment or quick success. Long calls may indicate confusion or complex issues.
+- **Resolution rate:** Did the caller accomplish their goal without transferring to a human? (Often requires post-call survey or intent-completion detection.)
+- **Transfer rate:** Percentage of calls handed off to a human agent. High transfer rate = voice AI isn't handling common cases.
+- **Abandonment rate:** Percentage of calls where the caller hung up before completion. This is your biggest red flag.
+- **Silence ratio:** Total seconds of silence divided by call duration. Some silence is natural (caller thinking). Too much silence = system failure or awkward UX.
+- **Talk-time ratio:** Percentage of time the AI was speaking vs the caller. Healthy conversations have balanced talk-time. If the AI dominates, it may be over-explaining or not listening.
+
+**Why these matter:**
+
+These metrics tell you if the call succeeded at the business level. They're not AI-specific — they're borrowed from traditional contact center monitoring. But they work.
+
+**How to instrument them:**
+
+Most telephony platforms (Twilio, Vonage, Plivo) emit call events: call started, call ended, silence detected, transfer initiated. Your monitoring system subscribes to these events and computes metrics per call.
+
+**Template call summary:**
+
+```yaml
+call_id: "call-2026-01-29-abc123"
+duration_seconds: 142
+resolution_status: "resolved"
+transfer_occurred: false
+abandonment: false
+silence_ratio: 0.08
+talk_time_ratio_ai: 0.42
+talk_time_ratio_caller: 0.50
+```
+
+You store this summary in your data warehouse and aggregate it daily, weekly, by intent, by caller segment, etc.
+
+---
+
+## Real-Time Quality Signals: Catching Problems as They Happen
+
+Call-level metrics are post-call summaries. But the best voice AI systems monitor quality in real-time, during the call.
+
+**Why real-time monitoring matters:**
+
+- You can trigger mid-call interventions (escalate to human if quality drops).
+- You can alert engineering teams immediately when latency spikes.
+- You can detect systemic failures (ASR model degradation, TTS service outage) before thousands of calls fail.
+
+**Key real-time signals:**
+
+### ASR Confidence Scores
+
+Every utterance from the caller produces an **ASR confidence score** (0.0 to 1.0). This tells you how confident the speech-to-text model is in its transcription.
+
+- **High confidence (above 0.9):** Clean audio, clear speech, strong recognition.
+- **Medium confidence (0.7–0.9):** Usable, but may have minor errors. Consider confirmation for critical fields.
+- **Low confidence (below 0.7):** Noisy audio, accents, mumbling, or ASR failure. The system should ask the caller to repeat.
+
+**Best practice:** Track ASR confidence per utterance and per call. If average confidence drops below 0.75 for a call, flag it for review.
+
+### TTS Quality Indicators
+
+Modern TTS systems (ElevenLabs, Play.ht, OpenAI TTS) emit quality signals:
+
+- **Generation latency:** Time to synthesize the audio. Should be under 200ms for real-time feel.
+- **Audio clarity score:** Some TTS APIs return a quality metric (though this is less common in 2026).
+- **Fallback events:** Did the TTS fail and fall back to a simpler voice or canned message?
+
+**Best practice:** Monitor TTS latency separately from ASR latency. A slow TTS is often the hidden culprit in "feels slow" feedback.
+
+### Component Latency Tracking
+
+Voice AI pipelines have multiple latency points:
+
+1. **ASR latency:** Time from caller stops speaking to transcript ready.
+2. **Reasoning latency:** Time from transcript to response text (LLM inference, tool calls, etc.).
+3. **TTS latency:** Time from response text to audio ready.
+4. **Network latency:** Time to send audio to caller's device.
+
+**End-to-end latency** = sum of all stages.
+
+Target: under 1 second for simple responses, under 2 seconds for complex (multi-tool) responses.
+
+**Best practice:** Instrument every stage. Log per-call latency distribution. Alert when P95 latency exceeds thresholds.
+
+**Example instrumentation:**
+
+```yaml
+call_id: "call-abc123"
+turn_number: 3
+asr_latency_ms: 180
+reasoning_latency_ms: 420
+tts_latency_ms: 150
+network_latency_ms: 80
+total_latency_ms: 830
+```
+
+You stream these metrics to your observability platform (Datadog, Grafana, Honeycomb) and build dashboards.
+
+---
+
+## Post-Call Analysis: Automated Review of Call Recordings
+
+Not every call can be reviewed by humans. Post-call analysis uses **automated scoring** to triage which calls need human review.
+
+**How it works:**
+
+1. **Store call recordings** (or transcripts, if recordings are too expensive or risky for PII).
+2. **Run automated scoring** on transcripts using an LLM or task-specific model.
+3. **Flag calls** that meet review criteria (low score, high silence, transfer, abandonment).
+4. **Sample randomly** for baseline quality checks (even "good" calls).
+
+**LLM-based call scoring:**
+
+You can use an LLM to score calls on dimensions like:
+
+- **Caller satisfaction (1–5):** Did the caller seem satisfied by the end?
+- **Issue resolution (yes/no):** Was the caller's issue resolved?
+- **AI performance (1–5):** Did the AI handle the conversation smoothly?
+- **Policy compliance (yes/no):** Did the AI follow required scripts (disclosures, confirmations)?
+
+**Example prompt for post-call scoring:**
+
+```yaml
+You are evaluating a customer service call transcript.
+
+Rate the call on the following dimensions:
+
+1. Caller satisfaction (1–5): Did the caller seem satisfied by the end of the call?
+2. Issue resolution (resolved / unresolved / escalated): Was the caller's issue resolved?
+3. AI performance (1–5): Did the AI respond appropriately, avoid repetition, and handle interruptions well?
+4. Policy compliance (pass / fail): Did the AI provide required disclosures and confirmations?
+
+Transcript:
+[full transcript here]
+
+Output your scores in this format:
+caller_satisfaction: [1-5]
+issue_resolution: [resolved/unresolved/escalated]
+ai_performance: [1-5]
+policy_compliance: [pass/fail]
+reasoning: [1-2 sentence explanation]
+```
+
+You run this on every call (or a sample, if volume is high). Calls with low scores go into a human review queue.
+
+**Sampling strategies:**
+
+- **Random sample:** 5–10% of all calls, to measure baseline quality.
+- **Threshold sample:** All calls with abandonment, transfer, or AI performance score below 3.
+- **Edge case sample:** Calls with rare intents, new features, or specific caller segments.
+- **Compliance sample:** Calls involving PII, payments, health data (required for audit trails).
+
+**Best practice:** Store sampling metadata so you can reconstruct your sampling logic during audits.
+
+---
+
+## User Satisfaction Signals: The Ground Truth of Voice Quality
+
+Automated metrics are proxies. The real measure of voice quality is: did the user have a good experience?
+
+**Post-call surveys:**
+
+After the call ends, prompt the caller (via SMS, email, or IVR):
+
+- **CSAT (Customer Satisfaction Score):** "How satisfied were you with this call? (1–5)"
+- **NPS (Net Promoter Score):** "How likely are you to recommend our service? (0–10)"
+- **Task completion:** "Did we resolve your issue today? (Yes / No)"
+
+**Response rates are low** (10–20% in practice), but the signal is strong.
+
+**Behavioral signals:**
+
+Even without surveys, you can infer satisfaction from behavior:
+
+- **Callback rate:** Did the caller call back within 24 hours with the same issue? (Sign of failure.)
+- **Repeat call rate:** Are callers with the same intent repeatedly transferring to humans? (Sign of chronic AI failure for that intent.)
+- **Task completion rate:** For transactional calls (e.g., pay a bill, schedule an appointment), did the task complete successfully in your backend system?
+
+**Best practice:** Combine survey data with behavioral data. Surveys tell you how people feel. Behavior tells you what actually happened.
+
+**Example dashboard:**
+
+```
+Intent: "Reset password"
+Calls this week: 1,240
+Resolution rate: 87%
+Transfer rate: 8%
+Abandonment rate: 5%
+Avg CSAT: 4.2 / 5
+Callback rate (24h): 6%
+```
+
+This gives you a complete picture of quality for a specific intent.
+
+---
+
+## Silence and Dead Air Detection: The Worst Voice UX Failure
+
+In voice AI, **silence is the enemy**.
+
+A few seconds of dead air feels like an eternity to a caller. It signals: the system is broken, or it's ignoring me.
+
+**Types of silence:**
+
+- **Natural silence:** Caller is thinking, reading something, or responding to a question. This is fine.
+- **System silence:** The AI is processing and hasn't responded yet. Acceptable if brief (under 2 seconds). Awkward if longer.
+- **Dead air:** The system has stopped responding, or the caller doesn't know what to do next. This is a failure.
+
+**How to detect dead air:**
+
+1. **Track silence duration per turn.** If silence exceeds 3 seconds after the caller stops speaking, flag it.
+2. **Track consecutive silence turns.** If the caller says something, silence, says something again, silence again — this is a conversation breakdown.
+3. **Track end-of-call silence.** If the last 10 seconds of the call are silence, the caller likely gave up.
+
+**Best practice:** Emit a "silence detected" event in real-time. Use it to trigger a fallback behavior:
+
+- "I'm still here. Are you ready to continue?"
+- "Let me transfer you to a specialist."
+- Play hold music or a progress indicator ("I'm looking that up for you...").
+
+**Alert threshold:** If more than 5% of calls have dead air longer than 5 seconds, investigate immediately.
+
+---
+
+## Emotional Trajectory Monitoring: Tracking Caller Sentiment Over Time
+
+A great voice AI call has an **emotional arc**:
+
+- Caller starts frustrated or neutral (they have a problem).
+- AI acknowledges, engages, resolves.
+- Caller ends satisfied or relieved.
+
+A bad call: caller starts frustrated, escalates to angry, hangs up.
+
+**Why track emotional trajectory:**
+
+You want to catch calls where the caller is getting more frustrated, even if the AI is "working." These are the calls most likely to damage brand reputation.
+
+**How to track sentiment:**
+
+Modern emotion AI models (Hume AI, Affectiva, or LLM-based sentiment analysis) can score each turn of the conversation:
+
+- **Positive / Neutral / Negative / Frustrated / Angry**
+
+You track sentiment per turn and per call:
+
+```yaml
+call_id: "call-abc123"
+turn_1_sentiment: "frustrated"
+turn_2_sentiment: "neutral"
+turn_3_sentiment: "neutral"
+turn_4_sentiment: "positive"
+overall_trajectory: "improving"
+```
+
+**Red flags:**
+
+- Sentiment goes from neutral to frustrated to angry (escalating frustration).
+- Sentiment is negative for more than 50% of turns.
+- Caller ends the call on a negative note (even if the AI "resolved" the issue).
+
+**Best practice:** If sentiment is escalating, trigger a human handoff before the caller hangs up.
+
+---
+
+## Drift Detection for Voice: When Your Callers Change
+
+Voice AI systems experience **drift**: changes in caller behavior, query types, audio conditions, or demographics.
+
+**Voice-specific drift signals:**
+
+- **Caller demographics:** Are you seeing more callers with accents your ASR struggles with? More older callers (who may speak slower or have hearing issues)? More mobile callers (noisier audio)?
+- **Query types:** Are callers asking questions outside your training data? New intents emerging?
+- **Noise conditions:** Are more calls coming from noisy environments (cars, public transit, street)?
+- **Device distribution:** Are more callers using speakerphone or Bluetooth (which degrades audio quality)?
+
+**How to detect drift:**
+
+1. **Track ASR confidence distribution over time.** If average confidence drops from 0.88 to 0.82 over two weeks, your ASR may be drifting.
+2. **Track top intents per week.** If a new intent suddenly appears in the top 10, your intent classifier may be seeing new patterns.
+3. **Track transfer rate per intent.** If transfer rate for "billing question" jumps from 10% to 18%, something changed (caller expectations, product changes, AI degradation).
+
+**Best practice:** Set up **drift alerts** that trigger when key metrics shift beyond normal variance.
+
+Example: "Transfer rate for 'reset password' intent increased by 25% week-over-week. Investigate."
+
+---
+
+## Alert Design for Voice Systems: What to Alert On, When to Page
+
+Not every issue needs to wake someone up at 3 AM. But some do.
+
+**Critical alerts (page immediately):**
+
+- **Latency spike:** P95 end-to-end latency exceeds 3 seconds for more than 5 minutes.
+- **ASR error rate spike:** ASR confidence drops below 0.7 for more than 10% of calls in the last 10 minutes.
+- **Silence ratio spike:** More than 15% of calls have dead air longer than 5 seconds.
+- **Abandonment spike:** Abandonment rate exceeds 20% in the last hour (normal baseline: 5–8%).
+- **Service outage:** ASR, TTS, or telephony provider returns errors for more than 10% of requests.
+
+**Warning alerts (investigate during business hours):**
+
+- **Transfer rate increase:** Transfer rate for a specific intent increases by more than 20% week-over-week.
+- **CSAT drop:** CSAT drops below 4.0 for two consecutive days.
+- **Callback rate increase:** Callback rate (same caller, same intent, within 24 hours) exceeds 10%.
+- **New intent emergence:** A new intent appears in the top 10 that wasn't there last week.
+
+**Best practice:** Use **multi-condition alerts** to reduce noise.
+
+Example: "Alert if abandonment rate exceeds 15% AND average call duration drops below 30 seconds (sign of immediate hangups)."
+
+---
+
+## Call Recording and Compliance: Storing, Reviewing, Deleting
+
+Call recordings are valuable for quality review, training, and compliance. They're also risky (PII, consent, retention).
+
+**Key compliance considerations in 2026:**
+
+- **Consent:** In many jurisdictions (California, EU, Canada), you must inform callers the call is being recorded and get consent.
+- **PII redaction:** If you store recordings, you must redact or mask PII (credit card numbers, SSNs, health info). Transcripts are easier to redact than raw audio.
+- **Retention limits:** You can't keep recordings forever. Set retention policies (30 days, 90 days, 1 year) based on legal and business requirements.
+- **Access controls:** Only authorized personnel (QA, compliance, legal) should access recordings. Log all access.
+- **Deletion workflows:** When retention expires, recordings must be deleted (not just "archived").
+
+**Best practice architecture for call recording:**
+
+1. **Store full recordings in secure, encrypted storage** (S3 with encryption at rest, access logging enabled).
+2. **Generate transcripts immediately** and redact PII (using NER models or LLM-based redaction).
+3. **Store metadata** (call ID, duration, intent, resolution status, quality scores) in a queryable database.
+4. **Delete recordings after retention window**, but keep metadata for analytics.
+
+**Example retention policy:**
+
+```yaml
+call_recordings:
+  retention_days: 90
+  storage_location: "s3://voice-ai-recordings-encrypted"
+  access_role: "voice-qa-team"
+  deletion_schedule: "automatic, daily cron job"
+
+call_transcripts:
+  retention_days: 365
+  pii_redaction: "enabled"
+  storage_location: "data-warehouse"
+
+call_metadata:
+  retention_days: "indefinite"
+  fields: ["call_id", "duration", "intent", "resolution", "csat"]
+```
+
+---
+
+## 2026 Patterns: Real-Time Voice Analytics Platforms
+
+By 2026, specialized platforms have emerged for voice AI monitoring. These platforms combine telephony integration, real-time analytics, LLM-based scoring, and compliance tooling.
+
+**What modern voice analytics platforms provide:**
+
+- **Real-time dashboards:** Latency, ASR confidence, silence ratio, transfer rate — all updating live.
+- **Automated call scoring:** LLM-based scoring of every call (or sampled calls) for quality, compliance, satisfaction.
+- **Emotion AI integration:** Track caller sentiment, emotional trajectory, frustration escalation.
+- **Alerting and anomaly detection:** Automatic alerts for latency spikes, abandonment spikes, drift.
+- **Recording management:** Secure storage, PII redaction, retention enforcement.
+- **Agent comparison:** Compare human agents vs AI agents on the same metrics (for hybrid contact centers).
+
+**Examples of platforms used in 2026:**
+
+- **Observe.AI** (originally human agent QA, now supports AI agents)
+- **Tethr** (conversation intelligence for voice)
+- **Gong / Chorus** (originally sales calls, now used for support and AI calls)
+- **Custom in-house platforms** (built on Datadog, Grafana, Snowflake, LLM APIs)
+
+**Best practice:** Don't build everything from scratch. Use a platform for the basics (latency, ASR, TTS metrics). Build custom logic for your specific quality dimensions (intent resolution, policy compliance).
+
+---
+
+## Failure Modes and Enterprise Expectations
+
+**Common failure modes in voice AI monitoring:**
+
+- **Monitoring latency, not experience:** Your logs show "200ms latency" but callers complain it "feels slow" (because you're not measuring silence or dead air).
+- **No real-time alerts:** You discover a 3-hour ASR outage the next morning from batch logs.
+- **No sampling strategy:** You try to review every call and get overwhelmed. Or you never review calls and miss systemic issues.
+- **PII leaks in logs:** You log full transcripts without redaction and violate GDPR or HIPAA.
+- **No drift detection:** Your ASR confidence slowly degrades over 6 months and you don't notice until customers complain.
+
+**Enterprise expectations for voice AI monitoring:**
+
+- **Real-time observability:** Dashboards show live call quality. Alerts fire within minutes of issues.
+- **Compliance-first recording:** Consent, redaction, retention, deletion are automated and auditable.
+- **Human-in-the-loop review:** Automated scoring + human review of edge cases and low-score calls.
+- **Cross-functional dashboards:** Engineering sees latency and error rates. QA sees call quality. Compliance sees recording access logs.
+- **Continuous improvement loop:** Monitoring insights feed back into eval datasets, prompt improvements, and ASR/TTS tuning.
+
+---
+
+## A Practical Template: Voice AI Monitoring Checklist
+
+Use this checklist to audit your voice AI monitoring:
+
+**Call-level metrics:**
+- [ ] Call duration tracked per call
+- [ ] Resolution rate computed (via surveys, task completion, or heuristics)
+- [ ] Transfer rate tracked per intent
+- [ ] Abandonment rate tracked and alerted
+- [ ] Silence ratio computed per call
+- [ ] Talk-time ratio computed (AI vs caller)
+
+**Real-time signals:**
+- [ ] ASR confidence logged per utterance
+- [ ] TTS latency logged per response
+- [ ] End-to-end latency logged per turn
+- [ ] Component latency broken down (ASR, reasoning, TTS, network)
+- [ ] Dead air detection in place (alerts on silence above 3 seconds)
+
+**Post-call analysis:**
+- [ ] Call recordings or transcripts stored securely
+- [ ] Automated LLM-based call scoring implemented
+- [ ] Sampling strategy defined (random, threshold, compliance)
+- [ ] Human review queue in place for low-score calls
+
+**User satisfaction:**
+- [ ] Post-call survey deployed (CSAT, NPS, task completion)
+- [ ] Callback rate tracked per intent
+- [ ] Repeat call rate tracked
+- [ ] Behavioral signals integrated into dashboards
+
+**Drift and alerts:**
+- [ ] ASR confidence distribution tracked over time
+- [ ] Transfer rate per intent tracked over time
+- [ ] Alerts defined for latency spikes, abandonment spikes, ASR degradation
+- [ ] Drift detection in place for new intents, caller demographics, audio quality
+
+**Compliance:**
+- [ ] Call recording consent obtained and logged
+- [ ] PII redaction implemented for transcripts
+- [ ] Retention policy enforced automatically
+- [ ] Access controls and audit logs for recordings
+
+---
+
+## Interview Q&A: Voice AI Monitoring
+
+**Q1: How do you monitor voice AI quality in production? What metrics do you track?**
+
+**A:** "Voice AI monitoring is different from text monitoring because the experience is timing-sensitive and multi-component. I track call-level metrics like resolution rate, transfer rate, and abandonment rate for business health. I track real-time signals like ASR confidence, TTS latency, and end-to-end latency for technical health. I use post-call automated scoring with LLMs to triage which calls need human review. And I track user satisfaction via post-call surveys and behavioral signals like callback rate. The key is to monitor both 'did the system work?' and 'did the caller have a good experience?'"
+
+---
+
+**Q2: What's the most important alert to set up for a voice AI system?**
+
+**A:** "Abandonment rate. If callers are hanging up before the call completes, that's the clearest signal something is broken. I set an alert if abandonment rate exceeds 15% over a rolling 1-hour window. The second most important is end-to-end latency — if P95 latency exceeds 2–3 seconds, callers will notice and disengage. Silence ratio is third: if more than 10% of calls have dead air longer than 5 seconds, something is failing in the conversation flow."
+
+---
+
+**Q3: How do you handle call recording compliance and PII?**
+
+**A:** "Call recordings are high-risk for PII. I ensure we have proper consent at the start of the call, either via IVR announcement or opt-in. I store recordings encrypted in S3 with strict access controls. I generate transcripts immediately and redact PII using NER models or LLM-based redaction before storing them in the data warehouse. I enforce retention policies automatically: recordings are deleted after 90 days, but metadata is kept indefinitely for analytics. All access to recordings is logged for audit trails."
+
+---
+
+**Q4: How do you detect drift in voice AI systems?**
+
+**A:** "Voice drift shows up in ASR confidence, transfer rates, and new intents. I track ASR confidence distribution over time — if average confidence drops from 0.88 to 0.80, the caller population may have changed (more accents, more noise). I track transfer rate per intent — if 'billing question' transfer rate jumps from 10% to 18%, either the AI is regressing or caller expectations changed. I also track new intents week-over-week. If a new intent appears in the top 10, I investigate whether it's a genuine new pattern or a classifier failure."
+
+---
+
+**Q5: What's the difference between monitoring human agents and AI agents in a contact center?**
+
+**A:** "Human agents and AI agents share core metrics like resolution rate, transfer rate, and CSAT. But AI agents need additional monitoring: ASR confidence, TTS latency, silence ratio, and real-time component latency. Human agents don't have 'dead air' issues the way AI does — humans naturally fill pauses. AI must be monitored for systemic failures (ASR model degradation, TTS outages) that don't apply to humans. The other difference is scale: AI handles thousands of calls simultaneously, so monitoring must be automated and real-time. Human QA is sampled and asynchronous."
+
+---
+
+## What's Next: Chapter 10.9
+
+You now know how to monitor voice AI quality in production: call metrics, real-time signals, post-call analysis, user satisfaction, compliance, and alerts.
+
+**Chapter 10.9 — Voice AI Regression Testing & Continuous Improvement** builds on this foundation. You'll learn how to catch regressions before they hit production, build voice-specific test suites, and continuously improve ASR, TTS, and conversation flow based on production signals.
+
+The shift: from reactive monitoring to proactive quality gates and continuous iteration loops for voice AI.

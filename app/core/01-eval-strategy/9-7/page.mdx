@@ -1,0 +1,473 @@
+# Chapter 9.7 — Multi-Source & Hybrid Retrieval Evaluation
+
+A product manager at a healthcare company once told me: "Our RAG system was amazing in the demo, then we deployed it and users complained it couldn't answer simple billing questions. Turns out we tuned retrieval on product docs but never added the billing knowledge base. The system was optimized for a dataset that didn't match production reality."
+
+This is the curse of single-source eval bias. You optimize semantic search on a single vector store, get 85% accuracy on your test set, ship it, and watch it fail in the wild. Why? Because production RAG systems pull from **multiple heterogeneous sources**: internal knowledge bases, SQL databases, search APIs, document stores, user history, and web search. Each source has different formats, latency profiles, update cadences, and access patterns. Your evaluation strategy must reflect this complexity, or you're optimizing for the wrong problem.
+
+In 2026, mature RAG deployments are hybrid, multi-source, and agentic. That means you're not just evaluating "did we retrieve the right chunks?" You're evaluating: did we query the right sources, fuse results correctly, prioritize authoritative data, handle cross-source conflicts, and route queries to the best retrieval path? If your eval pipeline still assumes a single vector store and top-k retrieval, you're measuring the wrong thing.
+
+---
+
+## The Multi-Source RAG Reality
+
+Most RAG tutorials show you how to chunk a PDF, embed it, throw it in Pinecone, and run semantic search. That's a toy example. Real enterprise RAG pulls from:
+
+**Knowledge bases:** product docs, FAQ databases, internal wikis
+
+**Structured databases:** customer records, billing tables, transaction logs
+
+**External APIs:** support ticket systems, CRM data, inventory management
+
+**Web search:** real-time information, competitor pricing, news
+
+**User context:** conversation history, user profile data, previous tickets
+
+Each source requires different retrieval logic. You don't run semantic search on a SQL table. You don't embed a CRM API call. You don't treat a user's conversation history the same way you treat a product manual. The system must decide **which sources to query** for each incoming question, then combine results intelligently.
+
+If your eval dataset only contains questions answered from a single knowledge base, you've never tested source selection. You've never tested fusion. You've never tested conflict resolution. You're flying blind.
+
+**Multi-source evaluation** means: for every test case, you know which sources should be queried, which should return relevant results, and which should be ignored. You track: did the system query the right sources? Did it ignore the wrong ones? Did it prioritize correctly when multiple sources returned conflicting information?
+
+---
+
+## Source Selection Evaluation
+
+Before you retrieve anything, you must decide **where to retrieve from**. A billing question should hit the billing knowledge base and the transaction database, not the product docs. A product feature question should hit the product docs and changelog, not the billing system.
+
+**Source selection** is the first decision point in multi-source RAG. It's often done via:
+
+**Keyword routing:** simple rules like "if query contains 'invoice' or 'payment', query billing KB"
+
+**Classifier-based routing:** train a small model to classify queries into source categories
+
+**Agentic routing (2026):** let an agent reason about which sources to query based on the question
+
+To evaluate source selection, you need:
+
+**Ground-truth source labels:** for each eval question, annotate which sources should be queried
+
+**Source selection metrics:** precision and recall of source selection decisions
+
+If your system should query two sources for a question, but only queries one, that's a **source recall failure**. If it queries four sources when only two are relevant, that's a **source precision failure**. Both hurt quality and cost.
+
+Example eval format:
+
+```
+question: "Why was I charged twice last month?"
+expected_sources: [billing_kb, transaction_db]
+actual_sources: [billing_kb, product_docs]
+source_precision: 0.5  (1 correct out of 2 retrieved)
+source_recall: 0.5     (1 correct out of 2 expected)
+```
+
+**Enterprise teams** track source selection accuracy per query category. A customer support RAG might have 20 intent categories and 8 data sources. You build a confusion matrix: for each intent, which sources are queried? Are there systematic misroutes?
+
+In 2026, we're seeing **agentic source selection** where an LLM reasons about which sources to query. This is more flexible than classifiers, but you must eval whether the agent is making correct decisions. Trace logs should show: query → agent reasoning → source selection → actual sources queried. You can LLM-as-judge the reasoning step: "Did the agent correctly justify why it chose these sources?"
+
+---
+
+## Hybrid Retrieval: Dense + Sparse Together
+
+**Hybrid retrieval** combines **dense retrieval** (embedding-based semantic search) with **sparse retrieval** (BM25 keyword search). Dense is great for conceptual similarity. Sparse is great for exact matches, rare terms, and jargon.
+
+Example: a user asks "What is the SLA for P0 incidents?" Dense retrieval might return documents about "service level agreements" and "critical bugs." Sparse retrieval (BM25) will prioritize documents containing the exact terms "SLA" and "P0." You want both.
+
+Evaluating hybrid retrieval means:
+
+**Evaluate dense retrieval alone:** standard metrics like recall at k, MRR, nDCG
+
+**Evaluate sparse retrieval alone:** same metrics, but on BM25 results
+
+**Evaluate the hybrid combination:** after fusing dense + sparse, did quality improve?
+
+You should see cases where:
+
+- Dense retrieval alone misses exact-match queries
+- Sparse retrieval alone misses semantically similar documents
+- The hybrid fusion catches both
+
+If hybrid retrieval doesn't outperform the best single method on your dataset, **you have a fusion problem or a dataset bias problem**. Maybe your eval set is too homogeneous, or your fusion weights are wrong.
+
+**Fusion weight tuning:** hybrid systems assign weights to dense and sparse scores. Common default: 50/50 or 70/30 dense-heavy. You can tune these weights per source or per query type. Eval this by sweeping weight ratios and plotting retrieval quality metrics. If dense-heavy works better for product docs but sparse-heavy works better for billing questions, consider **query-adaptive weighting**.
+
+In 2026, learned sparse retrieval models like SPLADE and ColBERT are replacing BM25 in high-end systems. These models learn which terms matter, rather than relying on TF-IDF heuristics. Eval these the same way: compare learned sparse vs BM25 vs dense vs hybrid fusion.
+
+---
+
+## Reranker Evaluation
+
+After initial retrieval (dense, sparse, or both), many systems apply a **reranker**: a small cross-encoder model that re-scores the top-k results based on query-document relevance. The goal: push the best results to the top.
+
+Rerankers are expensive (they run on every query-document pair), so you only rerank the top 20–100 results. But they're powerful: they can model query-document interactions that embedding models miss.
+
+**Reranker evaluation** asks: did reranking improve the final retrieval quality?
+
+Measure:
+
+**Before reranking:** nDCG, MRR, recall at k on the initial retrieval results
+
+**After reranking:** same metrics after reranking
+
+If reranking doesn't improve metrics, or makes them worse, you have a problem. Common causes:
+
+- Reranker trained on different data distribution
+- Reranker overfits to certain query types
+- Reranker is too slow, so you use it on too-small candidate sets
+
+**Reranker ablation tests:** run evals with reranker on vs off. Compare quality, latency, and cost. In production, reranking adds 50–200ms per query. Is the quality gain worth it?
+
+Track **reranker disagreement rate:** how often does the reranker change the top-1 result? If it only changes 5% of queries, maybe you don't need it. If it changes 60%, it's doing real work — eval whether those changes are improvements or regressions.
+
+Some teams use **LLM-based reranking** in 2026: pass top-k results to a small LLM and ask "which document best answers the query?" This is slower but often higher quality than cross-encoders. Eval it the same way: quality gain vs latency cost.
+
+---
+
+## Fusion Strategies: RRF, Weighted Fusion, Learned Fusion
+
+When you retrieve from multiple sources or multiple retrieval methods, you must **fuse** the results into a single ranked list. Common fusion strategies:
+
+**Reciprocal rank fusion (RRF):** combine rankings by summing 1 / (rank + k) for each result across methods
+
+**Weighted fusion:** assign weights to each retrieval method, combine scores
+
+**Learned fusion:** train a small model to predict final relevance given scores from all methods
+
+Evaluating fusion means:
+
+**Per-method baselines:** measure quality of each retrieval method independently
+
+**Fused results:** measure quality after fusion
+
+**Fusion gain:** how much did fusion improve over the best single method?
+
+If fusion doesn't beat the best single method, your fusion logic is broken or your methods are too correlated (they retrieve the same results, so fusion adds nothing).
+
+**RRF** is simple and works well when retrieval methods have different score distributions (e.g., dense embeddings return cosine similarities, BM25 returns TF-IDF scores — hard to combine directly). RRF ignores raw scores and only uses ranks.
+
+Eval RRF by sweeping the k parameter (common default: k=60). Plot nDCG vs k. Pick the k that maximizes quality.
+
+**Weighted fusion** requires tuning weights. If you have three retrieval methods, you have three weights to tune. Eval this by grid search or Bayesian optimization over your dev set. Track: which weights maximize nDCG?
+
+**Learned fusion** treats fusion as a learning-to-rank problem. Train a model on query, document, and per-method scores. This is powerful but requires labeled training data. Eval by comparing learned fusion to RRF and weighted fusion. If learned fusion doesn't beat RRF, you probably don't have enough training data or your features are weak.
+
+In 2026, some teams use **LLM-based fusion**: pass all retrieved results to an LLM and ask it to rank them. This is expensive but flexible. Eval it like reranking: quality gain vs cost.
+
+---
+
+## Source Priority and Weighting
+
+Not all sources are equally authoritative. The official product documentation is more authoritative than a user-submitted community post. The internal SLA policy doc is more authoritative than a blog post.
+
+**Source priority evaluation** asks: when multiple sources return results, does the system correctly prioritize authoritative sources?
+
+Annotate your eval set with **source authority labels**: for each question, which sources are high-authority vs low-authority? Then measure:
+
+**Authority-weighted nDCG:** weight retrieval quality by source authority
+
+**Top-1 source correctness:** is the top result from a high-authority source?
+
+If low-authority sources consistently rank higher than high-authority sources, you have a retrieval or fusion problem. Maybe your embeddings don't capture authority. Maybe your fusion weights treat all sources equally.
+
+**Source boosting:** some systems apply score multipliers to high-authority sources. For example, multiply scores from official docs by 1.5, multiply scores from community posts by 0.8. Eval this by sweeping multipliers and measuring quality.
+
+Track **source distribution in top-k:** for the top 5 results, how many come from each source? If one source dominates, you might have a coverage problem or a bias problem.
+
+---
+
+## Cross-Source Consistency Evaluation
+
+When multiple sources provide conflicting information, what should the system do?
+
+Example: the product docs say "Feature X is available in Pro tier." The changelog says "Feature X was deprecated in version 3.5." The support KB says "Feature X is available in Enterprise tier only."
+
+**Cross-source conflict scenarios:**
+
+- Different sources give different answers
+- One source is outdated
+- Sources have different levels of detail
+
+Your system must detect conflicts and handle them correctly. Options:
+
+**Prefer the most recent source**
+
+**Prefer the most authoritative source**
+
+**Surface the conflict to the user** ("Sources disagree: docs say X, changelog says Y")
+
+**Use an LLM to reconcile** (ask the LLM to resolve the conflict)
+
+To eval cross-source consistency, you need **conflict test cases**: questions where sources disagree. Annotate the correct resolution strategy for each case.
+
+Measure:
+
+**Conflict detection rate:** did the system detect the conflict?
+
+**Conflict resolution correctness:** did the system resolve it correctly (based on ground-truth resolution)?
+
+**Transparency:** did the system surface the conflict or silently pick one source?
+
+In 2026, some teams use **agentic conflict resolution**: the agent reads conflicting sources, reasons about which is correct (based on recency, authority, or detail), and explains the choice. Eval this by checking whether the agent's reasoning matches the ground-truth resolution strategy.
+
+---
+
+## Source Coverage Evaluation
+
+Are all sources being used, or is one source consistently ignored?
+
+**Source coverage metrics:**
+
+**Query coverage per source:** percentage of eval queries where each source returns relevant results
+
+**Retrieval coverage per source:** percentage of eval queries where each source is actually queried and returns top-k results
+
+If the billing KB is relevant for 30% of queries but only appears in top-k results for 5% of queries, you have a **source underutilization problem**. Maybe the billing KB has poor embeddings, or it's deprioritized in fusion, or it's not being queried at all.
+
+Track:
+
+**Source hit rate:** percentage of queries where each source is queried
+
+**Source contribution rate:** percentage of final answers that cite each source
+
+If a source is queried often but never contributes to answers, it might be low-quality or redundant. If a source is rarely queried but highly relevant when it is, you have a routing problem.
+
+**Source-specific retrieval quality:** measure nDCG per source. Maybe dense retrieval works well for product docs but poorly for billing docs. That tells you where to invest tuning effort.
+
+---
+
+## Multi-Hop Retrieval Evaluation
+
+Some questions require **chaining** information from multiple documents.
+
+Example: "What is the pricing for the Pro tier in EMEA?" You need:
+
+1. Retrieve: "Pro tier includes features A, B, C"
+2. Retrieve: "EMEA pricing is 20% higher than US pricing"
+3. Combine: "Pro tier in EMEA costs X"
+
+This is **multi-hop retrieval**. The system must retrieve multiple pieces of information and synthesize them.
+
+**Multi-hop eval challenges:**
+
+**Partial retrieval:** system retrieves step 1 but misses step 2
+
+**Incorrect chaining:** system retrieves both but combines them wrong
+
+**Redundant hops:** system retrieves irrelevant intermediate documents
+
+To eval multi-hop retrieval:
+
+**Annotate hop structure:** for each multi-hop question, list the required documents and the reasoning chain
+
+**Measure hop coverage:** did the system retrieve all required documents?
+
+**Measure synthesis quality:** did the system combine them correctly?
+
+In 2026, **agentic retrieval** handles multi-hop naturally: the agent retrieves document 1, realizes it needs more info, retrieves document 2, then synthesizes. Eval this by checking the agent's trace: did it retrieve the right sequence? Did it synthesize correctly?
+
+Some teams use **graph-based retrieval** for multi-hop: build a knowledge graph, then traverse edges. Eval by measuring whether the system found the correct path through the graph.
+
+---
+
+## Routing Evaluation: Query Classification and Path Selection
+
+Large RAG systems often have **multiple retrieval paths**:
+
+- Simple FAQ questions go to a lightweight BM25 index
+- Complex product questions go to a semantic search pipeline with reranking
+- Billing questions go to a SQL-backed retrieval system
+
+**Routing** is the decision: which retrieval path should this query take?
+
+Routing is often done via:
+
+**Keyword rules:** "if query contains 'invoice', route to billing path"
+
+**Classifier:** train a model to predict retrieval path
+
+**LLM-based routing (2026):** ask an LLM to decide which path to use
+
+**Routing evaluation** is a classification problem. Annotate each eval query with the correct retrieval path, then measure:
+
+**Routing accuracy:** percentage of queries routed to the correct path
+
+**Per-path metrics:** for each path, measure retrieval quality only on queries that should use that path
+
+If routing accuracy is low, you'll send queries to the wrong retrieval path and get poor results even if each path is high-quality.
+
+Track **routing confusion matrix:** which paths are commonly confused? Maybe "billing" and "account management" queries get mixed up because they use similar language.
+
+**Agentic routing (2026):** the agent decides dynamically which retrieval path to use, possibly trying multiple paths and comparing results. Eval this by checking whether the agent's final choice matches the ground-truth best path.
+
+---
+
+## 2026 Patterns: Agentic, Contextual, and Learned Sparse Retrieval
+
+The retrieval landscape in 2026 looks different from 2023.
+
+**Agentic retrieval:** instead of a fixed pipeline (query → retrieve → rerank → generate), the agent decides what to retrieve, when to retrieve more, and when to stop. The agent might retrieve from source A, realize it needs more context, retrieve from source B, then synthesize. Eval this by tracing agent decisions: did the agent retrieve the right sources in the right order?
+
+**Contextual retrieval with document summaries:** instead of embedding raw chunks, embed chunks plus document-level summaries. This improves semantic understanding. Eval by comparing retrieval quality with vs without contextual summaries.
+
+**ColBERT and late interaction models:** instead of single-vector embeddings, use multi-vector representations and compute query-document similarity via late interaction. ColBERT is slower but more expressive. Eval by comparing ColBERT retrieval to standard dense retrieval on your dataset.
+
+**Learned sparse retrieval (SPLADE, etc.):** replace BM25 with learned sparse models that predict term importance. Eval by comparing learned sparse to BM25 and dense retrieval.
+
+**Hybrid agentic fusion:** the agent retrieves from multiple sources, then decides how to fuse results based on source quality, recency, and user context. Eval by checking whether the agent's fusion decisions improve over static fusion strategies like RRF.
+
+All of these patterns require **deeper instrumentation**: trace logs showing agent reasoning, source selection, fusion decisions, and retrieval paths. Without detailed traces, you can't debug or eval these systems.
+
+---
+
+## Failure Modes in Multi-Source Hybrid Retrieval
+
+**Source selection failures:** system queries the wrong sources, misses the right sources, or queries too many sources (high cost, high latency)
+
+**Fusion failures:** fusion logic doesn't improve over single-method baselines, or actively degrades quality
+
+**Reranker failures:** reranker doesn't improve retrieval, or makes it worse
+
+**Routing failures:** queries routed to wrong retrieval path, causing poor results even when each path is high-quality
+
+**Source bias:** one source dominates results, other sources ignored
+
+**Conflict failures:** system doesn't detect or resolve cross-source conflicts, returns inconsistent or outdated information
+
+**Coverage gaps:** some sources underutilized, some query categories have no good retrieval path
+
+**Multi-hop failures:** system retrieves partial information, fails to chain hops, or chains incorrectly
+
+**Latency explosions:** querying too many sources or running expensive rerankers on every query
+
+---
+
+## Enterprise Expectations for Multi-Source Retrieval
+
+**Transparency:** users and auditors must know which sources were queried, which results were retrieved, and why
+
+**Source permissions:** retrieval must respect access controls (tenant isolation, role-based permissions)
+
+**Source freshness:** some sources update hourly (web search), others monthly (product docs). System must handle staleness correctly
+
+**Cost control:** querying external APIs costs money. Eval must track cost-per-query per source
+
+**Latency SLAs:** multi-source retrieval can be slow. Teams set budgets like "95th percentile latency below 500ms"
+
+**Auditability:** for compliance-heavy domains, every retrieval decision must be logged and explainable
+
+**Regression detection:** when you add a new source or change fusion logic, retrieval quality for existing queries must not degrade
+
+---
+
+## A Practical Multi-Source Eval Template
+
+For each eval question, annotate:
+
+**Question text**
+
+**Ground-truth answer**
+
+**Expected sources:** which sources should be queried?
+
+**Expected top-k documents:** ground-truth relevant documents from each source
+
+**Conflict scenario (if any):** do sources disagree? How should the system resolve it?
+
+**Multi-hop structure (if any):** which documents must be chained to answer the question?
+
+**Routing path:** which retrieval path should this query use?
+
+Then measure:
+
+**Source selection metrics:** precision, recall of source selection
+
+**Per-source retrieval quality:** nDCG, MRR, recall at k for each source independently
+
+**Fused retrieval quality:** nDCG, MRR, recall at k after fusion
+
+**Reranking gain:** quality improvement from reranking
+
+**Routing accuracy:** percentage of queries routed correctly
+
+**Cross-source consistency:** conflict detection and resolution correctness
+
+**End-to-end answer quality:** final answer accuracy, groundedness, relevance
+
+This template forces you to eval every component of the multi-source retrieval pipeline, not just the final answer.
+
+---
+
+## Debugging Playbook for Multi-Source Retrieval
+
+When multi-source retrieval fails, work backward:
+
+**1. Check source selection:** Did the system query the right sources? If not, fix routing or query classification.
+
+**2. Check per-source retrieval:** For each queried source, did it return relevant results? If not, fix embeddings, chunking, or indexing for that source.
+
+**3. Check fusion:** Did fusion combine results correctly? If not, tune fusion weights or try a different fusion strategy.
+
+**4. Check reranking:** Did reranking improve or degrade results? If degraded, disable reranker or retrain it.
+
+**5. Check conflict handling:** If sources conflicted, did the system detect and resolve correctly? If not, add conflict detection logic.
+
+**6. Check end-to-end answer:** Even if retrieval is correct, did the generator use the retrieved evidence correctly? If not, the problem is in generation, not retrieval.
+
+Trace logs are essential. For every eval failure, you should be able to see: query → sources queried → results per source → fusion → reranking → final top-k → generated answer.
+
+---
+
+## Scaling Multi-Source Evals
+
+Multi-source eval is expensive. You're running retrieval across multiple sources, possibly multiple methods, possibly with reranking and fusion. For a 1000-question eval set, that's thousands of retrieval calls.
+
+**Optimization strategies:**
+
+**Cache retrieval results:** if you're testing fusion or reranking changes, cache the initial retrieval results and reuse them
+
+**Subset testing:** test source selection and routing on the full set, but only run expensive multi-source retrieval on a subset
+
+**Parallel execution:** run retrieval across sources in parallel to reduce wall-clock time
+
+**Source-specific eval sets:** build smaller eval sets per source, test each source independently, then test fusion on a combined set
+
+**Progressive eval:** start with cheap evals (source selection, routing), only run expensive evals (full multi-source retrieval with reranking) on changes that pass the cheap evals
+
+In production, log every retrieval decision: source selection, per-source results, fusion scores, reranking scores, final top-k. Use production logs to build **real-world eval sets** that reflect actual query distribution and source usage patterns.
+
+---
+
+## The Bridge from Multi-Source Retrieval to Hallucination Detection
+
+You've built a multi-source hybrid retrieval system. You've evaled source selection, fusion, reranking, routing, and cross-source consistency. Your retrieval metrics look great: high nDCG, high recall, correct source prioritization.
+
+Then you deploy, and users report: "The system is making things up. It cited a document that doesn't say what it claims."
+
+That's a **generation problem**, not a retrieval problem. You retrieved the right documents. The model didn't use them correctly. Or worse: the model invented facts not present in any retrieved document.
+
+This is where **RAG hallucination detection** comes in. Chapter 9.8 covers: how to detect when the generated answer is not grounded in retrieved evidence, how to measure citation accuracy, how to catch subtle fabrications, and how to eval abstention behavior (when the system should say "I don't know" instead of making something up).
+
+Multi-source retrieval gives you the evidence. Hallucination detection ensures the model actually uses that evidence correctly. Together, they form the foundation of trustworthy RAG systems.
+
+---
+
+## Interview Questions & Answers
+
+**Q1: How do you evaluate whether a multi-source RAG system is querying the right sources for each question?**
+
+A: I annotate each eval question with the expected sources, then measure source selection precision and recall. Precision: what percentage of queried sources were relevant? Recall: what percentage of relevant sources were queried? I track this per query category to catch systematic misrouting. For example, if billing questions consistently miss the billing KB, that's a routing failure. I also track latency and cost per source to ensure we're not over-querying expensive APIs.
+
+**Q2: What's the difference between evaluating hybrid retrieval and evaluating fusion strategies?**
+
+A: Hybrid retrieval combines dense (semantic) and sparse (keyword) retrieval methods. Fusion is the strategy for combining results from multiple retrieval methods or sources. You eval hybrid retrieval by comparing dense-only, sparse-only, and hybrid results on metrics like nDCG. You eval fusion strategies (RRF, weighted fusion, learned fusion) by measuring whether fusion improves over the best single method. Hybrid retrieval is about which retrieval methods to use; fusion is about how to combine their results.
+
+**Q3: How do you handle cross-source conflicts when multiple sources give different answers to the same question?**
+
+A: First, I build eval cases where sources intentionally conflict. I annotate the ground-truth resolution strategy: prefer most recent, prefer most authoritative, surface the conflict to the user, or use LLM-based reconciliation. Then I measure conflict detection rate (did the system notice the conflict?) and resolution correctness (did it resolve correctly?). In 2026, I might use an agentic approach where the agent reasons about which source to trust and explains why.
+
+**Q4: What metrics do you use to evaluate rerankers in a multi-source RAG system?**
+
+A: I measure retrieval quality before and after reranking using nDCG, MRR, and recall at k. I track reranking gain: how much did quality improve? I measure reranker disagreement rate: how often does the reranker change the top-1 result? I also track latency and cost, since rerankers add overhead. If the reranker doesn't improve quality or makes it worse, I ablate it or retrain it on a dataset closer to production queries.
+
+**Q5: How do you evaluate agentic retrieval systems where an agent decides dynamically which sources to query?**
+
+A: I instrument the agent to log its reasoning: why it chose each source, in what order, and when it decided it had enough information. I compare the agent's source selection to ground-truth expected sources and measure precision and recall. I check whether the agent retrieved the right documents in the right sequence for multi-hop questions. I use LLM-as-judge to eval the agent's reasoning: did it correctly justify its retrieval decisions? I also track cost and latency, since agentic retrieval can make more retrieval calls than static pipelines.

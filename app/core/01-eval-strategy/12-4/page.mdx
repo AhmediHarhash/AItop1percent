@@ -1,0 +1,582 @@
+---
+title: "12.4 — CI/CD Integration for AI Quality"
+part: "Chapter 12"
+chapter: "Regression Testing & Quality Protection"
+version: "1.0.0"
+---
+
+# **12.4 — CI/CD Integration for AI Quality**
+
+---
+
+A friend who runs infrastructure at a Series B startup told me about the day their AI merge pipeline broke production. They had a standard CI/CD setup: pull request goes up, tests run, everything passes, code ships. Worked great for their web app. Then they added an AI feature—a customer support agent that answered questions about orders. They wrote unit tests for the plumbing, checked that the LLM API connected, saw green checkmarks, and shipped.
+
+Within an hour, support tickets flooded in. The agent was hallucinating order numbers. It told a customer their package had been delivered when it was still in transit. It apologized for delays that didn't exist. The "tests" had passed because they only checked whether the code ran, not whether the AI produced correct answers. My friend rolled back the deploy, spent the weekend writing eval cases, and learned a hard lesson: **traditional CI/CD assumes deterministic code where unit tests catch regressions in seconds. AI systems are probabilistic, slow to evaluate, expensive to score, and require fundamentally different quality gates.**
+
+This chapter is about how to integrate AI evaluation into continuous integration and deployment pipelines without grinding development to a halt or spending thousands of dollars on every pull request. You'll learn the three-tier speed architecture that separates fast checks from slow comprehensive evals, the cost management strategies that make LLM-as-Judge scoring affordable at scale, and the infrastructure patterns that surface quality impact in pull requests before code ships. By the end, you'll know how to build a CI/CD pipeline that protects production from AI regressions while keeping velocity high.
+
+---
+
+## **Why CI/CD for AI Is Different**
+
+Traditional software CI/CD is built for determinism and speed. You write a function that adds two numbers. You write a unit test that checks whether 2 + 2 equals 4. The test runs in milliseconds. You run ten thousand tests in under a minute. If any test fails, the build breaks. The model is simple: code changes are risky, automated tests are cheap and fast, so run all tests on every change.
+
+**AI breaks every assumption in that model.**
+
+First, **AI outputs are non-deterministic.** You can set `temperature=0` and still get different responses because of model updates, token sampling, or internal stochastic processes. Running the same input twice might yield slightly different wording. Traditional tests expect exact matches. AI evals need fuzzy scoring.
+
+Second, **AI evals are slow.** A unit test calls a function and checks the output. An AI eval sends a prompt to an LLM, waits for a response, then sends that response to an LLM-as-Judge model for scoring. That's two API calls per test case, each taking 2-10 seconds. If you have 500 eval cases, running them sequentially takes 30+ minutes. That's too slow for a pull request check.
+
+Third, **AI evals cost money.** Every eval case burns tokens. If you run 500 cases with an LLM-as-Judge that costs $0.02 per case, that's $10 per eval run. If your team merges 50 PRs a week, that's $500/week just for regression testing. At scale, eval costs can exceed production inference costs.
+
+Fourth, **AI evals require infrastructure.** You need a golden set dataset, a way to run prompts against your system, a judge model to score outputs, a results database to track metrics over time, and a reporting layer to surface results in pull requests. Traditional CI just needs a test runner.
+
+The constraint is clear: **you cannot run full AI eval suites on every code change the way you run unit tests. You need a tiered approach that balances speed, cost, and coverage.**
+
+---
+
+## **The AI CI/CD Pipeline Architecture**
+
+The core flow for AI-integrated CI/CD looks like this:
+
+**1. Developer pushes code or opens a pull request**
+**2. CI system triggers automated checks**
+**3. Tier 1 (fast): Deterministic checks run in under 2 minutes**
+**4. Tier 2 (medium): Golden set regression evals run in 5-15 minutes**
+**5. Tier 3 (slow): Full eval suite runs in 30+ minutes**
+**6. Results are posted to the PR as comments or status checks**
+**7. Quality gates enforce thresholds—if pass rate drops below threshold, build fails**
+**8. If gates pass, code can merge and progress toward deployment**
+**9. Pre-production deployment triggers Tier 3 before releasing to users**
+
+The key insight is that **not all checks run at all stages.** Pull requests get fast checks. Merges to main get medium checks. Production deploys get the full suite. This tiered design keeps PR feedback loops fast while ensuring comprehensive validation before production changes.
+
+---
+
+## **Tier 1: Fast Checks (Under 2 Minutes)**
+
+**Tier 1 checks are deterministic, cheap, and run on every PR.** They catch obvious mistakes without waiting for LLM responses.
+
+What runs in Tier 1:
+
+- **Syntax and linting:** Code compiles, prompts are valid, configuration files parse correctly
+- **Format validation:** Output structure checks—does the response include required fields? Is the JSON valid?
+- **Safety keyword filters:** Scan outputs for blocked terms, PII patterns, known toxic phrases
+- **Deterministic rule checks:** If the prompt contains "translate to Spanish," does the output include Spanish text?
+- **Schema validation:** If the system should return structured data, does the response match the schema?
+- **Smoke tests:** Send one or two simple test prompts and check that the system returns a response without errors
+
+These checks don't evaluate quality deeply, but they catch broken deploys. If your prompt accidentally includes a syntax error or your output parsing breaks, Tier 1 fails the build in seconds.
+
+**Example Tier 1 GitHub Actions snippet:**
+
+```yaml
+name: AI Tier 1 Fast Checks
+on: [pull_request]
+jobs:
+  fast-checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install dependencies
+        run: npm install
+      - name: Lint prompt templates
+        run: npm run lint:prompts
+      - name: Validate output schemas
+        run: npm run validate:schemas
+      - name: Run safety keyword filter
+        run: npm run check:safety
+      - name: Smoke test prompt
+        run: npm run smoke-test
+```
+
+If any step fails, the PR is blocked. Developers get feedback in under 2 minutes.
+
+---
+
+## **Tier 2: Golden Set Regression (5-15 Minutes)**
+
+**Tier 2 checks run your core golden set against the new code version.** This is where you detect regressions in AI quality. The golden set should be small enough to run quickly but comprehensive enough to catch common failures.
+
+What runs in Tier 2:
+
+- **Golden set eval cases:** 50-200 hand-curated examples with known-good outputs
+- **LLM-as-Judge scoring:** Each output is scored by a judge model (GPT-4, Claude 3.5 Sonnet, etc.)
+- **Regression comparison:** Compare current run scores to baseline scores from main branch
+- **Quality gate enforcement:** If pass rate drops below threshold (e.g., 85%), build fails
+
+The goal is to answer: **did this code change make AI outputs worse?** If your baseline pass rate on the golden set is 92% and the new version scores 78%, something broke.
+
+**Speed optimization:** Run eval cases in parallel. Instead of sequential API calls, batch them using concurrent workers or async frameworks. A 200-case eval that would take 20 minutes sequentially can finish in 5 minutes with 4 parallel workers.
+
+**Cost optimization:** Use smaller, cheaper judge models for PR checks. Instead of GPT-4o for every PR eval, use GPT-4o-mini or Claude 3.5 Haiku. Reserve the expensive judge for pre-production full runs.
+
+**Example Tier 2 workflow:**
+
+```yaml
+name: AI Tier 2 Golden Set Eval
+on:
+  pull_request:
+    types: [opened, synchronize]
+jobs:
+  golden-set-eval:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run golden set eval
+        run: npm run eval:golden-set -- --parallel=4 --judge-model=gpt-4o-mini
+      - name: Compare to baseline
+        run: npm run eval:compare-baseline
+      - name: Check quality gate
+        run: npm run eval:check-gate -- --threshold=85
+      - name: Post results to PR
+        run: npm run eval:post-pr-comment
+```
+
+Developers see eval results as a PR comment within 10 minutes.
+
+---
+
+## **Tier 3: Full Eval Suite (30+ Minutes)**
+
+**Tier 3 is the comprehensive eval that runs before production deployment.** This includes the full test suite: golden set, adversarial cases, edge cases, multi-turn dialogues, latency stress tests, and safety red-team probes.
+
+What runs in Tier 3:
+
+- **All eval datasets:** 500-5000 cases covering the entire input distribution
+- **Full judge model:** GPT-4o, Claude Opus 4.5, or your most accurate judge
+- **Multi-metric scoring:** Accuracy, safety, tone, factuality, latency, cost per query
+- **Regression analysis:** Detailed comparison to previous production version
+- **Safety and compliance checks:** Red-team evals, jailbreak resistance, bias audits
+- **Performance benchmarks:** Latency p50/p95/p99, throughput under load
+
+Tier 3 runs:
+
+- **On merge to main branch** (after PR approval)
+- **Before production deployment** (as a release gate)
+- **On a nightly schedule** (to catch model provider updates or drift)
+
+This is where you spend the time and money to ensure nothing broken ships to users. If Tier 3 fails, the deployment is blocked until the issue is fixed.
+
+**Parallelization is critical here.** With 2000 eval cases and 5-second average latency per case, sequential execution takes 3+ hours. With 20 parallel workers, it finishes in 30 minutes.
+
+**Example Tier 3 pre-deploy gate:**
+
+```yaml
+name: AI Tier 3 Full Eval Suite
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+jobs:
+  full-eval-suite:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run full eval suite
+        run: npm run eval:full -- --parallel=20 --judge-model=gpt-4o
+      - name: Generate eval report
+        run: npm run eval:report
+      - name: Check release gate
+        run: npm run eval:release-gate -- --threshold=90
+      - name: Upload results to dashboard
+        run: npm run eval:upload-results
+```
+
+If the pass rate is below 90%, the release gate fails and the deploy is blocked.
+
+---
+
+## **When to Run Which Tier**
+
+**Every pull request: Tier 1**
+Fast, cheap, deterministic. Catches broken code before review.
+
+**Merge to main branch: Tier 1 + Tier 2**
+Ensures that code landing in main doesn't regress quality on the core golden set.
+
+**Pre-production deploy: Tier 1 + Tier 2 + Tier 3**
+Full validation before releasing to users. This is your last line of defense.
+
+**Nightly or weekly schedule: Tier 3**
+Detect drift from model provider updates or subtle data distribution shifts.
+
+**On-demand: Tier 3**
+When you suspect an issue or want to validate a major feature, manually trigger the full suite.
+
+This structure keeps PR velocity high (developers get feedback in minutes, not hours) while ensuring production changes are thoroughly validated.
+
+---
+
+## **Cost Management Strategies**
+
+Running LLM-as-Judge evals on every PR gets expensive fast. A team shipping 50 PRs per week, each running 200 eval cases, burns 10,000 judge calls per week. At $0.02 per call, that's $200/week or $10,000/year just for PR evals.
+
+**Strategy 1: Use cheaper judge models for PR checks**
+Reserve GPT-4o or Claude Opus 4.5 for pre-production Tier 3 evals. Use GPT-4o-mini, Claude 3.5 Haiku, or Gemini 1.5 Flash for PR Tier 2 checks. These models cost 10x less and are fast enough for most regression detection.
+
+**Strategy 2: Cache judge responses**
+If the eval case hasn't changed and the system output hasn't changed, reuse the previous score. Store a hash of (input, output, judge prompt) and look up cached scores before making new API calls. This works well for golden set cases that rarely change.
+
+**Strategy 3: Run full evals only on main, not PRs**
+Make PRs fast and cheap (Tier 1 only or Tier 1 + small Tier 2). Run the full golden set eval only after merge to main. This shifts cost from "per PR" to "per merge," reducing total eval volume.
+
+**Strategy 4: Sample-based PR evals**
+Instead of running all 200 golden set cases on every PR, randomly sample 50 cases. If the sample shows a regression, trigger the full suite. This reduces cost by 75% while catching most issues.
+
+**Strategy 5: Incremental eval runs**
+If a PR only changes the prompt for one feature, only run eval cases for that feature. Use dependency tracking to determine which cases are affected by the code change.
+
+**Strategy 6: Use smaller context windows**
+Judge prompts often include full conversation context. If you can truncate or summarize context without losing signal, you reduce token counts and costs.
+
+A well-optimized CI/CD eval pipeline runs under $500/month for a team shipping 50 PRs/week.
+
+---
+
+## **Parallelization for Speed**
+
+The biggest bottleneck in AI CI/CD is latency. Even with fast models, 200 sequential API calls at 3 seconds each take 10 minutes. Parallelization is mandatory.
+
+**Pattern 1: Concurrent workers**
+Spin up multiple worker processes or threads that pull eval cases from a queue and execute them in parallel. If you have 200 cases and 10 workers, each worker handles 20 cases. Total time drops to 1/10th of sequential.
+
+**Pattern 2: Batch API requests**
+Some providers support batch endpoints where you send multiple prompts in one request. This reduces overhead and speeds up execution.
+
+**Pattern 3: Async/await in code**
+Use asynchronous programming (Python `asyncio`, Node.js Promises) to send multiple requests without blocking. Fire off 50 requests, wait for all to complete, then process results.
+
+**Pattern 4: Distributed execution**
+For very large eval suites (5000+ cases), split work across multiple CI runners or use a distributed task queue (Celery, Bull, etc.). Each runner handles a subset of cases.
+
+**Infrastructure tip:** Cloud CI runners (GitHub Actions, GitLab CI, CircleCI) often have limits on parallel jobs (e.g., 5 concurrent runners on free plans). Optimize within those limits or upgrade to higher concurrency tiers.
+
+A typical setup: **4-10 parallel workers for Tier 2, 20-50 parallel workers for Tier 3.**
+
+---
+
+## **Results Reporting in Pull Requests**
+
+Developers need to see eval results before merging. The best CI/CD integrations surface quality impact directly in the PR.
+
+**Pattern 1: PR comment with summary**
+Post a comment on the PR with:
+- Overall pass rate (current vs. baseline)
+- Number of cases improved, regressed, unchanged
+- Link to detailed eval report
+- Examples of failed cases (first 3-5)
+
+Example comment:
+```
+## AI Eval Results
+Pass rate: 88% (baseline: 92%, -4%)
+Cases: 180 passed, 20 failed
+Regressions: 8 cases worse than baseline
+Improvements: 3 cases better than baseline
+
+Failed cases:
+- Case #42: Customer refund request (judge score: 3/5, expected 4+)
+- Case #89: Product recommendation (hallucinated product name)
+- Case #120: Multi-turn conversation (lost context after turn 3)
+
+Full report: [View Dashboard](https://eval-dashboard.company.com/runs/abc123)
+```
+
+**Pattern 2: GitHub status checks**
+Create a status check that shows "AI Eval: Passing" or "AI Eval: Failed" next to other CI checks. This integrates with GitHub's merge protection rules.
+
+**Pattern 3: Inline annotations**
+For code changes that affect specific prompts, post inline comments on the PR diff showing which eval cases were affected.
+
+**Pattern 4: Dashboard links**
+Link to an eval dashboard (Braintrust, Humanloop, internal tool) where developers can explore detailed results, compare outputs side-by-side, and drill into failures.
+
+The goal: **make eval results as visible and actionable as unit test failures.**
+
+---
+
+## **Handling Flaky Eval Results**
+
+Non-deterministic LLM outputs cause flaky evals. A case that passes one run might fail the next, even with no code changes. This erodes trust in the CI system.
+
+**Strategy 1: Run each case multiple times**
+Execute each eval case 3 times and take the majority vote. If 2 out of 3 runs pass, the case passes. This smooths out random variation but triples eval cost and time. Use selectively for critical cases.
+
+**Strategy 2: Set tolerance bands**
+Instead of binary pass/fail, allow a small regression margin. If the baseline pass rate is 92%, allow the new version to dip to 90% without failing. Only fail if it drops below 88%. This prevents noise from blocking PRs.
+
+**Strategy 3: Separate deterministic from stochastic checks**
+Tier 1 checks (syntax, format, keywords) should always be deterministic. Only Tier 2/3 evals with LLM-as-Judge are stochastic. If a deterministic check fails, it's a real bug. If a stochastic eval flakes, treat it as advisory.
+
+**Strategy 4: Track flake rates**
+Log which eval cases flip between pass/fail across runs. If a case is flaky more than 20% of the time, either fix the judge prompt to be more consistent or remove the case from the gating set.
+
+**Strategy 5: Use confidence intervals**
+Instead of a single score, report a 95% confidence interval. If the interval overlaps between baseline and new version, the difference might be noise. Only fail if the lower bound of the new version is below the baseline threshold.
+
+**Best practice:** Combine tolerance bands with flake tracking. Allow small regressions but investigate cases that consistently regress.
+
+---
+
+## **Infrastructure Requirements**
+
+To run AI evals in CI/CD, you need:
+
+**1. Eval runner**
+A script, CLI tool, or platform that executes eval cases, calls your AI system, scores outputs, and returns results. This could be:
+- Custom script (Python, TypeScript)
+- Open-source framework (Promptfoo, LangSmith, Eval by Anthropic)
+- Commercial platform (Braintrust, Humanloop, Patronus)
+
+**2. Golden set storage**
+A version-controlled repository of eval cases. Common formats:
+- JSON or JSONL files in the repo
+- CSV files with columns for input, expected output, tags
+- Database tables queryable by the eval runner
+
+**3. Results database**
+Store eval run results over time to track trends. Options:
+- PostgreSQL with tables for runs, cases, scores
+- Time-series database (InfluxDB, TimescaleDB)
+- Platform-provided storage (Braintrust, Humanloop)
+
+**4. CI/CD integration**
+Connect the eval runner to your CI system:
+- **GitHub Actions:** Use workflow files (`.github/workflows`)
+- **GitLab CI:** Use `.gitlab-ci.yml`
+- **CircleCI:** Use `config.yml`
+- **Jenkins:** Use pipeline scripts
+
+**5. Reporting layer**
+A way to surface results to developers:
+- PR comments via GitHub API
+- Status checks via commit status API
+- Dashboard (custom or platform)
+
+**6. Secrets management**
+Store API keys for LLM providers, judge models, and eval platforms in CI secrets (GitHub Secrets, GitLab Variables, etc.). Never commit keys to the repo.
+
+**Minimal setup:** A single GitHub Actions workflow that runs a Python script reading cases from a JSON file, calling OpenAI API, scoring with GPT-4o-mini, and posting results as a PR comment. No external platform needed.
+
+**Production setup:** Braintrust or Humanloop integration with versioned golden sets, historical result tracking, multi-environment support, and team dashboards.
+
+---
+
+## **2026 Platform and Tooling Landscape**
+
+**Braintrust CI/CD integration**
+Braintrust offers native GitHub Actions that run evals, compare to baselines, and post results to PRs. You define eval cases in Braintrust, configure the action in your repo, and get automated regression checks.
+
+**Humanloop prompt versioning with CI**
+Humanloop versions prompts and runs evals on every prompt change. Integrate with CI to block merges if a prompt version fails eval gates.
+
+**Patronus Eval-as-a-Service**
+Patronus provides managed eval infrastructure. You send eval cases via API, Patronus runs judges, and returns scores. Integrate via webhook or SDK in CI.
+
+**GitHub Actions for LLM Evals**
+Community-built actions like `llm-eval-action` or `promptfoo-action` let you add eval steps to workflows without custom scripting.
+
+**Eval-as-a-Service platforms**
+Services like Scale AI Rapid or Hugging Face Evaluation offer hosted eval runners you can call from CI. You define cases, they run judges, you get results.
+
+**Automated PR quality summaries**
+Tools like Cursor AI and Codeium integrate LLM-based code review into PRs. In 2026, these are expanding to include AI system behavior review: "This prompt change may affect tone in customer support cases—run eval?"
+
+**Integrated observability and eval**
+Platforms like LangSmith and Weights & Biases combine production monitoring with CI/CD eval. You can compare CI eval results to live production metrics in one dashboard.
+
+---
+
+## **Failure Modes and What Goes Wrong**
+
+**Failure mode 1: Eval takes too long, blocks development**
+Symptoms: PRs sit for 30+ minutes waiting for evals. Developers merge without waiting for results.
+Fix: Move slow evals to post-merge. Only run fast checks on PRs.
+
+**Failure mode 2: Evals are too expensive**
+Symptoms: Monthly eval costs exceed production inference costs.
+Fix: Use cheaper judge models, cache results, sample cases, or run evals only on main.
+
+**Failure mode 3: Flaky evals erode trust**
+Symptoms: Same code passes one run, fails the next. Developers start ignoring eval results.
+Fix: Add tolerance bands, track flake rates, remove flaky cases from gates.
+
+**Failure mode 4: Eval results are invisible**
+Symptoms: Evals run but developers never see results. No PR comments, no dashboard links.
+Fix: Surface results as PR comments and status checks. Make them as visible as unit tests.
+
+**Failure mode 5: No baseline for comparison**
+Symptoms: Eval runs report raw scores but no sense of "is this better or worse than before?"
+Fix: Store baseline scores from main branch. Compare every PR run to baseline.
+
+**Failure mode 6: Judge model updates break evals**
+Symptoms: GPT-4o updates its behavior, suddenly all scores drop 10 points.
+Fix: Pin judge model versions or use self-hosted models. Track judge model changes.
+
+**Failure mode 7: Golden set becomes stale**
+Symptoms: Golden set was curated 6 months ago and no longer covers current use cases.
+Fix: Regularly refresh golden set with production cases. Add new cases for every major feature.
+
+---
+
+## **Enterprise Expectations for AI CI/CD**
+
+**Compliance and audit trails**
+Regulated industries (finance, healthcare, legal) need records of every eval run, every score, every gate decision. Your CI/CD system must log:
+- Which code version was evaluated
+- Which eval cases ran
+- What scores were produced
+- Whether gates passed or failed
+- Who approved exceptions (if gates were bypassed)
+
+**Multi-environment support**
+Enterprises run separate evals for dev, staging, and production. Each environment may use different models, different golden sets, or different thresholds. Your CI/CD pipeline needs environment-specific configuration.
+
+**Role-based access control**
+Not all developers should be able to bypass eval gates. CI/CD systems need permissions: junior devs can view results, senior devs can override gates, only platform team can change gate thresholds.
+
+**SLA guarantees**
+If your CI/CD eval pipeline is slow or unreliable, it blocks releases. Enterprises expect SLAs: "Eval results available within 15 minutes, 99.9% uptime."
+
+**Integration with existing tools**
+Large orgs already have CI/CD systems (Jenkins, GitLab, Bitbucket Pipelines). Your AI eval solution must integrate, not replace. Use webhooks, APIs, or plugins to fit into existing workflows.
+
+---
+
+## **Template: GitHub Actions AI Eval Pipeline**
+
+```yaml
+name: AI Quality Pipeline
+on:
+  pull_request:
+    types: [opened, synchronize]
+  push:
+    branches: [main]
+
+jobs:
+  tier1-fast-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v3
+      - name: Install dependencies
+        run: npm install
+      - name: Lint prompts
+        run: npm run lint:prompts
+      - name: Validate schemas
+        run: npm run validate:schemas
+      - name: Safety keyword check
+        run: npm run check:safety
+      - name: Smoke test
+        run: npm run smoke-test
+
+  tier2-golden-set-eval:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v3
+      - name: Run golden set eval
+        env:
+          OPENAI_API_KEY: OPENAI_API_KEY_SECRET
+        run: npm run eval:golden-set -- --parallel=4 --judge=gpt-4o-mini
+      - name: Compare to baseline
+        run: npm run eval:compare
+      - name: Check gate
+        run: npm run eval:gate -- --threshold=85
+      - name: Post results to PR
+        run: npm run eval:post-pr-comment
+      - uses: actions/checkout@v3
+      - name: Run full eval suite
+        env:
+          OPENAI_API_KEY: OPENAI_API_KEY_SECRET
+        run: npm run eval:full -- --parallel=20 --judge=gpt-4o
+      - name: Check release gate
+        run: npm run eval:release-gate -- --threshold=90
+      - name: Upload results
+        run: npm run eval:upload
+```
+
+This template runs fast checks on every PR, golden set eval on PR events, and full eval on main branch merges.
+
+---
+
+## **Practical Implementation Checklist**
+
+**Week 1: Set up Tier 1 fast checks**
+- Add prompt linting to CI
+- Add output schema validation
+- Add safety keyword filter
+- Ensure all checks run in under 2 minutes
+
+**Week 2: Build golden set and Tier 2 eval**
+- Curate 50-200 golden set cases
+- Write eval runner script
+- Integrate LLM-as-Judge scoring
+- Add parallelization for speed
+- Post results to PR comments
+
+**Week 3: Add baseline comparison and gates**
+- Store baseline scores from main branch
+- Compare PR eval results to baseline
+- Enforce quality gate (fail build if pass rate drops)
+
+**Week 4: Optimize cost and speed**
+- Switch to cheaper judge model for PRs
+- Cache judge responses for unchanged cases
+- Measure eval cost per PR and optimize
+
+**Month 2: Add Tier 3 full eval suite**
+- Expand eval cases to 500+
+- Run Tier 3 on main branch and pre-deploy
+- Set up nightly scheduled runs
+- Integrate with release process
+
+**Month 3: Productionize infrastructure**
+- Move eval cases to version-controlled storage
+- Set up results database for historical tracking
+- Build eval dashboard for team visibility
+- Add flake detection and tolerance bands
+
+---
+
+## **Bridging to Chapter 12.5**
+
+You've built a CI/CD pipeline that runs eval checks on every code change, blocks regressions before they merge, and validates quality before production deploys. But even with comprehensive pre-deploy evals, there's risk: **your eval cases might not cover the edge cases that real users hit in production.** A change that passes all evals in CI might still cause issues when it meets live traffic at scale.
+
+The next layer of protection is **canary and shadow deployment.** Instead of switching 100% of traffic to the new version at once, you release it to a small percentage of users first. You run the old and new versions side-by-side, compare their outputs, and measure real user impact. If the canary shows a quality drop, you roll back before most users are affected.
+
+**Chapter 12.5 — Canary & Shadow Deployment** shows you how to safely release AI changes to production using gradual rollouts, traffic splitting, and real-time quality monitoring. You'll learn how to set up canary deploys, when to use shadow mode (new version runs but doesn't serve users), and how to automate rollback when metrics degrade. Let's build the final safety net before production.
+
+---
+
+## **Interview Q&A: CI/CD Integration for AI Quality**
+
+**Q1: Why can't I just run all my AI eval cases on every pull request like I do with unit tests?**
+
+You could, but you'd hit three walls fast. First, **speed**: if you have 500 eval cases and each takes 5 seconds (prompt + judge scoring), that's 40+ minutes per PR. Developers won't wait. Second, **cost**: every eval case burns tokens for inference and judging. At $0.02 per case, 500 cases cost $10 per PR. If you ship 50 PRs a week, that's $500/week. Third, **flakiness**: non-deterministic outputs mean the same code might pass one run and fail the next, eroding trust. Unit tests are deterministic, instant, and free to run. AI evals are stochastic, slow, and expensive. You need a tiered approach: fast checks on every PR, medium checks on merge, full suite before deploy.
+
+**Q2: What's the minimum viable AI CI/CD setup I can start with?**
+
+Start with **Tier 1 fast checks only**: add prompt linting, output schema validation, and a safety keyword filter to your existing CI pipeline. These are deterministic, run in under 2 minutes, and catch broken code before review. Once that's stable, add **Tier 2 with 20-50 golden set cases**. Write a simple script that runs those cases, scores them with a cheap judge model (GPT-4o-mini), and posts pass rate to the PR as a comment. Don't enforce gates yet—just make results visible. After a few weeks, when you trust the results, add a quality gate that fails the build if pass rate drops more than 5% below baseline. That's enough to catch most regressions without slowing down development.
+
+**Q3: How do I handle the fact that LLM outputs are non-deterministic and my evals sometimes fail randomly?**
+
+You have four strategies. **One:** set **tolerance bands** instead of hard thresholds. If your baseline pass rate is 90%, allow the new version to dip to 87% without failing. Only block the PR if it drops below 85%. This prevents noise from blocking merges. **Two:** run each case **multiple times** and take the majority vote. If a case passes 2 out of 3 runs, it passes. This smooths variation but triples cost and time, so use it selectively. **Three:** **track flake rates**. Log which cases flip between pass and fail. If a case flakes more than 20% of the time, fix the judge prompt or remove it from gating. **Four:** separate **deterministic checks** (Tier 1) from **stochastic evals** (Tier 2/3). Only fail fast on deterministic failures. Treat stochastic results as advisory unless they show consistent regression.
+
+**Q4: My AI evals cost too much—how do I reduce costs without losing coverage?**
+
+Six cost-cutting strategies. **One:** use **cheaper judge models** for PR checks. GPT-4o-mini or Claude 3.5 Haiku cost 10x less than GPT-4o and catch most regressions. Save the expensive judge for pre-production. **Two:** **cache responses**. If the eval case and output haven't changed, reuse the previous score instead of calling the judge again. **Three:** **run full evals only on main**, not every PR. Make PRs fast and cheap (Tier 1 + small Tier 2). Run the full suite after merge. **Four:** **sample cases** on PRs. Randomly pick 25% of your golden set instead of running all 200 cases. If the sample shows regression, trigger the full run. **Five:** use **smaller context windows** in judge prompts. Truncate or summarize context to reduce token counts. **Six:** run evals **only when AI-related code changes**. If a PR only touches CSS, skip evals entirely.
+
+**Q5: How do I surface eval results so developers actually pay attention to them?**
+
+Make eval results as visible as unit test failures. **Post a comment on the PR** with a summary: pass rate, number of regressions, examples of failed cases, and a link to the full report. Use **GitHub status checks** so eval results show up next to other CI checks—developers can't merge until the check is green (or they consciously override). Link to a **dashboard** (Braintrust, Humanloop, or custom) where devs can drill into failures, compare outputs side-by-side, and understand why cases failed. For code that affects specific prompts, post **inline comments** on the diff showing which eval cases were impacted. The goal is to make eval results impossible to ignore and easy to act on. If results are buried in CI logs or hidden in a separate tool, developers will merge without looking.
+
+---
+
+**End of Chapter 12.4 — CI/CD Integration for AI Quality**
+**Next: Chapter 12.5 — Canary & Shadow Deployment**
+**Part of: Chapter 12 — Regression Testing & Quality Protection**
+

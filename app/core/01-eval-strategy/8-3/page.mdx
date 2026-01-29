@@ -1,0 +1,640 @@
+# Chapter 8.3 — Tool Use Correctness
+
+A friend runs a customer service agent that handles refunds. She showed me a trace from production:
+
+User: "Cancel my order and refund it."
+
+The agent called `get_order_details` (good), then called `issue_refund` with the right order ID (good), then called `cancel_order` (wrong — order was already refunded, canceling it marks it as "user-initiated" and voids the refund tracking).
+
+Result: customer got refunded but the accounting system thought it was a cancellation, not a return. Finance spent three weeks reconciling.
+
+The agent trajectory looked fine. The final outcome — refund issued — was technically correct. But the **tool use** was wrong: right tools, wrong order. And that broke everything downstream.
+
+This is the lesson: **agents are only as good as their tool interactions.** Wrong tool, wrong parameters, wrong timing — any of these turns a "smart reasoning" problem into a "real-world damage" problem.
+
+In 2026, tool use correctness is the critical eval layer for agents. Your model might have perfect language understanding, but if it calls `delete_account` when it should call `disable_notifications`, you've shipped a liability.
+
+This chapter shows you how to evaluate tool use rigorously — not just "did it work" but "did it do the right thing, the right way, at the right time."
+
+---
+
+## 1) Why tool use is the critical agent skill
+
+Chat models produce text. Agents produce **actions**.
+
+When an agent calls a tool, something happens in the real world:
+- Money moves
+- Data gets deleted
+- Emails go out
+- Appointments get booked
+- Inventory updates
+
+**The stakes are different.** A chat hallucination is embarrassing. A tool hallucination can cost you money, violate regulations, or damage customer trust.
+
+**The 2026 reality:**
+Models are very good at language now. The bottleneck for agent quality isn't "can it understand the request" — it's "can it translate understanding into correct, safe, efficient tool calls."
+
+Tool use correctness is where agents succeed or fail in production. Your eval strategy must reflect this.
+
+---
+
+## 2) Tool selection accuracy (did it pick the right tool?)
+
+The first question: given a user request, did the agent choose the right tool?
+
+### 2.1 What "right tool" means
+
+**Correct match:**
+User says "What's my account balance?" — agent calls `get_account_balance`, not `get_transaction_history`.
+
+**Necessary tool:**
+User says "Book a flight to Paris" — agent calls `search_flights`. If it tries to answer from memory or hallucinates flight details, that's a tool selection failure.
+
+**Unnecessary tool:**
+User says "What's your refund policy?" — agent should answer from knowledge, not call `get_refund_status` (which requires an order ID).
+
+### 2.2 How to measure it
+
+Track three metrics:
+
+**Correct tool rate:**
+- Numerator: cases where agent called the expected tool
+- Denominator: all cases requiring a tool call
+- Target: 95%+ for Tier 2–3 tasks
+
+**Unnecessary tool call rate:**
+- Numerator: cases where agent called a tool but shouldn't have
+- Denominator: all cases
+- Target: below 5%
+
+**Missed required tool rate:**
+- Numerator: cases where agent should have called a tool but didn't
+- Denominator: all cases requiring a tool call
+- Target: below 3%
+
+### 2.3 Edge cases to test
+
+**Similar tools, different purposes:**
+- `cancel_order` vs `return_order` vs `refund_order` — semantically close, functionally different
+- Agent must choose based on context (order already shipped? cancel not allowed, use return)
+
+**Tool availability changes:**
+- Preferred tool is down or rate-limited — does agent fall back to an alternative, or fail gracefully?
+
+**Ambiguous requests:**
+- User says "I need help with my payment" — could mean update payment method, check payment status, or dispute a charge
+- Does agent ask for clarification before tool selection, or guess?
+
+---
+
+## 3) Parameter accuracy (right tool, wrong arguments)
+
+Choosing the right tool is necessary but not sufficient. If the agent passes wrong parameters, the tool call fails or does the wrong thing.
+
+### 3.1 Parameter types to validate
+
+**Identifiers (IDs, account numbers, order numbers):**
+- Most critical — wrong ID means operating on the wrong entity
+- Test: does agent extract the right ID from context? Does it validate format before calling?
+
+**Amounts and quantities:**
+- User says "refund half my order" — did agent calculate 50% of the total correctly?
+- User says "book 3 seats" — did agent pass quantity=3, not quantity=1?
+
+**Dates and times:**
+- User says "next Tuesday" — did agent resolve to the correct date (accounting for timezone, week boundaries)?
+- User says "3pm" — did agent pass "15:00" or "3:00"? Does the API expect UTC or local time?
+
+**Enums and constrained values:**
+- API expects `status: "active" | "inactive" | "pending"` — does agent pass a valid value, or try to pass "enabled"?
+
+### 3.2 How to evaluate parameter correctness
+
+For each tool call in your eval traces, log:
+- **Expected parameters** (from gold label or reference plan)
+- **Actual parameters** (what the agent passed)
+- **Match status** (exact match, semantic match, mismatch)
+
+Score as:
+- **Pass:** all required parameters present and correct
+- **Partial:** some parameters correct, some wrong (e.g., right order ID, wrong refund amount)
+- **Fail:** missing required parameters or critical values wrong
+
+**Enterprise default:**
+Partial = fail for Tier 2–3 tasks. You cannot half-execute a payment or account change.
+
+### 3.3 Common parameter failures
+
+**Off-by-one errors:**
+Agent parses "seat 5" as index 5 (seat 6 in zero-indexed systems).
+
+**Unit mismatches:**
+User says "refund $50" — agent passes `amount: 50` but API expects cents, so it refunds $0.50.
+
+**Locale and format issues:**
+User says "10/03/2026" — is that October 3 or March 10? Agent must infer from user's locale or ask.
+
+**Missing context resolution:**
+User says "cancel it" (referring to prior order) — agent must resolve "it" to the order ID from conversation context. If it passes a null or generic placeholder, that's a failure.
+
+---
+
+## 4) Timing and ordering (dependencies between tools)
+
+Some tools must be called in a specific order. Violating the sequence causes errors or unsafe states.
+
+### 4.1 Sequential dependencies
+
+**Example: account access workflow**
+1. `verify_identity` — must pass before step 2
+2. `get_account_details` — depends on verified identity
+3. `update_account` — depends on having fetched current state
+
+If the agent skips step 1 or calls step 3 before step 2, it either fails (if the system enforces dependencies) or creates a security/data integrity issue (if the system doesn't enforce).
+
+### 4.2 What you test
+
+**Correct ordering:**
+- Does the agent call tools in the right sequence?
+- For workflows with known dependencies (defined in 3.7), compare actual order to expected order
+
+**Dependency enforcement:**
+- If a tool requires prior state (e.g., verified session), does the agent establish that state first?
+- Test cases: force agent to start mid-sequence (no prior state) — does it backtrack to satisfy dependencies, or fail safely?
+
+**Conditional ordering:**
+- Some tools should only be called if prior tools succeeded
+- Example: don't call `send_confirmation` if `process_payment` failed
+- Test with injected failures (7.3 chaos testing) — verify agent doesn't execute downstream tools when upstream fails
+
+### 4.3 Timing constraints
+
+**Not just order, but when:**
+- Some tools should be called immediately (time-sensitive actions)
+- Some should be delayed or batched (rate limits, cost optimization)
+
+Example: user asks "what's the weather and traffic for my commute tomorrow morning?"
+- Agent should call `get_weather_forecast` and `get_traffic_forecast` in parallel (not sequential)
+- Both should use "tomorrow 8am" not "now"
+
+**What you check:**
+- Parallelizable tools are called concurrently (not blocking each other)
+- Time-sensitive parameters are resolved correctly (relative times like "tomorrow" become absolute timestamps)
+
+---
+
+## 5) Tool output interpretation (reading API responses)
+
+Even if the agent calls the right tool with right parameters, it can still fail by misinterpreting the response.
+
+### 5.1 Common misinterpretation patterns
+
+**Ignoring error signals:**
+API returns `{"status": "failed", "error": "insufficient funds"}` — agent reports "payment processed successfully" because it didn't check the status field.
+
+**Misreading nested data:**
+API returns:
+```
+{
+  "order": {"id": "12345", "status": "shipped"},
+  "refund": {"eligible": false, "reason": "already_shipped"}
+}
+```
+Agent says "your refund is being processed" because it saw the refund key, but didn't check `eligible: false`.
+
+**Confusing similar values:**
+API returns `{"available_slots": []}` (no slots) — agent says "I found several times available" because it expected the field to be null when empty, not an empty array.
+
+### 5.2 How to test it
+
+Add eval cases where:
+- Tool returns success with caveats (e.g., "order placed but delayed shipping") — does agent communicate the caveat?
+- Tool returns partial data (some fields missing) — does agent handle gracefully or hallucinate the missing info?
+- Tool returns error states — does agent correctly report the error to the user in plain language?
+
+**Evaluation rubric for output interpretation:**
+- **Correct:** agent's response accurately reflects all critical fields from tool output
+- **Partial:** agent gets main result right but misses caveats or details
+- **Incorrect:** agent contradicts the tool output or hallucinates data not present
+
+---
+
+## 6) Error handling for tool failures
+
+What happens when a tool call fails? The agent's response to failure is as important as success handling.
+
+### 6.1 The three failure modes
+
+**Tool call rejected (4xx-style errors):**
+- Bad parameters, unauthorized access, invalid request
+- Agent should: identify the issue, correct it if possible, or escalate if not
+- Should NOT: retry the same broken call repeatedly
+
+**Tool call timed out or unavailable (5xx-style errors):**
+- Service down, network issue, rate limit
+- Agent should: retry with backoff (for transient errors), fall back to alternative tool, or escalate
+- Should NOT: give up immediately on first transient failure
+
+**Tool call succeeded but returned error state:**
+- API call went through but action failed (e.g., payment declined)
+- Agent should: interpret the error, explain to user, offer next steps (update payment method, try different card)
+- Should NOT: ignore the error or retry without addressing root cause
+
+### 6.2 Eval dimensions for error handling
+
+**Does the agent detect the failure?**
+- Check logs: did agent recognize that the tool call failed?
+
+**Does the agent explain it correctly to the user?**
+- User-facing message should be clear, non-technical, actionable
+
+**Does the agent take appropriate next steps?**
+- Retry (if transient), escalate (if critical), offer alternatives (if available)
+
+**Does the agent avoid cascading failures?**
+- If step 1 fails, does step 2 (which depends on step 1) get skipped, or does agent blindly proceed?
+
+### 6.3 Test cases for error resilience
+
+**Forced timeout:**
+Mock tool returns timeout error — verify agent retries (with backoff) or escalates after max retries.
+
+**Forced auth error:**
+Mock tool returns "unauthorized" — verify agent doesn't retry (retrying bad auth is a security smell), but instead escalates or asks user to re-authenticate.
+
+**Forced business logic error:**
+Mock tool returns "account frozen" or "insufficient balance" — verify agent explains the issue and offers resolution path (unfreeze account, add funds).
+
+---
+
+## 7) Unnecessary tool calls (efficiency failures)
+
+An agent that calls tools it doesn't need wastes time, money, and API quota.
+
+### 7.1 Types of unnecessary calls
+
+**Redundant calls:**
+Agent calls `get_account_balance` twice in the same turn, even though the balance didn't change.
+
+**Information already available:**
+Agent has user's name from context but calls `get_user_profile` to fetch it again.
+
+**Over-fetching:**
+User asks "what's my account status" — agent calls `get_full_account_details` (expensive, returns 50 fields) when `get_account_status` (cheap, returns 1 field) would suffice.
+
+### 7.2 Efficiency metrics
+
+**Tool calls per task:**
+- Track average tool calls per eval case
+- Compare to baseline (minimum required calls for the task)
+- Flag cases with 2x or more extra calls
+
+**Cache hit rate (for context-aware agents):**
+- If agent has memory or session state, it should reuse prior tool results when valid
+- Track: how often does agent fetch data it already has?
+
+### 7.3 When extra calls are acceptable
+
+**Verification calls (safety-critical tasks):**
+For Tier 2–3 tasks like payments or deletions, calling `verify_identity` twice (once at start, once before final action) is acceptable overhead.
+
+**Stale data refresh:**
+If tool results expire or the agent suspects data changed (e.g., user says "I just made a payment"), re-fetching is correct.
+
+**User explicitly requests fresh data:**
+"Check again" or "refresh my balance" → agent should call the tool even if it recently fetched the same data.
+
+---
+
+## 8) Tool hallucination (inventing tools or parameters)
+
+One of the most dangerous failure modes: the agent tries to call tools that don't exist or passes impossible parameters.
+
+### 8.1 What tool hallucination looks like
+
+**Non-existent tools:**
+Agent tries to call `cancel_subscription_and_refund_full_history` — a tool that doesn't exist. It's hallucinating a combination of `cancel_subscription` and `get_refund_history`.
+
+**Non-existent parameters:**
+Tool `update_address` accepts `{street, city, state, zip}` — agent tries to pass `{street, city, state, zip, country, latitude, longitude}` because it assumed the tool would accept those fields.
+
+**Impossible values:**
+Tool expects `date` in format `YYYY-MM-DD` — agent passes `next Tuesday` as a literal string.
+
+### 8.2 Why it happens
+
+**Model training on generic tool schemas:**
+Models are trained on broad tool-use examples. They learn patterns like "refund tools usually have amount and reason parameters" but may not know your specific API's exact schema.
+
+**Schema ambiguity:**
+Tool descriptions are vague or incomplete. Model guesses at missing details.
+
+**Over-generalization:**
+Model sees `get_order` and `get_user` and assumes `get_product` exists (but it doesn't).
+
+### 8.3 How to prevent and detect it
+
+**Prevention (design-time):**
+- Provide complete, precise tool schemas in the agent's prompt or config
+- Use structured output formats (JSON schema validation) so invalid calls are rejected before execution
+- Include example tool calls in few-shot prompts
+
+**Detection (eval-time):**
+- Log all tool call attempts (including rejected ones)
+- Flag any call to a tool not in the approved list
+- Flag any call with parameters not in the tool's schema
+- Track "tool error rate" — if 10%+ of tool calls are rejected for schema violations, your agent has a hallucination problem
+
+**Enterprise practice:**
+Run a **schema compliance suite** — eval cases specifically designed to tempt the agent into hallucinating tools or parameters. Example: "Can you cancel my order and auto-rebook me for next week?" when no such combined tool exists. A correct agent either uses two tools in sequence or explains it can't do that in one step.
+
+---
+
+## 9) Multi-tool coordination (state passing between tools)
+
+Many tasks require calling multiple tools in sequence, with output from tool 1 feeding into tool 2.
+
+### 9.1 What you're testing
+
+**Correct data flow:**
+- Tool A returns `order_id: "12345"`
+- Tool B is called with `order_id: "12345"` (not a different ID, not null, not a placeholder)
+
+**State updates:**
+- Tool A updates account status to "pending"
+- Tool B checks status and sees "pending" (not stale "active" state)
+
+**Intermediate results used correctly:**
+- Tool A returns `available_slots: ["2pm", "3pm", "5pm"]`
+- Agent asks user to choose
+- User picks "3pm"
+- Tool B is called with `slot: "3pm"` (not "2pm", not all three)
+
+### 9.2 Failure modes
+
+**Lost context:**
+Agent calls tool A, gets a result, but by the time it calls tool B, it has "forgotten" tool A's output and hallucinates a value.
+
+**Wrong mapping:**
+Agent calls `search_products` (returns list of 5 products), user says "I want the second one," agent maps that to `product_id: 1` (zero-indexed) instead of the actual second product's ID.
+
+**Stale state:**
+Agent calls tool A at turn 1, user makes changes at turn 3, agent calls tool B at turn 5 using stale data from turn 1 instead of re-fetching.
+
+### 9.3 How to evaluate multi-tool coordination
+
+**End-to-end workflow tests:**
+Design eval cases that require 2–5 tool calls in sequence. Log the full tool call chain. Verify:
+- Each tool call uses correct inputs (from prior tools or user)
+- State flows forward correctly
+- No hallucinated or stale values
+
+**Inject state changes mid-workflow:**
+At turn 2, simulate a backend state change (e.g., price updated, slot taken). At turn 3, agent calls a tool — does it see the new state or stale state?
+
+**Cross-tool consistency:**
+If two tools return overlapping data (e.g., `get_order` and `get_order_status` both return order ID), verify agent uses consistent values across tools (not ID "12345" from tool A and "67890" from tool B for the same order).
+
+---
+
+## 10) Sandbox and mock environments
+
+You cannot test tool use in production without risking real-world side effects. You need **safe testing environments**.
+
+### 10.1 Sandbox vs mock
+
+**Sandbox:**
+A real instance of your tool APIs, isolated from production. Changes here don't affect real users or data.
+- Use for: integration testing, end-to-end workflow validation
+- Pros: realistic, tests actual API behavior
+- Cons: expensive to maintain, may have data staleness issues
+
+**Mock:**
+Simulated tool responses. Agent calls a tool, but instead of hitting the real API, it gets a pre-scripted response.
+- Use for: unit testing tool selection and parameter construction, testing error handling (easy to inject failures)
+- Pros: fast, cheap, full control over responses
+- Cons: may not reflect real API behavior (schema drift, edge cases)
+
+### 10.2 What to test in each environment
+
+**Mock environment (daily regression):**
+- Tool selection accuracy
+- Parameter correctness (schema validation)
+- Error handling (inject timeouts, 4xx, 5xx)
+- Tool hallucination detection
+
+**Sandbox environment (pre-release):**
+- End-to-end workflows with real API calls
+- Multi-tool coordination with live state
+- Latency and timeout behavior
+- Compatibility with API version updates
+
+**Production monitoring (post-release):**
+- Track actual tool call success/failure rates
+- Detect drift between sandbox and production behavior
+- Capture edge cases not covered in sandbox
+
+### 10.3 Designing realistic mocks
+
+**Mocks must reflect real API behavior:**
+- Same response schema as production
+- Same error types and status codes
+- Realistic latency (add artificial delays to simulate network)
+
+**Mocks should include edge cases:**
+- Empty results (no matching records)
+- Partial results (some fields missing)
+- Rate limit errors
+- Malformed requests (test agent's schema adherence)
+
+**Keep mocks in sync with production APIs:**
+- When production API schema changes, update mocks immediately
+- Run "mock vs production" validation weekly — call both with same inputs, compare outputs
+
+---
+
+## 11) 2026 tool-use benchmarks and standards
+
+### 11.1 Function calling accuracy benchmarks
+
+**Berkeley Function Calling Leaderboard (BFCL):**
+Evaluates models on multi-turn function calling, complex parameters, and parallel tool execution. Tests tool selection, parameter accuracy, and multi-tool coordination.
+
+**Gorilla API Bench:**
+Tests agents on real-world API calls (HuggingFace, TorchHub, etc.). Measures whether agent can correctly call external APIs based on natural language requests.
+
+**ToolBench:**
+16,000+ real API calls across 49 categories. Tests tool discovery, parameter inference, and error handling.
+
+### 11.2 Enterprise tool-use standards (2026)
+
+**Tool schema requirements:**
+- Every tool has a JSON schema defining parameters, types, constraints, examples
+- Every tool has error documentation (what errors can occur, what they mean, how to handle)
+
+**Tool call logging:**
+- All tool calls logged with: tool name, parameters, timestamp, response status, response body, latency
+- Logs retained for 90 days minimum (longer for Tier 2–3)
+
+**Tool call review process:**
+- Failed tool calls reviewed weekly
+- Schema violations trigger alerts
+- Tool call efficiency metrics tracked (calls per task, redundancy rate)
+
+**Tool versioning:**
+- Tools have versions (v1, v2)
+- Agents specify which version they're calling
+- Deprecated tools return clear "deprecated" errors with migration guidance
+
+---
+
+## 12) Failure modes and enterprise expectations
+
+### 12.1 Failure modes
+
+**"Agent calls the wrong tool but outcome looks OK"**
+Example: user asks for account balance, agent calls `get_transaction_history` and extracts balance from the last transaction. Works until the transaction list is empty or balance changed since last transaction.
+
+**Root cause:** tool selection not validated, only final outcome checked.
+
+**Fix:** evaluate tool selection explicitly (expected tool vs actual tool), not just final answer.
+
+---
+
+**"Agent passes parameters in wrong format, tool fails silently"**
+Example: API expects `{"amount": 5000}` (cents), agent passes `{"amount": 50.00}` (dollars as float). API coerces to int, charges 50 cents instead of $50.
+
+**Root cause:** weak typing in API, agent doesn't validate units.
+
+**Fix:** add schema validation on agent side before calling tool. Test with unit mismatches explicitly.
+
+---
+
+**"Agent retries a bad tool call 20 times, burns API quota"**
+Example: agent calls tool with invalid ID, gets 400 error, retries immediately (no backoff), repeats until quota exhausted.
+
+**Root cause:** no retry logic differentiation (transient vs permanent errors).
+
+**Fix:** classify errors (retryable vs non-retryable). Add max retry limits. Test with forced 4xx errors (should not retry) and 5xx errors (should retry with backoff).
+
+---
+
+**"Agent uses stale tool results, acts on outdated information"**
+Example: agent fetches account status at turn 1 ("active"), user says "I just canceled" at turn 3, agent tries to charge at turn 5 using "active" status from turn 1.
+
+**Root cause:** agent caches tool results but doesn't invalidate when context changes.
+
+**Fix:** add cache invalidation rules. Re-fetch critical data before high-stakes actions. Test with mid-conversation state changes.
+
+---
+
+### 12.2 Enterprise expectations
+
+**Tool use is a first-class eval dimension:**
+Serious teams evaluate tool use separately from language quality. A correct answer via wrong tool call is a fail.
+
+**Schema enforcement is mandatory:**
+Before any tool call reaches production, it passes schema validation. Invalid calls are rejected at the agent layer, not the API layer.
+
+**Tool call traces are first-class debugging artifacts:**
+Every production issue starts with reviewing the tool call log. Teams can answer: what tools were called, in what order, with what parameters, and what did they return?
+
+**Tool efficiency is tracked:**
+Metrics include: average tool calls per task, redundant call rate, tool error rate. These are monitored alongside quality metrics.
+
+**Tool-use regressions block releases:**
+If tool selection accuracy drops below threshold (e.g., 95%), the release is blocked — even if final answer quality looks fine.
+
+---
+
+## Template: Tool-Use Eval Case
+
+```
+tool_use_eval_case:
+  id: "refund_001"
+  task: "Process refund for order #12345"
+  user_input: "I need a refund for order 12345"
+
+  expected_tools:
+    - tool: "get_order_details"
+      parameters:
+        order_id: "12345"
+      expected_response:
+        status: "delivered"
+        amount: 5000  # cents
+        refund_eligible: true
+
+    - tool: "issue_refund"
+      parameters:
+        order_id: "12345"
+        amount: 5000
+        reason: "customer_request"
+      expected_response:
+        refund_id: "R789"
+        status: "processed"
+
+  scoring:
+    tool_selection:
+      - correct_tools_called: true
+      - no_extra_tools: true
+      - no_missed_tools: true
+
+    parameter_accuracy:
+      - all_required_params_present: true
+      - all_params_correct_values: true
+      - correct_param_types: true
+
+    ordering:
+      - correct_sequence: true  # get before issue
+      - dependencies_satisfied: true
+
+    output_interpretation:
+      - agent_response_reflects_refund_success: true
+      - agent_communicates_refund_id: true
+
+    error_handling:
+      - handles_order_not_found: "escalate"
+      - handles_not_refund_eligible: "explain_to_user"
+      - handles_api_timeout: "retry_with_backoff"
+
+  risk_tier: 2
+  difficulty: normal
+```
+
+---
+
+## Interview Q&A
+
+**Q: How do you evaluate whether an agent is using tools correctly?**
+
+A: I break tool use into five dimensions: tool selection (right tool for the task), parameter accuracy (right arguments), timing and ordering (dependencies satisfied), output interpretation (agent correctly reads API responses), and error handling (graceful failures). For each eval case, I define the expected tool calls — which tools, which parameters, in what order — and compare the agent's actual calls against that gold standard. I test not just success cases but forced failures, to verify the agent retries transient errors and escalates permanent ones. Tool use is a first-class eval dimension — a correct answer via the wrong tool is a fail.
+
+---
+
+**Q: What's the most common tool-use failure you see in production agents?**
+
+A: Parameter errors. The agent picks the right tool but passes wrong arguments — wrong ID, wrong amount, wrong date format, wrong units. This happens because tool schemas are often ambiguous or incomplete, and the model guesses. The fix is strict schema validation on the agent side before calling any tool, and testing with parameter edge cases: wrong types, missing fields, boundary values. I also see ordering issues — calling tools in the wrong sequence, like processing payment before verifying the user's identity. Testing dependency enforcement explicitly catches this.
+
+---
+
+**Q: How do you test tool use without affecting production systems?**
+
+A: I use mocks for fast iteration and schema validation — simulated tool responses let me test tool selection, parameter construction, and error handling in isolation. Then I use a sandbox environment for end-to-end integration tests — real APIs, isolated from production data. Mocks are great for injecting failures and edge cases, but they can drift from production, so I keep them in sync by comparing mock and production schemas weekly. I also run "dry-run" evals in production where the agent plans tool calls but doesn't execute them, logging what it would have done for later review.
+
+---
+
+**Q: How do you prevent agents from calling tools they don't need?**
+
+A: I track tool call efficiency — average calls per task, redundant call rate. I compare actual calls to the minimum required for the task. If the agent calls a tool twice when once is enough, or fetches full account details when it only needs account status, that's an efficiency failure. I test cases where information is already in context — if the agent has the user's name but calls `get_user_profile` to fetch it again, that's a fail. For safety-critical tasks I allow redundant verification calls, but for routine tasks, unnecessary calls are waste. I report efficiency alongside correctness — a slow, expensive agent is a problem even if it's accurate.
+
+---
+
+**Q: What happens when an agent tries to call a tool that doesn't exist?**
+
+A: That's tool hallucination — the agent invents a tool or parameter. It happens when tool schemas are incomplete or the model generalizes from training data. Prevention: provide complete, precise schemas in the agent's config, and use structured output validation to reject invalid calls before execution. Detection: log all tool call attempts, including rejected ones, and flag anything that doesn't match the approved tool list. I run a schema compliance suite with cases designed to tempt hallucination — like "cancel and rebook in one step" when no such combo tool exists. A good agent either uses two tools in sequence or explains it can't do it atomically. If hallucination rate is above 2%, the agent needs better tool grounding.
+
+---
+
+Tool use correctness is the bridge between "the agent understands" and "the agent does the right thing." Get this right, and your agents become reliable. Get it wrong, and every deployment is a liability.
+
+Next, in **Chapter 8.4**, we'll cover **Planning Quality** — evaluating whether agents break down complex goals into sound, executable plans.

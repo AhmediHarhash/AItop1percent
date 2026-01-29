@@ -1,0 +1,568 @@
+export const metadata = {
+  title: "Sandbox & Environment Design | AI Top 1%",
+  description: "Chapter 8.7 — How to build safe, realistic test environments for evaluating agents that take real-world actions.",
+  date: "2026-01-29",
+  authors: ["AI Top 1%"],
+}
+
+# 8.7 Sandbox & Environment Design
+
+## The Rehearsal Stage
+
+A theater company is preparing for opening night of a complex play with live pyrotechnics, a rotating stage, and actors flying on wires. The director has a choice: rehearse the stunt sequences in the actual theater with all the real equipment, or practice in a bare room with tape on the floor marking where things will be.
+
+The bare room is safe and cheap, but actors won't learn how the harness actually feels or how to time their movements with the rotating stage. The full theater setup is realistic, but one mistake during rehearsal could injure someone or burn down the venue before opening night.
+
+The solution? A **rehearsal stage** that mirrors the real theater's dimensions and key equipment, with safety measures the real show won't have—crash mats under the wires, fire extinguishers everywhere, a kill switch that stops the stage rotation instantly.
+
+This is the central challenge of **agent sandbox design**. When your AI agent books calendar appointments, charges credit cards, or deploys infrastructure, you cannot safely evaluate it in production. But if your test environment is too simplified—the equivalent of tape on a floor—your evaluations won't catch real-world failure modes. You need an environment realistic enough to surface true bugs, but safe enough that failures don't cause actual damage.
+
+This chapter covers how to build test environments for agents that take real-world actions—from simple API mocks to full production-mirror sandboxes.
+
+---
+
+## The Sandbox Imperative
+
+Let's be direct: **you cannot evaluate action-taking agents in production without risking real harm**. If your agent can send emails, it might spam your entire customer list during a bad eval run. If it can modify a database, a logic error could corrupt real user data. If it calls a payment API, you might charge real credit cards thousands of times while testing retry logic.
+
+The fundamental rule: **agents under evaluation must run in isolated environments where their actions have no real-world consequences**.
+
+This sounds obvious, but it's violated constantly. Common anti-patterns:
+
+- Testing an email agent by sending to your personal inbox (works until the agent loops and sends 10,000 emails)
+- Evaluating a cloud infrastructure agent in a "test" AWS account that still has production access via IAM roles
+- Running a trading agent on a "paper trading" API that isn't actually isolated from live market data feeds
+- Testing a customer support agent on real tickets marked with a "test" tag (but the agent can still see and modify real customer data)
+
+The **sandbox imperative** says: build a separate environment where agent actions are either mocked (fake responses) or truly isolated (real systems that are completely disconnected from production).
+
+The challenge is doing this while maintaining enough realism that your evals are meaningful.
+
+---
+
+## Three Levels of Environment Fidelity
+
+Agent test environments exist on a spectrum of realism and isolation:
+
+**Level 1: Mocks (Fake Responses)**
+
+The agent calls APIs, but instead of reaching real services, requests are intercepted and return pre-written fake responses. The agent thinks it's booking a calendar slot, but it's really just receiving a JSON response you scripted.
+
+*Advantages:* Completely safe, zero cost, deterministic (same inputs always produce same outputs), fast, easy to set up.
+
+*Disadvantages:* Not realistic—the mock might not match real API behavior, edge cases, error modes, or timing. False confidence.
+
+**Level 2: Sandboxes (Isolated Real Systems)**
+
+The agent interacts with real services (real database, real email server, real payment processor), but these services are isolated instances that don't touch production data or users. A real Postgres database running in a Docker container with test data. A real Stripe account in test mode with fake card numbers.
+
+*Advantages:* Realistic—the agent experiences real API behavior, latency, errors. Catches integration bugs mocks miss.
+
+*Disadvantages:* More expensive to set up and maintain. Requires infrastructure. State management complexity (if agent modifies the database, you need to reset it between runs).
+
+**Level 3: Staging (Production-Like Environment)**
+
+A complete mirror of your production environment—same infrastructure, same data (scrubbed of PII), same third-party integrations. The agent runs in an environment virtually indistinguishable from production, but isolated via network rules, separate API keys, or feature flags.
+
+*Advantages:* Maximum realism. Catches subtle bugs that only appear in production-like conditions (scale, data diversity, integration complexity).
+
+*Disadvantages:* Expensive to maintain. Complex to keep in sync with production. Risk of accidental production access if isolation breaks.
+
+The art of sandbox design is **choosing the right fidelity level for your risk tolerance and budget**. A calendar booking agent might be fine with Level 1 mocks. A medical diagnosis agent that writes prescriptions needs Level 3 staging. A financial trading agent might need Level 2 sandboxes for development and Level 3 staging for final validation.
+
+Most mature agent systems use **all three levels**: mocks for fast iteration during development, sandboxes for integration testing, staging for pre-production validation.
+
+---
+
+## Mock Design Principles
+
+Mocks are deceptively hard to get right. The failure mode is **oversimplified mocks that pass evaluation but fail in production**.
+
+Example: You're testing an agent that books restaurant reservations via an API. Your mock returns:
+
+```yaml
+status: success
+reservation_id: "12345"
+time: "7:00 PM"
+party_size: 4
+```
+
+Your agent passes all evals. Then in production, it fails constantly because the real API sometimes returns:
+
+```yaml
+status: partial_success
+reservation_id: "12345"
+time: "7:15 PM"  # Restaurant pushed the time 15 min later
+party_size: 4
+note: "We can only offer a table for 90 minutes due to a later booking"
+```
+
+Your mock didn't include the `partial_success` status or the time negotiation or the time limit note. Your agent never learned to handle these cases.
+
+**Realistic mock design principles:**
+
+1. **Base mocks on real API responses**—capture actual responses from production APIs (via logging, proxy tools, or API documentation examples) and use those as mock templates.
+
+2. **Include error cases**—your mock should sometimes return errors (404, 500, timeout, rate limit) with the same error formats the real API uses.
+
+3. **Match real API validation**—if the real API rejects requests with missing fields or invalid formats, your mock should too.
+
+4. **Simulate realistic latency**—don't return instantly. Add realistic delays (50-500ms for typical APIs, 2-10 seconds for slow external services).
+
+5. **Version your mocks**—when the real API changes, update mocks to match. Track mock versions alongside API versions.
+
+A good practice: **record real API interactions in production and replay them as mocks**. Tools like VCR (Ruby), Polly (JavaScript), or HTTP mock servers can record real traffic and replay it in tests, ensuring mocks match reality.
+
+---
+
+## Deterministic vs Stochastic Mocks
+
+Should your mock always return the same response for the same input (**deterministic**)? Or should it vary (**stochastic**)?
+
+Deterministic mocks make debugging easier—if an eval fails, you can reproduce it exactly. This is essential for regression testing (Chapter 12) and debugging specific failure modes.
+
+But deterministic mocks can create **brittle agents that only work for the exact scenarios you mocked**. The agent learns to expect exactly one response pattern and fails when reality varies.
+
+**Stochastic mocks** introduce controlled randomness:
+
+- Sometimes return success, sometimes return errors (e.g., 95% success rate)
+- Vary response times (50ms to 5 seconds)
+- Return different valid responses (if an API can return data in multiple valid formats)
+- Occasionally return edge cases (empty lists, maximum-length strings, special characters)
+
+This trains the agent to be **robust to real-world variability** and catches bugs in error handling, retry logic, and edge case handling.
+
+Best practice: **use deterministic mocks for regression tests, stochastic mocks for robustness testing**. Your eval suite should include both:
+
+- A deterministic suite that runs on every commit, catching regressions
+- A stochastic suite that runs nightly or weekly, catching robustness issues
+
+Stochastic mocks are particularly important for **chaos testing** (Chapter 8.5)—you want to inject random failures to see how the agent handles them.
+
+---
+
+## Error Injection in Sandboxes
+
+Real-world systems fail constantly. APIs timeout. Databases deadlock. Networks drop packets. If your sandbox never fails, your agent won't learn to handle failures gracefully.
+
+**Error injection** is the practice of deliberately programming your sandbox to fail in realistic ways:
+
+- **API errors:** Return 500 errors, 429 rate limits, 503 service unavailable
+- **Timeouts:** Delay responses indefinitely or close connections mid-request
+- **Partial failures:** Return incomplete data (e.g., missing required fields)
+- **Transient errors:** Fail the first attempt but succeed on retry
+- **Cascading failures:** If service A fails, service B (which depends on A) should also fail
+- **Data corruption:** Return valid JSON but with nonsensical values
+- **Authentication failures:** Reject valid credentials randomly
+
+In sandboxes (Level 2), you can inject these errors via **chaos engineering tools**:
+
+- **Proxies:** Route agent traffic through a proxy (e.g., Toxiproxy, Chaos Proxy) that randomly injects latency, errors, or connection failures
+- **Failure flags:** Add configuration to your sandbox services that triggers specific failure modes on demand
+- **Time manipulation:** Speed up or slow down time to test timeout handling
+- **Resource exhaustion:** Limit CPU, memory, or disk to simulate resource contention
+
+Example: Your agent calls a search API. Your sandbox runs a real instance of that API, but behind a chaos proxy configured to:
+
+- Add 0-5 second latency to 20% of requests
+- Return 429 rate limit errors on 5% of requests
+- Timeout (no response) on 2% of requests
+- Return valid but empty results on 10% of requests
+
+Now your agent must handle all these cases. If it doesn't retry on 429s, doesn't timeout gracefully, or crashes on empty results, your evals will catch it before production does.
+
+This is directly related to **chaos testing** (Chapter 8.5), but applied specifically to the evaluation environment rather than production.
+
+---
+
+## State Management in Test Environments
+
+Agents often interact with stateful systems: databases, calendars, inventory systems, conversation histories. Your sandbox must **maintain state across agent interactions**, or your evals won't be realistic.
+
+Example: You're testing a customer support agent. First interaction: customer asks to return an item. Agent creates a return request in the system. Second interaction: customer asks for return status. Agent should retrieve the return request created earlier.
+
+If your sandbox doesn't maintain state, the second interaction will fail—there's no return request to retrieve.
+
+**State management requirements:**
+
+1. **Persistent state within an eval run**—if an agent performs multiple actions in one evaluation, those actions should affect subsequent actions (e.g., booking a calendar slot makes that slot unavailable for later bookings).
+
+2. **Isolated state across eval runs**—one eval run shouldn't affect another (if eval A fills the calendar, eval B shouldn't see a full calendar).
+
+3. **Deterministic initial state**—every eval run should start from the same known state (same database records, same available slots, same user data).
+
+4. **State inspection for assertions**—you need to inspect the final state to verify the agent did what it was supposed to (did it actually add the database record? Did it send the email?).
+
+Common approaches:
+
+**Transaction rollback:** Run each eval in a database transaction and roll back at the end. Works for databases but not for external APIs or file systems.
+
+**Snapshot and restore:** Take a snapshot of the environment state before each eval, restore it afterward. Works for virtual machines, Docker containers, database backups.
+
+**Clean slate rebuild:** Tear down and rebuild the entire environment for each eval. Slowest but most reliable.
+
+**Isolated namespaces:** Use separate databases, API namespaces, or user accounts for each eval run. Fastest but requires careful setup to ensure true isolation.
+
+For **multi-agent evals** (Chapter 16) or **multi-turn evals** (Chapter 8.6), state management is critical—agents must see the effects of each other's actions, and conversation state must persist across turns.
+
+---
+
+## Environment Reset and Reproducibility
+
+After an eval run, the sandbox must be **reset to a known state** for the next run. Otherwise, evals become non-reproducible—eval B might pass or fail depending on what eval A did.
+
+**Reproducibility** is essential for:
+
+- **Debugging failures**—if an eval fails, you need to rerun it in exactly the same conditions to debug
+- **Regression testing**—if you fix a bug, you need to verify the fix by rerunning the same eval
+- **A/B testing**—if you compare two agent versions, they must run in identical environments
+
+Reproducibility challenges:
+
+**Non-deterministic timing:** Agent actions might depend on timestamps, random IDs, or race conditions. Solutions: freeze time in tests, use deterministic UUIDs, serialize concurrent operations.
+
+**External dependencies:** If your sandbox calls real external APIs (weather, stock prices, etc.), those APIs might return different data on different runs. Solutions: record and replay API responses, use mocks for external data.
+
+**Random seeds:** If your agent uses LLMs with temperature greater than 0, responses will vary. Solutions: set temperature to 0 for deterministic evals, or use fixed random seeds (though many LLM APIs don't support this reliably).
+
+**State leakage:** If the sandbox shares infrastructure with other systems, state from those systems might leak in. Solutions: use fully isolated infrastructure, containerization, network segmentation.
+
+Best practice: **treat your eval environment as infrastructure-as-code**. Define the entire environment (database schemas, initial data, service configurations) in version-controlled code (Terraform, Docker Compose, Kubernetes manifests). This ensures:
+
+- Every developer can reproduce the exact eval environment locally
+- CI/CD systems run evals in the same environment
+- You can diff changes to the environment over time
+- Rolling back to an old agent version also rolls back to its eval environment
+
+---
+
+## Realistic User Simulation
+
+Many agents interact with users—chatbots, assistants, customer support agents, sales agents. Evaluating these agents requires **simulating realistic user behavior**.
+
+Simple approach: write scripted user inputs ("Book a table for 4 at 7pm"). This works for basic evals but misses realistic variability—real users make typos, change their mind, ask clarifying questions, get frustrated.
+
+Advanced approach: **LLM-powered user simulators** with personas.
+
+Example: You're evaluating a travel booking agent. Your user simulator is an LLM prompted with:
+
+```yaml
+You are Sarah, a busy professional booking a vacation.
+Personality: Decisive but detail-oriented, asks follow-up questions
+Goal: Book a 5-day trip to Tokyo for 2 people in March
+Constraints: Budget $3000, needs vegetarian restaurant recommendations
+Behavior: If the agent makes a mistake, politely correct it
+If the agent is unclear, ask for clarification
+```
+
+Now you run the booking agent against this simulated user. The conversation is realistic—Sarah asks questions the agent didn't anticipate, corrects misunderstandings, requests changes. Your eval catches failure modes that scripted inputs would miss.
+
+**Persona-based user simulation** is powerful for:
+
+- **Multi-turn evaluations** (Chapter 8.6)—simulated users hold conversations over many turns
+- **Stress testing**—simulate difficult users (impatient, confused, adversarial)
+- **Diversity testing**—simulate users with different backgrounds, languages, expertise levels
+- **Goal-oriented evals**—measure whether the agent helps the user achieve their goal, not just whether it gives correct responses
+
+Implementation approaches:
+
+**Simple prompting:** Give an LLM a persona prompt and have it respond to the agent's messages. Works for basic cases.
+
+**Structured personas:** Define personas as data (personality traits, goals, knowledge, behavior rules) and use an LLM to generate responses consistent with that data. More control.
+
+**Learned personas:** Train a model on real user conversations to generate realistic user behavior. Most realistic but requires data.
+
+**Hybrid human-AI:** Have humans play users for critical evals, use AI for bulk testing. Balances realism and scale.
+
+By 2026, **LLM-powered user simulation frameworks** are mature—tools like SimuLLM, PersonaGen, and AgentSim provide pre-built persona libraries and conversation orchestration. You can simulate hundreds of diverse users interacting with your agent in parallel, catching edge cases that would take months of production traffic to surface.
+
+This is particularly important for **human-in-the-loop evals** (Chapter 8.8), where you want to simulate realistic human behavior before testing with actual humans.
+
+---
+
+## Cost and Complexity Trade-offs
+
+More realistic environments cost more to build and maintain. The question is: **how much realism do you need?**
+
+**Cost dimensions:**
+
+- **Infrastructure costs:** Running sandbox databases, APIs, services (especially at scale)
+- **Engineering time:** Building mock systems, maintaining environment-as-code, debugging sandbox-specific bugs
+- **Operational overhead:** Resetting environments, managing test data, updating mocks when real APIs change
+- **LLM costs:** If using LLM-powered user simulators, you're paying for inference on every eval run
+
+**Complexity dimensions:**
+
+- **Setup complexity:** How hard is it to get a new engineer running evals locally?
+- **Maintenance burden:** How often do sandbox environments break or drift from production?
+- **Debugging difficulty:** When an eval fails, how hard is it to reproduce and debug?
+
+**Choosing the right fidelity:**
+
+**High-risk agents** (medical, financial, safety-critical): Invest in high-fidelity staging environments (Level 3). The cost of a production failure far exceeds the cost of realistic testing. Example: an agent that writes medical prescriptions should be tested in an environment that mirrors real EHR systems, pharmacy integrations, and drug interaction databases.
+
+**Medium-risk agents** (customer support, sales, data analysis): Use sandboxes (Level 2) for integration testing, mocks (Level 1) for fast iteration. Example: a customer support agent can be developed against mocks but validated against a sandbox that includes a real instance of your ticketing system with test data.
+
+**Low-risk agents** (internal tools, data retrieval, non-destructive operations): Mocks (Level 1) are often sufficient, with occasional sandbox testing for major changes. Example: an agent that answers questions by searching internal docs can be tested with mocked search results.
+
+A common pattern: **start with mocks, upgrade to sandboxes as the agent matures**. Early in development, you're iterating quickly and mocks are enough. As you approach production, invest in sandbox infrastructure to catch integration bugs.
+
+Another pattern: **tiered eval suites**. Fast mocked evals run on every commit (minutes). Slower sandbox evals run on every PR (hours). Full staging evals run nightly or before releases (days).
+
+---
+
+## Production Monitoring as Shadow Evaluation
+
+An alternative to pre-production sandboxes: **run the agent in production, but don't let its actions take effect**.
+
+**Shadow mode:** The agent runs alongside production systems, receiving the same inputs and making the same decisions, but its outputs are logged rather than executed. Human operators review the logs to see what the agent would have done.
+
+**Canary deployment:** The agent runs in production for a small percentage of real traffic (e.g., 1%), with human oversight. If it performs well, gradually increase the percentage.
+
+**Human-in-the-loop:** The agent proposes actions, but a human must approve them before they execute (Chapter 8.8).
+
+This approach offers **maximum realism**—the agent experiences real production data, real user behavior, real edge cases. It's particularly valuable for catching issues that artificial sandboxes miss.
+
+But it has risks:
+
+- **Privacy/security:** The agent sees real user data, real credentials, real sensitive information. Even if actions don't execute, there's risk of data leakage, logging sensitive data, or security vulnerabilities.
+- **Partial failures:** Even in shadow mode, the agent might trigger side effects (e.g., external API calls for read-only operations, cache warming, resource consumption).
+- **Human bottleneck:** Reviewing agent decisions at scale requires significant human time.
+
+Shadow mode works best for **gradual agent rollout** (Chapter 25)—you've validated the agent in sandboxes, now you're validating it in production before giving it full autonomy.
+
+Example: You've built an agent that automatically triages customer support tickets. Instead of immediately deploying it, you run it in shadow mode—for every incoming ticket, the agent decides how to triage it, but a human triages the ticket manually. You log both decisions and compare them. After a week, if the agent agrees with humans 95% of the time and its disagreements are minor, you promote it to canary mode—it triages 5% of real tickets, with human review. After another week of good performance, you give it full autonomy.
+
+This is **production monitoring as continuous evaluation**—every production decision is an eval run, with metrics tracked in real-time (Chapter 11).
+
+---
+
+## 2026 Sandbox Patterns
+
+By 2026, agent sandbox tooling has matured significantly:
+
+**Containerized agent sandboxes:** Entire agent environments packaged as Docker containers or Kubernetes pods, with infrastructure-as-code definitions. Spin up a fresh sandbox in seconds, tear it down after eval, zero state leakage. Tools like AgentBox, SandboxKit, and EvalEnv provide templates for common agent types (web agents, database agents, API agents).
+
+**OSUniverse-style browser environments:** For agents that interact with web UIs (browser automation, web scraping, GUI testing), sandboxes now include full browser environments with realistic rendering, JavaScript execution, and user interaction simulation. Based on tools like Playwright, Puppeteer, and OSWorld, but extended for AI agents. The agent operates a real browser in a containerized environment, with every action logged and the environment reset after each eval.
+
+**Tool-use simulation frameworks:** Instead of mocking individual APIs, frameworks like ToolSim and AgentGym provide **realistic simulations of entire tool ecosystems**. The agent can call file system operations, database queries, API requests, and shell commands—all simulated with realistic behavior, errors, and state management, but completely isolated from real systems.
+
+**Cloud-native agent test environments:** Major cloud providers (AWS, GCP, Azure) now offer **managed agent sandbox services**—pre-configured environments for testing agents that interact with cloud resources (compute, storage, databases, ML services). These environments include automatic error injection, cost tracking, and isolation guarantees. You can spin up a full AWS-like environment for your agent, run evals, and tear it down, paying only for eval duration.
+
+**Hybrid sandbox-production:** Some orgs run agents in production with **runtime safety constraints** (Chapter 25)—the agent can take real actions, but the environment enforces hard limits (rate limits, spend caps, approval requirements). This allows realistic evaluation while limiting blast radius.
+
+**Realistic data generation:** Tools like SynthAgent and DataGen use LLMs to generate realistic test data that matches production distributions—realistic user names, addresses, queries, edge cases—at scale. This solves the problem of sandbox data being too clean or too simple compared to production.
+
+---
+
+## Failure Modes and Risks
+
+Common sandbox design failures:
+
+**Over-simplified mocks:** Mocks that don't match real API behavior, creating false confidence. The agent passes all evals but fails in production.
+
+**Sandbox drift:** The sandbox environment diverges from production over time (different library versions, configuration drift, stale test data). Evals stop being predictive of production behavior.
+
+**State leakage:** Evals affect each other because the sandbox doesn't properly reset state. Non-reproducible failures.
+
+**False negatives:** The sandbox is too strict or unrealistic, causing evals to fail even though the agent would work fine in production. Teams lose confidence in evals.
+
+**Cost explosion:** High-fidelity sandboxes that cost thousands of dollars per eval run, making evals prohibitively expensive at scale.
+
+**Security vulnerabilities:** Sandbox isolation breaks, allowing the agent to access production systems or exfiltrate data.
+
+**Human review bottleneck:** Shadow mode evals require human review at a scale that's unsustainable.
+
+Prevention strategies:
+
+- **Automate sandbox validation:** Regularly test that your sandbox matches production behavior (run the same queries against both, compare results)
+- **Version control everything:** Environment configs, test data, mocks—all version-controlled and tied to agent versions
+- **Monitor sandbox costs:** Track infrastructure and LLM costs per eval, optimize hot paths
+- **Penetration test sandboxes:** Red team your sandbox isolation to ensure agents can't escape
+- **Invest in reset automation:** Make environment reset fast and reliable, enabling high eval velocity
+- **Balance fidelity and cost:** Use mocks for fast feedback, sandboxes for integration testing, staging for final validation
+
+---
+
+## Enterprise Expectations
+
+In regulated industries (healthcare, finance, government), sandbox design carries compliance requirements:
+
+**Audit trails:** Every agent action in the sandbox must be logged with timestamps, inputs, outputs, and decisions. Auditors need to reconstruct exactly what happened in an eval run.
+
+**Data privacy:** Even test data must be handled with care. If your sandbox uses production data (even scrubbed), you need privacy controls equivalent to production.
+
+**Isolation guarantees:** Enterprise security teams require formal verification that sandboxes cannot access production systems. Network segmentation, separate credentials, separate cloud accounts.
+
+**Reproducibility requirements:** For regulatory approval, you must demonstrate that evals are reproducible—running the same eval twice produces the same result (within acceptable variance for stochastic components).
+
+**Human oversight:** In high-stakes domains, evals may require human sign-off—an engineer must review every eval run before the agent is promoted to production.
+
+**Third-party audits:** External auditors may need to verify your sandbox design, run their own evals, and certify that your eval process is rigorous.
+
+**Change control:** Changes to sandbox environments must go through change control processes similar to production changes—approval, review, rollback plans.
+
+These requirements make sandbox design significantly more complex. Many enterprises build **dedicated eval infrastructure teams** responsible for maintaining sandbox environments, ensuring compliance, and supporting agent teams (Chapter 19).
+
+---
+
+## Sandbox & Environment Design Template
+
+Here's a template for documenting your agent sandbox strategy:
+
+```yaml
+Agent: [Name]
+Risk Level: [Low / Medium / High]
+
+Environment Strategy:
+  Development:
+    Type: [Mocks / Sandbox / Staging]
+    Fidelity: [Description of realism level]
+    Reset Strategy: [How environment is reset between runs]
+    Cost: [Estimated monthly cost]
+
+  CI/CD:
+    Type: [Environment type for automated evals]
+    Runs: [On every commit / PR / nightly]
+    Duration: [Expected eval duration]
+
+  Pre-Production:
+    Type: [Staging / Shadow mode / Canary]
+    Traffic: [Percentage of production traffic, if applicable]
+    Review: [Human review requirements]
+
+State Management:
+  Persistence: [How state is maintained during evals]
+  Isolation: [How state is isolated between evals]
+  Initial State: [How initial state is defined]
+  Inspection: [How final state is verified]
+
+Error Injection:
+  - [Error type 1, e.g., API timeouts]
+  - [Error type 2, e.g., rate limits]
+  - [Error type 3, e.g., invalid data]
+
+User Simulation:
+  Approach: [Scripted / LLM-powered / Hybrid / Human]
+  Personas: [Number and types of user personas]
+  Complexity: [Single-turn / Multi-turn conversations]
+
+Reproducibility:
+  Deterministic: [Yes / Partial / No]
+  Seed Control: [How randomness is controlled]
+  Version Control: [What is version-controlled]
+
+Compliance:
+  Audit Logging: [Yes / No, details]
+  Data Privacy: [Controls in place]
+  Isolation Verification: [How isolation is verified]
+```
+
+---
+
+## Interview: Sandbox & Environment Design
+
+**Q1: We're building an agent that books calendar appointments via API. How should we design the sandbox?**
+
+Start with **Level 1 mocks** for fast iteration during development. Your mock should return realistic responses based on the actual calendar API documentation—include success cases, error cases (slot already booked, invalid time), and edge cases (all-day events, recurring appointments, time zones). Add realistic latency (100-300ms).
+
+Once the basic logic works, upgrade to a **Level 2 sandbox**—a real calendar service (could be a test Google Calendar account, or a self-hosted calendar server). This catches integration bugs mocks miss—authentication issues, rate limits, timezone handling, API versioning.
+
+For state management, reset the calendar to a known state before each eval (delete all test appointments, add a standard set of existing appointments). Use **deterministic test data**—same initial appointments, same available slots, same user preferences—so evals are reproducible.
+
+Add **error injection**—configure your sandbox to occasionally return 429 rate limits or 503 service unavailable errors, to verify the agent handles them gracefully.
+
+If the agent interacts with users, add **basic user simulation**—a script that makes typical requests ("book me at 2pm tomorrow") and some edge case requests ("book me as soon as possible" or "I need to reschedule my 3pm to 4pm").
+
+As you approach production, run **shadow mode**—let the agent decide what appointments to book on real user requests, but don't actually execute the bookings. Log the decisions and compare them to what users actually wanted. This catches real-world complexity your sandbox missed.
+
+**Q2: Our agent failed in production but passed all sandbox evals. What went wrong?**
+
+This is the classic **sandbox realism gap**. Common causes:
+
+**Your mocks were too simple.** Real APIs have edge cases, error modes, and data formats that your mocks didn't include. Solution: base mocks on real API responses captured from production. Use tools that record and replay production traffic.
+
+**Your sandbox data was too clean.** Real production data has nulls, special characters, edge cases, duplicates, inconsistencies. Your sandbox had perfect test data. Solution: generate realistic messy data or use scrubbed production data in your sandbox.
+
+**Your sandbox didn't simulate failures.** Production has API timeouts, rate limits, partial failures, network issues. Your sandbox always succeeded. Solution: add error injection and chaos testing to your sandbox.
+
+**Your user simulation was unrealistic.** Real users make typos, change their minds, ask unclear questions, have edge case requests. Your sandbox used scripted inputs. Solution: use LLM-powered user simulators with diverse personas.
+
+**Your sandbox lacked production scale.** The agent handles 10 requests fine but breaks under load at 1,000 requests. Your sandbox never tested scale. Solution: add load testing to your eval suite.
+
+**Your sandbox is out of date.** The production API changed (new fields, new error codes, new validation rules) but your sandbox wasn't updated. Solution: version control your sandbox configuration and update it alongside production changes.
+
+The fix: conduct a **sandbox audit**—compare your sandbox's behavior to production across dozens of dimensions (API responses, data distributions, error rates, latency, user behavior). Close the gaps, then rerun evals.
+
+**Q3: How do we balance sandbox realism with cost and complexity?**
+
+Use a **tiered approach**:
+
+**Tier 1 (Fast and cheap):** Mocks for rapid iteration. Runs in seconds, costs nothing, runs on every code change. Catches basic logic errors.
+
+**Tier 2 (Realistic):** Sandboxes for integration testing. Runs in minutes, costs moderate (infrastructure for test services), runs on every PR. Catches integration bugs and API issues.
+
+**Tier 3 (Production-like):** Staging or shadow mode for final validation. Runs in hours, costs significant (full infrastructure mirror or production traffic analysis), runs nightly or before releases. Catches realistic edge cases and scale issues.
+
+Don't try to make every eval run in the highest-fidelity environment—you'll burn budget and slow down development. Instead, use **risk-based fidelity**:
+
+**High-risk actions** (payments, medical decisions, infrastructure changes): Always test in high-fidelity sandboxes or staging.
+
+**Medium-risk actions** (customer emails, data updates, scheduling): Test in sandboxes for integration testing, mocks for development.
+
+**Low-risk actions** (read-only queries, internal tool use): Mocks are usually sufficient.
+
+For cost optimization, use **cloud-native ephemeral sandboxes**—spin up sandbox infrastructure only when running evals, tear it down immediately after. Tools like Kubernetes, Docker Compose, or managed sandbox services make this easy. Pay for minutes of eval runtime instead of maintaining persistent test infrastructure.
+
+Another trick: **share sandbox infrastructure** across teams, but use isolated namespaces or databases to prevent state leakage. One physical database, but each eval run gets its own schema that's created on demand and dropped afterward.
+
+**Q4: How do we ensure our sandbox stays in sync with production as the system evolves?**
+
+This is the **sandbox drift problem**. Prevention strategies:
+
+**Infrastructure as code:** Define your sandbox environment in version-controlled code (Terraform, Docker Compose, Kubernetes manifests). When production infrastructure changes, update the sandbox definition in the same commit. Treat sandbox config as production code.
+
+**Automated sync checks:** Run regular tests that compare sandbox behavior to production (query the same APIs, check the same database schemas, verify the same configurations). Alert if they diverge.
+
+**Shared components:** Where possible, use the same code in sandbox and production. For example, if you have a mock user service, implement it as a configuration flag in the real user service rather than a separate codebase. One codebase, different modes.
+
+**Production data snapshots:** Periodically snapshot production data (scrubbed of PII), restore it in sandbox. This keeps sandbox data realistic. Automate this—nightly or weekly snapshots.
+
+**Version pinning:** Pin sandbox dependencies (library versions, API versions, database versions) to match production. When production upgrades, upgrade sandbox in lock-step.
+
+**Canary sandbox updates:** Before deploying production changes, deploy them to sandbox first and run evals. If evals pass, deploy to production. This ensures sandbox is always slightly ahead or in sync with production.
+
+**Monitor sandbox coverage:** Track what percentage of production API calls, data patterns, and user behaviors are covered by your sandbox. If production adds a new API endpoint, add it to sandbox.
+
+The goal: **sandbox drift should be caught in CI before it affects evals**. Automated checks that run on every commit, comparing sandbox definitions to production configurations.
+
+**Q5: When should we use LLM-powered user simulators instead of scripted user inputs?**
+
+Use **scripted inputs** when:
+
+- Testing deterministic, narrow scenarios (e.g., "Does the agent correctly parse this specific date format?")
+- You need exact reproducibility (same input every run)
+- You're testing single-turn interactions with simple inputs
+- Budget is tight (scripted inputs cost zero LLM inference)
+
+Use **LLM-powered simulators** when:
+
+- Testing multi-turn conversations where user responses depend on agent behavior
+- You need realistic variability (different users phrase requests differently)
+- Testing edge cases and robustness (simulated users can generate unexpected requests)
+- Testing goal achievement (does the agent help the user reach their goal?) rather than specific response patterns
+- Testing diverse user types (personas, skill levels, languages)
+
+Example: If you're testing a FAQ bot that answers simple questions, scripted inputs are fine—just feed it a list of questions and verify it returns the right canned answers.
+
+But if you're testing a travel booking agent that has multi-turn conversations, helps users make complex decisions, and needs to handle user uncertainty and changes of mind, LLM-powered simulation is essential. A scripted conversation can't capture the realistic back-and-forth, the clarifying questions, the mid-conversation goal changes.
+
+A practical hybrid: use **scripted inputs for regression tests** (fast, cheap, deterministic) and **LLM simulators for exploratory testing** (slower, costs inference, finds new issues). Run scripted tests on every commit, LLM simulation tests nightly or weekly.
+
+For LLM simulation, invest in **persona libraries**—pre-defined user personas (patient, impatient, technical, non-technical, confused, adversarial) that you can use across evals. This makes simulation more systematic and ensures you test diverse user types.
+
+---
+
+You've now built safe, realistic test environments for evaluating agents that take real-world actions—from simple mocks to production-mirror staging environments, with error injection, state management, user simulation, and cost-effective strategies for balancing realism with complexity.
+
+Next in Chapter 8.8, we'll cover **Human-in-the-Loop Agent Evaluation**—when and how to involve human reviewers in the evaluation process, from approval workflows to collaborative debugging to human-AI evaluation teams.

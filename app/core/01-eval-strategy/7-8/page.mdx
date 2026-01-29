@@ -1,0 +1,745 @@
+---
+title: "7.8 — Building an Automated Eval Pipeline"
+sectionId: "eval-strategy"
+chapterId: "07-automated-evals"
+chapterTitle: "Automated Evaluation"
+subChapter: true
+version: "1.0.0"
+lastModified: "2026-01-29"
+status: "live"
+---
+
+# 7.8 — Building an Automated Eval Pipeline
+
+A startup engineer once showed me their "eval system." It was a Python script that ran every night, loaded 200 test cases, called GPT-4 as a judge, dumped JSON to a file, and sent a Slack message with the average score. "It takes 40 minutes and costs $15," they said, "but we have evaluations now."
+
+Three months later they showed me version two. Same 200 cases, but now it ran rule checks first and caught 80 cases immediately — no judge needed. The remaining 120 cases went to a faster model first, escalating only 30 tricky ones to GPT-4. Total time: 8 minutes. Total cost: $3. And they could finally run evals on every pull request instead of just nightly.
+
+That's the difference between a script and a **pipeline**. A script runs checks. A pipeline orchestrates a sequence of stages, each optimized for speed, cost, and accuracy, with results flowing from one stage to the next. At scale, this architecture is the only way to evaluate thousands of cases across dozens of dimensions without burning budget or waiting hours for results.
+
+This chapter shows you how to build that pipeline — the system that wires together rule checks, reference metrics, LLM judges, and human escalation into a production-grade evaluation engine.
+
+---
+
+## The Pipeline Concept
+
+Evaluation isn't a single check. It's a **staged process** where you apply progressively more sophisticated (and expensive) techniques until you have a confident answer.
+
+Think of airport security. Everyone goes through a metal detector (cheap, fast). If it beeps, you get a pat-down (more expensive). If something's still unclear, you go to a private screening room (most expensive). You don't start everyone in the screening room — you'd never process the line.
+
+An eval pipeline works the same way:
+
+**Stage 1: Rule checks** — Does the output violate obvious constraints? Empty responses, malformed JSON, banned words, length limits. Fast boolean checks that catch clear failures immediately.
+
+**Stage 2: Reference metrics** — Does the output match known ground truth? Exact match, BLEU, F1, task-specific heuristics. Fast deterministic scoring for cases where you have a reference answer.
+
+**Stage 3: LLM judges** — For cases without clear ground truth, use a model to score quality. Start with a fast model (GPT-4o mini, Haiku). Escalate uncertain cases to a stronger model (GPT-4, Opus).
+
+**Stage 4: Human escalation** — For cases where even strong models are uncertain or where stakes are high, route to human reviewers. Store results to improve future automation.
+
+Each stage acts as a **filter**. If a case fails a rule check, you don't waste money running an LLM judge. If a fast judge is confident, you don't call the expensive model. The pipeline gets cheaper and faster by making smart decisions about what needs deep inspection.
+
+---
+
+## Pipeline Architecture
+
+A production eval pipeline has six core components:
+
+**1. Input Validation**
+
+Before running any checks, validate the eval request itself. Does the dataset exist? Are all required fields present? Are model outputs available? Catch configuration errors before burning compute.
+
+**2. Rule Engine**
+
+Execute boolean and regex-based checks. These run in milliseconds and catch obvious failures. Rules return pass/fail plus optional metadata (which rule failed, what was violated).
+
+**3. Metric Calculator**
+
+Compute reference-based metrics where applicable. This includes string similarity (BLEU, ROUGE), semantic similarity (embeddings), task-specific metrics (F1 for classification), and retrieval metrics (MRR, NDCG).
+
+**4. Judge Orchestrator**
+
+Route cases to appropriate LLM judges based on task type and difficulty. Manage prompt templates, model selection, retries, and confidence thresholds. This is typically the slowest and most expensive stage.
+
+**5. Aggregation Layer**
+
+Collect results from all stages and compute summary statistics. Roll up case-level scores into slice-level metrics (per category, per user segment) and overall system metrics.
+
+**6. Result Store**
+
+Persist every evaluation result with full metadata: timestamps, model versions, judge reasoning, costs, latencies. This becomes your **eval history** — critical for debugging regressions and tracking quality over time.
+
+The flow looks like this:
+
+```yaml
+# Pseudocode pipeline flow
+input: eval_dataset, model_outputs
+
+validate(eval_dataset, model_outputs)
+  → abort if invalid
+
+for each case:
+  rule_results = run_rules(case)
+  if rule_results.any_failed:
+    record_failure(case, rule_results)
+    continue  # Early exit
+
+  metric_results = compute_metrics(case)
+  if metric_results.has_reference:
+    record_success(case, metric_results)
+    continue
+
+  judge_result = run_llm_judge(case)
+  if judge_result.confidence < threshold:
+    escalate_to_human(case)
+  else:
+    record_success(case, judge_result)
+
+aggregate_results()
+generate_report()
+trigger_alerts_if_needed()
+```
+
+This architecture keeps the pipeline modular. You can swap out the judge model, add new rules, or change aggregation logic without rewriting the whole system.
+
+---
+
+## Stage Ordering and Early Exit
+
+The single biggest pipeline optimization is **running cheap checks first**.
+
+Rule checks cost fractions of a cent and run in milliseconds. LLM judges cost cents and take seconds. Human review costs dollars and takes hours. If you can catch a failure with a rule, you've saved 100x in cost and 1000x in time.
+
+**Early exit** means stopping the pipeline as soon as you have a definitive answer. If a rule fails, don't run metrics or judges. If a metric check passes with high confidence, don't call the judge.
+
+Example: You're evaluating customer support responses. Your pipeline checks:
+
+1. **Rule: Response length** — Must be at least 50 characters. Takes 1ms.
+2. **Rule: No profanity** — Regex check against banned words. Takes 5ms.
+3. **Metric: Answer relevance** — Embedding similarity to query. Takes 50ms.
+4. **Judge: Helpfulness and tone** — GPT-4o mini scores on rubric. Takes 2s, costs $0.01.
+
+If response is 20 characters, you fail at step 1 and skip steps 2-4. That's a 2-second and $0.01 savings per case. Across 10,000 cases, that's 6 hours and $100 saved.
+
+The key is **fail-fast architecture**. Structure your pipeline so common failures are caught early. If 20% of outputs are too short, that rule should be first. If profanity is rare, that rule can be later.
+
+Track which stages catch the most failures. If your LLM judge is catching issues that a simple rule could catch, promote that check to an earlier stage.
+
+---
+
+## Parallel vs Sequential Stages
+
+Some checks must run in order — you can't judge helpfulness before validating the response exists. But many checks can run **in parallel**.
+
+**Parallel execution** means running multiple checks simultaneously to reduce total pipeline time. If you have 5 independent checks that each take 2 seconds, running them in parallel takes 2 seconds total instead of 10.
+
+**When to parallelize:**
+
+- Multiple independent rule checks (length, profanity, PII detection)
+- Multiple reference metrics (BLEU, ROUGE, F1 all compute independently)
+- Multiple LLM judges for different dimensions (helpfulness, safety, tone can be judged in parallel)
+
+**When to stay sequential:**
+
+- When one stage depends on another (can't judge reasoning quality if response is invalid JSON)
+- When results inform routing (rule failure means skipping judge)
+- When you want early exit optimization (run cheap checks first, expensive ones only if needed)
+
+Most pipelines use a **hybrid approach**: parallel execution within each stage, sequential flow between stages.
+
+```yaml
+# Example pipeline with parallelism
+Stage 1 (Rules) - Parallel:
+  - Length check
+  - Profanity check
+  - PII detection
+  - JSON validation
+  All run simultaneously → aggregate results
+
+If all rules pass:
+  Stage 2 (Metrics) - Parallel:
+    - BLEU score
+    - Embedding similarity
+    - Task-specific metric
+    All run simultaneously → aggregate results
+
+If metrics inconclusive:
+  Stage 3 (Judges) - Parallel:
+    - Helpfulness judge
+    - Safety judge
+    - Tone judge
+    All run simultaneously → aggregate results
+```
+
+This structure gives you speed (parallelism within stages) and cost efficiency (sequential stages with early exit).
+
+---
+
+## Pipeline Configuration
+
+A single pipeline should handle multiple use cases by being **configurable**. Different tasks need different checks. Different risk tiers need different thoroughness. Different contexts (dev vs CI vs production) need different speed/cost tradeoffs.
+
+**Configuration dimensions:**
+
+**1. Task Type**
+
+A code generation eval runs different checks than a customer support eval. Your pipeline should load task-specific configuration that defines which rules, metrics, and judges to use.
+
+```yaml
+# task_config/code_generation.yaml
+rules:
+  - syntax_validation
+  - security_scan
+  - test_compliance
+
+metrics:
+  - code_match_percentage
+  - execution_success_rate
+
+judges:
+  - code_quality_rubric
+  - maintainability_rubric
+```
+
+**2. Risk Tier**
+
+Low-risk cases (internal tools, non-production) can skip expensive checks. High-risk cases (customer-facing, safety-critical) need exhaustive evaluation including human review.
+
+```yaml
+# risk_tiers.yaml
+low_risk:
+  judges: [fast_model_only]
+  human_review: false
+
+high_risk:
+  judges: [fast_model, strong_model, expert_review]
+  human_review_threshold: 0.8
+```
+
+**3. Eval Purpose**
+
+Development evals run on every code change and need fast feedback. Release gate evals run before deployment and can be thorough. Production monitoring runs continuously and needs to be cheap.
+
+```yaml
+# purpose_config.yaml
+development:
+  sample_size: 100
+  timeout: 2min
+  cost_limit: $1
+
+release_gate:
+  sample_size: full_dataset
+  timeout: 30min
+  cost_limit: $50
+
+production_monitoring:
+  sample_rate: 1%
+  timeout: 5min
+  cost_limit: $10/day
+```
+
+Your pipeline reads these configs and adjusts its behavior accordingly. This keeps the core pipeline code stable while allowing flexibility for different scenarios.
+
+---
+
+## Dataset Integration
+
+Your pipeline consumes **eval datasets** (Chapter 3) — collections of test cases with inputs, expected outputs, and metadata.
+
+The pipeline needs to:
+
+**1. Load datasets** — Fetch from storage (S3, GCS, database) or registry (eval platform). Handle versioning so you can reproduce results.
+
+**2. Generate model outputs** — For each case, call the system being evaluated and capture the response. Handle timeouts, errors, retries.
+
+**3. Match outputs to ground truth** — Pair each model output with its corresponding reference answer or metadata for scoring.
+
+**4. Chunk for parallel processing** — Split large datasets into batches that can be processed concurrently.
+
+**5. Track progress** — Monitor which cases have been evaluated, which are in progress, which failed. Enable resume after failures.
+
+A common pattern is to separate **output generation** from **evaluation**. Run all model inferences first, store outputs, then run the eval pipeline on the saved outputs. This lets you re-eval the same outputs with different judges or metrics without re-running inference.
+
+```yaml
+# Two-phase evaluation
+Phase 1: Generate outputs
+  - Load dataset
+  - Call model for each case
+  - Store outputs with metadata
+  - Takes 10 minutes, costs $5
+
+Phase 2: Evaluate outputs
+  - Load dataset + outputs
+  - Run pipeline on each case
+  - Store eval results
+  - Takes 5 minutes, costs $3
+
+# Can now re-evaluate Phase 2 with new judges
+# without re-running Phase 1
+```
+
+This separation also enables **comparative evaluation** — generate outputs from multiple models, then run the same eval pipeline on all of them.
+
+---
+
+## Result Storage
+
+Every eval result should be **stored** with complete metadata. This serves three purposes: debugging, auditing, and improvement.
+
+**What to store:**
+
+- **Case ID** — Links back to the original dataset case
+- **Timestamp** — When the evaluation ran
+- **Model version** — Which system was evaluated
+- **Pipeline version** — Which eval config/judges were used
+- **Stage results** — Pass/fail for each rule, score for each metric, judgment for each LLM judge
+- **Judge reasoning** — The chain-of-thought or explanation from LLM judges
+- **Confidence scores** — How certain was each judge
+- **Metadata** — Case tags, slice membership, risk tier
+- **Costs** — Inference cost, judge cost, total cost per case
+- **Latencies** — Time spent in each stage, total pipeline time
+- **Errors** — Any failures or retries
+
+This data goes into a **structured store** — typically a database (Postgres, BigQuery) or data lake (S3 + Parquet). You need to query it efficiently for reporting and analysis.
+
+Schema example:
+
+```yaml
+eval_results:
+  id: uuid
+  eval_run_id: uuid  # Groups all cases from one pipeline run
+  case_id: string
+  timestamp: datetime
+  model_version: string
+  pipeline_version: string
+
+  rule_results: json  # {rule_name: pass/fail}
+  metric_results: json  # {metric_name: score}
+  judge_results: json  # {judge_name: {score, reasoning, confidence}}
+
+  overall_score: float
+  passed: boolean
+
+  cost_usd: float
+  latency_ms: int
+
+  error_message: string (nullable)
+  metadata: json
+```
+
+With this schema you can answer questions like:
+
+- "Show me all cases that failed safety checks in the last week"
+- "What's the average cost per case for high-risk evals?"
+- "Which judge reasoning led to score changes after we updated the prompt?"
+
+Rich result storage is what separates a pipeline from a script. You're building an **audit trail** that enables continuous improvement.
+
+---
+
+## Aggregation and Reporting
+
+Individual case results are useful for debugging. But to understand system quality, you need **aggregated metrics**.
+
+**Aggregation levels:**
+
+**1. Overall metrics**
+
+What percentage of cases passed? What's the average score across all dimensions? This gives you a single quality number for the eval run.
+
+**2. Slice-level metrics**
+
+Break down results by **slices** (Chapter 5.5) — user segments, query types, risk categories. This shows where your system excels and where it struggles.
+
+**3. Dimension-level metrics**
+
+Report separately on different quality dimensions (helpfulness, safety, tone). A system might score 95% on helpfulness but 70% on tone — you need both numbers.
+
+**4. Temporal metrics**
+
+Track how metrics change over time. Is quality improving? Are recent changes causing regressions? Trend lines matter more than point-in-time scores.
+
+A good **eval report** includes:
+
+- **Executive summary** — Overall pass rate, headline metrics, comparison to previous runs
+- **Slice breakdown** — Table or chart showing performance across key slices
+- **Dimension breakdown** — Radar chart or scorecard for multi-dimensional quality
+- **Failure analysis** — Top failure modes, example cases, root cause categories
+- **Cost and performance** — Total cost, time, throughput for the eval run
+
+Most teams generate reports in two formats: **dashboard** (live, queryable, for ongoing monitoring) and **artifact** (HTML or PDF, for release gates and audits).
+
+---
+
+## Alerting Integration
+
+An eval pipeline should be **proactive** — if quality drops below threshold, someone needs to know immediately.
+
+**Alerting triggers:**
+
+**1. Absolute thresholds**
+
+Overall pass rate below 90%, safety score below 95%, any critical dimension below threshold. These are your red lines that block releases or page on-call.
+
+**2. Relative thresholds**
+
+Score dropped more than 5 percentage points from previous run, or below 7-day moving average. These catch regressions even if you're still above absolute thresholds.
+
+**3. Anomaly detection**
+
+Statistical outliers — a score that's 2 standard deviations below recent mean, or sudden spike in a rare failure mode. These catch novel issues.
+
+**4. Budget overruns**
+
+Eval cost exceeded limit, or latency exceeded timeout. These prevent runaway spending or blocked CI pipelines.
+
+**Alerting channels:**
+
+- **Slack/Teams** — Immediate notification for dev team
+- **PagerDuty** — On-call escalation for production issues
+- **JIRA/Linear** — Automatic ticket creation for investigation
+- **Email** — Digest reports for stakeholders
+
+The pipeline should include **alert configuration** as part of its setup:
+
+```yaml
+# alert_config.yaml
+alerts:
+  - name: overall_quality_drop
+    condition: overall_pass_rate < 0.90
+    severity: critical
+    channels: [slack, pagerduty]
+
+  - name: safety_regression
+    condition: safety_score < prev_run_safety_score - 0.05
+    severity: high
+    channels: [slack, jira]
+
+  - name: cost_overrun
+    condition: total_cost > 50
+    severity: medium
+    channels: [slack]
+```
+
+Good alerting turns your eval pipeline from a reporting tool into a **quality guardian** — actively protecting production from bad releases.
+
+---
+
+## Pipeline Versioning
+
+Here's a trap: You improve your LLM judge prompt to be more accurate. Suddenly all your scores drop. Did quality actually get worse, or did your evaluation get stricter?
+
+This is why **pipeline versioning** matters. Every component of your eval pipeline affects results:
+
+- Judge prompts and rubrics
+- Model versions used as judges
+- Rule definitions and thresholds
+- Metric implementations
+- Dataset composition
+
+When any of these change, your scores become incomparable to previous runs. You need to track which version produced which results.
+
+**Versioning strategy:**
+
+**1. Semantic versioning for the pipeline**
+
+`pipeline_version: 2.3.1` where major version changes when results are incomparable (new judge), minor version changes when results might shift slightly (tuned prompt), patch version changes when behavior is identical (bug fix, performance improvement).
+
+**2. Component versions in metadata**
+
+Store which judge model, which prompt version, which rule set was used for each eval run. This lets you analyze "Did scores change because the system improved or because we changed the evaluator?"
+
+**3. Frozen baseline runs**
+
+When you update the pipeline, re-run a baseline dataset with both old and new versions. Compare results to understand the delta. Document whether the new version is stricter or more lenient.
+
+**4. Migration strategy**
+
+When you ship a new pipeline version, you might need to re-evaluate recent model versions with the new pipeline to maintain consistent history. This is expensive but sometimes necessary for accurate trend analysis.
+
+The rule: **Treat your eval pipeline like production code.** Version it, test it, document changes, and maintain backward compatibility where possible.
+
+---
+
+## Cost Management
+
+At scale, eval pipelines get expensive. Running an LLM judge on 10,000 cases might cost $100-$500 depending on the model. Do that multiple times per day and you're spending thousands per month on evaluation alone.
+
+**Cost optimization strategies:**
+
+**1. Tiered judging**
+
+Use a fast/cheap model (GPT-4o mini, Haiku) as a first-pass judge. Only escalate to expensive models (GPT-4, Opus) when the fast judge is uncertain. This can cut costs by 80% while maintaining accuracy.
+
+**2. Sampling for production monitoring**
+
+You don't need to eval every production request. Sample 1-10% of traffic for continuous monitoring. Use statistical techniques to ensure the sample is representative.
+
+**3. Cached judgments**
+
+If you're evaluating the same outputs multiple times (common in development), cache judge results. If the input and model output haven't changed, reuse the previous judgment.
+
+**4. Rule promotion**
+
+When you notice an LLM judge consistently flagging a specific pattern, write a rule to catch it. Move the check from the expensive judge stage to the cheap rule stage.
+
+**5. Budget limits**
+
+Set per-run and per-day cost limits in the pipeline config. Abort or throttle evaluation if limits are exceeded. Better to have incomplete results than surprise bills.
+
+**6. Async evaluation**
+
+For non-blocking use cases (production monitoring, nightly analysis), batch requests and use async APIs to get cheaper pricing from LLM providers.
+
+A well-optimized pipeline might run 1000 evals for $5 instead of $50. That's the difference between "we can only eval weekly" and "we eval every commit."
+
+---
+
+## The 2026 Tooling Landscape
+
+You don't have to build a pipeline from scratch. The eval tooling ecosystem has matured significantly.
+
+**Eval platforms (managed):**
+
+**Braintrust** — Full-featured eval platform with judge templates, dataset management, CI/CD integration, and hosted dashboards. Strong API, good DX. Used by mid-market and enterprise teams.
+
+**LangSmith** — Integrated with LangChain ecosystem. Tracing + evaluation in one platform. Best if you're already using LangChain.
+
+**Arize** — ML observability platform that includes LLM eval capabilities. Emphasizes production monitoring, slice analysis, and drift detection. Enterprise-focused.
+
+**Humanloop** — Combines prompt management with evaluation. Good for teams iterating on prompts and needing quick eval feedback loops.
+
+**Weights & Biases** — Traditional ML platform that added LLM eval features. Strong experiment tracking, less mature on LLM-specific evals.
+
+**Open-source options:**
+
+**DeepEval** — Python library for building eval pipelines. Includes judge templates and common metrics. Good for teams that want control but don't want to build everything from scratch.
+
+**PromptFoo** — CLI tool for systematic prompt testing. Lighter weight than full platforms. Popular with individual developers and small teams.
+
+**RAGAS** — Specialized for RAG evaluation. Strong on retrieval metrics, context relevance, faithfulness checks.
+
+**Continuous-Eval** — Open-source library focused on production monitoring. Designed for streaming evaluation of production traffic.
+
+**Build vs Buy decision:**
+
+**Build your own if:**
+
+- You have unique eval requirements not covered by existing tools
+- You need tight integration with proprietary systems
+- You have strong engineering resources and want full control
+- You're optimizing for cost at massive scale
+
+**Buy a platform if:**
+
+- You want fast time-to-value and standard workflows
+- You need enterprise features (SSO, audit logs, governance)
+- You lack bandwidth to build and maintain eval infrastructure
+- You value community templates and integrations
+
+Most teams start with open-source tools for prototyping, then either graduate to a platform (if evaluation becomes core IP) or build custom (if scale demands it).
+
+By 2026, the mature move is to use platforms for standard evals (they've solved common problems) and build custom only for differentiating capabilities. Don't rebuild dataset management and dashboards — buy those. Do build custom judges for your unique domain.
+
+---
+
+## Failure Modes
+
+Even well-designed pipelines fail. Common issues:
+
+**1. Judge model downtime**
+
+Your pipeline calls OpenAI for judgments. OpenAI has an outage. Your entire eval pipeline is blocked. **Mitigation:** Support multiple judge providers, implement fallback models, enable graceful degradation.
+
+**2. Dataset drift**
+
+Your eval dataset becomes stale or unrepresentative. Pipeline runs fine but results no longer reflect real-world quality. **Mitigation:** Regularly refresh datasets (Chapter 3.8), monitor production data distribution, trigger alerts when eval vs production diverges.
+
+**3. Score inflation**
+
+Over time, your system is optimized to score well on evals (Chapter 15.4 — overfitting to eval). The pipeline shows improvement but real user satisfaction doesn't increase. **Mitigation:** Hold-out test sets, human review audits, user feedback integration.
+
+**4. Cost explosion**
+
+A config change accidentally enables expensive judges on full dataset. Thousands of dollars burned before anyone notices. **Mitigation:** Cost budgets in pipeline config, alerts on spending anomalies, require approval for high-cost runs.
+
+**5. Version confusion**
+
+Someone runs an eval with pipeline v2.0 but compares results to historical data from v1.5. They conclude quality regressed when actually the evaluator got stricter. **Mitigation:** Store pipeline version with every result, alert when comparing across versions, document version changes.
+
+**6. Slow execution**
+
+Pipeline takes 2 hours to run, blocking CI. Developers skip evals or ignore results. **Mitigation:** Optimize stage ordering, enable parallelism, use faster models, implement sampling for quick feedback.
+
+The best mitigation is **monitoring the monitor** — track your eval pipeline's reliability, latency, and cost just like you track your production systems.
+
+---
+
+## Enterprise Expectations
+
+In enterprise contexts, an eval pipeline isn't just a tool — it's **auditable infrastructure**.
+
+**Requirements:**
+
+**1. Reproducibility**
+
+Given a pipeline version and dataset version, results must be identical on re-run. This means locking LLM temperature to 0 (or seeding randomness), versioning all dependencies, and storing complete execution metadata.
+
+**2. Explainability**
+
+Every score must be traceable to a specific check or judgment. For regulated industries (healthcare, finance), you need to show auditors exactly why a system passed or failed evaluation.
+
+**3. Access control**
+
+Who can trigger eval runs? Who can see results? Who can modify pipeline configuration? Enterprise platforms need RBAC and audit logs.
+
+**4. Data privacy**
+
+Eval datasets might contain PII or sensitive data. Pipelines must respect data governance policies — potentially running judges on-premises or using models that don't retain data.
+
+**5. Integration with release process**
+
+Eval results must integrate with deployment workflows. Pass/fail gates in CI/CD, approval workflows for borderline cases, automatic rollback triggers for quality regressions.
+
+**6. SLA guarantees**
+
+If evals block releases, the pipeline needs uptime SLAs. Enterprise teams often run pipelines across multiple judge providers and regions for reliability.
+
+These requirements push you toward mature tooling — either a commercial platform with enterprise features or a seriously engineered custom solution. A Python script doesn't cut it.
+
+---
+
+## Bringing It All Together
+
+An automated eval pipeline is the orchestration layer that makes systematic evaluation practical at scale. It takes the components we've covered — rules, metrics, judges — and combines them into a cost-efficient, reliable, fast system that can run continuously.
+
+The key principles:
+
+- **Staged execution** — cheap checks first, expensive checks only when needed
+- **Early exit optimization** — stop as soon as you have an answer
+- **Configurability** — one pipeline, multiple use cases
+- **Rich result storage** — every eval is a learning opportunity
+- **Pipeline versioning** — track what produced which results
+- **Cost discipline** — eval shouldn't cost more than the system being evaluated
+
+A good pipeline fades into the background. Developers commit code, the pipeline runs automatically, and alerts only fire when something actually needs attention. Quality becomes a continuous metric, not a manual audit.
+
+The pipeline is infrastructure. Build it once, maintain it carefully, and it enables everything that comes next — regression testing, release gates, production monitoring, continuous improvement.
+
+---
+
+## Template: Simple Eval Pipeline Config
+
+```yaml
+# eval_pipeline.yaml
+pipeline_version: "1.2.0"
+
+tasks:
+  - task_id: customer_support_qa
+    dataset: "support_qa_v3"
+
+    stages:
+      - name: validation
+        checks:
+          - response_not_empty
+          - valid_utf8_encoding
+
+      - name: rule_checks
+        parallel: true
+        checks:
+          - response_length_range: {min: 50, max: 1000}
+          - no_profanity: {wordlist: "banned_terms.txt"}
+          - no_pii: {types: [email, phone, ssn]}
+        early_exit_on_failure: true
+
+      - name: metrics
+        parallel: true
+        metrics:
+          - embedding_similarity: {threshold: 0.7}
+          - answer_relevance: {model: "cross-encoder"}
+
+      - name: llm_judges
+        parallel: true
+        judges:
+          - judge_id: helpfulness_fast
+            model: gpt-4o-mini
+            prompt: "helpfulness_rubric_v2"
+            confidence_threshold: 0.8
+
+          - judge_id: safety_check
+            model: claude-3-5-haiku-20241022
+            prompt: "safety_rubric_v3"
+            confidence_threshold: 0.9
+
+        escalation:
+          if: any_judge_confidence < threshold
+          judge_id: helpfulness_expert
+          model: gpt-4o
+          prompt: "detailed_helpfulness_rubric_v2"
+
+    aggregation:
+      overall_score: weighted_average
+      weights:
+        helpfulness: 0.5
+        safety: 0.3
+        relevance: 0.2
+
+      pass_threshold: 0.85
+
+      slices:
+        - by: query_category
+        - by: user_tier
+
+    reporting:
+      dashboard: true
+      artifacts: [html_report, json_results]
+
+    alerts:
+      - condition: overall_pass_rate < 0.90
+        severity: critical
+        channels: [slack, pagerduty]
+
+      - condition: safety_score < 0.95
+        severity: high
+        channels: [slack]
+
+    cost_controls:
+      max_cost_per_run: 25.00
+      max_latency_minutes: 15
+
+    retry_policy:
+      max_retries: 3
+      backoff: exponential
+```
+
+---
+
+## Interview Q&A: Automated Eval Pipelines
+
+**Q1: We're running LLM judges on every case in our 5000-case eval dataset. It's taking 30 minutes and costing $80 per run, so we can only eval once per day. How can we make this practical for per-commit evaluation?**
+
+Add a **staged pipeline** with early exit. First, run rule checks — response length, format validation, banned terms. These catch maybe 15-20% of failures in milliseconds at near-zero cost. For the remaining 4000 cases, use a fast judge model like GPT-4o mini ($0.003 per case instead of $0.015). That drops cost to $12 for most cases. Then use **confidence-based escalation** — only send uncertain cases (maybe 500) to the expensive model. Total cost: ~$20, total time: ~10 minutes. You can now afford to eval every commit. Also consider **sampling for fast feedback** — run 500 cases on every commit for quick validation, full 5000 cases nightly or pre-release. The goal is right-sizing evaluation depth to the decision being made.
+
+**Q2: Our eval pipeline runs different checks for different product areas — customer support, code generation, creative writing. Should we build one flexible pipeline or separate pipelines per use case?**
+
+**One configurable pipeline** is almost always the right answer. The infrastructure is identical — dataset loading, result storage, reporting, alerting. What differs is which checks run and which judges are used. Use **task-type configuration files** that specify rules, metrics, and judge prompts for each product area. The pipeline code reads the config and executes the appropriate stages. This gives you consistent infrastructure (one codebase to maintain, one monitoring system) while allowing different evaluation logic per task. You'll want separate configs for development vs release-gate runs too — dev needs speed, release needs thoroughness. Keep the pipeline itself generic and push specifics into declarative config. Only build separate pipelines if you have truly different architectures (one sync, one async) or very different infrastructure requirements (one on-prem, one cloud).
+
+**Q3: We're storing eval results in JSON files in S3. It works, but we can't easily query things like "show me all cases that failed safety in the last month across all eval runs." What should we do?**
+
+Move to a **structured database** — Postgres, BigQuery, or Snowflake depending on scale. Schema should have two tables: `eval_runs` (one row per pipeline execution) and `eval_results` (one row per case evaluation). Store case_id, timestamp, pipeline version, stage results, scores, costs, and metadata. Now you can query: "SELECT case_id, judge_reasoning FROM eval_results WHERE safety_score less than 0.8 AND timestamp greater than now() minus 30 days." This enables **trend analysis, slice breakdowns, and root-cause debugging**. Also set up a dashboard (Metabase, Grafana, or your eval platform's built-in UI) for non-engineers to explore results without writing SQL. JSON in S3 is fine for raw storage and reproducibility, but you need a queryable layer for analysis. If you're at serious scale (millions of evals), consider a data lake with Parquet files and Athena/Presto for querying.
+
+**Q4: We updated our LLM judge prompt to be more accurate. Now our pass rate dropped from 88% to 81%, and leadership thinks quality regressed. How do we handle eval pipeline changes without confusing metrics?**
+
+This is why **pipeline versioning** is critical. You should have incremented the pipeline version when you changed the prompt, and stored that version with every result. Now you can compare v1.5 to v1.5 historically, and separately analyze v2.0 results. To bridge the gap, **re-run a baseline dataset with both versions** — take 500 representative cases, run them through old and new pipeline, show that new version is 7 points stricter on the same outputs. Document this: "v2.0 is more accurate but stricter. Old 88% is equivalent to new 81%." Going forward, only compare apples-to-apples (same pipeline version). For leadership reporting, you might maintain a "normalized score" that adjusts for pipeline changes, or track multiple metrics (pipeline v1 score for trends, pipeline v2 score for current quality). The key principle: **changing your evaluator is like changing your ruler** — you can't compare measurements directly. Always version, always document, always run comparison baselines.
+
+**Q5: What's the most important thing to get right when building an eval pipeline from scratch?**
+
+**Result storage with full metadata.** Everything else you can improve iteratively — you can optimize stage ordering, upgrade judges, tune configuration. But if you're not storing complete results with timestamps, pipeline versions, case IDs, and judge reasoning, you can't debug regressions, compare approaches, or learn from failures. Your pipeline becomes a black box that produces a score but doesn't enable improvement. A good result store lets you answer: "Why did this case fail?" "When did scores start dropping?" "Which prompt version performed best?" "What's our eval cost trajectory?" It's the foundation for everything — alerting, reporting, auditing, optimization. Get storage right on day one. Everything else can evolve. Second most important: **cost controls**. Set budget limits immediately, or you'll accidentally run a $500 eval job when someone misconfigures a loop. Third: **pipeline versioning**. Start versioning from v1.0, increment thoughtfully, store with results. These three investments on day one will save you countless hours later.
+
+---
+
+**Next Chapter:** [7.9 — Custom Metric Design](/core/01-eval-strategy/7-9) — When standard metrics don't capture what matters, you need to build your own. How to design, validate, and deploy task-specific metrics.
+
+**Previous Chapter:** [7.7 — Confidence and Uncertainty](/core/01-eval-strategy/7-7)
+
+**Chapter Home:** [7 — Automated Evaluation](/core/07-automated-evals)
