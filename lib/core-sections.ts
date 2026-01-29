@@ -37,6 +37,7 @@ export const coreSections: CoreSection[] = [
           { id: "2.3", title: "Good vs Bad Patterns", slug: "2-3" },
           { id: "2.4", title: "Uncertainty, Refusal & Safety Scoring", slug: "2-4" },
           { id: "2.5", title: "Enterprise Scorecards", slug: "2-5" },
+          { id: "2.6", title: "Multi-Turn Conversation Scoring", slug: "2-6" },
         ],
       },
       {
@@ -50,6 +51,7 @@ export const coreSections: CoreSection[] = [
           { id: "3.4", title: "Slice Strategy", slug: "3-4" },
           { id: "3.5", title: "Keeping Taxonomy Updated", slug: "3-5" },
           { id: "3.6", title: "Practical Coverage Math", slug: "3-6" },
+          { id: "3.7", title: "Agentic Task Decomposition", slug: "3-7" },
         ],
       },
       {
@@ -62,6 +64,7 @@ export const coreSections: CoreSection[] = [
           { id: "4.3", title: "Source-of-Truth Rules", slug: "4-3" },
           { id: "4.4", title: "Gold Sets & Adjudication", slug: "4-4" },
           { id: "4.5", title: "Preventing Label Rot", slug: "4-5" },
+          { id: "4.6", title: "Open-Ended & Creative Task Ground Truth", slug: "4-6" },
         ],
       },
       {
@@ -77,6 +80,9 @@ export const coreSections: CoreSection[] = [
           { id: "5.6", title: "De-duplication & Near-Duplicate Control", slug: "5-6" },
           { id: "5.7", title: "Dataset QA", slug: "5-7" },
           { id: "5.8", title: "Versioning, Lineage & Registry", slug: "5-8" },
+          { id: "5.9", title: "Synthetic Data Generation", slug: "5-9" },
+          { id: "5.10", title: "Multilingual & Cross-Cultural Datasets", slug: "5-10" },
+          { id: "5.11", title: "Dataset Evolution & Maintenance", slug: "5-11" },
         ],
       },
     ],

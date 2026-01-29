@@ -1,0 +1,441 @@
+# Chapter 3.7 — Agentic Task Decomposition & Composite Workflows
+
+Here's a pattern I see over and over:
+
+A team builds an agent that books appointments. They test it with "Book me a haircut for Tuesday at 3pm" and it works. They ship it. Then production logs show the agent:
+- checks availability (works),
+- confirms the slot (works),
+- tries to charge the card (fails),
+- sends a confirmation email anyway.
+
+Users get charged later or show up and there's no booking. Support tickets spike.
+
+What went wrong? The eval treated "book appointment" as **one atomic task**. But in reality, it's a **composite workflow** with four dependent steps. The taxonomy (3.1) and coverage map (3.2) never asked: what happens when step 3 fails?
+
+In 2026, autonomous agents don't just answer questions. They decompose goals into sub-tasks, execute them in sequence, handle errors, and propagate state. Your eval strategy needs to reflect this reality.
+
+This chapter shows you how.
+
+---
+
+## 1) Why atomic task taxonomy breaks for agents
+
+When we built task taxonomies in Chapter 3.1, we treated tasks as leaf nodes:
+- "Book appointment" = one task
+- "Refund order" = one task
+- "Update account details" = one task
+
+That's fine for chat and simple RAG. But for agents, these aren't tasks — they're **goals** that decompose into multi-step workflows.
+
+**Example: "Book appointment" is really:**
+1. Check availability for requested time
+2. Confirm slot with user
+3. Process payment
+4. Send confirmation (email/SMS)
+
+Each step:
+- can succeed or fail independently,
+- depends on the prior step's output,
+- requires different tool calls,
+- has different failure modes.
+
+If you evaluate "book appointment" as a pass/fail binary, you'll miss:
+- partial success (booking worked, payment failed),
+- wrong ordering (charged before confirming slot),
+- missing error recovery (payment fails, agent keeps going),
+- state corruption (confirmation sent with wrong details).
+
+**The uncomfortable truth:**
+Most agent failures in production aren't "the model is bad." They're "the workflow logic is bad, and we never tested it."
+
+---
+
+## 2) Mechanics: representing composite workflows in your taxonomy
+
+Instead of treating "Book appointment" as one leaf task, represent it as a **composite task** with sub-tasks.
+
+### 2.1 The structure
+
+**Goal-level task:**
+- Name: Book appointment
+- Type: Composite workflow
+- Channel: Agent
+- Risk tier: 2 (involves payment)
+
+**Sub-tasks (the decomposition):**
+1. Check availability (tool call: calendar API)
+2. Confirm slot with user (dialog turn)
+3. Process payment (tool call: payment API)
+4. Send confirmation (tool call: notification API)
+
+### 2.2 What you add to the taxonomy
+
+For each composite task, track:
+- **Sub-task list** (ordered if sequence matters)
+- **Dependencies** (which steps depend on prior steps)
+- **Success criteria per step**
+- **Overall success criteria** (all steps must pass? or partial OK?)
+- **Error recovery rules** (retry? skip? escalate?)
+
+---
+
+## 3) Evaluating partial success (the scoring problem)
+
+Here's where things get messy.
+
+**Scenario:**
+Agent successfully books the slot and confirms with the user, but payment fails. Agent escalates to human support.
+
+**Question:** Is this a pass or fail?
+
+**Answer depends on your definition of "good" (2.1):**
+- If "good" = complete the entire workflow autonomously → **fail**
+- If "good" = make progress and escalate gracefully when blocked → **pass**
+
+### 3.1 Practical scoring approaches
+
+**Option A: Binary (strict)**
+- Only score "pass" if all sub-tasks succeed
+- Use this for: high-stakes workflows (payments, account changes)
+
+**Option B: Partial credit (soft)**
+- Score each sub-task independently
+- Final score = average or weighted sum
+- Use this for: exploratory agents, research tasks
+
+**Option C: Milestone-based**
+- Define "critical path" sub-tasks (must pass)
+- Define "nice-to-have" sub-tasks (optional)
+- Pass if critical path succeeds
+- Use this for: complex workflows with fallback options
+
+**Enterprise default:**
+For Tier 2–3 workflows, use **strict binary** scoring for your regression gates, but track **per-step metrics** in monitoring so you can debug which step is failing.
+
+---
+
+## 4) Step ordering and dependency handling
+
+Some workflows are **sequential** (step 3 depends on step 2). Others are **parallel** (steps can run in any order).
+
+### 4.1 Sequential dependencies
+
+Example: "Refund order"
+1. Verify order exists (must pass before 2)
+2. Check refund policy (must pass before 3)
+3. Process refund (depends on 1 + 2)
+4. Send confirmation (depends on 3)
+
+**What you test:**
+- Does the agent execute steps in the right order?
+- If step 2 fails, does step 3 get skipped?
+- If the agent tries step 3 before step 1, does it fail safely?
+
+**How to test it:**
+Add eval cases where you **force a step to fail** (mock API returns error) and verify:
+- correct ordering is maintained,
+- downstream steps don't run,
+- agent reports the right failure reason.
+
+### 4.2 Parallel or flexible ordering
+
+Example: "Plan a trip"
+- Book flight (can happen first or second)
+- Book hotel (can happen first or second)
+- Send itinerary (must happen last)
+
+**What you test:**
+- Does the agent choose a reasonable order?
+- If one booking fails, does it continue with the other?
+- Does it always send itinerary last?
+
+---
+
+## 5) Evaluating the decomposition itself (planning quality)
+
+Modern agents use planning: they see a goal and decide how to break it down.
+
+**The new eval dimension:**
+Did the agent choose the **right plan**?
+
+### 5.1 What "right plan" means
+
+- Includes all necessary steps (completeness)
+- Skips unnecessary steps (efficiency)
+- Orders steps correctly (dependency-aware)
+- Chooses appropriate tools (tool selection)
+
+### 5.2 How to evaluate planning
+
+**Option A: Gold plan comparison**
+- For each goal, define a "reference plan" (the ideal decomposition)
+- Score: how closely does agent's plan match the reference?
+- Works well for: routine workflows with known best practices
+
+**Option B: Outcome-based**
+- Don't prescribe the plan, just verify the outcome
+- Agent can choose any valid plan as long as goal is achieved
+- Works well for: creative or exploratory tasks
+
+**Option C: Constraint satisfaction**
+- Define "must include" and "must not include" steps
+- Agent can vary the plan as long as constraints are met
+- Works well for: flexible workflows with safety boundaries
+
+**Enterprise practice:**
+For high-risk workflows, use **gold plan comparison** or **constraint satisfaction**. For low-risk, use **outcome-based**.
+
+---
+
+## 6) State propagation (how information flows between steps)
+
+In a composite workflow, each step produces outputs that later steps depend on.
+
+**Example: "Book appointment"**
+- Step 1 output: available time slots = ["2pm", "3pm", "5pm"]
+- Step 2 output: user confirms "3pm"
+- Step 3 input: charge for "3pm slot"
+- Step 4 input: send confirmation for "3pm"
+
+**What goes wrong (state corruption):**
+- Step 2 confirms "3pm" but step 3 charges for "2pm" (wrong state passed)
+- Step 3 succeeds but step 4 sends confirmation with old details (stale state)
+- Step 2 fails (user says "never mind") but step 3 runs anyway (missing cancellation signal)
+
+### 6.1 How to test state propagation
+
+Add eval cases that check:
+- **Correct pass-through:** outputs from step N become inputs to step N+1
+- **State isolation:** one workflow's state doesn't leak into another (multi-tenant agents)
+- **State updates:** if user changes their mind mid-workflow, later steps use updated state
+
+**Practical technique:**
+In your eval traces, log:
+- what state was available at each step,
+- what state was actually used,
+- where the state came from (which prior step).
+
+Then verify: the right values flowed to the right places.
+
+---
+
+## 7) Error recovery in workflows (retry, skip, escalate)
+
+When a sub-task fails, what should the agent do?
+
+### 7.1 The three recovery strategies
+
+**Retry:**
+- Try the same step again (with backoff)
+- Use when: transient failures (API timeout, rate limit)
+
+**Skip:**
+- Move to the next step, mark this one as incomplete
+- Use when: optional steps, or agent can continue without it
+
+**Escalate:**
+- Stop the workflow, hand off to human
+- Use when: critical step failed, or retry limit exceeded
+
+### 7.2 What you configure (knobs)
+
+For each sub-task, define:
+- **Max retries:** 0, 1, 3, or 5 (default: 1 for tool calls)
+- **Retry conditions:** which errors are retriable (timeouts yes, bad request no)
+- **Skip conditions:** when is it safe to skip (optional steps only)
+- **Escalation conditions:** when to give up (critical step failed, or 3 retries exhausted)
+
+### 7.3 What you test
+
+**Error injection tests (chaos eval):**
+- Force a tool call to fail with timeout → verify retry happens
+- Force a critical step to fail → verify escalation happens
+- Force an optional step to fail → verify workflow continues
+
+**Retry loop tests:**
+- Force a step to fail repeatedly → verify agent stops after max retries (not infinite loop)
+
+**Graceful degradation:**
+- Force payment API to be down → verify agent doesn't charge user twice when it recovers
+
+---
+
+## 8) Coverage implications (testing composite workflows end-to-end)
+
+When you have composite tasks, your coverage map (3.2) must track:
+
+### 8.1 Per-step coverage
+Each sub-task needs its own test cases:
+- "Check availability" → test with: no slots, some slots, all slots, API error
+- "Confirm slot" → test with: user says yes, no, changes their mind, unclear response
+- "Process payment" → test with: success, failure, timeout, retry needed
+- "Send confirmation" → test with: email success, SMS fallback, both fail
+
+### 8.2 End-to-end coverage
+Test the full workflow:
+- All steps pass (happy path)
+- Step 1 fails (early failure)
+- Step 3 fails (mid-workflow failure)
+- Step 4 fails (late failure, cleanup needed?)
+
+### 8.3 Cross-step coverage
+Test interactions between steps:
+- State propagation (3pm confirmed, 3pm charged)
+- Retry effects (step 2 retries, does step 3 wait?)
+- Partial completion (steps 1–2 done, step 3 pending, agent resumes correctly?)
+
+**Enterprise default:**
+- **Per-step:** 10–30 cases per sub-task (same as leaf tasks, 3.1)
+- **End-to-end:** 30–80 cases for the full composite workflow (depending on risk tier)
+- **Chaos/error injection:** 10–20 cases for forced failures
+
+---
+
+## 9) Knobs & defaults (what you actually set)
+
+### 9.1 Decomposition settings
+
+**Max sub-tasks per workflow:**
+- Default: 3–7 steps
+- Why: beyond 7, workflows become hard to test and reason about
+- If you need more, break into sub-workflows
+
+**Planning strategy:**
+- Fixed plan (no model decision) vs dynamic plan (model chooses)
+- For Tier 2–3: prefer **fixed plan** with clear rules
+- For Tier 0–1: allow **dynamic plan** for flexibility
+
+**Dependency enforcement:**
+- Strict (must follow order) vs flexible (order doesn't matter)
+- Default: strict for high-risk, flexible for low-risk
+
+### 9.2 Error recovery defaults
+
+**Retry config (per sub-task):**
+- Max retries: 1–3
+- Retry delay: exponential backoff (1s, 2s, 4s)
+- Retriable errors: timeout, rate limit, 5xx (not 4xx)
+
+**Escalation rules:**
+- Critical steps: escalate on first failure (no retry for payments, deletions)
+- Non-critical steps: escalate after 3 retries
+
+**Abort conditions:**
+- Total workflow time budget: 30s–2min (prevent infinite loops)
+- Total tool calls budget: 10–20 (prevent thrashing)
+
+---
+
+## 10) Failure modes (symptoms + root causes)
+
+### 10.1 "Agent loops forever"
+Symptoms:
+- Same tool called repeatedly
+- Workflow never finishes
+
+Root causes:
+- No max retries set
+- No stop condition in plan
+- Missing "done" criteria
+
+Fix:
+- Set max retries + timeout
+- Add "done" signal to each step
+- Log tool call count and abort after budget exceeded
+
+### 10.2 "Partial success, user confused"
+Symptoms:
+- Booking confirmed but payment failed
+- Charge went through but no confirmation sent
+
+Root causes:
+- No rollback/compensation logic
+- Success criteria too loose (partial = pass)
+
+Fix:
+- Use strict binary scoring for critical workflows
+- Add rollback steps (cancel booking if payment fails)
+- Test partial-failure cases explicitly
+
+### 10.3 "Wrong order of operations"
+Symptoms:
+- Payment processed before user confirmed
+- Confirmation sent before action completed
+
+Root causes:
+- Dependencies not enforced
+- Agent re-orders steps incorrectly
+
+Fix:
+- Use fixed plan or strict dependency rules
+- Test with "wrong order" cases (verify they fail)
+
+### 10.4 "State corruption across turns"
+Symptoms:
+- User says "3pm" but agent books "2pm"
+- User changes mind but old value is used
+
+Root causes:
+- State not updated between steps
+- Steps read stale state
+
+Fix:
+- Log state at each step
+- Test with "user changes mind" cases
+- Add state validation between steps
+
+---
+
+## 11) Enterprise expectations (what serious teams do)
+
+### 11.1 Workflow versioning
+- Every composite workflow has a version (v1.0, v1.1)
+- Changes to sub-tasks or ordering require version bump
+- Regression tests are pinned to workflow version
+
+### 11.2 Structured traces
+- Every workflow execution logs:
+  - goal
+  - plan (sub-tasks chosen)
+  - per-step: tool calls, inputs, outputs, errors, retries
+  - final outcome
+- Traces are indexed by workflow ID for debugging
+
+### 11.3 Per-step SLAs
+- Each sub-task has:
+  - success rate target (e.g., 95%)
+  - latency target (e.g., under 2s)
+- Monitored in production
+- Alerts fire when sub-task degrades (before full workflow fails)
+
+### 11.4 Rollback and compensation
+- For Tier 2–3 workflows, define compensation logic:
+  - If payment succeeds but confirmation fails → retry confirmation
+  - If booking succeeds but payment fails → cancel booking
+- Test rollback paths explicitly
+
+---
+
+## 12) Interview Q&A
+
+**Q: How do you evaluate a composite agent workflow, like booking an appointment?**
+
+A: I break it into sub-tasks — check availability, confirm slot, process payment, send confirmation — and evaluate both per-step correctness and end-to-end success. I test the happy path, but also error injection: what happens if payment fails? Does the agent retry, escalate, or incorrectly proceed? I track partial success separately from full success, and I verify state propagates correctly between steps. For high-risk workflows, I use strict binary scoring and require rollback logic.
+
+---
+
+**Q: What's the difference between evaluating the plan and evaluating the execution?**
+
+A: Planning is: did the agent choose the right sub-tasks and order them correctly? Execution is: did each sub-task actually succeed? I evaluate both. For planning, I compare the agent's plan to a reference plan or check constraint satisfaction (must include X, must not include Y). For execution, I run the workflow and verify each step's output. In high-risk scenarios, I use fixed plans so there's no planning variance. In exploratory tasks, I allow flexible planning but verify the outcome.
+
+---
+
+**Q: How do you test error recovery in a multi-step workflow?**
+
+A: I inject failures — force a tool call to timeout, return an error, or produce bad data — and verify the agent handles it correctly. Does it retry? Does it escalate? Does it skip and continue? I also test retry limits: if a step fails three times, does the agent stop (not loop forever)? For critical steps like payments, I verify the agent escalates immediately. I keep a "chaos eval suite" with forced failures for every sub-task and test them in regression.
+
+---
+
+This decomposition mindset — treating workflows as graphs of sub-tasks, not atomic units — is the foundation for evaluating agentic systems in 2026.
+
+Next, in **Chapter 3.8**, we'll talk about how to handle **adversarial and edge-case coverage** when agents have tool access and can take real actions.
