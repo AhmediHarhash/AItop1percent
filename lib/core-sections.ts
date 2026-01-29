@@ -35,6 +35,7 @@ export const coreSections: CoreSection[] = [
           { id: "2.1", title: "Task-Specific Definitions of \"Good\"", slug: "2-1" },
           { id: "2.2", title: "Rubrics Humans Can Score Consistently", slug: "2-2" },
           { id: "2.3", title: "Good vs Bad Patterns", slug: "2-3" },
+          { id: "2.4", title: "Uncertainty, Refusal & Safety Scoring", slug: "2-4" },
         ],
       },
     ],
