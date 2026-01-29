@@ -48,6 +48,7 @@ export const coreSections: CoreSection[] = [
           { id: "3.2", title: "Coverage Map", slug: "3-2" },
           { id: "3.3", title: "Sampling Strategy", slug: "3-3" },
           { id: "3.4", title: "Slice Strategy", slug: "3-4" },
+          { id: "3.5", title: "Keeping Taxonomy Updated", slug: "3-5" },
           { id: "3.6", title: "Practical Coverage Math", slug: "3-6" },
         ],
       },
