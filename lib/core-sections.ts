@@ -39,6 +39,14 @@ export const coreSections: CoreSection[] = [
           { id: "2.5", title: "Enterprise Scorecards", slug: "2-5" },
         ],
       },
+      {
+        id: "3",
+        title: "Chapter 3",
+        slug: "ch3",
+        subchapters: [
+          { id: "3.1", title: "Build a Task Taxonomy", slug: "3-1" },
+        ],
+      },
     ],
   },
   {
