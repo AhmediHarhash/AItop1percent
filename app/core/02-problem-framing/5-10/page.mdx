@@ -1,0 +1,230 @@
+# 5.10 — Tool Contracts: Permissions, Idempotency, Rate Limits, Audit Logs
+
+In early 2026, a SaaS company deployed an AI agent to automate customer support workflows. The agent could read support tickets, query the knowledge base, update ticket status, and send emails to customers. It worked beautifully in testing. Within hours of launch, things went wrong. A customer complained that they received the same email five times. The team investigated and discovered that the agent had called the "send email" tool five times for the same ticket because it kept retrying after transient errors. Another customer complained that their ticket was marked "resolved" when it was not. The team found that the agent had called the "update ticket status" tool without checking the current status first. A third customer found that the agent had accessed their billing information to answer a question about their subscription, which violated the company's data access policies. The team spent the weekend rolling back the agent, reviewing every action it had taken, and implementing guardrails. The root cause was not the agent itself — it was the **tool contracts**. The tools had no permission boundaries, no idempotency guarantees, no rate limits, and no audit logs. The agent could do anything, and the team had no way to control it or track what it did.
+
+This is the defining challenge of agentic systems in 2026: tools are powerful and dangerous. They are the interface between the AI and the real world. They can read data, write data, send messages, charge credit cards, trigger workflows, and make decisions that affect users and businesses. If tools do not have well-defined contracts, your agent will do things you do not intend, violate policies you thought were enforced, and cause damage you cannot undo.
+
+This subchapter covers how to specify tool contracts for agentic systems, how to define permissions, ensure idempotency, enforce rate limits, maintain audit logs, and use tool contracts as a security boundary.
+
+## Why Tools Need First-Class Contracts
+
+In traditional software, functions are internal abstractions. You call a function, it does something, it returns a result. If the function has a bug, you fix it. If the function does the wrong thing, you change the code.
+
+In agentic systems, tools are **first-class components**. The agent decides which tool to call and what parameters to pass. The tool executes in response to the agent's decision, not in response to hardcoded logic. This creates two problems:
+
+**Problem 1: The agent can call the wrong tool or pass the wrong parameters.** The agent is not deterministic. It might misinterpret the user's query. It might choose a tool that seems relevant but is not. It might pass parameters that are valid but incorrect. If the tool does not validate inputs or check permissions, it will execute the wrong action.
+
+**Problem 2: The agent can call tools in ways that violate system invariants.** The agent does not know about side effects, idempotency, rate limits, or data access policies unless you tell it. If the tool charges a credit card, the agent might call it twice. If the tool sends an email, the agent might spam the user. If the tool accesses sensitive data, the agent might expose it to unauthorized users.
+
+The tool contract is the specification that prevents these problems. It defines not just **what the tool does**, but **what it is allowed to do**, **how it should be called**, and **what must be logged**.
+
+## Permissions: What Can the Tool Do?
+
+The first element of a tool contract is **permissions**: what actions the tool is allowed to take. This is the principle of least privilege: the tool should have the minimum permissions needed to do its job, and no more.
+
+Here is how to specify permissions:
+
+**Read vs write.** Is the tool read-only or read-write? A tool that queries a database should have read-only access. A tool that updates a database should have read-write access, but only to the specific tables it needs to modify. Do not give a tool write access unless it needs it.
+
+**Scope of access.** What data can the tool access? A tool that reads user profiles should only access the profiles of users who have given consent. A tool that reads financial data should only access the data for the current session's user, not all users. Define the scope explicitly: which databases, which tables, which rows, which columns.
+
+**Action boundaries.** What operations can the tool perform? A tool that sends emails should only send emails to verified addresses, not arbitrary addresses. A tool that charges credit cards should only charge the amount specified in the current transaction, not arbitrary amounts. Define the allowed operations explicitly.
+
+**External service access.** If the tool calls external APIs, which APIs can it call? Can it call any URL or only approved URLs? Can it send arbitrary data or only structured data that has been validated?
+
+**User context.** Does the tool respect user-level permissions? If the user is not authorized to access certain data, the tool should not access it on their behalf. If the user is in a restricted role, the tool should not perform actions that role is not allowed to perform.
+
+The permissions specification is **separate from the tool implementation**. You document the permissions in the tool contract, and you enforce them programmatically in the tool's code. The agent should not have to know about permissions — the tool should enforce them automatically.
+
+## Idempotency: Can the Tool Be Called Safely Multiple Times?
+
+The second element of a tool contract is **idempotency**: whether the tool can be called multiple times with the same parameters safely. This is critical for retry logic, error recovery, and agent self-correction.
+
+Here is what idempotency means:
+
+**Idempotent tools** can be called multiple times with the same parameters, and the result is the same as calling it once. Examples: reading a database, querying an API, fetching a web page. If you call "get user profile" five times, you get the same profile five times. No harm done.
+
+**Non-idempotent tools** change state, and calling them multiple times has different effects. Examples: sending an email, charging a credit card, creating a database record, incrementing a counter. If you call "send email" five times, the user gets five emails. If you call "charge credit card" five times, the user gets charged five times.
+
+Here is how to specify idempotency in the tool contract:
+
+**Mark the tool as idempotent or non-idempotent.** This is a binary flag. If the tool is idempotent, say so explicitly. If it is non-idempotent, say so explicitly and document the consequences of retrying.
+
+**For non-idempotent tools, provide idempotency keys.** An idempotency key is a unique identifier the caller provides with each request. If the tool receives the same idempotency key twice, it returns the result of the first call instead of executing again. This makes non-idempotent tools safe to retry. For example, when charging a credit card, the caller provides an idempotency key (like a transaction ID). If the agent retries the charge with the same key, the payment processor returns the result of the first charge instead of charging again.
+
+**For non-idempotent tools without idempotency keys, disable retries.** If the tool is non-idempotent and does not support idempotency keys, the agent should not retry it. If the tool fails, the agent should surface the error to the user instead of retrying and causing duplicate actions.
+
+**Document side effects.** Even if a tool is idempotent in terms of the data it returns, it might have non-idempotent side effects. For example, a tool that logs analytics events is idempotent in terms of returning the same result, but non-idempotent in terms of logging events — calling it five times logs five events. Document all side effects explicitly.
+
+Idempotency is often overlooked in agentic systems, but it is one of the most important aspects of tool design. If your tools are not idempotent and the agent retries them, you will cause duplicate actions, corrupt data, and frustrate users.
+
+## Rate Limits: How Often Can the Tool Be Called?
+
+The third element of a tool contract is **rate limits**: how often the tool can be called. Rate limits prevent abuse, protect external services, and control costs.
+
+Here is how to specify rate limits:
+
+**Per-second limits.** How many times can the tool be called per second? This prevents runaway loops where the agent calls the same tool hundreds of times in a tight loop. For example, if a tool queries an external API, you might limit it to 10 calls per second to avoid hitting the API's rate limit.
+
+**Per-minute limits.** How many times can the tool be called per minute? This is useful for tools that are expensive or have quota limits. For example, if a tool uses a paid API that charges per call, you might limit it to 60 calls per minute to control costs.
+
+**Per-session limits.** How many times can the tool be called in a single user session? This prevents a single session from monopolizing resources. For example, you might limit a tool that sends emails to 5 calls per session to prevent spam.
+
+**Per-user limits.** How many times can the tool be called by a single user across all sessions? This is useful for enforcing fair use policies. For example, you might limit a tool that generates reports to 100 calls per user per day.
+
+**What happens when limits are hit?** When a rate limit is exceeded, what should the tool do? Return an error? Queue the request? Wait and retry? Document the behavior explicitly so the agent knows how to handle it.
+
+**Exemptions.** Are there users or contexts where rate limits do not apply? For example, internal users or premium users might have higher limits. Document exemptions explicitly.
+
+Rate limits are enforced **at the tool level**, not at the agent level. The tool tracks its own rate limit state and returns an error when the limit is exceeded. The agent does not need to know about rate limits — it just needs to handle the error.
+
+## Audit Logs: What Must Be Logged for Each Tool Call?
+
+The fourth element of a tool contract is **audit logs**: what must be logged every time the tool is called. Audit logs are critical for compliance, debugging, and security review.
+
+Here is what to log for each tool call:
+
+**Timestamp.** When was the tool called? Include the date, time, and timezone.
+
+**User context.** Who triggered the tool call? Include the user ID, session ID, and any other relevant context like IP address or user agent.
+
+**Tool name and version.** Which tool was called, and what version of the tool? If the tool's behavior changes across versions, you need to know which version was used.
+
+**Input parameters.** What parameters were passed to the tool? Log the full parameter set, but redact sensitive data like passwords, credit card numbers, or personal identifiable information. If you cannot redact automatically, log a hash of the parameters so you can identify duplicate calls without exposing the data.
+
+**Output or error.** What did the tool return? If it succeeded, log the result (redacted if necessary). If it failed, log the error code and error message.
+
+**Latency.** How long did the tool call take? This is useful for debugging performance issues.
+
+**Cost.** If the tool incurs a cost (e.g., calling a paid API), log the cost. This helps track spending and identify expensive operations.
+
+**Side effects.** Did the tool modify data, send a message, or trigger an external action? Log what changed. For example, if the tool sent an email, log the recipient and subject line. If the tool updated a database, log which records were modified.
+
+**Idempotency key.** If the tool uses idempotency keys, log the key so you can identify retries.
+
+Audit logs should be **structured** and **queryable**. Do not log plain text messages. Log JSON or another structured format so you can query logs programmatically. Use a logging system that supports search, filtering, and aggregation.
+
+Audit logs are not just for compliance. They are your primary debugging tool. When an agent does something wrong, you trace the logs to see which tools it called, what parameters it passed, and what errors it encountered. Without audit logs, debugging is guesswork.
+
+## Error Handling: What Errors Can the Tool Return?
+
+The fifth element of a tool contract is **error handling**: what errors the tool can return and how the agent should respond.
+
+Here is how to specify error handling:
+
+**Define error codes.** For each type of failure, define an error code and an error message format. For example: INVALID_PARAMETERS, PERMISSION_DENIED, RATE_LIMIT_EXCEEDED, EXTERNAL_API_FAILURE, TIMEOUT, INTERNAL_ERROR.
+
+**Document error semantics.** For each error code, explain what it means. INVALID_PARAMETERS means the input parameters did not match the schema. PERMISSION_DENIED means the user does not have permission to perform this action. RATE_LIMIT_EXCEEDED means the tool was called too many times.
+
+**Specify agent behavior.** For each error code, specify what the agent should do. Should it retry? Ask the user for clarification? Fail and surface the error to the user? For example:
+- INVALID_PARAMETERS: Do not retry. Ask the user for clarification or use a different tool.
+- PERMISSION_DENIED: Do not retry. Surface the error to the user with an explanation.
+- RATE_LIMIT_EXCEEDED: Wait and retry after the rate limit window expires.
+- EXTERNAL_API_FAILURE: Retry up to three times with exponential backoff. If all retries fail, surface the error to the user.
+- TIMEOUT: Retry once. If the retry fails, surface the error to the user.
+- INTERNAL_ERROR: Do not retry. Surface the error to the user and log it for investigation.
+
+**Provide error recovery hints.** If the tool returns an error, can the agent recover? For example, if the tool returns INVALID_PARAMETERS, the error message should explain which parameter was invalid and what the valid format is. This helps the agent self-correct.
+
+Error handling is often the weakest part of tool contracts. Teams focus on the happy path and assume errors will be rare. In production, errors are common. The agent calls a tool with malformed parameters. The external API is down. The database is slow. The user does not have permission. If your tool contract does not specify how to handle these errors, the agent will fail silently or retry indefinitely.
+
+## Timeout Handling: What If the Tool Doesn't Respond?
+
+The sixth element of a tool contract is **timeout handling**: what happens if the tool takes too long to respond.
+
+Here is how to specify timeouts:
+
+**Define the timeout threshold.** How long should the agent wait for the tool to respond? This depends on the tool. A database query might have a 5-second timeout. An external API call might have a 30-second timeout. A long-running computation might have a 5-minute timeout.
+
+**Specify what happens on timeout.** Should the tool return an error? Should the agent retry? Should the tool continue running in the background and return the result later? Document the behavior explicitly.
+
+**Provide timeout hints.** If the tool is slow, can the agent predict the latency? For example, if the tool queries a large database, it might return an estimated completion time. The agent can use this to decide whether to wait or show the user a progress indicator.
+
+Timeouts are critical for agentic systems because the agent does not know how long a tool will take. If the agent waits indefinitely, the user experience suffers. If the agent times out too early, it wastes work. The tool contract needs to specify the timeout threshold and the fallback behavior.
+
+## Tool Contracts as a Security Boundary
+
+In 2026, the most common security vulnerability in agentic systems is **excessive agency**: the agent has more power than it should. The agent can access data it should not access. The agent can perform actions the user did not authorize. The agent can call tools in ways that violate policies.
+
+The tool contract is the **primary control mechanism** for excessive agency. By specifying permissions, idempotency, rate limits, and audit logs, you create a security boundary. The agent can only do what the tools allow. The tools enforce permissions, log actions, and limit the blast radius of mistakes.
+
+Here is how to use tool contracts as a security boundary:
+
+**Enforce permissions at the tool level.** Do not rely on the agent to check permissions. The tool should check permissions before executing any action. If the user does not have permission, the tool returns PERMISSION_DENIED.
+
+**Limit tool scope.** Each tool should do one thing. Do not create a "do anything" tool that can read any database, write any file, call any API. Create narrow tools with limited scope: "read user profile," "update ticket status," "send email to verified address."
+
+**Require explicit user confirmation for high-risk actions.** If a tool performs a high-risk action (e.g., charging a credit card, deleting data, sending an email to a large group), require the user to confirm before executing. The tool should return a confirmation prompt, and the agent should surface it to the user.
+
+**Use allow-lists, not deny-lists.** Define what the tool is allowed to do, not what it is not allowed to do. Allow-lists are safer because they default to denying unknown actions.
+
+**Audit everything.** Log every tool call, every parameter, every result, every error. If the agent does something wrong, you need a complete audit trail to understand what happened and prevent it from happening again.
+
+The tool contract is not just a technical specification. It is a **security policy**. It defines what the agent can and cannot do. It creates accountability. It enables review and oversight.
+
+## Practical Example: Email Tool Contract
+
+Let's make this concrete with an example. Suppose you are building an agent that can send emails on behalf of the user. Here is the tool contract:
+
+**Tool name:** send_email
+**Version:** 1.0.0
+**Description:** Sends an email to a specified recipient on behalf of the user.
+
+**Permissions:**
+- The tool can only send emails to addresses in the user's contact list or addresses the user has explicitly approved.
+- The tool cannot send emails to arbitrary addresses.
+- The tool cannot send emails to more than 10 recipients at once.
+
+**Input parameters:**
+- recipient (string, required): Email address of the recipient. Must be in the user's contact list or approved addresses.
+- subject (string, required): Subject line of the email. Maximum 200 characters.
+- body (string, required): Body of the email. Maximum 10,000 characters.
+- idempotency_key (string, required): Unique identifier for this email. If the tool is called with the same key twice, it returns the result of the first call without sending a duplicate email.
+
+**Output:**
+- status (string): SUCCESS or FAILURE.
+- message_id (string): Unique identifier for the sent email (returned only on success).
+- error_code (string): Error code if the call failed (returned only on failure).
+- error_message (string): Human-readable error message (returned only on failure).
+
+**Idempotency:** Non-idempotent. Requires idempotency_key to prevent duplicate sends.
+
+**Rate limits:**
+- 5 emails per minute per user.
+- 50 emails per day per user.
+- On limit exceeded, returns error code RATE_LIMIT_EXCEEDED.
+
+**Error codes:**
+- INVALID_RECIPIENT: Recipient is not in the user's contact list or approved addresses.
+- INVALID_SUBJECT: Subject line exceeds 200 characters or is empty.
+- INVALID_BODY: Body exceeds 10,000 characters or is empty.
+- RATE_LIMIT_EXCEEDED: User has exceeded rate limits.
+- PERMISSION_DENIED: User does not have permission to send emails.
+- EXTERNAL_API_FAILURE: Email service is unavailable.
+
+**Audit logs:**
+- Timestamp, user ID, session ID, recipient, subject (first 50 characters), idempotency_key, status, message_id or error_code, latency.
+
+**Timeout:** 30 seconds. If the email service does not respond within 30 seconds, return error code TIMEOUT.
+
+This tool contract is precise, enforceable, and safe. The agent knows exactly what the tool does, what parameters it needs, what errors it can return, and what constraints apply. The tool enforces permissions, prevents duplicates, respects rate limits, and logs every action.
+
+## Practical Takeaways
+
+**Treat tools as first-class components.** Tools are not internal abstractions. They are the boundary between the agent and the real world. They need explicit contracts.
+
+**Specify permissions.** Read vs write, scope of access, action boundaries, external service access, user context. Enforce permissions at the tool level.
+
+**Specify idempotency.** Mark tools as idempotent or non-idempotent. For non-idempotent tools, use idempotency keys or disable retries.
+
+**Specify rate limits.** Per-second, per-minute, per-session, per-user. Document what happens when limits are hit.
+
+**Specify audit logs.** Log timestamp, user context, tool name and version, input parameters, output or error, latency, cost, side effects, idempotency key.
+
+**Specify error handling.** Define error codes, document semantics, specify agent behavior for each error, provide recovery hints.
+
+**Specify timeouts.** Define the timeout threshold and what happens on timeout.
+
+**Use tool contracts as a security boundary.** Enforce permissions, limit tool scope, require explicit confirmation for high-risk actions, use allow-lists, audit everything.
+
+The next question is: what about users who speak different languages, live in different regions, and have different expectations for format, tone, and policy? How do you specify those requirements in your I/O contract?

@@ -1,0 +1,119 @@
+# 2.7 — Dependency Mapping Between Sub-Problems
+
+When a major e-commerce company launched their AI-powered product recommendation system in late 2024, they encountered a puzzling problem. The system would work flawlessly for hours, then suddenly start recommending completely irrelevant products to customers. A user shopping for kitchen appliances would see recommendations for motorcycle parts. A customer browsing children's books would get suggestions for industrial equipment. The errors weren't random — they happened in waves, affecting thousands of users simultaneously before correcting themselves.
+
+The engineering team initially blamed model quality, then data freshness, then caching issues. After two weeks of investigation, they finally discovered the real culprit: they had never mapped the dependencies between their system's sub-problems. Their recommendation pipeline had six stages: user behavior tracking, session context assembly, product catalog indexing, candidate generation, ranking, and real-time personalization. These stages ran on different services with different update frequencies and different failure modes.
+
+The problem was a data dependency they hadn't documented. The ranking stage depended on product embeddings from the catalog indexing stage. When catalog indexing fell behind due to load spikes, it would temporarily serve stale embeddings. The ranking stage had no visibility into this — it just used whatever embeddings it received. For a brief window, users were being shown recommendations based on product embeddings that were 6-8 hours old, before catalog structure updates. A product categorized as "kitchen" that morning would still have yesterday's embedding placing it in "automotive."
+
+This is the hidden complexity that emerges when you decompose problems: the sub-problems don't exist in isolation. They depend on each other in specific ways, and those dependencies determine how your system behaves, how it fails, and how you need to architect it. Dependency mapping isn't optional documentation — it's the foundation for building reliable systems.
+
+## Serial Versus Parallel Sub-Problems
+
+The most fundamental distinction in dependency mapping is between serial sub-problems that must execute in sequence and parallel sub-problems that can execute simultaneously. This distinction determines your system's architecture, performance characteristics, and failure modes.
+
+Serial sub-problems have data dependencies — the output of one sub-problem is the input to the next. In a document processing pipeline, you can't extract information from text until OCR has converted the image to text. You can't classify entities until text extraction has identified the relevant passages. You can't validate extracted data until entity recognition has identified the fields. Each stage must complete before the next can begin.
+
+Serial dependencies create a pipeline architecture. Data flows through stages in order, each stage transforming the output of the previous stage. This has important implications. First, latency accumulates — your total end-to-end latency is the sum of all stage latencies plus any coordination overhead. If OCR takes 2 seconds, layout understanding takes 1.5 seconds, entity extraction takes 0.8 seconds, and validation takes 0.3 seconds, your minimum total latency is 4.6 seconds even with perfect parallelization within each stage.
+
+Second, failures cascade. If OCR fails, everything downstream fails. If entity extraction has bugs that misidentify fields, validation will be checking the wrong data. Serial dependencies mean that the reliability of your entire system is limited by the reliability of your least reliable stage. If each of five serial stages has 95% success rate, your end-to-end success rate isn't 95% — it's 0.95 to the fifth power, or about 77%.
+
+Parallel sub-problems have no data dependencies on each other — they can execute simultaneously. In a content moderation system, checking for violent content, checking for hate speech, checking for spam, and checking for misinformation can all happen in parallel. Each analyzes the same input independently. The outputs might be combined later, but the sub-problems themselves don't depend on each other.
+
+Parallel dependencies enable fan-out architectures. A single input spawns multiple concurrent processing paths that execute independently. This has different implications than serial pipelines. Latency is determined by your slowest parallel sub-problem, not the sum of all sub-problems. If four parallel checks take 1.2 seconds, 0.8 seconds, 1.5 seconds, and 0.9 seconds respectively, your total latency is 1.5 seconds (the maximum) plus combination overhead, not 4.4 seconds.
+
+Reliability also behaves differently. Whether parallel failures cascade depends on how you combine results. If all parallel sub-problems must succeed for the overall task to succeed, reliability multiplies just like serial dependencies. But if you can proceed with partial results — say, flagging content if any of the four checks fails — then parallel sub-problems improve reliability through redundancy.
+
+The critical insight from dependency mapping is that serial versus parallel isn't a property of sub-problems in isolation — it's a property of the relationships between sub-problems. Proper decomposition identifies not just what the sub-problems are, but how they relate to each other.
+
+## Types of Dependencies: Data, Control, and Resource
+
+When you map dependencies between decomposed sub-problems, you're actually tracking three different types of dependencies that behave differently and require different architectural considerations.
+
+Data dependencies are the most obvious. Sub-problem B needs the output from sub-problem A as input. In a fraud detection system, the risk scoring sub-problem needs the output from the transaction parsing sub-problem. The transaction parsing extracts amounts, merchant categories, locations, and timestamps. Risk scoring uses those extracted features to calculate fraud probability. This is a data dependency — risk scoring can't run until transaction parsing provides data.
+
+Data dependencies determine execution order and define your critical path for latency. They also define error propagation — if transaction parsing extracts incorrect data, risk scoring will calculate incorrect scores, even if the risk scoring logic itself is perfect. When you're optimizing latency, you optimize data dependencies first because they're on the critical path. When you're debugging accuracy problems, you trace data dependencies to find where incorrect data originated.
+
+Control dependencies are more subtle. Sub-problem B doesn't need data from sub-problem A, but whether B runs at all depends on a decision made by A. In a customer service chatbot, the intent classification sub-problem determines which response generation sub-problem to invoke. If intent classification identifies a technical support question, the technical response generator runs. If it identifies a billing question, the billing response generator runs. These response generators don't depend on each other, but which one runs depends on the control flow decision made by intent classification.
+
+Control dependencies create branching architectures where different execution paths handle different cases. They also create a different kind of error propagation. If intent classification makes the wrong decision, it routes to the wrong downstream sub-problem. The downstream sub-problem might execute perfectly, but you'll get the wrong type of response because control flow sent you down the wrong path.
+
+Resource dependencies occur when sub-problems compete for limited resources even if they don't have data or control relationships. In a real-time video processing system, multiple parallel sub-problems might all need GPU compute, memory bandwidth, or network throughput. Two sub-problems with no data dependency might still need to be scheduled carefully to avoid resource contention.
+
+Resource dependencies affect performance and reliability in ways that aren't obvious from data flow alone. You might design parallel sub-problems for speed, only to discover they all hit the same database and create lock contention. You might deploy independent services that all try to allocate GPU memory and cause out-of-memory failures. Resource dependency mapping reveals these conflicts before they become production problems.
+
+## Building a Dependency Graph
+
+The practical tool for dependency mapping is a dependency graph — a visual representation of sub-problems as nodes and dependencies as edges. Building this graph systematically prevents the kind of hidden dependency that caused the recommendation system failures in our opening story.
+
+Start with your decomposed list of sub-problems. Each sub-problem becomes a node in your graph. For the e-commerce recommendation system, you might have nodes for user behavior tracking, session context assembly, product catalog indexing, user embedding generation, product embedding generation, candidate generation, ranking, and real-time personalization.
+
+Next, add data dependency edges. Draw an arrow from sub-problem A to sub-problem B if B needs data produced by A. User behavior tracking feeds into session context assembly — add an edge. Session context assembly feeds into candidate generation — add an edge. Product catalog indexing feeds into product embedding generation — add an edge. Product embeddings feed into both candidate generation and ranking — add edges to both.
+
+Now add control dependency edges, typically shown with a different arrow style or color. If session context includes a decision that determines which candidate generation strategy to use, that's a control dependency. If user segment classification determines whether personalization runs or uses a default path, that's a control dependency.
+
+Finally, annotate resource dependencies, often shown as undirected edges or notes rather than arrows since resource conflicts don't imply execution order. If candidate generation and ranking both hit the same database, note it. If product embedding generation and user embedding generation both require GPU allocation, note it.
+
+The resulting graph reveals your system's structure. Long chains of serial dependencies indicate latency bottlenecks — those chains define your minimum end-to-end latency. Dense clusters of dependencies indicate potential failure cascade zones — a failure in a node that many other nodes depend on will affect many downstream sub-problems. Parallel branches indicate opportunities for concurrency and throughput optimization.
+
+Looking at the recommendation system's dependency graph, the team realized they had an undocumented data dependency between product catalog indexing and ranking that crossed service boundaries. Catalog indexing ran in a batch service that updated every 30 minutes. Ranking ran in a real-time service that pulled product embeddings on demand. When catalog indexing fell behind, ranking had no way to know it was using stale embeddings. The graph made the dependency visible, enabling them to add versioning and staleness detection.
+
+## How Dependency Structure Determines System Architecture
+
+Once you have a dependency graph, it essentially dictates your system architecture. The patterns in your dependencies map directly to architectural patterns, and fighting against this mapping creates fragile systems.
+
+Serial dependencies lead to pipeline architectures. If your dependency graph is mostly a linear chain — A feeds B feeds C feeds D — you're building a pipeline. Each stage processes input, produces output, and hands off to the next stage. Pipeline architectures are straightforward to reason about but have accumulated latency and cascading failures. They're appropriate when the problem genuinely has sequential logic that can't be parallelized.
+
+The document processing system is a natural pipeline: ingest document, perform OCR, understand layout, extract entities, validate data, format output. Trying to avoid the pipeline architecture would require breaking genuine data dependencies, which is either impossible or requires speculative execution that wastes resources.
+
+Parallel fan-out dependencies lead to fan-out/fan-in architectures. If your dependency graph shows one node with edges to multiple independent nodes, and those nodes later converge at a combination node, you have a fan-out pattern. Content moderation is naturally fan-out: one input content item fans out to parallel safety checks, then results fan back in to a final decision. Fan-out architectures optimize for throughput and latency by exploiting parallelism, but they require careful result combination logic.
+
+Control dependencies lead to branching architectures with routing logic. If your dependency graph has decision points that route to different downstream paths, you need a system with explicit routing components. The customer service chatbot has this structure: initial message processing routes to different specialized handlers based on intent classification. Branching architectures need clear routing contracts and often benefit from a registry or dispatcher pattern.
+
+Cyclic dependencies indicate iterative refinement architectures. If your dependency graph has cycles — A depends on B depends on C depends on A — you have an iterative process. Document parsing might iterate: initial OCR produces text, layout understanding identifies structure, contextual OCR re-processes ambiguous regions with layout hints, updated layout understanding refines structure. Cyclic dependencies require termination conditions and convergence logic, and they complicate both latency prediction and failure handling.
+
+The recommendation system had a hybrid architecture implied by its dependencies. Product catalog indexing and user behavior tracking were independent parallel batch processes. These fed into embedding generation services. Embedding outputs fed into a real-time pipeline: session context assembly, candidate generation, ranking, personalization. The architecture mistake was treating the batch-to-real-time boundary as a simple API call rather than recognizing it as a dependency that required versioning and staleness handling.
+
+## Dependency Mapping Reveals Failure Cascade Paths
+
+One of the most valuable outcomes of dependency mapping is understanding how failures propagate through your system. When sub-problem X fails, which other sub-problems are affected? This is the concept of blast radius — the scope of impact from a single failure.
+
+Follow the dependency edges from any node to see what depends on it directly and transitively. If user behavior tracking fails, it affects session context assembly directly. Session context assembly failure affects candidate generation. Candidate generation failure affects ranking. Ranking failure affects personalization. The blast radius of a user behavior tracking failure is potentially the entire recommendation pipeline — five downstream sub-problems.
+
+Compare that to product catalog indexing failure. It affects product embedding generation directly. Product embeddings feed into candidate generation and ranking, which affect personalization. The blast radius is four downstream sub-problems, similar scope but different path.
+
+Now consider real-time personalization failure. It has no downstream dependencies — it's a terminal node in the graph. Its blast radius is just itself. A failure there is contained, affecting output quality but not cascading to break other sub-problems.
+
+This analysis tells you where to invest in reliability. Sub-problems with large blast radius need more defensive coding, better error handling, more comprehensive testing, and possibly redundancy or fallback strategies. Sub-problems with small blast radius can tolerate more risk because failures are contained.
+
+It also reveals where you need circuit breakers and degraded mode handling. In the recommendation system, if product embedding generation fails, you can't run the normal ranking algorithm. But you could fall back to a simpler ranking that uses only user behavior data, not product embeddings. Your dependency map shows you where to put the circuit breaker (detecting embedding service failure) and which sub-problems to swap out (ranking) with what alternatives (behavior-only ranking).
+
+Without dependency mapping, you discover failure cascades in production when one sub-problem fails and mysteriously breaks three others that seemed unrelated. With dependency mapping, you design for these cascades proactively.
+
+## Bottleneck Identification Through Critical Path Analysis
+
+In any system with dependencies, there's a critical path — the sequence of serial dependencies that determines minimum end-to-end latency. Finding this path tells you where latency optimization will have the most impact.
+
+Walk through your dependency graph following the longest path from input to output, where path length is measured in total execution time, not number of nodes. In the recommendation system, one path might be: product catalog indexing (10 minutes on 30-minute schedule) leads to product embedding generation (2 minutes) leads to candidate generation (80ms) leads to ranking (120ms) leads to personalization (40ms). Total: 10 minutes 2.24 seconds, but the batch schedule dominates.
+
+Another path: user behavior tracking (streaming, effectively 0 latency) leads to session context assembly (20ms) leads to candidate generation (80ms) leads to ranking (120ms) leads to personalization (40ms). Total: 260ms for the real-time path.
+
+The critical path for real-time user-facing latency is the second path, and ranking is the bottleneck — it's 120ms of the 260ms total, or 46% of latency. Optimizing ranking has direct impact on user experience. The critical path for data freshness is the first path, and catalog indexing is the bottleneck at 10 minutes.
+
+This reveals a key insight: you have multiple critical paths for different quality dimensions. Latency has one critical path, data freshness has another, cost has another. Dependency mapping helps you identify all of them.
+
+For cost, track which sub-problems consume the most resources and which dependencies create resource multiplication. If ranking calls the embedding service three times per request, and ranking processes 10,000 requests per second, that's 30,000 embedding calls per second. A data dependency created a resource multiplication factor that makes embedding lookup the cost bottleneck even if each individual lookup is cheap.
+
+Bottleneck identification tells you where optimization efforts will have system-level impact versus where they'll be wasted. Optimizing personalization from 40ms to 20ms saves 20ms on the critical path — meaningful. Optimizing catalog indexing from 10 minutes to 5 minutes doesn't affect real-time latency at all because it's not on that critical path.
+
+## The 2026 Discipline: Dependency-Driven Design
+
+By 2026, teams building production AI systems have learned that dependency mapping isn't a documentation exercise you do after building the system — it's a design tool you use before writing code. The pattern that emerged is dependency-driven design: decompose your problem, map dependencies, let the dependency structure guide your architecture.
+
+The e-commerce company rebuilt their recommendation system starting with dependency mapping. They identified that product embeddings had a data dependency on catalog data but that catalog data didn't need to be real-time for recommendations to work well. They introduced explicit versioning: catalog indexing tagged embeddings with timestamps, ranking services checked staleness, and if embeddings were more than 2 hours old, the system used a fallback ranking strategy that didn't depend on product embeddings.
+
+They also identified that user behavior tracking and product catalog indexing could run completely independently, so they separated them into different services with different scaling profiles and different failure modes. When one failed, the other kept working, and the system degraded gracefully rather than failing completely.
+
+The dependency graph became their primary design document. When adding new features, they started by identifying which existing sub-problems the feature depended on and which new sub-problems it introduced. They rejected feature designs that created circular dependencies or that put new serial dependencies on their latency critical path. They designed features to be parallel when possible, serial only when necessary, and always with explicit blast radius analysis.
+
+This discipline transforms how you build AI products. You're not just implementing features — you're composing sub-problems with explicit dependency contracts, designing for failure propagation, optimizing critical paths, and building systems whose behavior you can predict because you understand the dependency structure. That understanding becomes even more critical when deciding how finely to decompose your problem — the question of granularity we address next.
