@@ -1,5 +1,18 @@
 # CLAUDE.md — Project Rules for AI Top 1% Book
 
+## CRITICAL — MDX BUILD SAFETY (read this first)
+
+All `.mdx` files are parsed by MDX which treats `{`, `}`, `<`, `>` as JSX syntax. Using ANY of these characters in prose **breaks the Vercel build**. This has caused repeated build failures.
+
+**NEVER write in any .mdx file:**
+- Curly braces: no JSON examples, no template variables, no `{"<"}` escape hacks
+- Angle brackets: no HTML/XML tags, no comparison symbols
+- Instead: describe everything in plain prose ("an object with name and email fields", "less than 500ms", "the tone placeholder")
+
+**This rule applies to ALL agents writing .mdx content. Include it in every agent prompt.**
+
+---
+
 ## Quick Start (if session crashed)
 Say: "Read CLAUDE.md and continue writing section 2"
 
