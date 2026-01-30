@@ -1,0 +1,117 @@
+# 7.2 — Integration Testing the Full RAG Pipeline
+
+In November 2025, a fintech startup integrating RAG into their compliance automation tool passed all their unit tests but shipped a system that returned empty answers for 60 percent of production queries. Each component worked correctly in isolation. The chunker produced well-formed chunks. The retriever returned relevant documents. The generator produced grounded answers when given context. But when connected in the full pipeline, something broke at the integration points. The retriever output format did not match what the generator expected. The context assembly logic truncated documents at the wrong boundary. The validation layer rejected answers that were actually correct because it misinterpreted the citation format.
+
+They discovered these issues after launch because they had no integration tests. They tested each component separately but never tested the assembled pipeline. They assumed that if every piece works, the whole system works. That assumption cost them three weeks of firefighting, one delayed enterprise contract, and credibility with early users who received broken responses. The post-mortem conclusion was blunt: unit tests verify components, integration tests verify systems. You need both.
+
+Integration testing the full RAG pipeline means running queries through every stage from input to output and verifying the final answer is correct, relevant, and grounded. It catches the bugs that unit tests cannot: interface mismatches, configuration errors, state management issues, timing problems, resource contention. It verifies that your architecture diagram actually works when the boxes are connected. It is the difference between "each piece works" and "the system works."
+
+## What Integration Tests Catch That Unit Tests Miss
+
+Unit tests isolate components by mocking dependencies. This is fast and precise but hides integration bugs. Your retriever unit test mocks the vector database and returns fixed results. It does not test that the actual vector database client correctly parses connection strings, handles authentication, retries on transient failures, or interprets query filters the way your retriever expects. Those bugs only surface when the retriever talks to the real database.
+
+The first category of integration bugs is interface mismatches. Component A produces output in format X. Component B expects input in format Y. If X and Y differ slightly, the pipeline breaks. Your retriever returns documents with metadata fields "doc_id" and "page_num". Your generator expects "document_id" and "page_number". The mismatch causes the generator to fail to cite sources correctly, but unit tests did not catch it because each component's mocks used the format that component expected.
+
+The second category is configuration errors. Your retriever is configured to use index "compliance-docs-v2" but your deployment script created "compliance-docs-v3". The retriever runs without errors, it just queries the wrong index and returns irrelevant results. Your unit tests mocked the index, so they never touched the real configuration. Integration tests use the real configuration and catch the mismatch.
+
+The third category is resource and timing issues. Your generator has a 5-second timeout. Your retriever takes 3 seconds under load. Your reranker takes 2.5 seconds. Together they exceed the timeout, causing requests to fail. Each component's unit tests ran in isolation with no time pressure. Integration tests run the full pipeline and reveal that cumulative latency exceeds your budget.
+
+The fourth category is state and ordering bugs. Your context assembly stage depends on metadata populated during chunking. If chunks are indexed before metadata is populated, retrieval works but citations fail. Unit tests for each stage work because they provide properly formed inputs. Integration tests run stages in production order and catch cases where one stage's output is not yet ready when the next stage runs.
+
+The fifth category is failure cascade. Your retriever fails on 2 percent of queries. Your generator fails on 3 percent of queries given edge-case context. Independently those are acceptable. But if failures are correlated, the combined failure rate might be 8 percent, not 5 percent. Unit tests measure component reliability in isolation. Integration tests measure system reliability with compounding failures.
+
+Integration tests do not replace unit tests. They complement them. Unit tests are fast, precise, and run on every commit. Integration tests are slower, broader, and run less frequently. You use both. Unit tests catch logic errors. Integration tests catch connection errors. Together they give you confidence the system works.
+
+## Designing Integration Test Fixtures: Known Questions, Known Answers
+
+An integration test needs controlled inputs and expected outputs. For RAG, that means a test document corpus, a set of queries, and the expected answers for those queries. You build these fixtures carefully because they determine what your tests can verify.
+
+The test corpus should be small but representative. Five to twenty documents covering the main types in your production corpus. If you index product manuals, legal contracts, and internal wikis, your test corpus includes examples of each. If you handle tables, code blocks, and multi-lingual content, your test corpus includes those. The corpus is small enough to understand completely but diverse enough to catch real bugs.
+
+Each document in the test corpus has known structure and content. You can manually verify that chunk boundaries are correct, that retrieval should return specific documents for specific queries, that answers should cite specific sections. You do not use production documents with ambiguous content or unclear ground truth. You use synthetic or curated documents where the correct behavior is obvious.
+
+The test queries are realistic but targeted. You write queries that should retrieve document A, queries that should retrieve documents B and C, queries that have no relevant documents, queries that are ambiguous. You cover the happy path and the edge cases. You aim for 10 to 30 queries that exercise different retrieval patterns, different answer types, different citation formats.
+
+For each query, you define the expected answer or answer properties. You cannot always define the exact text because language models are non-deterministic. But you can define what the answer must contain: a specific fact, a citation to a specific document, an acknowledgment that no answer is available. You write assertions that check these properties rather than exact string matches.
+
+Some teams use golden datasets: real production queries with manually labeled correct answers. This is valuable for regression testing but expensive to create. You start with synthetic fixtures that are cheap to produce and easy to understand. You graduate to golden datasets when you have the resources to label them and the test infrastructure to use them.
+
+The fixture corpus becomes part of your repository. You version it alongside your code. When you change chunking logic, you update the expected chunks in the fixtures. When you change retrieval logic, you verify the test queries still return expected documents. When you change generation logic, you verify answers still have required properties. The fixtures are your specification of correct behavior.
+
+## Running End-to-End Tests: From Query to Answer
+
+An end-to-end integration test takes a query, runs it through the full pipeline, and verifies the answer. You start with your test corpus already indexed. You issue a query. The query goes through query understanding, retrieval, reranking, context assembly, generation, and validation. You receive the final answer. You assert that the answer has the expected properties.
+
+The simplest property to check is that an answer exists. For queries that should have answers, you verify the system returns non-empty text. For queries that should have no answer, you verify the system returns a "no information available" message. This catches catastrophic failures where the pipeline crashes or returns nothing.
+
+The next property is citation correctness. You verify that the answer cites the expected documents. If you query "What is the return policy?" and your test corpus has a document titled "Return Policy Guide," you verify the answer cites that document. You do not check the exact citation format unless your system enforces a specific format, but you check that the cited document is relevant.
+
+The third property is grounding. You verify the answer includes facts that appear in the retrieved context. If the return policy document says "30 days for refunds," you check that the answer mentions 30 days. You do not require exact phrasing, but you check that the core fact is present. This catches hallucination where the generator invents facts not in the context.
+
+The fourth property is instruction adherence. If you instructed the generator to format answers as bullet points, you check that the output contains bullet points. If you instructed it to limit answers to 100 words, you count words. If you instructed it to avoid disclaimers, you check that disclaimers are absent. Language models do not always follow instructions perfectly, but large deviations indicate a problem.
+
+The fifth property is latency. You measure how long the full pipeline takes and verify it is within your budget. If your SLA is 3 seconds, you fail the test if the pipeline takes 5 seconds. This catches performance regressions introduced by code changes, dependency updates, or infrastructure issues.
+
+You write these tests as code, usually in the same testing framework as your unit tests. Each test sets up the query, runs the pipeline, captures the answer, and asserts properties. The tests are deterministic where possible. You use fixed test data, control randomness, and mock only the components you truly cannot control in tests.
+
+You run these tests in a staging environment that mirrors production. The same database configuration, the same model endpoints, the same resource limits. You do not run them in production because test queries should not pollute production metrics or incur production costs. Staging is your safe space to verify the system works before shipping to users.
+
+## Testing Pipeline Integration Points: Handoffs and Data Flow
+
+Each stage of the RAG pipeline produces output that the next stage consumes. Integration tests verify these handoffs work correctly. The retriever produces a list of documents. The reranker consumes that list and produces a reordered list. The context assembly stage consumes the reordered list and produces formatted text. The generator consumes the formatted text and produces an answer. Each handoff is an integration point where bugs can hide.
+
+Testing handoffs means verifying data format compatibility. The retriever returns documents with fields "id," "content," "metadata." The reranker expects those fields to exist. If the retriever changes to "doc_id" instead of "id," the reranker breaks. Integration tests catch this by running both components together and verifying the reranker receives the data it expects.
+
+Testing handoffs also means verifying data semantic correctness. The retriever returns "metadata.page" as an integer. The citation formatter expects "metadata.page" as a string. If you change the retriever to return integers, citations break. Your unit tests mocked these dependencies, so they missed the type mismatch. Integration tests catch it because they run the real retriever and real citation formatter together.
+
+Another handoff issue is data completeness. The generator needs document IDs to cite sources. If the context assembly stage strips metadata, the generator cannot cite correctly. Your unit tests provided context with metadata, so the generator worked. Integration tests run the full pipeline and discover that context assembly removes metadata, breaking citations.
+
+A fourth handoff issue is state propagation. Some pipelines pass state between stages: user session ID, conversation history, logging context. If one stage fails to propagate state, downstream stages lack information they need. Your unit tests did not test state propagation because each component ran independently. Integration tests run the full pipeline and verify state propagates end-to-end.
+
+Testing handoffs explicitly means writing tests that focus on stage boundaries. You retrieve documents and inspect the output before it reaches the reranker. You rerank documents and inspect the output before it reaches context assembly. You assemble context and inspect it before it reaches the generator. These intermediate assertions help pinpoint where data corruption or loss occurs.
+
+Some teams log intermediate outputs in production and replay them in tests. You capture the retriever output for a failing production query, use it as a test fixture, and verify downstream stages handle it correctly. This creates regression tests from real failures. The failed query becomes a permanent test case ensuring that failure mode never recurs.
+
+## Environment Setup for Integration Tests: Dependencies, Data, and Configuration
+
+Integration tests need an environment with real dependencies: a vector database, a language model endpoint, document storage. Setting up this environment is more complex than unit tests, which mock dependencies. You need infrastructure that is reliable, isolated, and reproducible.
+
+The simplest approach is a containerized environment. You package your test corpus, vector database, and application code in containers. You spin up the containers, run tests, tear them down. Each test run starts from a clean state. This ensures tests are reproducible and do not interfere with each other.
+
+Some dependencies are hard to containerize. Language model APIs run on external services you do not control. You cannot spin up a local GPT-4 instance. You either mock the model or use a real API with a test account. Mocking sacrifices realism but makes tests fast and cheap. Using the real API makes tests realistic but slow and expensive. You choose based on your priorities.
+
+For vector databases, you use a lightweight in-memory instance for tests. Many vector databases support this: ephemeral instances that exist only for the test run. You index your test corpus, run queries, verify results, shut down. The database is fast, isolated, and requires no persistent storage. This is much better than sharing a test database across runs, which creates state dependencies and flakiness.
+
+Configuration management is critical. Your integration tests should use test-specific configuration: test database URLs, test API keys, test model endpoints. You do not want tests accidentally using production resources, which is expensive and dangerous. You isolate test configuration in environment variables or config files that are clearly marked as test-only.
+
+Data setup happens before each test run. You index your test corpus into the vector database. You verify the index is healthy. You run a smoke-test query to ensure retrieval works. Only then do you run the actual tests. This setup phase catches environment issues before tests run, preventing misleading test failures caused by broken infrastructure.
+
+Teardown happens after tests. You delete the test index, shut down containers, clean up temporary files. You leave no state behind that could affect the next test run. Proper teardown prevents tests from accumulating garbage that slows down your CI environment or causes flaky failures.
+
+Some teams maintain a persistent staging environment for integration tests. The environment stays up 24/7, and tests run against it. This avoids setup/teardown time but introduces state management complexity. You must ensure tests do not interfere with each other, queries are idempotent, and leftover data from failed tests does not corrupt future runs.
+
+The trade-off is speed versus simplicity. Ephemeral environments are slower to set up but simpler to reason about. Persistent environments are faster but require careful state management. You choose based on your test run frequency and team size.
+
+## What to Test and What to Skip in Integration Tests
+
+Integration tests are slower and more expensive than unit tests. You cannot test every edge case end-to-end. You focus on critical paths and known failure modes. You test the happy path: a typical query that should retrieve relevant documents and produce a correct answer. This verifies the basic pipeline works.
+
+You test common failure modes: queries with no relevant documents, queries that retrieve contradictory information, queries that exceed the context window, queries in languages the system does not support. These are cases that break naive implementations and must degrade gracefully in production.
+
+You test integration-specific scenarios: configuration errors, resource limits, timeout handling, retry logic. These are things unit tests cannot cover because they involve interactions between components and infrastructure.
+
+You do not test every query variation. If your unit tests verify the generator handles citations correctly, you do not need 50 integration tests covering different citation formats. One or two integration tests verifying citations work end-to-end is enough. The bulk of citation testing happens in unit tests, which are faster and more focused.
+
+You do not test performance edge cases in integration tests. Load testing, stress testing, and concurrency testing are separate test categories with different infrastructure requirements. Integration tests verify correctness under normal load, not under extreme load.
+
+You do not test every combination of components. If you have three retrieval strategies, two reranking models, and two generators, you do not test all twelve combinations. You test the default configuration and maybe one or two critical alternatives. Combinatorial explosion is the enemy of maintainable test suites.
+
+You add tests based on production failures. When a bug escapes to production, you write an integration test that would have caught it. The test becomes a regression test, ensuring that failure mode never recurs. Over time, your integration test suite becomes a living record of every significant bug you have ever fixed.
+
+The fintech startup that shipped a broken system rebuilt their test suite with integration tests. They created a test corpus of ten compliance documents covering the main document types in their domain. They wrote 20 test queries covering common user questions and edge cases. They verified that each query returned a correct answer with proper citations.
+
+The integration tests caught six bugs that unit tests missed: a metadata field mismatch between retriever and generator, a context assembly bug that truncated documents mid-sentence, a timeout issue where reranking plus generation exceeded the API gateway limit, a configuration error where the test environment used a different index than the code expected, a data encoding issue where special characters corrupted citations, and a failure cascade where retriever errors caused generator failures at higher rates than predicted.
+
+Each bug would have caused production incidents. The integration tests caught them before launch. The tests ran in 90 seconds and became a mandatory gate for every deployment. When the team later refactored their context assembly logic, the integration tests verified the refactor did not break end-to-end behavior. When they upgraded their vector database, the tests caught compatibility issues. When they added a new retrieval strategy, the tests verified it integrated correctly with existing components.
+
+That is the value of integration testing the full RAG pipeline. It verifies the system works, not just the pieces. It catches the bugs that live between components, in configuration, in infrastructure, in timing and state. It gives you confidence that when you ship to production, the full pipeline will behave correctly. Unit tests tell you each piece works. Integration tests tell you the system works. You need both to ship reliable RAG.

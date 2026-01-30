@@ -1,0 +1,157 @@
+# 1.6 — Latency Budgets Across the RAG Pipeline
+
+In October 2024, a fintech company launched a RAG-powered financial advisor chatbot with a target latency of under one second. Their CEO had used ChatGPT and expected similar responsiveness. The product team agreed to the one-second target without consulting engineering. Engineering built a production RAG system with query preprocessing, hybrid retrieval, cross-encoder reranking, GPT-4 generation, and citation validation. Median latency was 2,800 milliseconds. The CEO was furious. Users churned because the experience felt sluggish compared to competitors.
+
+The engineering team had not blown the latency budget through incompetence. They had built a high-quality RAG system with all the components necessary for reliable, cited answers. The problem was that no one had allocated a latency budget across pipeline stages before committing to a one-second target. Query preprocessing took 150 milliseconds. Embedding took 100 milliseconds. Vector search took 200 milliseconds. Keyword search took 180 milliseconds. Reranking 50 candidates took 600 milliseconds. Context assembly took 80 milliseconds. GPT-4 generation took 1,200 milliseconds. Validation took 300 milliseconds. Total: 2,810 milliseconds.
+
+Every stage was reasonably optimized. The problem was architectural: achieving one-second end-to-end latency with this pipeline was physically impossible without removing stages or degrading quality. The team had to choose between meeting the latency target by cutting reranking and validation, or keeping quality by accepting higher latency. They chose quality, pushed back on the CEO with data, and reset user expectations. But they lost three months and early adopters who never came back.
+
+Latency budgets are not aspirational. They are constraints that shape architectural decisions. If you do not allocate latency across pipeline stages before you build, you will either miss your target or compromise quality to hit it. Understanding where time goes in a RAG pipeline, what the non-negotiable costs are, and where optimization is possible is foundational to building systems that users actually want to use.
+
+## The Latency Budget Framework
+
+A latency budget is an allocation of acceptable latency to each stage of your pipeline, summing to your end-to-end target. If your target is 2,000 milliseconds, you might allocate 100 milliseconds to query preprocessing, 150 milliseconds to embedding, 250 milliseconds to retrieval, 500 milliseconds to reranking, 50 milliseconds to context assembly, 800 milliseconds to generation, and 150 milliseconds to validation. These are not guesses; they are engineering targets based on measured performance and architectural choices.
+
+The budget framework forces you to make tradeoffs explicit. If you want to add a reranking stage that takes 600 milliseconds, you must either increase your end-to-end target, cut 600 milliseconds from other stages, or accept that you cannot add reranking. There is no magic. Latency is cumulative, and every component contributes.
+
+Budgets also guide optimization priorities. If generation takes 1,200 milliseconds and reranking takes 200 milliseconds, optimizing generation has six times the impact of optimizing reranking. If retrieval takes 50 milliseconds and is already well-optimized, spending engineering time to cut it to 30 milliseconds is low-leverage. Budgets tell you where to invest effort.
+
+The most common mistake is setting an end-to-end target without decomposing it. Teams say "we need to be under one second" and then build a multi-stage pipeline that sums to three seconds. When they discover the gap, they either thrash trying to optimize every stage, or they cut essential stages like validation, or they ship a slow product and blame infrastructure. The discipline is to budget first, architect to the budget, and measure continuously.
+
+## Query Preprocessing Latency: The Hidden Tax
+
+Query preprocessing is often the first latency expense users do not see directly. It includes intent classification, entity recognition, query expansion, coreference resolution, and routing logic. Each of these can be rule-based or model-based. Rule-based preprocessing is fast—typically under 50 milliseconds—but less capable. Model-based preprocessing is more powerful but slower.
+
+If you use an LLM to classify intent or expand the query, you add an LLM call before retrieval. That call might take 300 to 800 milliseconds depending on the model and prompt length. This is before you have retrieved anything or generated an answer. For latency-sensitive applications, this is unacceptable. You need rule-based preprocessing, a small specialized model, or you skip preprocessing entirely and accept lower retrieval quality.
+
+If you use a small classifier model—say a BERT-based intent classifier—you add 50 to 150 milliseconds. This is acceptable for most use cases. The tradeoff is capability: small models handle fewer edge cases than LLMs. You must decide whether the latency savings justify the quality delta.
+
+In production systems, query preprocessing latency is often optimized through caching. If users ask similar questions, you cache the preprocessed output and reuse it. This works well for FAQ-style applications but poorly for open-ended conversational queries. The cache hit rate determines how much latency you save.
+
+Typical allocation: 50 to 200 milliseconds for query preprocessing, depending on complexity and model choice. If you blow this budget, you either simplify preprocessing or increase the end-to-end target.
+
+## Embedding Latency: Batch Size and Model Choice
+
+Embedding converts text to vectors. Latency depends on the embedding model, text length, and batch size. Small models like MiniLM embed text in 20 to 50 milliseconds per batch. Larger models like text-embedding-ada-002 from OpenAI take 80 to 150 milliseconds per batch. Very large models can exceed 200 milliseconds.
+
+Batch size matters for indexing but less for queries. During indexing, you embed thousands of chunks and can batch them into groups of 100 or more, amortizing API overhead. During query processing, you embed a single query, so batch size is one. Some hosted embedding APIs have higher latency for single-item batches, and you cannot optimize around this without switching providers or self-hosting.
+
+Text length also affects latency. Embedding a short query (10 to 20 tokens) is faster than embedding a long query (100 to 200 tokens). If your query preprocessing stage produces very long expanded queries, embedding latency increases. This is another tradeoff: longer queries might improve retrieval quality but cost latency in embedding.
+
+In production, embedding latency is relatively stable and hard to optimize beyond choosing a faster model or self-hosting. Most teams allocate 80 to 150 milliseconds and move on. The exception is teams using very large or custom embedding models, where latency can exceed 300 milliseconds and becomes a bottleneck.
+
+Typical allocation: 80 to 150 milliseconds for query embedding. If you need faster, switch to a smaller or self-hosted model.
+
+## Vector Search Latency: Corpus Size and Index Tuning
+
+Vector search latency depends on corpus size, vector dimensionality, index type, and accuracy requirements. Searching 10,000 vectors with HNSW indexing takes 20 to 50 milliseconds. Searching 1,000,000 vectors takes 100 to 300 milliseconds. Searching 10,000,000 vectors can exceed 500 milliseconds without sharding or advanced tuning.
+
+Vector databases trade off accuracy and speed. Increasing the search parameter that controls candidate set size improves recall but increases latency. Decreasing it speeds up search but might miss relevant results. Tuning this parameter is corpus-specific and requires evaluation.
+
+Metadata filtering adds latency. If you filter by date or document type during search, the database must check filters for each candidate vector. Heavy filtering can double search latency. Some databases support pre-filtering (filter first, then search within the filtered set) which is faster; others support post-filtering (search first, then filter results) which is slower but more flexible.
+
+In production, vector search latency grows as your corpus grows. Teams that start with 100,000 documents and 200-millisecond search latency discover that at 1,000,000 documents, latency is 600 milliseconds. Scaling strategies include sharding, better indexes, or accepting higher latency. There is no free lunch.
+
+Typical allocation: 100 to 300 milliseconds for vector search, growing with corpus size. If you exceed this, shard your index or upgrade infrastructure.
+
+## Keyword Search Latency: The Parallel Path
+
+If you use hybrid retrieval, you run keyword search in parallel with vector search. Keyword search with Elasticsearch or similar engines typically takes 50 to 200 milliseconds depending on corpus size and query complexity. Because it runs in parallel with vector search, it does not add to total latency if it finishes before vector search does.
+
+However, score fusion and merging add latency after both searches complete. Merging two ranked lists with reciprocal rank fusion takes 10 to 30 milliseconds. This is negligible but non-zero.
+
+In production, keyword search is usually faster than vector search for the same corpus size, because inverted indexes are more mature and better optimized than vector indexes. The combined latency of hybrid retrieval is dominated by the slower of the two, which is usually vector search.
+
+Typical allocation: keyword search runs in parallel with vector search and does not add to the sequential latency budget. Score fusion adds 10 to 30 milliseconds.
+
+## Reranking Latency: The Quality Multiplier That Costs Time
+
+Reranking is where most RAG systems blow their latency budget. If you retrieve 50 candidates and rerank them with a cross-encoder that takes 15 milliseconds per inference, and you process sequentially, that is 750 milliseconds. If you use an LLM for reranking and each candidate takes 100 milliseconds, that is 5,000 milliseconds. Reranking is both the biggest quality lever and the biggest latency cost.
+
+The optimization path is parallelization and batching. Instead of scoring candidates sequentially, batch them and process in parallel. A cross-encoder that takes 15 milliseconds per candidate might process a batch of 10 candidates in 80 milliseconds if batched. Processing 50 candidates in five batches of 10 takes 400 milliseconds instead of 750 milliseconds.
+
+GPU acceleration helps. Cross-encoders on GPU can process batches much faster than on CPU. A self-hosted cross-encoder on a T4 GPU might process 50 candidates in 200 milliseconds. The same model on CPU might take 600 milliseconds. The tradeoff is infrastructure cost: GPUs are more expensive than CPUs.
+
+The other lever is reducing the number of candidates to rerank. If you rerank only the top 20 instead of the top 50, latency drops proportionally. The risk is that a highly relevant document ranked 25th by retrieval never gets reranked and stays buried. The balance is empirical: measure how often the best documents fall outside your reranking window and adjust accordingly.
+
+LLM-based reranking is expensive. Even with batching, prompting an LLM to score candidates takes 100 to 300 milliseconds per batch, and you might need multiple batches. Some teams use two-stage reranking: a fast cross-encoder reranks 50 candidates down to 20, then an LLM reranks those 20 down to the final five. This balances quality and latency.
+
+Typical allocation: 200 to 600 milliseconds for cross-encoder reranking of 20 to 50 candidates. If you use LLMs, allocate 500 to 1,500 milliseconds. This is often the largest controllable latency cost in the pipeline.
+
+## Context Assembly Latency: Negligible but Measurable
+
+Context assembly is usually the fastest stage. Ordering chunks, adding metadata, truncating to fit token budgets—these are string operations that take single-digit milliseconds. Even complex assembly logic like deduplication or summarization rarely exceeds 100 milliseconds.
+
+The exception is when assembly includes an LLM call, such as summarizing chunks to fit more information into the context. If you summarize 10 chunks to compress them, and each summarization takes 200 milliseconds, you add 2,000 milliseconds. This is rare but not unheard of in research or enterprise RAG systems that prioritize completeness over latency.
+
+Typical allocation: 20 to 80 milliseconds for standard context assembly. If you include LLM-based summarization, allocate 500 to 2,000 milliseconds and consider whether the latency cost justifies the quality gain.
+
+## LLM Generation Latency: The Unavoidable Core
+
+LLM generation is the most visible latency cost. Users see the model "thinking" as tokens stream in. Latency depends on model size, output length, and provider infrastructure. GPT-4 typically generates at 20 to 40 tokens per second. A 200-token answer takes 5 to 10 seconds to generate. Claude Opus generates at similar speeds. Smaller models like GPT-3.5 or Claude Haiku generate at 40 to 80 tokens per second.
+
+Streaming helps perceived latency. Instead of waiting for the full answer, you show tokens as they arrive. The user sees progress and feels the system is responsive even if total latency is high. Streaming is standard in production RAG systems.
+
+Output length is the key lever. If you instruct the model to generate concise answers, you reduce latency. A 50-token answer takes one-quarter the time of a 200-token answer. The tradeoff is completeness: shorter answers might omit important details.
+
+Model choice is the other lever. Smaller, faster models reduce latency but might produce lower-quality answers. GPT-3.5 is three to four times faster than GPT-4. Claude Haiku is two to three times faster than Claude Opus. If your latency budget is tight, use a smaller model.
+
+Typical allocation: 800 to 2,000 milliseconds for generation with streaming, depending on model and output length. This is the largest single latency cost and the hardest to optimize without changing models or reducing output length.
+
+## Post-Generation Validation Latency: The Final Gate
+
+Validation checks citations, factual consistency, and safety. Rule-based validation is fast—50 to 100 milliseconds to check citation IDs and run regex-based safety checks. Model-based validation is slower.
+
+If you use an entailment model to check factual consistency, you add a model inference. Small entailment models take 100 to 200 milliseconds. Large models or LLMs take 300 to 800 milliseconds. If you validate multiple claims in the answer, latency multiplies.
+
+The tradeoff is quality versus latency. Validation catches errors before they reach users, but it delays the final response. Some teams validate asynchronously: show the answer to the user immediately and validate in the background, flagging issues afterward. This is risky in high-stakes domains but acceptable in low-stakes ones.
+
+Typical allocation: 100 to 300 milliseconds for validation. If you use LLMs for validation, allocate 300 to 800 milliseconds.
+
+## Where Time Actually Goes: Empirical Breakdown
+
+In a typical production RAG system with cross-encoder reranking and GPT-4 generation, latency breaks down as:
+
+- Query preprocessing: 100 milliseconds
+- Embedding: 100 milliseconds
+- Vector search: 200 milliseconds
+- Keyword search (parallel): 150 milliseconds
+- Score fusion: 20 milliseconds
+- Reranking (50 candidates, batched): 400 milliseconds
+- Context assembly: 50 milliseconds
+- LLM generation: 1,200 milliseconds
+- Validation: 200 milliseconds
+
+Total: 2,270 milliseconds.
+
+Generation and reranking account for 70 percent of latency. Retrieval and embedding account for 20 percent. Everything else is 10 percent. This distribution is common. The implication is that optimizing query preprocessing or context assembly has minimal impact, while optimizing generation and reranking has high impact.
+
+The mistake teams make is optimizing the wrong stages. They spend weeks shaving 50 milliseconds off vector search when they could spend the same time reducing reranking candidates from 50 to 30 and save 200 milliseconds. Latency budgets focus optimization effort on high-impact stages.
+
+## Why Most Teams Blow Latency Budgets on Retrieval, Not Generation
+
+The subtitle is a trick. Most teams do not blow budgets on retrieval. They blow budgets on reranking, which is often grouped under "retrieval" in informal discussion. Pure retrieval—embedding and vector search—is 200 to 400 milliseconds and hard to reduce further. Reranking is 200 to 1,500 milliseconds and highly variable.
+
+Teams that skip reranking hit their latency budgets but ship low-quality answers. Teams that add reranking without budgeting for it blow latency budgets and scramble to optimize. The teams that succeed budget for reranking upfront, choose reranking strategies that fit their latency constraints, and measure continuously.
+
+## Optimization Priorities: Where to Invest Engineering Time
+
+First priority: reduce reranking latency through batching, parallelization, or reducing candidate counts. This has the highest leverage.
+
+Second priority: reduce generation latency by using smaller models, streaming aggressively, or constraining output length.
+
+Third priority: optimize retrieval by tuning vector database parameters, sharding, or caching frequent queries.
+
+Fourth priority: optimize validation by using faster models, caching validation results, or validating asynchronously.
+
+Everything else is micro-optimization. Shaving 20 milliseconds off query preprocessing does not matter if reranking takes 800 milliseconds.
+
+## The Latency-Quality Tradeoff and How to Navigate It
+
+Every latency optimization risks quality degradation. Reranking fewer candidates might miss the best result. Using a smaller generation model might produce less accurate answers. Skipping validation might let errors through. The question is not "how do we minimize latency" but "how do we minimize latency subject to quality constraints."
+
+The answer is measurement. Define quality metrics—retrieval precision, answer accuracy, citation correctness. Measure quality at different latency targets. Plot the tradeoff curve. Find the elbow: the point where further latency reduction costs quality disproportionately. Operate at the elbow.
+
+For the fintech company, the elbow was 2,000 milliseconds with full reranking and validation. Going to 1,000 milliseconds required cutting reranking and validation, which dropped answer accuracy by 20 percent. Going to 3,000 milliseconds by adding more reranking candidates improved accuracy by only 3 percent. They chose 2,000 milliseconds, reset user expectations with data, and retained customers because answers were reliable even if not instant.
+
+That is latency budgeting in production. Not aspirational targets, but engineering constraints. Not guesses, but measured allocations. Not optimization for its own sake, but deliberate tradeoffs between latency, quality, and cost. The teams that succeed are those who budget before they build, measure continuously, and optimize with data. Everyone else ships slow systems, or ships fast systems that do not work, and wonders why users churn.

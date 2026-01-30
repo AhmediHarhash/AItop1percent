@@ -1,0 +1,135 @@
+# 6.12 — Evaluation Frameworks: RAGAS, DeepEval, and Custom Harnesses
+
+In November 2025, a Series A healthcare startup spent six weeks building a custom RAG evaluation framework from scratch. They implemented retrieval precision and recall, answer correctness scoring using embedding similarity, faithfulness checking through entailment models, and a sophisticated relevance metric that weighted different aspects of answer quality. The framework worked beautifully on their internal test sets, producing clean numeric scores that tracked system improvements across iterations.
+
+Then they attended an ML conference and learned about RAGAS, an open-source evaluation framework that implemented all the same metrics they had just built, plus several they had not considered, with better implementations and extensive testing on diverse datasets. Their custom framework had subtle bugs in metric calculations that inflated scores, lacked proper normalization for comparison across different answer lengths, and had no support for multi-turn conversations or context-dependent queries.
+
+They had reinvented a wheel that already existed in better form, spending six engineering weeks they could have invested in actually improving their RAG system. The lesson was bitter but clear: understand what evaluation frameworks already provide before building custom infrastructure. The engineer who led the custom framework effort later admitted to the CEO that they had been unaware RAGAS existed because they never thought to search for existing RAG evaluation tools. They assumed evaluation was so domain-specific that no general framework could possibly work.
+
+You face a choice when building RAG evaluation infrastructure: use existing frameworks like RAGAS or DeepEval, build custom harnesses from scratch, or combine both approaches. Each option has clear tradeoffs. Existing frameworks provide battle-tested metrics, extensive documentation, and community support, but they come with opinions about what to measure and how to measure it. Custom harnesses give you complete control and domain-specific metrics, but require significant engineering investment and ongoing maintenance.
+
+Most mature RAG systems end up with hybrid approaches, using framework metrics as a foundation and supplementing them with custom domain-specific evaluation. Understanding what frameworks offer, where they fall short, and when to extend versus replace them determines whether you spend your time building infrastructure or building product value.
+
+## Understanding RAGAS Metrics and Design Decisions
+
+RAGAS emerged in early 2024 as one of the first comprehensive open-source frameworks specifically designed for RAG evaluation. It implements a suite of metrics organized around three core concerns: retrieval quality, answer quality, and faithfulness. Understanding these metrics and their implementations helps you decide when RAGAS fits your needs and when you need custom approaches.
+
+The framework makes specific design decisions about how to measure each dimension, and those decisions work well for some domains while being inappropriate for others. Recognizing the assumptions built into each metric prevents you from applying them blindly to domains where they do not fit.
+
+Faithfulness in RAGAS measures whether the generated answer is grounded in the retrieved context without hallucinations. The implementation extracts claims from the generated answer using an LLM, then uses another LLM call to judge whether each claim can be verified from the provided context. The metric computes the proportion of claims that are supported by the context. An answer with five claims where four are supported receives a faithfulness score of 0.8.
+
+This approach works well for factual domains where answers consist of verifiable claims. It struggles with subjective content, comparative statements, and answers that involve synthesis or reasoning beyond simple fact extraction. A legal analysis that draws inferences from case law might make claims that are reasonable interpretations but not explicitly stated in the source documents, resulting in low faithfulness scores despite being high-quality responses.
+
+The claim extraction step itself introduces variability and potential errors. Different LLMs extract different numbers and types of claims from the same answer. If the extraction is too granular, you get inflated claim counts where trivial statements are separated unnecessarily. If the extraction is too coarse, you miss important claims that should be verified independently. The quality of your faithfulness metric depends on the quality of claim extraction, which RAGAS abstracts away but which significantly affects results.
+
+Answer relevance in RAGAS measures whether the generated answer actually addresses the question asked. The implementation generates questions from the answer using an LLM, then compares these generated questions against the original question using embedding similarity. The intuition is that if you can reconstruct the original question from the answer, the answer must be relevant to that question.
+
+High similarity between original and reconstructed questions indicates relevant answers. Low similarity suggests the answer drifts off-topic or addresses a different question. This metric catches answers that are factually correct and well-grounded but fail to address what the user actually asked. A user asks about pricing and the system responds with feature details; the answer might be faithful and correct but completely irrelevant.
+
+The weakness is dependency on the question generation step: if the LLM generates poor questions from the answer, relevance scores become unreliable. The metric also assumes that relevant answers enable reconstructing the original question, which is true for straightforward factual queries but less true for complex multi-part questions or questions requiring synthesis across multiple topics.
+
+Context precision measures whether retrieved documents ranked higher contain more relevant information than documents ranked lower. For a given question, the metric checks whether relevant documents appear near the top of the retrieved list rather than being buried at rank fifteen or twenty. The implementation requires ground truth labels indicating which documents are relevant for each question.
+
+It then computes precision at various cutoff ranks and averages them, weighted by whether relevant documents appear at each position. High context precision means your retrieval system successfully prioritizes the most useful documents. Low context precision means relevant information exists in retrieved documents but is buried below irrelevant content, making it unlikely the generation model will use it effectively.
+
+This metric requires extensive ground truth annotation: for each evaluation question, you must label which documents are relevant. This annotation burden is substantial, making context precision expensive to compute at scale. Many teams skip this metric early and add it later when retrieval becomes a known bottleneck worth the annotation investment.
+
+Context recall measures what proportion of relevant information needed to answer the question appears in the retrieved documents. This requires ground truth annotations of relevant documents for each question. The metric checks whether all documents necessary to construct a complete answer were retrieved.
+
+Perfect recall means every needed document was retrieved, though possibly with many irrelevant documents as well. Low recall means critical information is missing from the retrieved set, making it impossible to generate complete answers regardless of generation quality. The tradeoff between precision and recall in RAG mirrors the classic tradeoff in information retrieval: high recall retrieves everything relevant but includes much irrelevant content, while high precision retrieves only relevant content but risks missing important information.
+
+## Using Metrics for Diagnosis
+
+The power of RAGAS lies in combining these metrics to diagnose specific system failures. Low faithfulness with high context recall suggests a generation problem: the system retrieves appropriate documents but hallucinates when synthesizing answers. The retrieval component is working correctly, finding relevant information, but the generation step adds unsupported claims or distorts information during summarization.
+
+High faithfulness with low answer relevance suggests the system is accurately summarizing retrieved content but not focusing on the specific question asked, possibly indicating query understanding issues. The system finds documents and faithfully represents them, but it does not understand what the user actually wanted to know. This pattern often emerges when query rewriting or expansion goes wrong, causing the system to retrieve information related to query keywords but not aligned with user intent.
+
+Low context precision but high context recall suggests the retrieval system finds relevant documents but ranks them poorly, potentially indicating a ranking model problem. The system successfully identifies which documents contain relevant information but fails to prioritize them, burying the most useful content below less useful results. The generation model might not even see the best information because it appears too late in the retrieved list.
+
+These metric combinations guide optimization efforts toward the components causing observed failures. Instead of looking at overall accuracy and knowing something is wrong without knowing where, you can isolate whether problems originate in retrieval, ranking, or generation. This diagnostic capability makes comprehensive frameworks like RAGAS valuable even if you end up customizing individual metrics.
+
+## RAGAS Implementation Dependencies and Costs
+
+RAGAS implementations rely heavily on LLM-based judges for several metrics, particularly faithfulness and answer relevance. This introduces dependencies on LLM API availability, costs, and judge reliability. Running RAGAS evaluations on a five-hundred example dataset might require thousands of LLM calls for claim extraction, verification, and question generation.
+
+At GPT-4 prices, this gets expensive fast. Each evaluation run might cost twenty to fifty dollars depending on answer length and complexity. Running evaluations multiple times per day during active development accumulates substantial API costs. The framework supports using different models for different metrics, allowing you to use expensive high-quality models for critical metrics while using cheaper models for less critical evaluations.
+
+You might use GPT-4 for faithfulness checks where accuracy matters most, but use GPT-3.5 or an open-source model for relevance scoring where slightly lower quality is acceptable. This tiered model usage keeps costs manageable while preserving quality where it matters. Judge reliability issues discussed in detail in other chapters apply fully to RAGAS: judge drift, bias, and calibration problems affect metric quality.
+
+When OpenAI updates GPT-4, your RAGAS faithfulness scores might shift even with no changes to your RAG system. You need strategies for detecting and accounting for judge drift to maintain metric consistency over time.
+
+## DeepEval as a Broader Alternative
+
+DeepEval provides a complementary framework with overlapping but distinct metric implementations. While RAGAS focuses heavily on RAG-specific concerns, DeepEval covers a broader range of LLM evaluation needs including summarization, toxicity, bias, and conversational quality. For RAG-specific evaluation, DeepEval implements answer relevancy, faithfulness, contextual precision, and contextual recall metrics similar to RAGAS but with different implementation details.
+
+The answer relevancy metric uses a different approach based on semantic similarity between the question and answer, avoiding the question-generation step that RAGAS uses. Instead of generating questions from answers and comparing embeddings, DeepEval directly embeds the question and answer and computes similarity. This is computationally cheaper and avoids the variability introduced by question generation, but it might miss relevance issues that the question-generation approach catches.
+
+The faithfulness implementation uses a different prompting strategy for the judge. Where RAGAS extracts claims then verifies each claim separately, DeepEval might use a single holistic judge prompt that evaluates overall faithfulness. The details vary across DeepEval versions, but the key point is that implementation differences produce different scores.
+
+These implementation differences matter because they produce different scores on the same outputs. You cannot directly compare a RAGAS faithfulness score to a DeepEval faithfulness score; they measure related but distinct things. When choosing between frameworks, review the actual metric implementations to understand what you are measuring. Read the code, examine the prompts used for LLM judges, and run both frameworks on a small sample of your data to see how results differ.
+
+Some teams run multiple frameworks in parallel, using agreement between frameworks as an additional signal: if both RAGAS and DeepEval indicate low faithfulness, you have high confidence in that signal. If they disagree, you investigate to understand why. One framework might be more sensitive to certain failure modes while the other catches different issues.
+
+DeepEval's broader scope makes it useful for organizations evaluating multiple LLM applications beyond RAG. Instead of learning separate frameworks for your RAG system, your summarization feature, and your conversational agent, you learn DeepEval once and apply it across use cases. The tradeoff is that DeepEval may be less optimized for RAG-specific concerns than a specialized framework like RAGAS.
+
+The contextual precision and recall implementations may not handle RAG edge cases as thoroughly as metrics designed exclusively for retrieval augmentation. If RAG is your only LLM application, RAGAS specialization might serve you better. If you have multiple LLM systems to evaluate, DeepEval's breadth might outweigh any loss of RAG-specific optimization.
+
+## When Custom Harnesses Make Sense
+
+Building custom evaluation harnesses becomes necessary when your domain has requirements that standard frameworks do not address. A medical RAG system might need to measure not just factual accuracy but also adherence to clinical guidelines, appropriate handling of uncertainty, and correct severity triage. A patient asks about symptoms, and the system must not only provide accurate medical information but also recommend appropriate urgency levels for seeking care.
+
+Standard frameworks measure whether the answer is grounded and relevant, but they do not measure whether the system correctly distinguishes symptoms requiring immediate emergency care from those that can wait for a scheduled appointment. This clinical triage capability requires domain-specific evaluation that generic frameworks cannot provide.
+
+A legal RAG system might need to verify citation formats, check whether answers appropriately distinguish binding versus persuasive precedent, and measure how well the system handles conflicting authorities. When multiple court decisions provide different guidance on the same legal question, the system must acknowledge the conflict and explain the nuances. Standard faithfulness metrics check whether claims are supported by retrieved documents, but they do not check whether the answer appropriately handles contradictory sources.
+
+Custom harnesses also make sense when you need tight integration with existing infrastructure. If your organization already has extensive ML evaluation pipelines, model registries, and experiment tracking systems, building custom RAG evaluation that integrates with this infrastructure might be easier than adapting generic frameworks.
+
+You control the data formats, storage mechanisms, and reporting interfaces to match existing patterns. Your evaluation results flow into the same dashboards as your other model metrics, enabling unified monitoring and alerting. The cost is ongoing maintenance as frameworks evolve and new evaluation approaches emerge.
+
+## Hybrid Approaches and Framework Extensions
+
+The hybrid approach combines framework metrics for standard concerns with custom metrics for domain-specific requirements. You use RAGAS or DeepEval to measure faithfulness, relevance, and retrieval quality, benefiting from tested implementations and community best practices. You supplement these with custom metrics that matter to your business.
+
+A customer support RAG system might add custom metrics for measuring answer politeness, measuring whether answers include appropriate next steps, and scoring whether answers de-escalate frustrated customers. An educational RAG system might add custom metrics for pedagogical quality, measuring whether explanations are age-appropriate and whether answers encourage deeper learning rather than just providing answers.
+
+Implementing custom metrics requires clear specifications of what you are measuring and how to measure it. Vague goals like "measure answer quality" do not translate into actionable metrics. Specific goals like "measure whether answers to troubleshooting questions include step-by-step instructions with clear success criteria for each step" can be operationalized.
+
+You might implement this through a combination of format checking for numbered lists and LLM-based judging of whether each step includes verification instructions. Document these metric definitions carefully: six months later when someone reviews evaluation results, they need to understand exactly what each custom metric measures and what scores mean.
+
+Extending frameworks for domain-specific needs is often easier than building from scratch. Both RAGAS and DeepEval support custom metrics that integrate with their evaluation pipelines. You implement a new metric class following the framework's interface, and it runs alongside built-in metrics with consistent data handling and reporting.
+
+This approach gives you the best of both worlds: standard metrics with tested implementations, plus domain-specific metrics that encode your unique requirements. The learning curve involves understanding the framework architecture well enough to implement compatible extensions, but this investment pays off in reduced maintenance burden compared to fully custom infrastructure.
+
+## Framework Versioning and Metric Stability
+
+Framework versioning introduces a subtle challenge that teams often miss. RAGAS version 0.0.15 might implement faithfulness differently than version 0.0.20 due to prompt improvements or algorithm changes. If you run evaluations with one version, then upgrade the framework and run evaluations again, your metrics might change not because your system changed but because the measurement approach changed.
+
+This appears as sudden jumps in evaluation dashboards that confuse developers. Overall faithfulness drops five points overnight despite no system changes. Investigation reveals that the framework upgrade changed how claims are extracted or how verification prompts are structured, causing systematic scoring differences.
+
+The solution is explicitly pinning framework versions and only upgrading deliberately with awareness that metrics may shift. When you upgrade, run evaluations on both old and new framework versions against the same baseline system to measure how much the framework change affects scores. Document this recalibration so teams understand which metric changes reflect system improvements versus measurement changes.
+
+Some teams maintain a frozen baseline evaluation that always runs on a specific framework version, providing long-term trend stability. Current development uses the latest framework version to benefit from improvements, but the frozen baseline enables comparing current performance against historical performance on a consistent measurement basis.
+
+## Avoiding Black Box Metrics
+
+The most common mistake teams make with evaluation frameworks is treating them as black boxes that produce authoritative scores without understanding what those scores actually measure. You run RAGAS, see a faithfulness score of 0.85, and report that your system has eighty-five percent faithfulness without understanding that this specifically measures claim-level verification against retrieved context using GPT-4-based judgments.
+
+When stakeholders ask what faithfulness means, you cannot explain the details. When scores seem wrong, you cannot debug why. When you need to optimize for faithfulness, you do not know which system changes will affect the metric. Understanding framework implementations transforms scores from magic numbers into actionable insights.
+
+Read the source code for metrics you use. Understand what LLM prompts are involved. Know what data preprocessing happens before metric computation. This knowledge enables you to interpret scores correctly, debug unexpected results, and predict how system changes will affect metrics.
+
+The second common mistake is using framework defaults without customization. Frameworks make opinionated choices about chunk sizes for retrieval evaluation, temperature settings for LLM judges, similarity thresholds for relevance scoring, and dozens of other parameters. These defaults represent reasonable starting points but may not fit your domain.
+
+A technical documentation RAG system with highly structured content might need different relevance thresholds than a conversational customer support system with informal language. Review and customize framework parameters based on your data and requirements rather than blindly accepting defaults.
+
+## Calibration and Validation
+
+You evaluate evaluation frameworks by running them on sample data where you have strong intuitions about quality. Take ten examples where you know the answers are excellent and ten where you know they are poor. Run them through RAGAS and DeepEval. Do the metrics reflect your intuitions. If high-quality answers score poorly or low-quality answers score well, investigate why.
+
+Maybe the metric definition does not align with your quality criteria, or maybe your intuitions are wrong and the metric reveals problems you missed. This calibration process builds confidence in metric interpretation and reveals when frameworks match versus diverge from your domain needs.
+
+Comparing framework scores against human evaluations provides quantitative calibration. Have domain experts rate a sample of answers on faithfulness, relevance, and overall quality. Compute correlations between human ratings and framework scores. High correlation suggests the framework measures what humans care about. Low correlation suggests metric-human divergence that you must understand and address.
+
+You choose between frameworks, custom harnesses, and hybrid approaches based on your domain complexity, engineering resources, and evaluation maturity. Early-stage RAG systems benefit from adopting proven frameworks quickly to establish baseline evaluation. As systems mature and domain-specific requirements become clear, you extend frameworks with custom metrics.
+
+When you have very specialized requirements or deep existing infrastructure, custom harnesses make sense. Most teams end up in the hybrid middle: framework metrics for standard concerns, custom metrics for unique requirements, all integrated into consistent evaluation pipelines. Build awareness of what you are measuring, not just what scores you produce. Your evaluation infrastructure determines what you can optimize. Choose and customize it deliberately.

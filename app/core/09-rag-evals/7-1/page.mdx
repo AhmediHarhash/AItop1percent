@@ -1,0 +1,135 @@
+# 7.1 — Unit Testing RAG Components: Chunkers, Retrievers, Generators
+
+In August 2025, a Series C legal tech company shipped a document analysis feature that worked perfectly for three weeks, then began returning empty results for 18 percent of queries. Users complained. Engineers investigated and discovered their chunking logic had silently broken when a dependency updated its text processing library. The chunker was now splitting documents at incorrect boundaries, creating malformed chunks that never matched any query embeddings. The bug went undetected because they had no unit tests for the chunker. They tested the full pipeline end-to-end, but when the pipeline failed, they had no way to isolate which component broke.
+
+The incident cost them two weeks of engineering time to diagnose, one week to fix, and four enterprise pilot customers who lost trust during the outage. The post-mortem identified the root cause: treating RAG as a monolithic system rather than a composition of testable components. They had integration tests that verified the pipeline worked, but no unit tests that verified each component worked in isolation. When a component failed, the integration tests caught the symptom but not the cause. Debugging required manually stepping through the pipeline, adding print statements, inspecting intermediate outputs, guessing which stage introduced the error.
+
+That is the difference between testing a RAG system and testing RAG components. Integration tests tell you the system is broken. Unit tests tell you which piece broke and why. In a multi-stage pipeline with six or more components, each with distinct logic and failure modes, unit testing is not optional. It is the foundation that makes debugging possible, refactoring safe, and quality predictable. You cannot build reliable RAG without it.
+
+## Why RAG Components Demand Unit Testing
+
+RAG pipelines fail in component-specific ways. A chunker can split text incorrectly, losing context across boundaries or creating chunks too small to be meaningful. A retriever can return irrelevant documents because the embedding model misunderstands the query, or because the vector index is corrupted, or because metadata filters are misconfigured. A generator can produce hallucinated content because the retrieved chunks do not contain the answer, or because the prompt is ambiguous, or because the model temperature is too high.
+
+Each failure mode is local to a specific component. When the full pipeline fails, you need to identify which component caused the failure. End-to-end tests do not provide that information. They tell you input X produces incorrect output Y, but they do not tell you whether the chunker, retriever, or generator is responsible. You end up adding logging, running the pipeline multiple times with different inputs, trying to triangulate the problem. This is slow, error-prone, and scales poorly as the pipeline grows.
+
+Unit tests solve this by testing each component in isolation with controlled inputs and expected outputs. You test the chunker by feeding it known documents and verifying it produces the expected chunks with correct boundaries and metadata. You test the retriever by giving it a query and a fixed index, verifying it returns the documents you know are relevant. You test the generator by providing a query and fixed retrieved context, verifying it produces a grounded answer with correct citations.
+
+The isolation is critical. When a chunker test fails, you know the chunker is broken. You do not need to investigate the retriever, reranker, or generator. You focus your debugging effort on the specific component that failed its unit tests. This reduces debugging time from hours to minutes and makes it safe to refactor components without fear of introducing regressions elsewhere in the pipeline.
+
+## Unit Testing Chunkers: Boundaries, Metadata, and Edge Cases
+
+A chunker takes raw documents and splits them into passages suitable for embedding and retrieval. The naive implementation splits on fixed character counts or paragraph boundaries. Production chunkers handle sentence boundaries, code blocks, tables, lists, headers, and semantic breaks. They preserve metadata about each chunk's source document, page number, section heading, and position. They make deliberate choices about overlap between adjacent chunks to avoid losing context that spans boundaries.
+
+Unit testing a chunker starts with boundary correctness. You provide a document with known structure and verify the chunker produces the expected number of chunks with correct start and end positions. You test that it splits at sentence boundaries, not mid-sentence. You test that it respects semantic units like paragraphs, list items, or code functions. You test that chunk sizes fall within your configured min and max bounds, with exceptions for edge cases like very long sentences or tables.
+
+Boundary handling is where naive chunkers fail. You test what happens when a sentence is longer than your max chunk size. Does the chunker split mid-sentence, violating semantic coherence? Does it expand the chunk beyond the max size to preserve the sentence? Does it apply a fallback strategy like splitting on clause boundaries? Each choice is defensible, but you must test that your implementation matches your intended behavior.
+
+Metadata preservation is the second unit test category. Each chunk must carry metadata about its source. You test that a chunk from page 14 has page equals 14 in its metadata. You test that chunks under a section heading include that heading in their metadata. You test that chunks from different documents have different document IDs. This metadata is critical for citation, filtering, and debugging, so losing it is a production incident.
+
+Overlap testing verifies that adjacent chunks share context. You configure 50-token overlap and verify that the last 50 tokens of chunk N match the first 50 tokens of chunk N+1. You test edge cases where overlap is impossible, like when a chunk is shorter than the overlap window. You test that overlap does not duplicate entire chunks or create degenerate cases where every chunk is identical.
+
+Edge case testing covers the inputs that break naive implementations. Empty documents should produce zero chunks, not crash. Documents shorter than the minimum chunk size should produce a single chunk, not fail. Documents with unusual characters, mixed encodings, or malformed structure should degrade gracefully, not corrupt the entire index. You test each edge case explicitly because production data contains all of them.
+
+The goal is not 100 percent code coverage. The goal is confidence that your chunker behaves correctly on the document types and structures you expect in production. You build a suite of test documents representing your data distribution: typical documents, long documents, short documents, documents with tables and lists, documents with unusual formatting. You verify the chunker produces reasonable chunks for each. When you change the chunking logic, you rerun these tests and catch regressions before they reach production.
+
+## Unit Testing Retrievers: Relevance, Filtering, and Performance
+
+A retriever takes a query and returns candidate documents from the index. The naive implementation does a vector similarity search and returns top-k results. Production retrievers handle metadata filtering, hybrid search combining dense and sparse retrieval, query expansion, and fallback strategies when vector search fails. They make decisions about k dynamically based on the query, apply thresholds to filter low-similarity results, and return structured responses with scores and metadata.
+
+Unit testing a retriever starts with relevance. You index a small fixed corpus with known documents and known relevant results for specific queries. You issue query A and verify that document X is in the top-k results. You issue query B and verify that document Y is not in the results. You test that retrieval is deterministic: running the same query twice returns the same results in the same order.
+
+Relevance testing requires ground truth. You manually label which documents are relevant for a set of test queries. This is tedious but essential. Without labeled data, you cannot verify that your retriever is working correctly. You might think it is retrieving relevant documents, but without ground truth, you are guessing. The test corpus does not need to be large. Ten documents and twenty queries are enough to catch most bugs. You expand the test set as you discover new failure modes in production.
+
+Filtering tests verify that metadata filters work correctly. You index documents with metadata fields like author, date, category. You issue a query with a filter requiring author equals "Smith" and verify only Smith-authored documents are returned. You test filter combinations, date ranges, numeric thresholds. You test that filters combine correctly with vector similarity: a document that matches the filter but has low similarity should rank below a document that matches the filter with high similarity.
+
+Hybrid search testing covers retrievers that combine vector and keyword search. You test queries that should match on keywords but not vectors, and vice versa. You test that the fusion algorithm correctly interleaves results from both strategies. You test edge cases where one strategy returns no results and the other returns many. You verify that the hybrid approach actually improves recall compared to vector-only or keyword-only search.
+
+Performance testing in unit tests is limited but valuable. You test that retrieval completes within your latency budget for a small index. You test that k equals 100 does not take ten times longer than k equals 10, which would indicate an implementation bug. You test that adding metadata filters does not degrade performance catastrophically. You do not test production-scale performance in unit tests, that is what integration and load tests are for. But you catch obvious performance bugs early.
+
+Mock strategies are critical for retriever unit tests. You do not want to spin up a full vector database for every test run. You mock the index with an in-memory structure that supports the operations your retriever needs: similarity search, metadata filtering, result ranking. The mock does not need to be production-quality. It needs to be fast, deterministic, and support the test scenarios you care about. You trade realism for speed and reliability.
+
+The result is a test suite that runs in seconds and verifies your retriever works correctly on known inputs. When you change the retrieval logic, add a new filter type, or switch embedding models, you rerun the tests and catch regressions immediately. When a production query fails to retrieve relevant documents, you add it to your test suite as a regression test, ensuring that failure mode never recurs.
+
+## Unit Testing Generators: Grounding, Citation, and Instruction Following
+
+A generator takes a query and retrieved context and produces an answer. The naive implementation stuffs context into a prompt template and calls the language model. Production generators format context carefully, provide detailed instructions about citation and uncertainty, apply structured output schemas, validate that the model followed instructions, and handle cases where the context does not contain an answer.
+
+Unit testing a generator is harder than testing a chunker or retriever because language model outputs are non-deterministic. You cannot assert that the output exactly matches an expected string. You must test properties of the output: it contains required elements, it follows the expected format, it grounds claims in the provided context, it does not hallucinate information not present in the context.
+
+Grounding tests verify the generator uses the provided context. You give the generator a query and context containing a specific fact, and verify the answer includes that fact. You give the generator a query and context that does not contain the answer, and verify the generator says "I do not have enough information" rather than hallucinating. You test that the generator prefers context over parametric knowledge when they conflict.
+
+Citation tests verify the generator attributes claims to sources. You provide context from multiple documents and verify the answer cites the correct document for each claim. You test that citation format matches your requirements: footnotes, inline links, reference numbers. You test that hallucinated citations are absent; the generator does not invent document IDs or page numbers. This requires parsing the output and checking that every cited source actually exists in the provided context.
+
+Instruction following tests verify the generator respects your prompt constraints. You instruct the generator to format answers as bullet points, and verify the output is bullet-pointed. You instruct the generator to limit answers to 100 words, and verify the output length. You instruct the generator to avoid certain topics, and verify those topics do not appear. Language models are imperfect instruction followers, so these tests catch regressions when prompt changes reduce instruction adherence.
+
+Edge case testing covers scenarios that break naive generators. What happens when the context is empty? When all chunks contradict each other? When the query is ambiguous? You test each case and verify the generator degrades gracefully: returns "no information available" for empty context, acknowledges contradiction when chunks conflict, asks clarifying questions when the query is ambiguous.
+
+Mocking the language model is essential for generator unit tests. You cannot call a production LLM in every test; it is too slow, too expensive, and too non-deterministic. You mock the LLM with a function that returns fixed outputs for specific inputs. For a grounding test, the mock returns text that includes a fact from the provided context. For a citation test, the mock returns text with a citation in the expected format. For an instruction-following test, the mock returns text that violates the instruction, allowing you to test your validation logic.
+
+The mock does not simulate the full complexity of a language model. It returns deterministic outputs that let you test your generator logic: prompt formatting, context assembly, output parsing, validation. When you need to test actual model behavior, you write integration tests with a real model. Unit tests focus on the logic you control, not the model behavior you do not.
+
+Some teams use temperature equals zero and fixed seeds to make model outputs deterministic for testing. This works for small models but is fragile. Model updates change outputs even with fixed seeds. Prompts that produce one output today produce different outputs after a model version bump. Relying on deterministic model behavior makes tests brittle. Mocking the model makes tests stable and fast.
+
+## The Practical Testing Strategy: What to Test and What to Skip
+
+Not every function needs a unit test. Not every edge case matters. You test the components where bugs have the highest impact and the highest likelihood. Chunkers are high-impact because bad chunks corrupt the entire index. Retrievers are high-likelihood because they interact with external systems that change without warning. Generators are high-impact because they directly produce user-facing outputs where errors destroy trust.
+
+You test the logic you own, not the dependencies you import. You do not unit-test the vector database client library; you assume it works and mock it in your tests. You do not unit-test the embedding model; you trust that Anthropic or OpenAI tested it. You test your chunking logic, your retrieval filtering, your prompt templates. The code where your bugs live.
+
+You test invariants, not implementations. A good test verifies that the output has the required properties, not that the function executes a specific sequence of operations. You test that chunks have correct metadata, not that the chunker calls a specific library function. This makes tests resilient to refactoring. You can rewrite the chunker implementation completely, and as long as it still produces chunks with correct metadata, the tests pass.
+
+You test failure modes that have occurred in production or that you expect to occur. If you have never seen a query that returns zero results, you might not test that edge case yet. If you routinely see queries that return zero results and need to handle them gracefully, you write tests for that scenario. The test suite evolves as you learn which failure modes matter in your specific system.
+
+You run tests on every commit and in CI. Fast unit tests run in seconds, so there is no excuse for skipping them. When tests fail, you fix the code or update the test before merging. Test failures are blocking. You do not ship code that fails unit tests, because that is shipping known bugs.
+
+The testing pyramid applies to RAG: many unit tests, fewer integration tests, even fewer end-to-end tests. Unit tests are fast, focused, and catch most bugs. Integration tests verify components work together, catching interface mismatches and configuration errors. End-to-end tests verify the full system works for real users, catching the rare bugs that slip through unit and integration tests. You invest most effort in unit tests because they provide the best return on investment: fast feedback, precise diagnostics, safe refactoring.
+
+## Mocking Strategies: Speed, Reliability, and Realism Tradeoffs
+
+Mocking external dependencies is essential for fast, reliable unit tests. You mock the embedding model, the vector database, the language model, the document storage. Mocks return fixed outputs for specific inputs, eliminating the variability and latency of real dependencies. This makes tests deterministic and fast.
+
+The simplest mock is a function that returns a hardcoded value. Your retriever calls the vector database client to search for similar documents. Your test mocks the client with a function that returns a fixed list of documents. No actual database, no network calls, no latency. The test verifies your retriever processes the returned documents correctly.
+
+More sophisticated mocks simulate some dependency behavior. Your test might mock the vector database with an in-memory dictionary where you can insert documents and query by ID. This lets you test metadata filtering and result ranking logic without running a real database. The mock is simple enough to implement in a few dozen lines, fast enough to run thousands of times per second, and realistic enough to catch most retriever bugs.
+
+The tradeoff is realism versus speed. A real vector database returns results in a specific order, handles edge cases in specific ways, has performance characteristics that matter in production. Your mock does not capture all of that. It captures enough to test the logic you care about. You accept that some bugs will only appear with the real dependency and catch those in integration tests.
+
+Some dependencies are hard to mock. Language models are non-deterministic, so mocking them requires choosing what output to return for each test case. You might mock the model to return the correct answer for a happy-path test, an incorrect answer for an error-handling test, and a malformed response for a parsing test. This gives you coverage of your error handling logic without relying on the model to actually produce errors during testing.
+
+Other dependencies are easy to mock but not worth mocking. If your chunker uses a mature text processing library, you probably do not mock it. The library is deterministic, fast, and well-tested. Mocking it adds complexity without benefit. You use the real library in your unit tests and trust that it works. You focus your mocking effort on the slow, flaky, or expensive dependencies: databases, external APIs, large models.
+
+The goal is not perfect isolation. The goal is fast, reliable tests that catch the bugs you care about. You mock the dependencies that make tests slow or flaky. You use real implementations for dependencies that are fast and stable. You balance purity and pragmatism, choosing the mocking strategy that lets you ship high-quality code quickly.
+
+## When Unit Tests Fail: Debugging, Iteration, and Test Quality
+
+A failing unit test is valuable information. It tells you exactly which component is broken and, if well-written, why it is broken. Your chunker test fails because the output chunks have incorrect metadata. Your retriever test fails because it returns documents in the wrong order. Your generator test fails because it produces hallucinated citations. The failure is narrow and specific, so fixing it is straightforward.
+
+Sometimes the test is wrong, not the code. You wrote a test that expects the chunker to produce five chunks, but after reviewing the document, you realize six chunks is correct. You update the test. Test failures are not always bugs; sometimes they are learning opportunities that reveal incorrect assumptions.
+
+Other times the test is right, but your mental model is wrong. You thought the retriever would return document A, but it returns document B. You investigate and discover document B is actually more relevant than document A for the query. The test revealed a gap in your understanding of how the retriever ranks results. You update your mental model and possibly the test.
+
+Test quality matters. A flaky test that passes sometimes and fails sometimes is worse than no test. It trains you to ignore failures, assuming they are false positives. You lose confidence in the test suite and stop treating failures as blocking. Eventually you disable the flaky test, losing the coverage it provided. Flaky tests are usually caused by non-determinism: tests that depend on timing, randomness, or external state that changes. You fix flakiness by mocking dependencies, controlling randomness with fixed seeds, or isolating tests from shared state.
+
+Test clarity matters. A test that fails with an obscure error message is hard to debug. You spend time figuring out what the test was checking before you can fix the code. Good tests have clear names that describe what they test and clear assertion messages that explain what went wrong. A test named "test retriever returns relevant documents" with an assertion message "expected document X in top-five results, but got documents Y and Z" is easy to debug.
+
+Test coverage matters, but only to a point. 100 percent line coverage does not mean your code is correct. It means your tests executed every line, not that they verified every behavior. You can have complete coverage with useless tests that do not assert anything meaningful. You aim for high coverage of critical paths and edge cases, not coverage for its own sake.
+
+The real metric is confidence. After you refactor a component, do you feel confident it still works? After you change a dependency version, do you trust the system did not break? If unit tests give you that confidence, they are doing their job. If you still feel the need to manually test everything after running unit tests, your test suite is insufficient.
+
+## Building a Unit Test Suite: Starting Small, Growing With Needs
+
+You do not write 500 unit tests on day one. You start with the most critical component and the most common failure mode. For a RAG system, that is usually the retriever. You write a test that indexes three documents and verifies a query returns the correct one. You run the test, watch it pass, commit it. You have a test suite.
+
+You add tests as you add features. When you implement metadata filtering, you add tests for filtering. When you add query expansion, you add tests for expansion. When you discover a bug in production, you add a test that reproduces it before you fix it. The test suite grows organically, tracking the actual complexity of your system.
+
+You refactor tests as you refactor code. When you change an interface, you update the tests that depend on it. When you discover a test is no longer relevant because you removed a feature, you delete the test. The test suite is not a museum of old code; it is a living specification of how your system should behave.
+
+You run tests locally before pushing and in CI before merging. Local runs catch obvious breaks. CI runs catch integration issues, platform differences, and the occasional problem that only manifests in a clean environment. You make test runs fast so developers run them frequently. A test suite that takes five minutes to run is fine. A test suite that takes an hour is a problem; developers will skip it.
+
+You measure value, not vanity metrics. The value of a test is how much confidence it gives you relative to its maintenance cost. A test that catches bugs frequently and is easy to maintain is high value. A test that never fails and breaks every time you refactor is low value. You keep the high-value tests and delete or rewrite the low-value ones.
+
+The healthcare documentation company that lost contracts rebuilt their system with a unit test suite. They wrote tests for their chunker, verifier it split medical documents at section boundaries and preserved footnotes. They wrote tests for their retriever, verified it filtered by document type and date range. They wrote tests for their generator, verified it cited sources correctly and acknowledged uncertainty. The tests ran in 30 seconds and caught 80 percent of bugs before code review.
+
+When they later migrated to a new vector database, the unit tests caught six integration bugs in the new database client. When they updated their chunking logic to handle tables better, the tests verified the change did not break existing behavior. When a library dependency updated and broke text encoding, the tests failed immediately with clear error messages pointing to the broken component. The test suite paid for itself in the first month and continued paying dividends every week.
+
+That is the value of unit testing RAG components. It is not about achieving coverage metrics or following dogma. It is about building confidence that each piece of your pipeline works correctly, so when the full system fails, you know where to look. It is about making debugging fast, refactoring safe, and quality predictable. It is about treating RAG as a composition of testable components rather than a monolithic black box. The teams that do this ship reliable systems. The teams that skip it spend their time debugging production incidents that unit tests would have caught in seconds.

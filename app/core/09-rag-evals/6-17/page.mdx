@@ -1,0 +1,125 @@
+# 6.17 — Claim-Level Grounding Evaluation: Mapping Each Claim to a Source Span
+
+In March 2026, a Series B financial services company believed they had solved RAG faithfulness. Their answer-level faithfulness metric showed ninety-three percent of responses were grounded in retrieved context, a score their investors loved to cite in board presentations. The evaluation infrastructure ran automatically on every deployment, tracking metrics across releases and showing steady improvement over the previous six months.
+
+Then a regulatory audit revealed systematic problems that the metrics had completely missed: answers frequently included one or two accurate facts from source documents alongside subtle errors or unsupported claims that changed the meaning significantly. An answer about investment fees might correctly state the management fee while misstating or omitting expense ratios. An answer about account eligibility might correctly cite age requirements while hallucinating exceptions that did not exist.
+
+The answer-level faithfulness metric checked whether the overall answer was consistent with source documents, which it usually was because most claims were correct. But the metric missed minority claims that were unsupported or wrong. A ninety-three percent faithful answer might contain seven correct claims and one incorrect claim, and that one incorrect claim might be the one that mattered most to the user making financial decisions.
+
+The company spent four months building claim-level evaluation infrastructure that could detect these granular faithfulness failures. The new metric revealed that only seventy-eight percent of answers had all claims grounded correctly. The prior metric had provided false confidence by masking partial faithfulness problems. The fifteen-point gap between answer-level and claim-level faithfulness represented systematic quality issues that had gone undetected for months while they optimized the wrong metric.
+
+Answer-level faithfulness evaluation treats responses as atomic units: either the entire answer is faithful or it is not. You present a question, retrieved context, and generated answer to a judge and ask whether the answer is supported by the context. This approach works for short answers with single claims, but most RAG responses contain multiple distinct factual statements.
+
+An answer to "What are the features of Product X" might list six features, each representing a separate claim that could be true or false independently. Evaluating faithfulness at the answer level misses which specific claims are grounded and which are not. You know an answer has faithfulness issues but not which parts require correction. This makes debugging nearly impossible and prevents targeted improvements.
+
+## Decomposing Answers Into Claims
+
+Claim-level evaluation decomposes answers into individual factual claims, then evaluates each claim's grounding separately. The same answer listing six product features is broken into six distinct claims. For each claim, the evaluation system determines whether that specific claim can be verified from the provided context and ideally identifies which source span supports it.
+
+This granular approach provides several advantages over answer-level evaluation. You identify exactly which information is unsupported, enabling targeted debugging. You can compute precise faithfulness scores based on the proportion of supported claims rather than binary pass-fail judgments. You can analyze patterns in which types of claims are prone to hallucination, revealing systematic weaknesses in your generation process.
+
+You can provide targeted feedback to improve specific aspects of generation quality. If pricing claims consistently fail grounding while feature claims succeed, you know where to focus optimization efforts. This precision is impossible with answer-level metrics that only tell you something is wrong without revealing what.
+
+Claim extraction is the first step in claim-level evaluation and presents immediate challenges. You need to parse a natural language answer into a structured set of individual factual statements that can be independently verified. A simple sentence might contain one claim or multiple claims.
+
+"Product X costs two hundred dollars and includes free shipping" contains two claims: one about price and one about shipping. A complex sentence with subordinate clauses might contain three or four claims that need to be separated. Claim extraction must preserve the meaning of the original answer while creating verifiable atomic statements.
+
+Manual claim extraction is possible for small evaluation datasets but does not scale to production use. A human annotator reads each answer, identifies distinct factual claims, and writes them out as separate statements. This process is time-consuming and requires care to ensure claims are truly independent and preserve original meaning.
+
+For a five-hundred example evaluation dataset with answers averaging eight claims each, manual extraction requires annotating four thousand claims, potentially twenty to forty hours of expert time. This investment might be worthwhile for critical high-stakes systems but is prohibitively expensive for routine evaluation or rapid iteration.
+
+Automated claim extraction using LLMs provides scalable alternatives that enable claim-level evaluation at production scale. You prompt a language model to read an answer and decompose it into individual claims. The prompt might specify: "Read the following answer and extract all factual claims as a numbered list. Each claim should be a single verifiable statement that can be checked independently against source documents."
+
+The model processes the answer and outputs structured claims that can be programmatically verified. This approach scales to large evaluation datasets and can be integrated into automated evaluation pipelines without manual annotation bottlenecks. The quality of extraction depends on the model's language understanding capabilities and the clarity of extraction prompts.
+
+Claim extraction prompts require careful design to avoid over-segmentation or under-segmentation. Over-segmentation breaks sentences into pieces so fine that they lose meaning. "Product X includes feature Y" might be broken into "Product X includes something" and "That something is feature Y," creating claims that are not independently verifiable because they lack necessary context.
+
+Under-segmentation leaves multiple claims bundled together, failing to isolate the atomic units needed for precise evaluation. "Product X costs two hundred dollars, includes free shipping, and comes with a warranty" treated as a single claim makes it impossible to determine which parts are grounded if only some information is supported.
+
+Balancing these extremes requires iterative prompt development and validation against human-annotated examples. Test your claim extraction on a sample of answers, compare automated extraction against what domain experts would extract manually, and refine prompts until agreement is high.
+
+## Matching Claims to Source Spans
+
+Span matching techniques identify which parts of the source documents support each claim. Once you have extracted individual claims, you need to determine whether each claim appears in the retrieved context and if so, where. The simplest approach uses semantic similarity: embed the claim and embed all sentences or passages in the retrieved documents, then find the highest similarity match.
+
+If similarity exceeds a threshold perhaps eighty-five or ninety percent, you consider the claim supported and note which source span matches it. This approach works for claims that are close paraphrases of source text but struggles when claims require synthesis across multiple source spans or when claims are inferences from source information rather than direct restatements.
+
+Entailment models provide more sophisticated span matching by framing the problem as textual entailment: does source span S entail claim C. An entailment model trained specifically for this task predicts whether S logically implies C, going beyond surface similarity to capture semantic relationships.
+
+Entailment handles paraphrase better than similarity matching and can recognize when source text supports a claim even without lexical overlap. "The product is inexpensive" might be entailed by "The product costs twenty dollars" even though the words are completely different. The limitation is that entailment models can still struggle with claims that require multi-step reasoning or synthesis across multiple sources.
+
+A claim like "Product X is cheaper than Product Y" might require reading price information from two separate documents, and no single source span entails the comparative claim. The model must synthesize information across spans to verify the claim, which standard entailment models are not designed to handle.
+
+LLM-based span matching uses language models as judges to evaluate whether source text supports claims, handling the complex reasoning that simpler approaches miss. You prompt a model: "Does the following source text support this claim? If yes, identify which part of the source text supports it. If the claim requires information from multiple sources, identify all relevant source parts."
+
+The model can handle complex reasoning, synthesis across multiple spans, and various forms of inference that similarity and entailment models miss. A claim requiring comparison between two products can be verified by a model that reads both product descriptions and confirms the comparative statement is accurate.
+
+The tradeoff is computational cost: you must make an LLM call for each claim-source pair, potentially thousands of calls per evaluation run. For an evaluation with five hundred answers averaging eight claims each, verified against five retrieved documents each, you need twenty thousand LLM judge calls. At typical API prices, this becomes expensive quickly.
+
+Caching and prompt optimization help manage costs. Cache source document embeddings and judge responses for common claim-source pairs that appear across multiple evaluation runs. Batch multiple claim verifications into single prompts where possible. Use cheaper models for preliminary filtering and expensive models only for uncertain cases.
+
+## Computing Granular Faithfulness Scores
+
+Granular faithfulness scoring computes metrics based on claim-level verification results. The most straightforward metric is claim support rate: the proportion of claims that are verified as grounded in source context. An answer with eight claims where seven are verified receives a claim support rate of 0.875 or eighty-seven point five percent.
+
+This metric provides more precise faithfulness measurement than answer-level binary scoring. Instead of knowing that fifteen percent of answers are unfaithful, you know that on average answers have twelve percent unsupported claims. You can track how many answers have perfect claim support, how many have mostly supported claims, and how many have majority unsupported claims.
+
+These distributions reveal faithfulness issues that answer-level metrics obscure. You might discover that sixty percent of answers have perfect faithfulness, thirty percent have one or two unsupported claims, and ten percent have systematic faithfulness failures with multiple unsupported claims. This informs whether you have a systematic generation problem or occasional edge case failures.
+
+Weighted claim scoring accounts for the fact that not all claims are equally important. A claim about a product's primary function might be more critical than a claim about packaging color. Weighting schemes can reflect claim importance, penalizing unsupported critical claims more heavily than unsupported minor claims.
+
+Implementing this requires annotating claim importance, which adds complexity but improves metric alignment with user impact. An answer with one unsupported critical claim might score worse than an answer with three unsupported minor claims despite having fewer errors, because the critical claim matters more to user decisions.
+
+You might assign importance weights through manual annotation, asking domain experts to rate each claim's importance on a scale. Or you might derive weights automatically based on claim types: pricing claims weighted higher than aesthetic claims in a product search system, dosage claims weighted higher than side effect prevalence in a medical system.
+
+## Advantages Over Answer-Level Evaluation
+
+Claim-level evaluation is more precise than answer-level because it identifies exactly which information is problematic. When an answer receives a low faithfulness score, you can examine which specific claims failed verification. This enables targeted debugging and improvement that answer-level metrics cannot support.
+
+Maybe claims about pricing are consistently hallucinated, suggesting your generation prompt needs better instructions about only including prices found in context. Maybe claims involving negatives like "does not include feature X" are often unsupported because the model struggles with verifying absence claims. These patterns guide optimization efforts more effectively than aggregate answer-level scores.
+
+Answer-level evaluation might indicate faithfulness issues but provide no insight into root causes. You know fifteen percent of answers are unfaithful but not why. Claim-level evaluation reveals that twenty percent of pricing claims are unsupported, eight percent of feature claims are unsupported, and comparisons are unsupported forty percent of the time.
+
+This breakdown identifies which generation capabilities need improvement and allows you to prioritize high-impact fixes. Improving comparison handling might be more valuable than improving feature description if comparisons fail more frequently and matter more to users.
+
+Implementation complexity of claim-level evaluation is significantly higher than answer-level evaluation. You need claim extraction infrastructure that reliably decomposes answers into verifiable units. You need span matching systems that accurately determine which source text supports which claims. You need careful handling of claims that require multi-source synthesis.
+
+You need significantly more computation per evaluation example: extract claims, match each claim against multiple source spans, aggregate results. The evaluation pipeline becomes slower and more expensive. For a large-scale evaluation with thousands of examples, the cost difference between answer-level and claim-level evaluation might be substantial, potentially ten to twenty times more expensive.
+
+Teams must decide whether the precision gains justify the cost increases based on their quality requirements and budget constraints. High-stakes domains where partial faithfulness poses serious risks likely justify the investment. Lower-stakes applications where approximate faithfulness is sufficient might find answer-level evaluation adequate.
+
+## Claim-Level as Gold Standard
+
+Why claim-level is the gold standard in 2026 reflects the maturation of RAG systems and evaluation practices. Early RAG implementations focused on getting systems to produce coherent answers at all, making answer-level evaluation sufficient. The question was whether the system could generate anything reasonable, not whether every detail was perfectly grounded.
+
+As systems improved and partial faithfulness became the dominant failure mode, answer-level evaluation lost sensitivity. Organizations operating high-stakes RAG systems in medical, legal, financial, and regulated domains cannot tolerate partial hallucinations. An answer that is mostly correct but contains one critical error causes serious problems ranging from financial losses to patient harm to regulatory violations.
+
+These organizations adopted claim-level evaluation because it is the only approach with sufficient precision to detect and prevent such failures. Answer-level metrics that report ninety percent faithfulness hide the ten percent of answers with errors. Claim-level metrics that report answers have an average of eight percent unsupported claims reveal exactly where quality problems exist.
+
+Research advances in NLP made claim-level evaluation practical at scale. Improved LLM capabilities for claim extraction reduced the manual annotation burden that previously made claim-level evaluation prohibitively expensive. Better entailment models improved span matching accuracy. More efficient inference reduced the computational barriers.
+
+Open-source tools and frameworks specifically designed for granular faithfulness checking lowered implementation barriers. As costs decreased and capabilities improved, claim-level evaluation transitioned from a research technique requiring significant ML expertise to a production best practice that any team can adopt with reasonable effort.
+
+## Common Mistakes
+
+The most common mistake teams make with claim-level evaluation is inconsistent claim extraction. Claim extraction is not a deterministic process; different extraction methods or different extraction prompts produce different claim sets from the same answer. If your claim extraction is inconsistent, your faithfulness scores become noisy and hard to interpret.
+
+An answer might score seventy-five percent faithful on one run and eighty-five percent on another run simply because extraction produced different numbers of claims. The system did not change, the answer did not change, but the measurement changed because extraction varies. Standardizing extraction methodology and validating consistency through repeated extraction on sample data helps control this noise.
+
+The second common mistake is not validating span matching accuracy. You implement a span matching approach, whether similarity-based, entailment-based, or LLM-based, and assume it works correctly without validation. Span matching can fail in systematic ways: marking unsupported claims as supported because it finds superficially similar text, or marking supported claims as unsupported because it misses valid paraphrase or inference.
+
+Validating span matching against human annotations on a sample dataset reveals these errors and allows you to tune thresholds or improve matching logic. Without validation, you might be computing precise metrics based on incorrect claim verification, producing numbers that are precise but wrong.
+
+The third mistake is treating claim-level evaluation as a replacement for answer-level evaluation rather than a complement. Claim-level evaluation provides precision about faithfulness but might miss answer-level quality issues like poor coherence, inappropriate tone, or missing context that makes individual claims misleading even when each is technically true.
+
+Comprehensive evaluation uses both: claim-level metrics for precise faithfulness measurement and answer-level metrics for holistic quality assessment. The combination provides fuller coverage than either approach alone.
+
+You implement claim-level evaluation by building or adopting claim extraction capabilities that parse answers into verifiable atomic statements. You implement span matching that identifies which source text supports each claim, using similarity, entailment, or LLM-based approaches based on your accuracy and cost requirements.
+
+You compute granular faithfulness metrics based on the proportion of claims that are grounded, potentially with importance weighting for critical claims. You validate your extraction and matching against human annotations to ensure accuracy. You use claim-level results to identify patterns in faithfulness failures and guide targeted improvements.
+
+You combine claim-level faithfulness metrics with answer-level quality metrics for comprehensive evaluation. Claim-level evaluation is more expensive and complex than answer-level evaluation. It is also more precise, more actionable, and more aligned with how faithfulness failures actually manifest in production.
+
+For systems where partial hallucinations pose serious risks, the investment is justified and increasingly expected by stakeholders. For lower-stakes applications where approximate faithfulness is sufficient, answer-level evaluation may remain adequate. The decision depends on your domain, your risk tolerance, and your quality requirements.
+
+But as RAG systems mature and evaluation practices advance, claim-level grounding evaluation has emerged as the most rigorous approach available. If you operate in a high-stakes domain or pursue evaluation excellence, this is where the field is heading. Understand it, consider adopting it, and recognize it as the current frontier of RAG faithfulness measurement that separates adequate systems from exceptional ones.

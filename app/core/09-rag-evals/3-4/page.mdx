@@ -1,0 +1,146 @@
+# 3.4 — Indexing Algorithms: HNSW, IVF, and Production Tradeoffs
+
+In November 2024, an e-commerce company built a product recommendation RAG system using a vector database configured with an IVF-Flat index. They embedded descriptions for 20 million products, built the index, and launched. The system worked, but query latency was consistently 300 to 400 milliseconds—far above their target of under 100 milliseconds. They investigated and discovered that their IVF index was configured with 1,000 clusters and nprobe set to 50, meaning each query searched 50 clusters out of 1,000. This gave high recall but required scanning one million vectors per query, which was slow. They tuned nprobe down to 10, reducing search scope to 200,000 vectors, and latency dropped to 80 milliseconds. Recall decreased slightly, from 98 percent to 94 percent, but retrieval quality in production was indistinguishable. They had been running a poorly tuned index for two months, paying for over-provisioned infrastructure, because they did not understand the tradeoff between recall and latency.
+
+By 2026, approximate nearest neighbor indexing algorithms are the foundation of every production vector database. These algorithms determine how fast your queries run, how much memory your index consumes, how long it takes to build the index, and how well the system scales. The three dominant algorithms are HNSW, IVF, and flat brute-force search. Each has different performance characteristics, and the right choice depends on your data size, query patterns, latency requirements, and infrastructure constraints. This chapter teaches you how these algorithms work, when to use each, how to tune their parameters, and when approximate search is good enough.
+
+## The Approximate Nearest Neighbor Problem
+
+The exact nearest neighbor problem is straightforward: given a query vector and a database of N vectors, find the k vectors with the smallest distance to the query. The brute-force solution is to compute the distance between the query and every vector, sort by distance, and return the top k. This approach is simple, exact, and scales linearly with N. For a database with one million 768-dimensional vectors, you perform one million dot products, each requiring 768 multiply-add operations. On modern hardware, this might take 50 to 200 milliseconds per query.
+
+For small databases—tens of thousands of vectors—brute-force search is perfectly viable. For large databases—millions or billions of vectors—brute-force search is too slow for production systems that require sub-100-millisecond latency. Approximate nearest neighbor algorithms solve this problem by building index structures that allow you to prune the search space, checking only a subset of vectors while still returning results that are very close to the true nearest neighbors.
+
+The tradeoff is accuracy versus speed. Approximate algorithms do not guarantee that you get the true top k neighbors. They return a set of neighbors that are close, but not necessarily the closest. The quality of the approximation is measured by recall: if the true top ten neighbors are A, B, C, D, E, F, G, H, I, J, and the approximate algorithm returns A, B, C, D, E, F, G, H, X, Y, the recall is 80 percent. High recall means the approximate result is close to the exact result. Low recall means the algorithm is missing true neighbors.
+
+The goal of index tuning is to maximize recall while minimizing query latency and memory usage. Different algorithms achieve this tradeoff in different ways.
+
+## Flat Indexes: Exact but Expensive
+
+A flat index is not really an index—it is brute-force search with no pruning. You store all vectors in memory, and for each query, you compute the distance to every vector, sort, and return the top k. This is exact: you always get the true nearest neighbors. It is also slow and memory-intensive.
+
+Flat indexes are viable when your vector count is small—under 100,000 vectors—and you have enough memory to store them all. They are also useful as a baseline for measuring the recall of approximate algorithms. You run queries against a flat index to get the ground truth, then run the same queries against an approximate index and measure how many true neighbors the approximate index returns.
+
+In 2026, flat indexes are rarely used in production for large-scale RAG systems. They are prototyping tools and baselines, not production infrastructure. The exception is when you need guaranteed exact results and are willing to pay the latency cost—for example, in scientific applications where approximate results are unacceptable.
+
+## HNSW: Fast, Accurate, and Memory-Hungry
+
+HNSW stands for Hierarchical Navigable Small World. It is the most popular approximate nearest neighbor algorithm in production vector databases as of 2026. HNSW builds a multi-layer graph where each vector is a node, and edges connect nearby neighbors. The graph has multiple layers, with the top layers sparsely connected and the bottom layers densely connected. Queries start at the top layer and navigate downward, following edges to nodes that are closer to the query, until they reach the bottom layer and perform a local search.
+
+HNSW is fast because it reduces the search problem to graph traversal. Instead of comparing the query to every vector, you compare it to a small number of neighbors at each step and follow the path toward the nearest neighbors. The hierarchical structure ensures that you make progress quickly at the top layers and refine your search at the bottom layers. Typical query times are single-digit milliseconds for millions of vectors.
+
+HNSW is accurate because the graph is carefully constructed to ensure that the greedy traversal finds good neighbors with high probability. The recall on well-tuned HNSW indexes is often 95 percent or higher, meaning you get nearly exact results with a fraction of the compute cost.
+
+The downside of HNSW is memory usage. The graph structure requires storing edges for every vector. Each vector might have 16, 32, or 64 neighbors per layer, and each edge is a pointer or index into the vector array. For large databases, the graph overhead can be substantial—sometimes doubling or tripling the memory footprint compared to storing raw vectors.
+
+Another downside is build time. Constructing an HNSW index requires inserting vectors one by one and updating the graph structure to maintain connectivity. For large datasets, index construction can take hours. HNSW is optimized for read-heavy workloads where you build the index once and query it many times. If you need to insert or update vectors frequently, HNSW incurs overhead because each insertion requires graph updates.
+
+HNSW has two key parameters: M and efConstruction. M is the number of bidirectional links created for each node in the graph. Higher M improves recall but increases memory usage and build time. Typical values are 16, 32, or 64. efConstruction controls the size of the dynamic candidate list during index construction. Higher efConstruction improves index quality but increases build time. Typical values are 100, 200, or 500.
+
+At query time, HNSW has a parameter called ef, which controls the size of the candidate list during search. Higher ef improves recall but increases query latency. You tune ef based on your recall and latency requirements. For example, setting ef to 50 might give 95 percent recall with 10-millisecond latency. Setting ef to 200 might give 99 percent recall with 40-millisecond latency.
+
+HNSW is the right choice when you need fast queries, high recall, and can afford the memory overhead. It is the default algorithm in Qdrant, Weaviate, and many other vector databases.
+
+## IVF: Memory-Efficient but Slower
+
+IVF stands for Inverted File Index. It is a clustering-based approximate nearest neighbor algorithm. The idea is to partition the vector space into clusters using k-means or a similar algorithm, then assign each vector to the nearest cluster. At query time, you find the clusters closest to the query, search only the vectors in those clusters, and return the top k results from the searched clusters.
+
+IVF reduces the search space by skipping vectors in clusters that are far from the query. If you partition ten million vectors into 1,000 clusters, each cluster contains roughly 10,000 vectors. If you search only the ten nearest clusters, you scan 100,000 vectors instead of ten million—a 100x reduction in comparisons.
+
+IVF is memory-efficient because it does not require storing a graph structure. You store the vectors, a mapping from vectors to clusters, and cluster centroids. The memory overhead is minimal compared to HNSW.
+
+The downside of IVF is lower recall and higher latency for the same memory usage compared to HNSW. The quality of IVF depends on how well the clustering captures the structure of the vector space. If the clusters are well-separated and the query is clearly closer to one cluster than others, IVF works well. If the clusters overlap or the query is near cluster boundaries, IVF misses true neighbors that are in clusters you did not search.
+
+IVF has two key parameters: nlist and nprobe. nlist is the number of clusters. Higher nlist creates more fine-grained partitions, which improves recall but increases build time and the cost of finding the nearest clusters. Typical values are 1,000, 4,000, or 16,000. nprobe is the number of clusters to search at query time. Higher nprobe improves recall but increases latency. Typical values are 10, 50, or 100.
+
+The tradeoff is that increasing nprobe linearly increases the number of vectors you scan, which increases latency. If you set nlist to 1,000 and nprobe to 100, you are searching 10 percent of your database—only a 10x speedup over brute-force. To achieve 100x or 1,000x speedups, you need nprobe to be much smaller than nlist, which hurts recall.
+
+IVF is the right choice when memory is constrained, you can tolerate slightly lower recall, or your vector space has natural clusters that IVF can exploit. It is common in systems that use product quantization to compress vectors, because IVF and quantization combine well.
+
+## Product Quantization: Compressing Vectors for Scale
+
+Product quantization is not an index structure but a compression technique that reduces the memory footprint of vectors. Instead of storing 768-dimensional float32 vectors, which occupy 3 KB each, you quantize the vectors into compact codes that occupy 64 or 128 bytes each. The compression ratio is 20x or more.
+
+The idea is to split the vector into subvectors, quantize each subvector to a small integer code using a learned codebook, and store the codes instead of the original floats. At query time, you approximate distances using the quantized codes. This is lossy—you lose precision—but for many applications, the recall degradation is acceptable.
+
+Product quantization is often combined with IVF to create IVF-PQ indexes, which partition the space into clusters and quantize vectors within each cluster. This combines the memory efficiency of quantization with the search pruning of IVF. IVF-PQ indexes are common in systems that need to store billions of vectors with limited memory.
+
+The downside is reduced recall and increased complexity. Tuning a PQ index requires choosing the right number of subvectors, codebook size, and training the codebook on representative data. If you do it wrong, recall collapses. In 2026, most teams use HNSW or IVF without quantization unless memory is a hard constraint.
+
+## DiskANN: Scaling Beyond Memory
+
+DiskANN is a family of algorithms designed for datasets that do not fit in RAM. Instead of storing the entire index in memory, DiskANN stores it on SSD and uses graph-based search with carefully optimized disk I/O patterns. The idea is to build a graph index similar to HNSW but stream data from disk in a way that minimizes random reads and maximizes SSD throughput.
+
+DiskANN allows you to index billions of vectors on a single machine without requiring terabytes of RAM. The tradeoff is higher latency compared to in-memory indexes—query times are tens of milliseconds instead of single-digit milliseconds—but this is still acceptable for many production use cases.
+
+DiskANN is less mature than HNSW or IVF, but it is gaining adoption in systems that need extreme scale without extreme hardware costs. Milvus supports DiskANN, and research labs continue to improve the algorithm.
+
+DiskANN is the right choice when your vector count exceeds available RAM, you cannot afford to scale horizontally, and you can tolerate slightly higher latency. It is not the default choice, but it is a powerful tool for specific scale problems.
+
+## Build Time Versus Query Time Tradeoffs
+
+Index algorithms trade off three resources: build time, query time, and memory. HNSW has long build times but fast query times and high memory usage. IVF has shorter build times, slower query times, and lower memory usage. Flat indexes have zero build time, slow query times, and minimal memory overhead.
+
+When you select an index, consider your workload characteristics. If you build the index once and query it millions of times, optimize for query time—choose HNSW. If you rebuild the index frequently or insert vectors continuously, optimize for build time—choose IVF or flat. If memory is constrained, use IVF with product quantization or DiskANN.
+
+A common production pattern is to use HNSW for the primary index and maintain a small flat index for newly inserted vectors. You query both indexes and merge results. Periodically, you rebuild the HNSW index to include the new vectors and clear the flat index. This gives you fast queries on the bulk of your data and fast inserts for new data, at the cost of maintaining two indexes.
+
+## Parameter Tuning: Finding the Sweet Spot
+
+Index parameters control the recall-latency-memory tradeoff. For HNSW, the key parameters are M, efConstruction, and ef. For IVF, the key parameters are nlist and nprobe. The optimal values depend on your data distribution, query patterns, and quality requirements.
+
+The tuning process is empirical. You build indexes with different parameter settings, run queries from a representative test set, measure recall and latency, and choose the configuration that meets your requirements. You need ground truth nearest neighbors to measure recall, which you can compute with a flat index on a sample of your data.
+
+A typical tuning workflow:
+1. Build a flat index on a sample of 10,000 to 100,000 vectors and compute ground truth neighbors for 1,000 queries.
+2. Build HNSW indexes with M values of 16, 32, 64 and efConstruction values of 100, 200, 500.
+3. For each index, measure recall at k for ef values of 50, 100, 200, 400.
+4. Plot recall versus latency for each configuration.
+5. Choose the configuration that meets your recall target with the lowest latency.
+
+You repeat this process whenever your data distribution changes significantly or when you upgrade to a new database version.
+
+The failure mode is to use default parameters without tuning. Default parameters are chosen to work reasonably well on average datasets, but they are rarely optimal for your specific workload. A poorly tuned index might have 80 percent recall when a well-tuned index achieves 95 percent recall with the same latency.
+
+## When Approximate is Good Enough
+
+Approximate nearest neighbor search returns results that are close to the true nearest neighbors but not necessarily exact. The question is whether the approximation degrades your application quality. For RAG systems, the answer depends on how sensitive retrieval quality is to recall.
+
+If your RAG system retrieves the top ten chunks and uses them for context, does it matter whether those are the true top ten or approximately the top ten? In many cases, the answer is no. The top twenty or top thirty chunks are all relevant, and retrieving ten of the top thirty is almost as good as retrieving the true top ten. The LLM reads the context and generates an answer, and the small difference in chunk selection does not materially affect the answer quality.
+
+There are exceptions. If your retrieval task requires finding a single, specific document—for example, "find the contract for customer X"—and that document is ranked 11th instead of 10th, the retrieval fails. If your task is sensitive to the exact ranking of results, approximate search might not be good enough.
+
+The way to know is to measure end-to-end quality, not just recall. Run your RAG pipeline with an exact flat index, then with an approximate index, and compare the final outputs. If the approximate index produces answers that are indistinguishable from the exact index, the approximation is good enough. If quality degrades measurably, you need higher recall or exact search.
+
+In 2026, most production RAG systems use approximate indexes with 90 to 95 percent recall and accept the tradeoff. The speed and cost benefits outweigh the small quality loss. Systems that require exact results—scientific search, legal compliance, or applications with strict correctness requirements—use flat indexes or very high-recall approximate indexes with ef or nprobe tuned aggressively.
+
+## Index Degradation and Maintenance
+
+Indexes are not static. As you insert, update, or delete vectors, the index structure changes, and performance can degrade. HNSW indexes can become unbalanced if you insert many vectors without rebuilding. IVF indexes can become unbalanced if cluster sizes grow unevenly. The result is higher query latency, lower recall, or both.
+
+The mitigation is periodic index maintenance. You rebuild the index from scratch, recompute clusters, or rebalance the graph. The rebuild process is expensive—it takes hours for large indexes—but it restores optimal performance. Production systems schedule rebuilds during low-traffic windows or run them in the background with blue-green deployments, where you build a new index while serving queries from the old one, then swap them atomically.
+
+If you update vectors frequently—for example, re-embedding documents because the content changed—you need a strategy for incremental updates. Some databases support in-place updates, others require delete-and-reinsert. The performance characteristics depend on the database and index type. This is another reason to evaluate databases on your actual workload, not on marketing claims.
+
+## Choosing the Right Index for Your Workload
+
+When you deploy a vector database, you choose an index algorithm and tune its parameters. The right choice depends on your workload characteristics:
+
+**For fast queries with high recall and ample memory:** Use HNSW with M set to 32 or 64, efConstruction set to 200 or higher, and tune ef at query time to meet your latency budget.
+
+**For memory-constrained environments with large datasets:** Use IVF with nlist set to 4,000 or higher, nprobe set to 10 to 50, and optionally add product quantization to compress vectors.
+
+**For datasets larger than available RAM:** Use DiskANN or a distributed system that shards across multiple nodes.
+
+**For small datasets under 100,000 vectors:** Use a flat index and skip the complexity of approximate search.
+
+**For mixed workloads with frequent writes:** Use a dual-index strategy with HNSW for the bulk of your data and a flat or IVF index for recent inserts.
+
+The worst choice is to accept default settings without understanding what they do. Index parameters have a direct impact on the quality, cost, and latency of your RAG system. Treat index tuning as a first-class engineering task, not an afterthought.
+
+## The Iterative Tuning Process
+
+Index tuning is not a one-time decision. Your data distribution evolves, your query patterns shift, and your quality requirements change. The discipline of production RAG is to treat index tuning as an ongoing process.
+
+When you onboard new data, measure recall and latency on a sample. If recall drops, retune your parameters or rebuild the index. If latency increases, investigate whether the index has degraded or whether your hardware is under-provisioned. When you upgrade your vector database, revalidate your index parameters because algorithm implementations change.
+
+Every quarter, or whenever you notice quality or performance degradation, rerun your tuning benchmarks. The teams that maintain high-quality RAG systems are the teams that continuously measure, tune, and optimize their indexes. The teams that break are the ones that set parameters once and never revisit them.

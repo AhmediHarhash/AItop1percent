@@ -1,0 +1,115 @@
+# 7.7 — Data Freshness Testing: Do Answers Reflect Current Documents
+
+In March 2026, a SaaS company's internal knowledge base RAG system told employees that the parental leave policy was 12 weeks when HR had updated it to 16 weeks two months earlier. Three employees made life decisions based on the incorrect information. When they discovered the truth, they filed complaints. The company faced an internal trust crisis and had to audit every policy answer the system had ever given. The investigation revealed that while the updated policy document was in their CMS, the RAG system's index had not been refreshed in four months. Answers were grounded in stale data.
+
+The engineering team had tested answer quality extensively. They verified answers were accurate when the system launched. But they never tested whether answers stayed accurate as documents changed. They never measured how long it took for document updates to propagate to the index and ultimately to user-facing answers. They assumed updates happened automatically and immediately. That assumption was wrong. In production RAG, data freshness is not automatic. It requires deliberate architecture, monitoring, and testing.
+
+Testing data freshness means verifying that when you update a document, subsequent queries reflect the update within your SLA. It means measuring propagation lag, detecting stale answers, and ensuring that "eventually consistent" is fast enough for your users. Freshness testing is the discipline of treating time as a variable in your test strategy, not a constant.
+
+## Measuring Freshness Lag: From Document Update to Answer Update
+
+Freshness lag is the time between updating a document in your source system and seeing that update reflected in query answers. This lag has multiple components: detection lag, indexing lag, and propagation lag.
+
+Detection lag is how long it takes your system to notice a document changed. If you poll your CMS for updates every hour, detection lag is up to one hour. If you use webhooks, detection lag is seconds. Testing detection lag means updating a document and measuring how long until your ingestion pipeline picks it up.
+
+Indexing lag is how long it takes to process the updated document and update the index. This includes downloading the document, chunking it, embedding chunks, and writing to the vector database. Testing indexing lag means measuring the time from detection to index write completion.
+
+Propagation lag is how long until queries actually use the updated index. Some vector databases have eventual consistency: writes succeed but are not immediately visible to queries. Testing propagation lag means writing an update, then immediately querying and checking whether you see the update.
+
+Total freshness lag is detection plus indexing plus propagation. If detection is 10 minutes, indexing is 5 minutes, and propagation is 2 minutes, total lag is 17 minutes. Your freshness SLA must account for all three components.
+
+Testing freshness lag in isolation is straightforward. You update a test document with a unique marker: "updated at timestamp T." You wait. You query for information in that document. You check whether the answer includes the marker. You measure the elapsed time from update to correct answer. This is your observed freshness lag.
+
+You test freshness lag under different conditions. Does lag increase when the system is under load? Does lag increase when you update many documents simultaneously? Does lag vary by document size or type? You measure lag across conditions and verify it meets your SLA in all of them.
+
+You test worst-case lag. What if your update happens one second after a polling cycle? You wait a full polling interval before detection. What if the indexing queue is backed up? You wait for all pending jobs to complete. Worst-case lag might be 10x median lag. You verify that even worst-case lag is acceptable.
+
+## Testing Update Propagation Time: From Index Write to Query Result
+
+Even after a document is indexed, there can be lag before queries return it. This happens in distributed systems with caching, replication, and eventual consistency.
+
+If you cache retrieval results, stale cache entries serve old results even after the index is updated. Testing cache freshness means updating a document, verifying the index is updated, querying, and checking whether you get cached stale results or fresh results. You verify cache invalidation works correctly.
+
+If your vector database has replicas, writes go to the primary but queries might hit replicas. Replication lag means replicas serve stale results. Testing replication lag means writing an update, querying each replica, and verifying all replicas serve the update within your SLA.
+
+If your system precomputes embeddings or aggregations, those precomputed values might be stale. Testing precomputation freshness means updating a document, verifying the index is updated, and checking whether precomputed values reflect the update.
+
+You test propagation in your full pipeline. You update a document, wait for indexing to complete, issue a query, and check the answer. You verify not just that the updated document is retrievable but that the generator actually uses it. Sometimes retrieval returns the updated document but ranks it low, so the generator ignores it. Your test must verify the update impacts the final answer, not just the retrieval step.
+
+You test propagation under concurrency. If 100 users query while an update is propagating, do some see old answers and some see new answers? Inconsistent answers are confusing and erode trust. You verify that propagation either happens atomically for all queries or that you explicitly version answers so users know which version they are seeing.
+
+## Stale Answer Detection: Identifying When Answers Are Outdated
+
+Detecting stale answers in production is harder than testing for them in controlled conditions. You cannot manually check every answer against every document version. You need automated detection.
+
+The simplest detection is versioning documents and tagging answers with document versions. Each document has a version number or timestamp. When the generator produces an answer, you log which document versions were used. When a document is updated, you mark all answers citing old versions as stale. You can proactively notify users or invalidate cached answers.
+
+More sophisticated detection uses content hashing. You hash document content. When retrieval returns a chunk, you check whether its hash matches the current hash for that document section. If not, the chunk is stale. You either flag the answer as potentially outdated or re-retrieve using the updated index.
+
+Another approach is timestamp comparison. Each document has a last-modified timestamp. Each answer logs when it was generated. If a document was modified after an answer was generated and that answer cited the document, the answer might be stale. You flag it for review or re-generation.
+
+You test your detection mechanism by creating scenarios where staleness exists and verifying detection works. You index a document, generate an answer, update the document, and verify your system flags the old answer as stale. You test false positives: updates that do not affect the answer should not flag it as stale.
+
+You test detection latency. How long after a document update until stale answers are detected? If detection takes hours but your freshness SLA is minutes, you have a problem. You measure detection latency and optimize it.
+
+You test detection coverage. Does your detection mechanism catch all stale answers, or do some slip through? You create test cases with different types of updates: typo fixes, factual changes, deletions, additions. You verify detection works for each type.
+
+## Freshness SLAs: When Eventually Consistent Is Not Fast Enough
+
+"Eventually consistent" is acceptable in some domains and unacceptable in others. For a news RAG system, freshness SLA might be 5 minutes. For a policy document system, 24 hours might be fine. For a real-time monitoring dashboard, 30 seconds might be too slow.
+
+Setting a freshness SLA requires understanding user expectations. If users expect instant updates, you need near-real-time propagation. If users understand batch updates happen overnight, daily freshness is acceptable. You survey users, observe behavior, and set SLAs that match expectations.
+
+You test whether your system meets its freshness SLA. You update documents and measure propagation time. If your SLA is 10 minutes and propagation takes 8 minutes on average but 15 minutes at p95, you violate the SLA for 5 percent of updates. You either tighten your system or relax your SLA.
+
+You test SLA violations under different workloads. Does freshness degrade during peak load? If you can meet a 10-minute SLA at low load but only a 30-minute SLA during peak usage, you have a capacity problem. You provision more resources or implement backpressure to prevent SLA violations.
+
+You test SLA trade-offs. Faster freshness usually costs more: more frequent polling, more indexing resources, less caching. You test different configurations and measure the cost-freshness trade-off. You choose the configuration that meets your SLA at acceptable cost.
+
+You monitor freshness SLA compliance in production. You log propagation time for every update. You alert when propagation exceeds your SLA. You track SLA compliance over time: what percentage of updates propagate within SLA? If compliance drops below 95 percent, you investigate.
+
+You communicate freshness to users. If your SLA is 24 hours, you might show "last updated" timestamps on answers. If your SLA is minutes, you might show real-time freshness indicators. Transparency about freshness builds trust even when freshness is imperfect.
+
+## Testing Incremental Updates Versus Full Reindexing
+
+There are two strategies for keeping your index fresh: incremental updates and full reindexing. Incremental updates process only changed documents. Full reindexing rebuilds the entire index periodically. Each has different freshness characteristics and different testing requirements.
+
+Incremental updates provide low latency freshness. A document changes, you detect it, you reindex just that document. Freshness lag is detection plus single-document indexing time, often under a minute. Testing incremental updates means verifying that updates are detected, processed correctly, and propagate without affecting other documents.
+
+The failure mode of incremental updates is drift. If detection misses some updates, or if updates fail silently, the index gradually diverges from source truth. Testing for drift means running incremental updates for a period, then comparing the index to source documents. You verify that every source document has a corresponding index entry with matching content.
+
+Full reindexing provides guaranteed consistency. You rebuild the index from scratch periodically. Any drift from incremental updates is corrected. But full reindexing has higher latency: freshness lag is up to the reindexing interval, often hours or days.
+
+Testing full reindexing means verifying the process completes successfully, the new index is consistent with sources, and the cutover from old index to new index is seamless. You test that queries during reindexing do not fail or return inconsistent results.
+
+Some systems use hybrid strategies: incremental updates for freshness, periodic full reindexing for consistency. Testing the hybrid means verifying incremental updates work, full reindexing corrects drift, and the two strategies do not conflict.
+
+You test the cutover process. When you finish building a new index, how do you switch queries to use it? Atomic cutover means all queries instantly use the new index. Gradual cutover means you route increasing percentages of traffic to the new index. You test that cutover does not cause downtime, inconsistent answers, or performance degradation.
+
+You test rollback. What if the new index is broken? Can you roll back to the old index? You test rollback by intentionally breaking a reindex and verifying you can revert to the previous good index without data loss or downtime.
+
+## Continuous Freshness Monitoring: Catching Staleness Before Users Do
+
+Freshness is not a one-time test. It is an ongoing operational concern. You need continuous monitoring to catch freshness degradation before users notice.
+
+You instrument your update pipeline with metrics. You log detection time, indexing time, propagation time for every update. You compute aggregates: median lag, p95 lag, max lag. You plot trends. If lag is increasing over weeks, you investigate even if it is still within SLA.
+
+You run synthetic freshness probes. You periodically update a canary document with a unique value, query for it, and measure lag. Canary tests verify end-to-end freshness in production without relying on real document updates. If a canary test fails, you know freshness is broken before users encounter stale answers.
+
+You sample production queries and check freshness. You randomly select 1 percent of queries, identify which documents were retrieved, check when those documents were last modified, and verify they are recent. If you frequently retrieve documents that are weeks old, you might have a freshness problem or a relevance problem.
+
+You alert on freshness violations. If a document update does not propagate within your SLA, you alert. If lag exceeds threshold for an hour, you page the on-call engineer. Alerts catch freshness incidents early.
+
+You track freshness debt: how many documents in your index are stale? You compare last-modified timestamps in source documents versus index entries. If 5 percent of index entries are stale, you have significant freshness debt. You investigate why updates are not propagating.
+
+You review freshness metrics in team meetings. Freshness is a quality metric like accuracy or latency. You track it, trend it, and discuss it. When freshness improves, you celebrate. When it degrades, you investigate and fix.
+
+The SaaS company rebuilt their system with freshness testing and monitoring. They set a freshness SLA: policy updates must propagate to answers within 4 hours. They instrumented their update pipeline and measured lag. They discovered median lag was 90 minutes, p95 was 6 hours. They violated their SLA on 10 percent of updates.
+
+They optimized by switching from polling to webhooks for detection, reducing detection lag from 30 minutes to under 1 minute. They parallelized indexing, reducing indexing lag from 60 minutes to 15 minutes. They tuned their vector database replication lag from 20 minutes to under 5 minutes. Total lag dropped to median 20 minutes, p95 80 minutes. SLA compliance increased to 98 percent.
+
+They deployed synthetic freshness probes: every 10 minutes, update a canary document and query for it. They measured probe lag continuously. When lag spiked above threshold, they alerted. They caught two incidents where indexing jobs stalled, causing freshness lag to grow to hours. They fixed the stalls before users complained.
+
+They added "last updated" timestamps to answers. Users could see when the information was current. Transparency built trust. When the parental leave policy was updated, the freshness system propagated it within 22 minutes. Employees saw the new policy on the same day it was published. The freshness crisis became a freshness success.
+
+Data freshness testing is the discipline of treating updates as first-class test scenarios. It is testing that the system not only works when data is static but continues working as data evolves. It is measuring lag, detecting staleness, and ensuring answers stay current. Teams that test freshness ship systems where users trust the information is up-to-date. Teams that skip it ship systems that confidently cite obsolete information, destroying trust when users discover the truth.

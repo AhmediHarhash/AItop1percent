@@ -1,0 +1,109 @@
+# 1.2 — The RAG Pipeline: Query, Retrieve, Rerank, Generate, Validate
+
+In November 2024, a legal tech company processing contract review queries discovered that 40 percent of their "high-confidence" answers cited clauses that did not exist. Not wrong clauses, not misinterpreted clauses—completely fabricated section references. The system would say "According to Section 4.2.1 of the agreement" and link to a document that had no Section 4.2.1. Users who trusted the citations made legal recommendations based on hallucinated contract terms. One client caught the error before signing a deal that would have exposed them to liability. They churned immediately and posted about it publicly.
+
+The root cause was not the language model. The model generated reasonable-sounding answers grounded in the retrieved context. The problem was that the pipeline had no validation stage. Retrieved chunks mentioned section numbers, the model repeated those numbers in answers, but nothing checked whether the citations were accurate or whether the chunks themselves were correctly attributed. The company had built query, retrieve, generate. They skipped rerank and validate. Those two missing stages cost them a major client and six months of trust recovery with their remaining customer base.
+
+Every stage in a RAG pipeline is a potential failure point. Every omitted stage is a category of errors you are choosing to accept. Understanding each stage, its purpose, its failure modes, and its interaction with other stages is not optional knowledge for teams building production RAG. It is the minimum foundation required to make architectural decisions that do not explode in production.
+
+## Query Preprocessing: Turning User Input Into Effective Retrieval
+
+Users do not phrase queries the way retrieval systems expect them. They use ambiguous pronouns, domain jargon, incomplete sentences, assumptions about shared context from previous turns in a conversation. A user asks "what about the Q3 change" and your system has no idea what "the change" refers to, which Q3, or what type of information they want. Naive RAG treats this raw input as a retrieval query. Production RAG preprocesses it first.
+
+Query preprocessing starts with intent classification. Is this an informational query, a navigational query, a transactional query? Is the user looking for facts, procedures, definitions, comparisons, troubleshooting steps? Intent shapes retrieval strategy. Factual queries benefit from dense retrieval optimized for semantic similarity. Navigational queries might need keyword matching to find specific document titles or section headers. Transactional queries might route to structured data stores instead of document indexes.
+
+Next is entity recognition and expansion. If the query mentions "GPT-4," your system should know that is an entity, understand it might be referenced as "GPT4" or "OpenAI GPT-4" in documents, and potentially expand the query to include variants. If the query mentions "last quarter" in January 2026, you should resolve that to Q4 2024 and potentially add that as a metadata filter. If the query uses an acronym common in your domain, expand it to the full term to improve retrieval recall.
+
+Coreference resolution matters in conversational RAG. A user asks "Tell me about the refund policy" and then "What are the exceptions?" The second query has no meaning without the first. Your preprocessing layer must maintain conversation context, rewrite the second query as "What are the exceptions to the refund policy," and potentially retrieve the same documents fetched for the first query to ensure consistency.
+
+Query expansion is high-risk, high-reward. Adding synonyms or related terms can dramatically improve recall when the user's vocabulary does not match the document's vocabulary. But aggressive expansion introduces noise, retrieving irrelevant documents that happen to mention expanded terms. The balance depends on your domain. In specialized domains with controlled vocabularies, expansion is safer. In open-domain settings, it is risky.
+
+The output of query preprocessing is not always a single query. Sometimes you generate multiple queries to retrieve diverse content, then merge results. Sometimes you generate a structured query with metadata filters, keyword constraints, and a semantic search component. Sometimes you route to different indexes entirely based on intent. The sophistication of this stage directly impacts retrieval quality, and retrieval quality is the foundation of everything downstream.
+
+## Retrieval: Fetching Candidate Documents Across Modalities
+
+Retrieval is where you go from a processed query to a ranked list of candidate chunks or documents. The naive approach is pure vector search: embed the query, find the k-nearest neighbors in your vector database, return those chunks. This works acceptably for queries that are semantically similar to passages in your corpus and fails badly otherwise.
+
+Production retrieval is almost always hybrid. You combine dense retrieval using embeddings with sparse retrieval using keyword matching. Dense retrieval excels at semantic similarity—finding documents that mean the same thing as the query even if they use different words. Sparse retrieval excels at exact matching—finding documents that contain specific terms, names, identifiers that must appear verbatim. Neither is sufficient alone for most real-world corpora.
+
+Hybrid retrieval requires score fusion. You get a ranked list from vector search and a ranked list from keyword search. How do you merge them? Reciprocal rank fusion is common: score each document based on its rank position in each list, then sum or average those scores. Learned fusion is more sophisticated: train a model to combine scores based on query type, document type, or other features. The fusion strategy affects which documents land in your top-k, which directly affects answer quality.
+
+Metadata filtering is critical for time-sensitive or scoped queries. If the user asks about "current pricing," you should filter documents to only those published or updated in the last six months. If the user asks about a specific product line, filter to documents tagged with that product. Filtering happens before or during retrieval, not after, because it changes the effective corpus size and thus the ranking distribution.
+
+Some systems use re-retrieval or iterative retrieval. After an initial retrieval pass, you analyze what you found and issue follow-up queries. Maybe you retrieved documents about topic A but they reference topic B as a dependency—retrieve B in a second pass. Maybe you retrieved summaries and need to fetch the full documents they reference. This multi-hop retrieval increases latency and complexity but can dramatically improve answer completeness for complex questions.
+
+Retrieval failure modes are diverse. You might retrieve chunks that are semantically similar but factually irrelevant. You might miss the best document because it uses terminology your embedding model does not align well. You might retrieve chunks from outdated versions of documents when updated versions exist. You might retrieve the middle of an explanation and miss the crucial setup or conclusion. Every failure mode propagates downstream, feeding bad context to reranking and generation.
+
+## Reranking: Separating True Relevance From Surface Similarity
+
+Retrieval gives you candidates. Reranking gives you confidence that those candidates are actually relevant to the query, not just similar in embedding space. The difference is enormous. Retrieval models see queries and documents independently—they embed each separately and compare vectors. Reranking models see query-document pairs jointly, allowing them to assess relevance in context.
+
+Cross-encoder rerankers are the most common approach. You pass the query and a candidate document to a transformer model that outputs a relevance score. The model sees both inputs together, so it can recognize when a document mentions the query terms but answers a different question, or when a document answers the query without using the exact terms. Cross-encoders are slower than bi-encoders because you cannot precompute document representations, but they are far more accurate.
+
+LLM-based reranking is increasingly viable in 2026. You prompt a language model to score how well a document answers the query, or you ask it to rank a set of documents in order of relevance. This is expensive—you are making an LLM call per candidate or per batch of candidates—but it can outperform cross-encoders, especially when your domain is unusual or your notion of relevance is complex. Some teams use LLM reranking only for high-value queries or as a final stage after cross-encoder reranking.
+
+The key decision in reranking is how many candidates to rerank. If retrieval returns 100 candidates and you rerank all of them, you are making 100 model inferences. If you rerank only the top 20, you might miss a highly relevant document ranked 25th by retrieval but worthy of top-five placement. The tradeoff is latency and cost versus quality. Most production systems rerank between 20 and 50 candidates, empirically determined to balance these factors.
+
+Reranking also enables diversity objectives. Maybe you want the top five results to cover different aspects of the query, not five paraphrases of the same point. Maximal marginal relevance is a classic algorithm: select the most relevant document, then iteratively select documents that are relevant but dissimilar from already-selected documents. This prevents redundancy in the context you show to the language model.
+
+Without reranking, you are trusting that retrieval rank order reflects true relevance. That trust is often misplaced. Retrieval optimizes for semantic similarity or keyword overlap, not for answerability. A document can be highly similar to the query but lack the information needed to answer it. Reranking adds a second opinion, a more expensive but more accurate model that corrects retrieval errors before they become generation errors.
+
+## Context Assembly: Structuring Retrieved Content for the Language Model
+
+You have a reranked list of relevant chunks. Now you must assemble them into context for the language model. This is not concatenation. This is a deliberate structuring process that affects model performance, citation accuracy, and token efficiency.
+
+First decision: ordering. Do you present chunks in relevance order, most-relevant first? Or in document order, preserving the original sequence if chunks came from the same document? Or in chronological order, if recency matters? Relevance order is most common—you put the best chunk at the top of the context, where the model is most likely to attend to it. But document order is better if understanding depends on narrative flow, and chronological order is better if you are tracking how information changed over time.
+
+Second decision: truncation. You have a token budget, often much smaller than the total length of your retrieved chunks. How do you decide what to include? Truncate lower-ranked chunks first, keeping only the top k that fit? Truncate each chunk proportionally, preserving some content from each? Truncate intelligently, keeping complete sentences or paragraphs rather than cutting mid-sentence? Each strategy has different failure modes.
+
+Third decision: metadata inclusion. Do you prepend each chunk with its source document title, publication date, author, section header? This metadata helps the model cite correctly and reason about credibility, but it consumes tokens. The tradeoff depends on your use case. In legal or medical domains, citations are mandatory, so metadata is worth the token cost. In casual search, users care less about sources, so you might skip metadata to fit more content.
+
+Fourth decision: deduplication and redundancy management. If retrieval and reranking return similar chunks from different documents, do you include all of them or deduplicate? Including all increases confidence through redundancy but wastes tokens. Deduplicating is more efficient but risks losing nuance or contradictions between sources that might be important.
+
+Context assembly is where you encode domain knowledge about what good context looks like. In customer support RAG, you might always include the most recent documentation version first, then older versions only if the recent version does not answer the query. In research RAG, you might cluster chunks by theme and include representative chunks from each cluster to ensure coverage. In compliance RAG, you might always include the exact regulatory text before any interpretative guidance.
+
+The assembly choices you make are invisible to the language model but shape its outputs profoundly. Poor assembly means the model sees the right information in the wrong order or structure, and it underperforms. Good assembly means the model sees information in a format that makes correct grounding easy and citation natural.
+
+## Generation: Producing Grounded Outputs With Citations and Uncertainty
+
+Generation is where the language model produces an answer using the assembled context. This is the stage everyone focuses on, but by the time you reach generation, most of the quality and reliability decisions have already been made. Generation quality is bounded by the quality of context you provide.
+
+Your generation prompt is critical. It must instruct the model to ground answers in the provided context, to cite sources, to express uncertainty when the context is ambiguous or incomplete, and to refuse to answer when the context does not support an answer. Without these instructions, the model will happily blend retrieved content with parametric knowledge, hallucinate citations, and express unwarranted confidence.
+
+Citation formats vary by use case. Some systems ask for inline citations with chunk IDs or document names in brackets. Some ask for footnotes. Some ask for structured output where each claim is paired with its supporting evidence. The format affects downstream validation—structured citations are easier to verify than free-text citations—but also affects user experience and token efficiency.
+
+Uncertainty handling is where most naive RAG systems fail. If the context does not contain a clear answer, the model should say so. But language models are trained to be helpful and will generate plausible-sounding answers even when they should abstain. You must prompt explicitly for uncertainty: "If the context does not contain enough information to answer confidently, say 'I do not have enough information' rather than guessing."
+
+Some production systems use constrained generation or structured output. You define a schema for the answer—maybe a JSON object with fields for answer text, confidence score, and citations—and use a library like Outlines or Guidance to constrain the model's generation to match that schema. This prevents free-form hallucination and makes downstream validation easier, but it adds latency and restricts expressiveness.
+
+Generation is also where you handle multi-turn conversation state. If this is the third query in a conversation, the model needs context about previous queries and answers to maintain coherence. You might include conversation history in the prompt, or you might use the conversation to inform retrieval (as in query preprocessing), or both. Managing this state is complex and token-expensive but necessary for conversational RAG.
+
+The output of generation is a candidate answer. It is not the final answer. It might be wrong, it might cite incorrectly, it might violate safety or compliance policies. Treating generation output as final output is the mistake that led to the legal tech company's hallucinated citations and lost client.
+
+## Post-Generation Validation: Catching Errors Before Users See Them
+
+Validation is the safety net. It runs after generation and before you show the answer to the user. The goal is to catch errors that would destroy trust, violate policy, or cause harm. Validation can reject answers entirely, prompt for regeneration, or flag answers for human review.
+
+Citation validation is the most common check. For every factual claim in the generated answer, is there a citation? For every citation, does it point to a real chunk or document? Does the cited content actually support the claim, or did the model hallucinate the connection? Automated citation validation usually involves checking citation IDs against your document store and, optionally, using an entailment model to verify that the cited content entails the claim.
+
+Factual consistency checks compare the generated answer to the retrieved context. Does the answer introduce facts not present in the context? Does it contradict the context? You can use natural language inference models for this, prompting them to classify whether the answer is entailed by, contradicts, or is neutral with respect to the context. High contradiction scores are red flags.
+
+Safety and compliance validation checks for policy violations. Does the answer contain personally identifiable information that should be redacted? Does it make medical or legal claims that require disclaimers? Does it use language that violates your content policy? Rule-based checks catch known bad patterns, and model-based checks catch novel violations.
+
+Confidence scoring aggregates signals from across the pipeline. Low retrieval scores, low reranking scores, high uncertainty language in the generation, low factual consistency scores—all of these indicate low confidence. You might set a threshold: answers below 70 percent confidence route to human review instead of being shown directly to users. This trades off latency and cost for reliability.
+
+Validation failure is not always a reject decision. Sometimes you regenerate with adjusted prompts or different context. Sometimes you fall back to a safer response like "I found some relevant information but cannot answer confidently; here are the documents I found." Sometimes you log the failure and show the answer anyway but with a disclaimer. The policy depends on your domain and risk tolerance.
+
+The legal tech company added citation validation and factual consistency checks to their pipeline. It added 400 milliseconds to their median latency and cost them one additional model call per query, but it caught 90 percent of hallucinated citations before they reached users. Trust scores recovered over six months as clients stopped encountering fabricated references.
+
+## The Pipeline as a System, Not a Sequence of Independent Steps
+
+Each stage in the RAG pipeline affects every other stage. Query preprocessing determines what you retrieve, retrieval determines what you rerank, reranking determines what context you assemble, context assembly determines what the model generates, generation determines what validation checks. Optimizing one stage in isolation can degrade overall performance if it creates problems downstream.
+
+For example, aggressive query expansion improves retrieval recall—you find more potentially relevant documents—but it also introduces more noise. If your reranking is weak, that noise makes it into your context, and the model generates lower-quality answers. The right move is not to avoid query expansion but to pair it with strong reranking. The stages must be designed together.
+
+Similarly, if you improve reranking to the point where your top five results are nearly perfect, you might not need expensive validation. Or if your validation is very strong, you might tolerate noisier retrieval and reranking because validation will catch the errors. The cost-quality tradeoff is system-level, not stage-level.
+
+Debugging pipeline failures requires stage-level observability. When an answer is wrong, you need telemetry showing what the query preprocessing produced, what retrieval returned, what reranking scored, what context was assembled, what the model generated, and what validation flagged. Without this visibility, you are guessing about root causes. With it, you can pinpoint that retrieval missed the key document, or reranking ranked it 15th, or the model misinterpreted a chunk, or validation failed to catch an error.
+
+The teams that build reliable RAG systems think in pipelines, not in models. They instrument every stage, they evaluate each stage independently and jointly, they optimize the system for end-to-end metrics rather than stage-specific metrics. They understand that production RAG is not "vector search plus LLM." It is query, retrieve, rerank, generate, validate—five distinct stages, each of which must work well and work together for the system to be production-ready.

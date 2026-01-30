@@ -1,0 +1,93 @@
+# 5.2 — Context Relevance Filtering: Dropping Low-Quality Retrievals
+
+In November 2025, a B2B SaaS company providing contract analysis tools saw their answer accuracy drop from 91 percent to 78 percent after upgrading their retrieval system to return ten chunks per query instead of five. They had assumed that more context would always be better, that giving the language model more information to work with would improve its ability to synthesize comprehensive answers. Instead, they found that the additional five chunks were mostly low-relevance results that introduced noise, distracted the model from the high-quality chunks, and occasionally contained misleading information that the model incorporated into its responses. Reverting to five chunks restored their accuracy, but the incident cost them two weeks of degraded service and several customer complaints about incorrect contract interpretations.
+
+You have built a retrieval system that ranks documents by relevance. You have tuned your embeddings, optimized your indexing, and the top results are usually good. But as you go deeper into the ranked list, quality degrades. The tenth-ranked chunk is worse than the fifth. The twentieth is worse than the tenth. At some point, including additional chunks stops helping and starts hurting. The question is where that point is, how to detect it, and how to enforce it dynamically so that each query gets exactly as much context as it needs and no more.
+
+## The Marginal Value of Additional Context
+
+The first retrieved chunk for a well-tuned system is usually highly relevant. It directly addresses the user's query, contains key information, and grounds the model's response effectively. The second chunk adds something the first did not, perhaps additional detail, a different perspective, or supporting evidence. The third chunk might fill in remaining gaps. But by the fourth or fifth chunk, you are often seeing diminishing returns. The information is either redundant with earlier chunks or only tangentially related to the query.
+
+This diminishing returns curve is not unique to retrieval systems. It is a property of information relevance in general. The most relevant information is concentrated in a small number of sources, and as you expand your search, you pull in progressively less relevant material. In traditional search engines, users understand this and typically only look at the first page of results. In RAG systems, the language model does not have that instinct. It will try to make use of whatever context you give it, even if that context is marginal or misleading.
+
+The danger is that low-relevance chunks do not just fail to help; they actively interfere with answer quality. They introduce distracting details, conflicting information, or irrelevant examples that pull the model's attention away from the high-relevance chunks. The model might try to synthesize information across all chunks, blending high-quality and low-quality sources in ways that dilute accuracy. Or it might latch onto a specific detail from a low-relevance chunk simply because that detail was novel or surprising, even though it is not central to the query.
+
+## Relevance Score Thresholds
+
+The simplest filtering strategy is to set a hard relevance score threshold and discard any chunk that falls below it. If your retrieval system returns chunks with cosine similarity scores, you might decide that anything below 0.7 is too low to be useful and should be excluded from the prompt. This ensures that only reasonably relevant chunks make it to the model, and it adapts naturally to different queries: if a query has ten chunks above the threshold, you include all ten; if it has only two, you include only two.
+
+The challenge is choosing the threshold. Too high, and you exclude chunks that would have been helpful, leaving the model with insufficient context to answer complex queries. Too low, and you include junk that degrades quality. The optimal threshold is not universal; it depends on your embedding model, your corpus, your query distribution, and your task. You need to tune it empirically by measuring answer quality at different threshold values.
+
+One approach is to sweep the threshold over a range (say, 0.5 to 0.9 in increments of 0.05) and evaluate answer quality on a held-out test set for each threshold value. Plot quality as a function of threshold and look for a peak or plateau. If quality peaks at 0.75 and stays flat or degrades at higher thresholds, use 0.75. If it keeps improving up to 0.85, use 0.85. If it is flat across a wide range, pick a middle value and move on; the threshold is not a critical lever for your system.
+
+Thresholds also need to account for score calibration. Some embedding models produce scores that cluster tightly around certain values, while others spread scores across a wider range. A threshold of 0.7 might be very restrictive for a model that rarely exceeds 0.75, but very permissive for a model that routinely produces scores above 0.9. You need to understand your score distribution and set thresholds relative to that distribution, not in absolute terms.
+
+## Dynamic Filtering Based on Score Distributions
+
+A more sophisticated approach is to filter based on the distribution of scores for each query, rather than a fixed threshold. For example, you might include only chunks whose score is within 80 percent of the top score for that query. If the top chunk scores 0.90, you include all chunks scoring 0.72 or higher. If the top chunk scores only 0.60, you include all chunks scoring 0.48 or higher. This adapts to query difficulty: easy queries with high-scoring matches get fewer chunks, hard queries with lower-scoring matches get more.
+
+The relative threshold approach helps address cases where retrieval quality varies across queries. Some queries have clear, unambiguous matches in your corpus, yielding high scores. Others are vague or request information that is not well-represented, yielding lower scores across the board. A fixed absolute threshold would exclude too much context for hard queries and not enough for easy queries. A relative threshold adjusts to the available information.
+
+Another dynamic strategy is to look for score gaps. If you have five chunks with scores around 0.8 and then the next five drop to 0.5, that gap suggests a natural cutoff. Include the top cluster and exclude the bottom cluster. This can be formalized by sorting chunks by score, computing the score difference between consecutive chunks, and cutting at the largest gap. This "elbow detection" heuristic works well when your corpus has clear relevance tiers for each query.
+
+You can also use percentile-based filtering. Always include the top N percent of retrieved chunks, regardless of absolute scores. If you retrieve 20 chunks and use a 50th percentile cutoff, you include the top 10. This guarantees a consistent amount of context per query while still filtering out the bottom half. The downside is that it does not adapt to cases where even the top chunks are low quality, but it is simple and robust.
+
+## The Retrieval Noise Floor
+
+Every retrieval system has a noise floor: a level of score below which chunks are essentially random matches with no meaningful relevance to the query. This noise floor is a function of your embedding model, your corpus diversity, and the inherent ambiguity of natural language. Even with a perfect embedding model, some queries will retrieve chunks that superficially match keywords or phrases but miss the semantic intent.
+
+Identifying your noise floor requires looking at low-scoring retrievals and assessing whether they are genuinely irrelevant or just less relevant. If chunks scoring below 0.5 are almost always off-topic, then 0.5 is near your noise floor. If chunks scoring 0.3 still occasionally contain useful information, your noise floor is lower. Once you know your noise floor, you can confidently discard anything below it without worrying that you are losing valuable context.
+
+The noise floor is not static. It can shift as you update your embedding model, add new documents to your corpus, or encounter new query patterns. Monitor the relevance of low-scoring chunks over time by sampling them and having human reviewers assess their quality. If you notice that chunks just above your current threshold are frequently irrelevant, raise the threshold. If chunks just below the threshold are often useful, lower it.
+
+In some systems, the noise floor varies by document type or source. Chunks from high-quality, well-structured sources might have a lower noise floor because even lower-scoring matches are still coherent and relevant. Chunks from user-generated content or scraped web data might have a higher noise floor because they contain more junk. You can encode this by applying source-specific thresholds: stricter filtering for noisy sources, more permissive filtering for clean sources.
+
+## When Including Irrelevant Chunks Hurts Quality
+
+Irrelevant chunks hurt in several ways. First, they increase prompt length, which increases latency and cost without improving answer quality. You are paying for tokens that contribute nothing. Second, they dilute the attention the model gives to relevant chunks, because the model has to process all the chunks you provide, and its attention budget is finite. Third, they introduce a risk of contamination, where the model picks up irrelevant details and weaves them into the answer, creating factual errors or off-topic tangents.
+
+Contamination is especially insidious because it is unpredictable. Sometimes the model ignores irrelevant chunks entirely. Other times, it latches onto a random detail because it seems novel or fits a pattern the model expects. A low-relevance chunk about a different product might mention a feature name that the model associates with the product the user asked about, leading to confusion. A chunk from an outdated document might contain deprecated information that contradicts current docs, and the model might blend both, producing an answer that is partially correct and partially wrong.
+
+Users do not know which chunks were retrieved or what scores they had. They just see the answer. If the answer is contaminated by irrelevant context, they lose trust in the system. If the answer is obviously wrong because it incorporated information from a completely unrelated document, they might abandon the tool entirely. The cost of including one bad chunk can outweigh the benefit of including five mediocre chunks, because the bad chunk creates a clear, memorable failure.
+
+## Balancing Precision and Recall
+
+Filtering is a precision-recall tradeoff. Strict filtering increases precision by ensuring that only high-relevance chunks are included, but it decreases recall by excluding chunks that might have contained useful information. Loose filtering increases recall by including more chunks, but it decreases precision by letting in noise. The optimal balance depends on your task and your tolerance for different types of errors.
+
+For factual question answering, precision is usually more important than recall. You want the model to ground its answer in highly relevant, accurate information, and you are willing to risk missing some marginal details if it means avoiding contamination. For exploratory or research-oriented tasks, recall might be more important because users want comprehensive coverage, and they can tolerate some irrelevant information as long as the relevant information is present.
+
+You can tune this tradeoff by adjusting your filtering threshold or your retrieval depth. Retrieve more chunks and filter aggressively for high precision. Retrieve fewer chunks and filter loosely for high recall. Or retrieve a moderate number and filter at a moderate threshold for a balanced approach. Measure the impact on your evaluation metrics and choose the point on the precision-recall curve that aligns with your quality goals.
+
+## Multi-Stage Filtering Pipelines
+
+Some teams use multi-stage filtering where an initial retrieval step pulls a large set of candidate chunks, and then a reranking or filtering step narrows it down to a smaller, higher-quality set. The initial retrieval is optimized for recall, casting a wide net. The reranking step is optimized for precision, scoring chunks with a more expensive but more accurate model and discarding anything below a high threshold.
+
+This two-stage approach lets you separate the concerns of finding candidates and selecting the best candidates. The initial retrieval can be fast and cheap, using a simple embedding similarity search. The reranking can be slower and more expensive, using a cross-encoder or a fine-tuned model that scores query-chunk pairs more accurately. You only pay the reranking cost for the top candidates from the first stage, not for the entire corpus.
+
+Filtering can happen at multiple stages. After initial retrieval, discard chunks below a lenient threshold to drop obvious junk. After reranking, discard chunks below a stricter threshold to drop marginal candidates. After chunk selection, you might even apply a post-hoc filter based on diversity or redundancy, removing chunks that are too similar to ones already included. Each stage refines the context, ensuring that only the best, most relevant, most diverse chunks make it to the model.
+
+## Dynamic Context Budgets
+
+Instead of filtering based only on relevance, you can also impose a token budget and include chunks until you hit that budget, ordered by relevance. This controls cost and latency while still adapting to the available information. If high-relevance chunks are short, you will include more of them. If they are long, you will include fewer. The budget becomes a hard constraint, and relevance ordering ensures you get the best chunks within that constraint.
+
+Dynamic budgets work well in production systems where latency and cost are critical. You can set a budget based on your SLA: if you need to respond in under two seconds and your model processes 1000 tokens per second, your context budget is 2000 tokens. Retrieve chunks, order them by relevance, and include as many as fit within 2000 tokens. This guarantees you meet your latency target while maximizing the quality of the context you provide.
+
+Budgets can also be query-dependent. Simple queries might get a smaller budget because they need less context. Complex queries might get a larger budget because they need more information to answer thoroughly. You can classify queries or use a heuristic like query length or number of entities mentioned to adjust the budget dynamically. This allocates resources where they are most needed, rather than giving every query the same treatment.
+
+## Monitoring Filtering Decisions
+
+In production, log every filtering decision: how many chunks were retrieved, how many passed the filter, what the score distribution looked like, and what the final context length was. Aggregate these logs to understand your filtering behavior at scale. Are you consistently including ten chunks per query, or does it vary widely? Are most queries hitting your token budget, or are they well below it? Are you seeing a lot of queries where all chunks are below your threshold, leaving the model with no context at all?
+
+These patterns reveal problems. If most queries result in zero chunks passing the filter, your threshold is too strict or your retrieval system is underperforming. If most queries max out your chunk limit, your threshold is too loose or your corpus has a lot of redundant documents. If chunk counts vary wildly, your filtering strategy might not be adapting well to different query types, and you might need query-specific thresholds.
+
+User feedback is the ultimate test. If users complain that answers are incomplete or miss obvious information, you might be filtering too aggressively. If they complain that answers are off-topic or contain irrelevant details, you might be filtering too loosely. Correlate user feedback with filtering logs to see if there are patterns: do low-chunk queries get worse feedback? Do high-chunk queries get more complaints about relevance? Use this data to refine your filtering strategy over time.
+
+## The Cost of Over-Filtering and Under-Filtering
+
+Over-filtering leaves the model with too little context, forcing it to generate answers based on incomplete information or fall back on its parametric knowledge, which might be outdated or incorrect. Under-filtering leaves the model with too much context, increasing latency, cost, and the risk of contamination. Both hurt quality, but in different ways.
+
+Over-filtering is easier to detect because it often results in the model saying it does not have enough information to answer, or giving a partial answer and noting that details are missing. Users will complain that the system is unhelpful or incomplete. Under-filtering is harder to detect because the model will still generate fluent, confident answers, even if they are subtly wrong due to contamination. Users might not notice immediately, but over time they will encounter enough errors to lose trust.
+
+The safest approach is to start with strict filtering and loosen it gradually based on feedback and evaluation. It is easier to add more context if you are over-filtering than to remove context if you are under-filtering, because adding context is a parameter change while removing context requires re-evaluating what is essential. Start conservative, measure quality, and relax constraints as you gain confidence that additional context improves rather than degrades performance.
+
+Filtering is not glamorous, but it is essential. It is the quality control step that ensures the model only sees information worth seeing. Done well, it is invisible: the model gets exactly the context it needs, and answers are accurate and grounded. Done poorly, it is obvious: answers are contaminated, incomplete, or inconsistent, and users notice. Treat filtering as a first-class concern in your RAG pipeline, tune it carefully, and monitor it continuously. The payoff is a system that feels reliable and trustworthy, rather than one that occasionally surprises users with bizarre or incorrect answers that seem to come from nowhere.

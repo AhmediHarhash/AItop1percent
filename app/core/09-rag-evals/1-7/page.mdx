@@ -1,0 +1,133 @@
+# 1.7 — RAG Failure Modes: A Production Taxonomy
+
+In April 2025, a financial services company launched their AI-powered investment research assistant to 12,000 premium clients. Within 72 hours, three clients made trading decisions based on outdated earnings reports. The RAG system had retrieved documents from Q3 2024 when Q4 results were already published. The company paid $847,000 in settlement costs. The failure wasn't in the language model. It was in retrieval strategy, index freshness, and document metadata—the invisible infrastructure that determines what context your LLM ever sees.
+
+You inherit this taxonomy when you build RAG systems. Every production deployment will encounter these failure modes. The question isn't whether your system will fail, but which failure modes you've explicitly designed to detect, measure, and mitigate. Most teams discover their failure modes through customer complaints. The top 1 percent catalog them during architecture design and build eval infrastructure before the first production query.
+
+## The Three-Layer Failure Model
+
+RAG systems fail at three distinct layers: retrieval, generation, and pipeline infrastructure. Most teams conflate these layers, treating every bad answer as an LLM hallucination. This diagnostic error leads to misguided solutions. You add prompt instructions when the problem is missing documents. You increase context window size when the problem is retrieval ranking. You switch to a stronger model when the problem is index staleness.
+
+Retrieval failures happen before the LLM sees anything. The wrong documents are retrieved, the right documents are missing, or the documents are outdated. Generation failures happen after retrieval succeeds. The LLM hallucinates despite good context, ignores relevant context, or incorrectly mixes information from multiple sources. Pipeline failures are infrastructure problems. Embedding services time out, vector databases return corrupted results, or network partitions cause partial failures.
+
+Each layer requires different evaluation metrics and different mitigation strategies. Retrieval failures need better chunking, embeddings, or ranking. Generation failures need better prompts, stronger models, or output validation. Pipeline failures need circuit breakers, retries, and graceful degradation. Teams that treat all failures identically waste months optimizing the wrong layer.
+
+## Retrieval Failure Type One: Wrong Documents Retrieved
+
+The most common retrieval failure is retrieving semantically similar but factually wrong documents. A user asks about Python 3.11 features. Your system retrieves Python 3.9 documentation because the embedding space doesn't distinguish version numbers well. The LLM generates a confident answer citing features that don't exist in 3.11 or missing features that do.
+
+This failure mode appears in every domain where subtle distinctions matter. Medical RAG systems retrieve information about similar-sounding medications. Legal RAG systems retrieve precedents from the wrong jurisdiction. Code search systems retrieve deprecated API documentation. The documents aren't random noise—they're plausibly relevant, which makes the failure harder to detect and more dangerous when undetected.
+
+The root cause is usually semantic search limitations. Vector embeddings compress text into fixed-size representations. Similar text gets similar vectors, but "similar" conflates many types of similarity. Syntactic similarity, topical similarity, stylistic similarity all collapse into a single distance metric. Your retrieval system can't distinguish between "this document is about the same topic" and "this document answers the user's specific question."
+
+Metadata filtering helps but introduces new failure modes. You filter documents by product version, but someone tagged the wrong version during ingestion. You filter by publication date, but the document itself contains outdated information that was never updated. You filter by document type, but the taxonomy is inconsistent across your corpus. Metadata quality determines retrieval precision, and metadata quality is usually worse than teams assume.
+
+The downstream impact depends on LLM behavior. Some models will faithfully cite the wrong document. Others will notice the mismatch and try to reconcile it, often making things worse. A few will recognize the document doesn't answer the question and say so, but this requires strong reasoning capability and explicit prompting for citation checking. Most production systems don't verify document relevance post-retrieval.
+
+## Retrieval Failure Type Two: Missing Required Documents
+
+More insidious than retrieving wrong documents is failing to retrieve the right documents. A user asks a question. The perfect answer exists in your corpus. Your retrieval system returns ten plausible-but-incomplete documents. The LLM generates an answer from incomplete information, never knowing the complete answer was available.
+
+This failure mode has multiple causes. Chunking strategy might split the crucial information across multiple chunks, and you only retrieve one. Embedding quality might fail to capture the semantic relationship between query and document. Ranking algorithms might deprioritize the best document because it's longer, older, or uses different terminology. Each cause requires different detection and mitigation.
+
+The challenge is ground truth. How do you know which documents should have been retrieved? In customer support RAG, you might have historical resolution data showing which articles solved similar issues. In legal RAG, you might have attorney annotations of relevant precedents. In code search, you might have test coverage mapping queries to files. Without ground truth, you're measuring retrieval recall blindly.
+
+Teams often discover missing document failures through manual review of bad answers. An engineer sees a wrong answer, searches the knowledge base manually, finds the right document, and realizes the retrieval system failed. This is expensive, slow, and biased toward visible failures. The systematic approach is building retrieval eval datasets that specify which documents must be retrieved for each query, then measuring recall before generation happens.
+
+The cost of missing documents scales with question complexity. Simple factual questions often have redundant information across multiple documents. Missing the best document still leaves okay documents. Complex analytical questions require synthesizing information from multiple specific documents. Missing any one makes the final answer incomplete or wrong. RAG for research, legal analysis, or technical troubleshooting has much higher missing-document risk than RAG for simple FAQs.
+
+## Retrieval Failure Type Three: Stale or Outdated Documents
+
+The financial services disaster from our opening story is this failure mode. The retrieval system works perfectly—it finds and ranks relevant documents. But the documents themselves are outdated. The index contains last quarter's earnings report but not this quarter's. The LLM generates an accurate answer to a question about reality four months ago, not reality today.
+
+Document freshness is a data pipeline problem disguised as a retrieval problem. How quickly do updated documents flow from source systems into your vector index? How do you detect when a document has been updated versus when a new document should supplement the old one? How do you handle versioned information where both old and new versions are simultaneously correct for different contexts?
+
+Most teams build RAG pipelines with batch updates. Every night, you re-embed changed documents and update your index. This works until the business requires real-time freshness. Customer support needs to see knowledge base updates within minutes. E-commerce product search needs to reflect inventory changes immediately. Compliance documentation needs to show policy updates the moment they're approved.
+
+Real-time freshness conflicts with embedding cost optimization. You don't want to re-embed entire documents for minor changes. You need change detection that identifies which chunks changed and incremental updates to your vector index. You need cache invalidation strategies that remove stale embeddings. You need versioning that lets you retrieve the correct document version based on temporal context in the query.
+
+The evaluation challenge is temporal. You can't evaluate freshness by measuring retrieval quality on a static test set. You need time-series eval data that includes queries before and after document updates, with ground truth about which version should be retrieved. Very few teams build this eval infrastructure, which is why stale document failures are usually discovered in production through user complaints.
+
+## Generation Failure Type One: Hallucination Despite Context
+
+You've successfully retrieved the right documents. The context window contains the exact information needed. The LLM still hallucinates, inventing facts that contradict the provided context. This is a pure generation failure, independent of retrieval quality.
+
+Context-aware hallucination happens more often than teams expect. Early RAG optimism assumed that providing accurate context would eliminate hallucinations. Reality is messier. Models sometimes ignore context when their prior training has strong conflicting information. They sometimes blend context with parametric knowledge in ways that introduce errors. They sometimes misinterpret context, extracting wrong conclusions from correct facts.
+
+The failure pattern is often subtle. The LLM doesn't invent completely random facts. It generates plausible-sounding information that's consistent with the general topic but not supported by the specific documents. A legal RAG system might correctly cite a case but incorrectly describe its holding. A medical RAG system might correctly identify a treatment but incorrectly describe its dosage.
+
+Detection requires comparing generated answers against source documents with more sophistication than keyword matching. You need semantic entailment checking: does the generated claim logically follow from the retrieved context? This is itself an LLM task, which means your hallucination detection can hallucinate. The best approach is using a stronger model to evaluate a weaker model's output, but this doubles your inference cost.
+
+Mitigation strategies focus on prompt engineering and output validation. You explicitly instruct the model to only use provided context, to cite sources, to acknowledge when context is insufficient. You ask the model to quote relevant passages before synthesizing. You use structured output formats that separate claims from citations. None of these techniques eliminate the problem completely, but they reduce frequency and make failures more detectable.
+
+## Generation Failure Type Two: Ignoring Relevant Context
+
+The opposite failure is equally problematic. Your retrieval system provides highly relevant context. The LLM generates an answer without using it, falling back on parametric knowledge or refusing to answer because it doesn't recognize the context as relevant.
+
+This failure mode increased with instruction-tuned models optimized for safety. These models are trained to be cautious about unfamiliar information, which can manifest as ignoring retrieved context that doesn't match their training distribution. A model might see retrieved context about a proprietary internal API and treat it as potentially unreliable, preferring to say "I don't have information about that" rather than using the provided documentation.
+
+Context length exacerbates the problem. When you retrieve 20 documents and concatenate them into a 15,000-token context, the model must identify which parts are relevant to the specific query. Models have varying capability in this kind of "needle in haystack" reasoning. Some will focus on the first and last documents, ignoring middle context. Others will weight recent context more heavily than older context, even when older context is more relevant.
+
+The evaluation gap is that most RAG eval focuses on retrieval quality, not context utilization. You measure whether the right documents were retrieved, but not whether the model actually used them. Building context-utilization eval requires annotating which parts of the retrieved context should appear in the answer, then checking for their presence or influence in generation.
+
+Mitigation involves both prompting and architecture changes. You can explicitly reference the context in your prompt: "Use the following documents to answer." You can use structured prompts that ask the model to first identify relevant context sections, then generate an answer from those sections. You can reduce context size through re-ranking or query-focused summarization. You can switch to models with better long-context reasoning capability.
+
+## Generation Failure Type Three: Incorrect Source Attribution and Mixing
+
+When RAG systems retrieve multiple documents, the LLM must synthesize information across sources. This introduces attribution failures. The model combines facts from different documents in ways that misrepresent their original context. It attributes information to the wrong source. It creates composite claims that no individual source supports.
+
+Citation accuracy is critical in high-stakes domains. Legal RAG systems must attribute each claim to specific precedents. Medical RAG systems must distinguish between peer-reviewed research and clinical guidelines. Financial RAG systems must identify which analyst report made which forecast. When attribution fails, the entire answer becomes unreliable even if the facts are individually correct.
+
+The challenge is that current LLMs don't have strong built-in citation mechanisms. You're asking the model to simultaneously perform two cognitive tasks: understand and synthesize information, and track provenance for each piece of information. Humans struggle with this in complex research tasks. Models are learning, but citation accuracy lags general reasoning capability.
+
+Structured output formats help but don't solve the problem. You can require the model to output JSON with separate fields for claims and citations. You can use XML tags to wrap cited content. You can ask for quote-then-analyze patterns. These formats increase citation frequency but don't guarantee citation accuracy. The model might cite the wrong document, cite a document that doesn't support the claim, or cite a document correctly but extract the wrong conclusion from it.
+
+Verification requires comparing generated citations against source documents. Did the cited document actually say what the model claims? Is the citation the best source for this claim, or did a better source appear in the context? If multiple sources are combined, is the synthesis logically valid? This verification is expensive and often requires another LLM call or human review.
+
+## Pipeline Failure Type One: Embedding Service Degradation
+
+Your RAG system depends on embedding services to convert text into vectors. When embedding APIs slow down or fail, your entire pipeline stalls. In March 2025, a major embedding provider had a 6-hour outage. Hundreds of RAG applications went dark. Some had no fallback strategy. Others fell back to keyword search with dramatically worse quality. A few had cached embeddings for common queries and degraded gracefully.
+
+Embedding service failures manifest in multiple ways. Complete outages are rare but catastrophic. More common are latency spikes that cascade into timeout failures. Rate limiting can cause intermittent failures under load. Silent failures where the service returns embeddings but with degraded quality are nearly impossible to detect without active monitoring.
+
+The dependency is bidirectional. You need embeddings at index time to populate your vector database. You need embeddings at query time to retrieve relevant documents. Query-time failures are immediately visible to users. Index-time failures are silent until you notice your index is stale, which might take days if you don't have active freshness monitoring.
+
+Mitigation requires redundancy and graceful degradation. Some teams run their own embedding models alongside API services, accepting higher infrastructure cost for reliability. Others cache embeddings for frequent queries and use approximate matching when embedding services fail. The best approach depends on your latency, cost, and quality requirements.
+
+The evaluation gap is that most teams don't test failure modes. Your eval dataset measures quality under ideal conditions, not degraded conditions. Building resilience eval requires testing your system with simulated embedding failures, latency spikes, and quality degradation. How does answer quality degrade when embeddings are 20 percent worse? What happens when embedding latency goes from 50ms to 2000ms?
+
+## Pipeline Failure Type Two: Vector Database Corruption and Inconsistency
+
+Vector databases are complex distributed systems. They can return inconsistent results due to replication lag, corrupted indices, or version skew between query and index. In November 2024, a healthcare company discovered their RAG system was randomly missing documents. The cause was a corrupted HNSW index that failed to return some nearest neighbors. The corruption had existed for three weeks before detection.
+
+Index corruption is often silent. The database doesn't return errors—it returns incomplete or wrong results. Detection requires ground truth queries where you know which documents should be retrieved, executed continuously to catch drift. Most teams don't have this monitoring, so corruption is discovered through accumulated user complaints.
+
+Consistency issues appear in distributed vector databases. You update a document, but queries hit a replica that hasn't seen the update yet. You delete a document, but it still appears in search results for minutes or hours. You're running queries during an index rebuild and get a mix of old and new results. Each consistency failure creates retrieval failures that look like relevance problems, not infrastructure problems.
+
+The mitigation is treating your vector database as a complex distributed system that requires monitoring, testing, and operational rigor. You need health checks that verify index integrity. You need consistency checks that compare replicas. You need rollback capabilities for bad index updates. You need staging environments where you test index changes before production.
+
+Very few teams build this operational infrastructure because vector databases are marketed as simple APIs. You send vectors, you get results. The underlying complexity is hidden until it fails. The top 1 percent treat vector databases like they treat traditional databases: mission-critical infrastructure requiring monitoring, backup, disaster recovery, and change management.
+
+## Pipeline Failure Type Three: Cascading Timeouts and Partial Failures
+
+RAG pipelines chain multiple services. Query embedding service calls vector database calls LLM API. Each call has latency and failure probability. When any component slows or fails, the entire pipeline stalls. In distributed systems, this creates cascading failures. Your embedding service is slow, so requests queue up. Your application servers run out of threads waiting for embeddings. Your load balancer starts timing out requests. Users see failures even though the LLM and vector database are healthy.
+
+Partial failures are worse than complete failures. Your vector database times out after returning 7 of 10 requested documents. Do you proceed with incomplete context or fail the request? Your embedding service returns embeddings for the query but fails to embed one of your retrieved documents for relevance re-ranking. Do you skip re-ranking or fail?
+
+Most teams don't explicitly design partial failure behavior. The code uses default timeout values and error handling that treats any error as a complete failure. This maximizes reliability but minimizes availability. When 10 percent of requests have partial failures, you're failing 10 percent of user requests even though you could serve them with degraded quality.
+
+Graceful degradation requires explicit design. You define quality tiers: optimal, degraded, minimal. Optimal is all components working, full context, full re-ranking. Degraded is missing some components but still functional—maybe you skip re-ranking, reduce context size, or use cached results. Minimal is keyword search fallback or canned responses. Each tier has different latency, cost, and quality characteristics.
+
+The evaluation challenge is testing these tiers. Your eval dataset should include expected quality for each degradation tier. When you fall back to keyword search, what's the acceptable quality drop? How much worse are answers with 5 documents instead of 10? If you skip re-ranking, how much does precision suffer? These benchmarks guide your runtime decisions about when to degrade versus when to fail.
+
+## Building Failure Mode Detection Into Architecture
+
+The best time to address failure modes is during architecture design, not after production deployment. Every RAG component should emit metrics that enable failure detection. Your embedding calls should track latency, success rate, and embedding quality scores. Your retrieval should track precision, recall, and result diversity. Your generation should track context utilization, citation accuracy, and factual consistency.
+
+Most teams treat evaluation as a pre-deployment activity. You build an eval set, measure your system, deploy if it's good enough. The top 1 percent treat evaluation as continuous production monitoring. Every query is an eval opportunity. You log queries, retrieved documents, generated answers, and user feedback. You sample these logs for manual review. You run automated eval metrics on production traffic. You detect quality degradation in real-time, not through quarterly reviews.
+
+Building this infrastructure requires treating eval as a first-class system component, not a testing afterthought. Your RAG service needs eval endpoints that accept ground truth and return metrics. Your logging pipeline needs to capture full request context, not just final answers. Your alerting needs quality thresholds that trigger investigation before users notice problems.
+
+The failure taxonomy in this chapter becomes your monitoring checklist. For each failure mode, you need detection metrics and alerting thresholds. Retrieval failures need precision and recall monitoring. Generation failures need hallucination detection and citation accuracy. Pipeline failures need latency, error rate, and consistency monitoring. When any metric degrades beyond threshold, you investigate before it cascades into user-visible failures.
+
+The investment in failure-aware architecture pays off exponentially. You catch problems in development, not production. You detect regressions immediately, not after user complaints accumulate. You have objective data for debugging instead of anecdotal reports. You can make confident changes because you have comprehensive metrics showing impact. This is the difference between operating a fragile prototype and operating production infrastructure that earns user trust.

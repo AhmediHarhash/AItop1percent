@@ -1,0 +1,125 @@
+# 1.5 — RAG System Components and Data Flow
+
+In January 2025, a logistics company's RAG system started returning answers with 15-second latency, up from two seconds the previous month. Users complained, usage dropped, and the engineering team scrambled to debug. They checked the LLM provider status page—no issues. They checked vector database performance—query times were normal. They checked embedding latency—also normal. After three days of investigation, they discovered the bottleneck: their reranking service was processing candidates sequentially instead of in batches, and as their corpus grew, the number of candidates to rerank per query increased from 20 to 80. Sequential reranking of 80 candidates took 12 seconds.
+
+The root cause was not a single component failure. It was a misunderstanding of data flow through the system. The team had architected each component in isolation—document store, embedding service, vector database, retrieval service, reranker, LLM—and assumed they would compose gracefully. They did not map out how data actually flowed through the pipeline, where latency accumulated, where parallelization was possible, where bottlenecks would emerge as scale increased. When the system broke under load, they did not know where to look because they did not understand the system as a whole.
+
+Production RAG is not a collection of independent services. It is a directed graph of components with data dependencies, latency budgets, failure modes, and scaling characteristics. Understanding this graph—what each component does, what it depends on, how data flows through, where state lives—is necessary for designing, debugging, and operating the system reliably.
+
+## The Document Store: Source of Truth
+
+The document store is where your raw content lives. This might be a blob storage service like S3 or Azure Blob, a document database like MongoDB, a content management system, a wiki, or a combination of sources. The document store holds the original documents—PDFs, Word files, HTML pages, markdown files, structured data—in their native formats.
+
+The key property of the document store is that it is the source of truth. When you need to verify that a citation is correct, you go back to the document store to check the original content. When a user clicks a citation link, you serve the document from the store. When you need to reindex after changing your chunking strategy, you fetch documents from the store and reprocess them.
+
+Document stores are typically not optimized for search. They are optimized for storage, versioning, access control, and retrieval by ID or path. You do not query the document store with semantic search; you query it with "give me document X" or "give me all documents updated since date Y." The indexing and search logic lives elsewhere.
+
+Data flows out of the document store during indexing and in response to citation verification. During indexing, you extract text from documents, chunk it, and embed it. You might also extract metadata—author, date, title, tags—and store it alongside embeddings. During citation verification, you fetch the cited document to check that the content matches the claim.
+
+In a well-architected system, the document store is append-mostly. You add new documents, update changed documents, and occasionally delete obsolete documents, but you do not modify the store on every user query. This separation of read-heavy query workload from write-heavy indexing workload allows you to scale and optimize each independently.
+
+## The Embedding Service: Text to Vectors
+
+The embedding service takes text and produces vectors. During indexing, it embeds document chunks. During query time, it embeds user queries. The embedding model might be a hosted API like OpenAI embeddings or Cohere embeddings, or a self-hosted model like a fine-tuned Sentence-BERT variant.
+
+Embedding is stateless and parallelizable. Each chunk or query can be embedded independently, which makes scaling straightforward—add more workers or increase throughput on your API calls. Latency is typically 50 to 150 milliseconds per batch of embeddings, depending on batch size and model.
+
+The critical design choice is dimensionality and model selection. Smaller embedding dimensions (384, 512) are faster to search but may have lower representational capacity. Larger dimensions (1024, 1536) capture more nuance but increase storage and search costs. The model itself determines quality—how well it captures semantic similarity, how robust it is to domain shift, how well it handles multilingual or multi-modal inputs.
+
+Data flows through the embedding service in two paths. The indexing path processes all document chunks, producing vectors that are stored in the vector database. The query path processes user queries in real time, producing query vectors that are compared against stored document vectors. These paths have different latency and throughput requirements. Indexing can be batched and asynchronous; query embedding must be low-latency and synchronous.
+
+In production systems, the embedding service is often the first place you add caching. If users ask the same question multiple times, you cache the query embedding and skip re-embedding. If you retrieve the same chunks repeatedly, you might cache their embeddings in the retrieval service to avoid fetching from the vector database.
+
+## The Vector Database: Similarity Search at Scale
+
+The vector database stores embeddings and provides similarity search. Given a query vector, it returns the k-nearest neighbors—the document chunks whose embeddings are most similar to the query embedding. Common vector databases include Pinecone, Weaviate, Qdrant, Milvus, Chroma, and vector extensions for traditional databases like pgvector for Postgres.
+
+The vector database must solve two problems: storage and search. Storage is straightforward—you write vectors with metadata to the database. Search is hard. Finding exact nearest neighbors in high-dimensional space requires comparing the query vector to every stored vector, which is prohibitively expensive at scale. Vector databases use approximate nearest neighbor algorithms—HNSW, IVF, ANNOY—to trade off a small amount of accuracy for orders of magnitude speedup.
+
+The key performance parameters are recall and latency. Recall measures how often the true nearest neighbors appear in the returned results. Latency measures how long the search takes. There is a tradeoff: more accurate algorithms or larger candidate sets improve recall but increase latency. Tuning this tradeoff is database-specific and corpus-specific.
+
+Data flows into the vector database during indexing. You write embeddings along with metadata—document ID, chunk ID, source URL, timestamp, any other attributes you want to filter on. Data flows out during retrieval. You query with a vector and optional metadata filters, and the database returns ranked results.
+
+In production, the vector database is often the scaling bottleneck for read-heavy workloads. As your corpus grows from thousands to millions of chunks, search latency increases unless you scale your database infrastructure. Sharding, replication, and index tuning become necessary. Teams that do not plan for this discover degraded performance at scale and must retrofit scaling solutions.
+
+## The Retrieval Service: Orchestrating Hybrid Search
+
+The retrieval service orchestrates the fetching of candidate documents. In naive RAG, this is just a vector search call. In production RAG, it is hybrid search: combining vector search with keyword search, applying metadata filters, merging results from multiple sources, and sometimes doing multi-hop retrieval.
+
+The retrieval service calls the vector database for semantic search and might call a keyword search engine like Elasticsearch for term-based search. It merges the ranked lists from both using a fusion algorithm like reciprocal rank fusion. It applies metadata filters—date ranges, document types, access permissions—to ensure results are relevant and authorized.
+
+Data flows into the retrieval service from the query preprocessing stage. The preprocessed query includes the semantic query, keyword query, metadata filters, and possibly intent classification. The retrieval service uses these inputs to decide which indexes to search, how to weight different retrieval strategies, and how many candidates to fetch.
+
+Data flows out of the retrieval service as a ranked list of candidates. Each candidate includes the chunk text, metadata, and relevance score. This list flows to the reranking stage, which will reorder it based on a more expensive but more accurate relevance model.
+
+The retrieval service is where you implement caching and deduplication. If the same query is issued multiple times, you cache the candidate list. If hybrid search returns the same chunk from both vector and keyword paths, you deduplicate before sending to reranking. These optimizations reduce downstream latency and cost.
+
+## The Reranker: Contextual Relevance Scoring
+
+The reranker takes the candidate list from retrieval and reorders it using a model that sees the query and each candidate together. Cross-encoder models are common: they take a query-document pair as input and output a relevance score. The reranker scores all candidates and sorts them by score, promoting truly relevant content to the top.
+
+Reranking is expensive. If you retrieve 50 candidates and use a cross-encoder to rerank them, you make 50 model inferences. If your cross-encoder takes 20 milliseconds per inference and you process sequentially, that is 1,000 milliseconds. Batching and parallelization are critical. Most production systems batch candidates and process them in parallel, reducing latency to 200 to 500 milliseconds.
+
+The choice of reranking model affects both quality and cost. A small cross-encoder (e.g., MiniLM-based) is fast but less accurate. A large cross-encoder (e.g., RoBERTa-large or DeBERTa-based) is more accurate but slower. LLM-based reranking is most accurate but most expensive, often reserved for high-value queries or final-stage reranking after a cheaper first-pass reranker.
+
+Data flows into the reranker from the retrieval service. Data flows out as a reranked candidate list. The top k candidates from this list—typically five to ten—go to the context assembler to be formatted for the LLM.
+
+In production, reranking is often where you implement business logic. Maybe you boost recent documents, or demote documents that users historically downvoted, or enforce diversity so that the top results cover different aspects of the query. The reranker is the quality gate between noisy retrieval and clean context.
+
+## The Context Assembler: Formatting for the LLM
+
+The context assembler takes the top k reranked chunks and formats them into a prompt for the language model. This is not concatenation. It is a structured process that orders chunks, adds metadata, handles truncation, removes redundancy, and ensures the context fits within the token budget.
+
+The assembler decides ordering: relevance-first, document-first, chronological? It decides what metadata to include: source titles, dates, page numbers, section headers? It decides how to handle overflow: truncate lower-ranked chunks, truncate each chunk proportionally, or summarize some chunks to fit more information?
+
+Data flows into the context assembler from the reranker. Data flows out as a formatted prompt that includes the user query, the assembled context, and instructions for the language model. This prompt is sent to the LLM for generation.
+
+The assembler is where you implement domain-specific knowledge. In legal RAG, you might always include full citations with page and paragraph numbers. In customer support RAG, you might include the document title and last-updated date. In research RAG, you might cluster chunks by theme and include a representative chunk from each cluster.
+
+In production systems, the context assembler is often where you implement fallback strategies. If the top chunks are all low-confidence, you might skip generation and return a message like "I could not find enough information to answer confidently." If the chunks are contradictory, you might flag the contradiction in the prompt so the model can acknowledge it.
+
+## The LLM: Generating Grounded Answers
+
+The language model takes the assembled prompt and generates an answer. The prompt includes the query, the context, and instructions about how to answer—cite sources, express uncertainty, refuse when information is insufficient. The model generates text that hopefully adheres to these instructions.
+
+The LLM is stateless with respect to the RAG pipeline. It does not know about retrieval, reranking, or validation. It only sees the prompt you give it. This simplicity is valuable—it decouples LLM choice from the rest of the pipeline. You can swap in a different model, upgrade to a newer version, or A/B test models without changing upstream components.
+
+Data flows into the LLM from the context assembler. Data flows out as generated text, possibly including citations. This text goes to the validation stage before being shown to users.
+
+In production, the LLM is often the highest-cost component per query, but not the highest-latency component. Generation might take 1,000 to 2,000 milliseconds, but retrieval plus reranking might also take 1,000 to 2,000 milliseconds. Optimizing end-to-end latency requires optimizing the full pipeline, not just the LLM.
+
+## The Output Validator: Final Quality Gate
+
+The output validator checks the generated answer before it reaches the user. It verifies citations, checks factual consistency, flags safety or compliance issues, and scores confidence. Validation can be rule-based, model-based, or hybrid.
+
+Citation validation checks that every citation ID or source reference in the generated text corresponds to a real chunk or document, and optionally checks that the cited content supports the claim. Factual consistency checks compare the answer to the retrieved context to ensure no hallucinated facts. Safety checks scan for prohibited content.
+
+Data flows into the validator from the LLM. Data flows out as a validated answer, or a rejection with a fallback response, or a flag for human review. The output is what the user sees.
+
+In production, validation is where you implement quality thresholds. If confidence is below 70 percent, route to human review. If citations are missing, regenerate with stricter instructions. If safety issues are detected, block the response and log the incident.
+
+## How Data Flows Through the Full Pipeline
+
+A user submits a query. The query preprocessing stage analyzes it, expands entities, resolves coreferences, and classifies intent. The processed query flows to the embedding service, which produces a query vector. The query vector and any metadata filters flow to the retrieval service.
+
+The retrieval service queries the vector database for semantic neighbors and optionally queries a keyword search index for term matches. It merges the results and returns a ranked candidate list. This list flows to the reranker.
+
+The reranker scores each candidate in context with the query, using a cross-encoder or LLM. It reorders candidates by score and passes the top k to the context assembler.
+
+The context assembler formats the chunks into a prompt, adding metadata and instructions. The prompt flows to the LLM, which generates an answer. The answer flows to the output validator.
+
+The validator checks citations, consistency, and safety. If the answer passes, it flows to the user. If it fails, a fallback response or human review request is generated instead.
+
+This is the data flow in a production RAG system. Eleven steps from query to answer: preprocess, embed, retrieve, rerank, assemble, generate, validate, respond. Each step can fail. Each step contributes latency. Each step is an opportunity to improve quality or introduce errors.
+
+## Where State Lives and Why It Matters
+
+The document store holds persistent state: the original documents. The vector database holds persistent state: the embeddings and metadata. Everything else in the pipeline is ephemeral or derived. Query preprocessing, retrieval, reranking, assembly, generation, validation—these are stateless transformations that take inputs and produce outputs.
+
+This separation is important for scaling and debugging. Stateless services can scale horizontally. If retrieval is slow, add more retrieval workers. If reranking is the bottleneck, parallelize reranking. Stateful components require more careful scaling—you must shard or replicate the database, manage consistency, handle failover.
+
+Debugging is easier when state is localized. If an answer is wrong, you replay the pipeline with the same query and the same state (documents and embeddings), and you can see where the failure occurred. If state were scattered across components, reproducing failures would be hard.
+
+The logistics company that experienced 15-second latency eventually fixed their reranking bottleneck by parallelizing candidate scoring. They also added observability at every pipeline stage—logging latency, candidate counts, scores, and token counts. When the next bottleneck appeared (context assembly as they added metadata), they identified it in hours instead of days. Understanding data flow and component responsibilities turned debugging from guesswork into engineering.
+
+That is the value of understanding RAG system components and data flow. Not as an academic exercise, but as a practical foundation for building, debugging, and scaling production systems. You cannot optimize what you do not understand. You cannot debug what you cannot observe. You cannot scale what you have not architected with scale in mind. The pipeline is the system. Know the pipeline.

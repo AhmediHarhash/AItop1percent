@@ -1,0 +1,144 @@
+# 3.6 — Embedding Drift and Model Upgrades
+
+In March 2025, a legal research company decided to upgrade their embedding model from OpenAI's ada-002 to the newer text-embedding-3-large. They had embedded 15 million legal documents with ada-002 over the previous two years. The new model promised better performance, longer context windows, and improved domain understanding. They updated their query embedding pipeline to use the new model and deployed it to production. Within hours, retrieval quality collapsed. Users reported that search results were "completely broken" and "returned random documents." The engineering team investigated and realized they had created a catastrophic mismatch: they were embedding new queries with text-embedding-3-large but searching against a database of documents embedded with ada-002. The two models produce vectors in different semantic spaces, and cosine similarity between them is meaningless. They had to roll back the query pipeline, re-embed all 15 million documents with the new model—a process that took three weeks and cost 18,000 dollars in API fees—and coordinate a synchronized cutover. The migration wiped out a quarter of their engineering budget for the year.
+
+By 2026, embedding drift and model upgrades are recognized as one of the most expensive and risky operational challenges in production RAG systems. When you change embedding models, all existing vectors become incompatible with new vectors, and you must re-embed your entire corpus. The cost scales linearly with corpus size, and the coordination required to avoid downtime is complex. This chapter teaches you why embedding drift happens, what triggers it, how to plan for model upgrades, what migration strategies minimize risk and cost, how to test embedding changes before committing, and how to avoid the reindex cost problem.
+
+## Why Embedding Models Create Incompatible Spaces
+
+Embedding models map text into high-dimensional vector spaces. The geometry of that space—where vectors land, how distances are distributed, which dimensions encode which features—is determined by the model's architecture, training data, and learned parameters. Different models create different spaces, even if they have the same dimensionality.
+
+When you embed a document with Model A, you get a vector that lives in Model A's space. When you embed a query with Model B, you get a vector that lives in Model B's space. If you compute cosine similarity between a Model A vector and a Model B vector, the result is mathematically defined but semantically meaningless. The two vectors do not live in the same space, so their similarity does not reflect the semantic similarity of the underlying text.
+
+This incompatibility is absolute. You cannot mix embeddings from different models in the same vector database and expect retrieval to work. You must embed all documents and all queries with the same model. If you change the model for queries, you must re-embed all documents with the new model. There are no shortcuts.
+
+The same incompatibility applies to different versions of the same model. If OpenAI releases text-embedding-3-large-v2 with improved training, the embeddings it produces will differ from text-embedding-3-large-v1. Even small changes to model weights, training data, or preprocessing can shift the embedding space enough to break retrieval. You must treat model version updates as full model changes unless the provider explicitly guarantees backward compatibility—and almost no providers do.
+
+## What Triggers Embedding Drift
+
+Embedding drift occurs whenever the vectors you produce for new data differ from the vectors you produced for old data. The most obvious trigger is changing embedding models, but there are other, subtler triggers that catch teams off guard.
+
+**Model version updates.** Embedding API providers occasionally update their models to improve quality, add features, or fix bugs. OpenAI updated ada-002 several times, and each update subtly shifted the embedding space. If you embedded your corpus with version 1.0 and later embed new documents with version 1.1, you introduce drift. Most providers now offer version pinning to prevent this, but you must actively manage versions.
+
+**Retraining or fine-tuning.** If you fine-tune an open-source embedding model on domain-specific data, the fine-tuned model produces different embeddings than the base model. You must re-embed all documents with the fine-tuned model. If you periodically retrain the model as you gather more data, you must re-embed the entire corpus after each retraining cycle.
+
+**Preprocessing changes.** If you change how you preprocess text before embedding—for example, switching from raw text to cleaned text, changing tokenization, or normalizing unicode differently—the embeddings change even if the model does not. Preprocessing is part of the embedding pipeline, and changes to it trigger drift.
+
+**Context or prompt changes.** Some embedding models accept prompts or instructions that condition the embedding. Cohere's embed-v3 allows you to specify a task type—search queries versus documents. If you change the prompt or task type, embeddings change. If you embedded documents with one prompt and later switch to a different prompt, you must re-embed.
+
+**Hardware or library version changes.** In rare cases, different hardware or different versions of numerical libraries can produce slightly different floating-point results, leading to tiny differences in embeddings. This is usually negligible, but for systems that depend on exact reproducibility, it can matter.
+
+The common thread is that any change to the pipeline that produces vectors can trigger drift. The discipline is to track every component of the embedding pipeline—model version, preprocessing code, prompts, library versions—and coordinate changes across all documents and queries.
+
+## The Reindex Cost Problem
+
+Re-embedding a large corpus is expensive in time, compute, and money. If you have ten million documents and use an API like OpenAI, re-embedding costs thousands of dollars in API fees. If you self-host, re-embedding costs GPU hours, which translate to hundreds or thousands of dollars in infrastructure costs. The process also takes time—embedding ten million documents might take days, even with parallelization.
+
+During the reindexing process, your system is in a mixed state. Some documents have new embeddings, others have old embeddings. You cannot serve queries with a mix of old and new embeddings without breaking retrieval. You need a migration strategy that avoids downtime and ensures consistency.
+
+The cost problem is compounded by the fact that you cannot easily test whether a new embedding model is better until you re-embed your corpus and measure retrieval quality. You might invest days and thousands of dollars in re-embedding, only to discover that the new model performs worse on your data. This risk discourages teams from upgrading, which means they miss out on improvements.
+
+The discipline is to plan for reindexing as a regular operational task, not a rare emergency. Treat embedding model upgrades like database schema migrations—carefully planned, tested on a subset of data, and rolled out with rollback procedures.
+
+## Migration Strategy One: Dual Indexing with Cutover
+
+The safest migration strategy is to build a second vector index with the new model while keeping the old index running. You re-embed your entire corpus with the new model, load it into a new index, test retrieval quality, and then cut over traffic from the old index to the new index in a single switch.
+
+The process looks like this:
+1. Deploy a new embedding pipeline that uses the new model.
+2. Re-embed all documents with the new model and load them into a new vector database index or namespace.
+3. Run test queries against both the old index and the new index, measuring retrieval quality on a held-out test set.
+4. If the new index performs better or equivalently, switch query traffic from the old index to the new index.
+5. Monitor retrieval quality in production. If issues arise, roll back by switching traffic back to the old index.
+6. Once the new index is stable, delete the old index to free up resources.
+
+This strategy requires doubling your storage and compute resources temporarily—you run two indexes in parallel—but it eliminates downtime and allows easy rollback. If the new model performs poorly, you abort the migration without affecting production.
+
+The cost is infrastructure overhead. For a large corpus, running two indexes might double your vector database hosting costs for weeks or months. You need to budget for this.
+
+## Migration Strategy Two: Gradual Rollover
+
+Gradual rollover is a more resource-efficient strategy where you re-embed documents incrementally and query both the old and new indexes until the migration is complete. You split your corpus into batches, re-embed each batch with the new model, and load it into the new index. At query time, you search both indexes, merge results, and return the combined set.
+
+The process looks like this:
+1. Deploy a new embedding pipeline that uses the new model.
+2. Re-embed a batch of documents—for example, 10 percent of your corpus—and load them into a new index.
+3. Update your query pipeline to search both the old index and the new index, merging results with reciprocal rank fusion or score blending.
+4. Repeat step 2 for additional batches until all documents are re-embedded.
+5. Once the new index contains all documents, stop querying the old index and delete it.
+
+This strategy avoids doubling infrastructure costs because you only store each document once. However, it introduces complexity in the query pipeline—you must search two indexes, merge results, and handle the case where the same document appears in both indexes.
+
+The other risk is degraded retrieval quality during the transition. Because your query searches a mix of old and new embeddings, the ranking might be inconsistent. Documents in the new index are compared to the query with the new model, while documents in the old index are compared with the old model. The merged ranking might not reflect true relevance.
+
+This strategy is viable when infrastructure cost is a hard constraint and you can tolerate slightly degraded quality during migration.
+
+## Migration Strategy Three: Batch Reindexing with Downtime
+
+The simplest strategy is to take your system offline, re-embed all documents, rebuild the index, and bring the system back online. This works for applications that can tolerate downtime—for example, internal tools, batch jobs, or systems with maintenance windows.
+
+The process looks like this:
+1. Announce a maintenance window to users.
+2. Stop serving queries.
+3. Re-embed all documents with the new model.
+4. Rebuild the vector index with the new embeddings.
+5. Deploy the updated query pipeline that uses the new model.
+6. Bring the system back online.
+
+This strategy avoids the complexity of dual indexing or gradual rollover, but it incurs downtime proportional to the reindexing time. For large corpora, downtime might be hours or days, which is unacceptable for user-facing production systems.
+
+This strategy is appropriate for offline or low-availability systems, not for production RAG services with uptime requirements.
+
+## Testing Embedding Model Changes Before Committing
+
+Before you commit to a full reindexing, test the new embedding model on a sample of your data. The testing process should measure retrieval quality, latency, and cost.
+
+**Step one: sample your corpus.** Select a representative sample of 10,000 to 100,000 documents and 1,000 queries with ground-truth relevance labels. The sample should reflect the diversity of your full corpus—different topics, lengths, and styles.
+
+**Step two: embed the sample.** Embed the sample documents and queries with the new model. Measure embedding latency and API or compute costs. Extrapolate to estimate the cost of re-embedding your full corpus.
+
+**Step three: measure retrieval quality.** Build a vector index for the sample, run your test queries, and measure recall at k, precision, mean reciprocal rank, and normalized discounted cumulative gain. Compare these metrics to a baseline using the old model.
+
+**Step four: analyze failure cases.** Identify queries where the new model performs significantly worse than the old model. Understand why—does the new model misunderstand domain-specific terms, struggle with certain query patterns, or have different biases?
+
+**Step five: decide whether to proceed.** If the new model delivers measurably better quality, proceed with the full migration. If the improvement is marginal, consider whether the cost and risk of migration are justified. If the new model performs worse, abort the migration.
+
+This testing process costs a fraction of a full reindexing and de-risks the decision. You discover issues on a small scale before committing to an expensive, risky migration.
+
+## Version Pinning and Reproducibility
+
+Most embedding API providers in 2026 support version pinning, allowing you to specify the exact model version you want to use. OpenAI, Cohere, and Voyage all allow you to pin to a specific version or date snapshot, ensuring that your embeddings remain consistent over time.
+
+When you deploy a production RAG system, pin your embedding model version explicitly. Do not use "latest" or a floating version tag that automatically updates. If the provider releases a new version, you choose when to upgrade by changing your version pin and coordinating a reindexing.
+
+Version pinning gives you control but also responsibility. You must actively monitor for new model releases, evaluate whether they are worth upgrading to, and plan migrations. If you never upgrade, you miss out on improvements. If you upgrade haphazardly, you introduce drift.
+
+The operational discipline is to treat embedding model versions like software dependencies. Pin to a specific version, track when new versions are released, test them on a sample, and upgrade deliberately with a migration plan.
+
+## Handling Incremental Corpus Growth During Migration
+
+If your corpus grows while you are re-embedding, you need a strategy to handle new documents. The cleanest approach is to freeze ingestion during the migration—stop adding new documents until the reindexing is complete. This is often impractical for production systems that ingest data continuously.
+
+The alternative is to embed new documents with the new model and load them into the new index immediately. During the migration, new documents go into the new index, and you query both indexes to ensure all documents are searchable. Once the migration is complete and all old documents are re-embedded, you have a single index with all documents in the new model.
+
+This requires tracking which documents have been migrated and which have not, ensuring that each document is only indexed once, and handling updates or deletions during the migration period. The complexity is significant, but it avoids freezing ingestion.
+
+## The Cost-Benefit Tradeoff of Upgrading Models
+
+Upgrading embedding models is expensive, risky, and operationally complex. The question is whether the benefits justify the costs. The benefits are improved retrieval quality, access to new features like longer context windows, and better domain fit if you fine-tune or switch to a specialized model. The costs are reindexing time, compute or API fees, infrastructure overhead, and the risk of introducing bugs or degrading quality.
+
+The decision depends on how much better the new model is and how much your users care about retrieval quality. If the new model improves recall at ten from 85 percent to 92 percent, that is a meaningful gain. If it improves recall from 92 percent to 93 percent, the gain might not be worth the migration cost.
+
+The other consideration is whether your current model is good enough. If your retrieval quality is already high and users are satisfied, there is less urgency to upgrade. If users complain about poor search results, upgrading might be critical.
+
+The discipline is to treat embedding model upgrades as a cost-benefit analysis, not a reflex. Measure the improvement on a test set, estimate the migration cost, and decide whether the ROI is positive.
+
+## Long-Term Planning for Embedding Model Stability
+
+The best way to manage embedding drift is to minimize model changes. When you select an embedding model, choose one that you expect to use for years, not months. Evaluate models thoroughly before committing, because switching later is expensive. Favor models with stable APIs, long-term support commitments, and version pinning.
+
+If you self-host, choose models with active maintenance and long-term viability. Open-source models can disappear or become unmaintained, forcing you to migrate. Proprietary APIs can deprecate versions, forcing you to upgrade. Neither option is risk-free, but you can reduce risk by choosing mature, widely adopted models.
+
+Another long-term strategy is to build infrastructure that abstracts the embedding model behind an interface. If you isolate model-specific logic in a single module, you can swap models by changing the module implementation without rewriting application code. This does not eliminate the cost of re-embedding, but it reduces the engineering effort required to deploy a new model.
+
+The teams that manage embedding drift effectively are the teams that plan for it from the start, treat model selection as a long-term commitment, and build migration processes that are tested, repeatable, and low-risk. The teams that struggle are the ones that treat embedding models as interchangeable and discover the hard way that changing models is a months-long, high-cost project.
