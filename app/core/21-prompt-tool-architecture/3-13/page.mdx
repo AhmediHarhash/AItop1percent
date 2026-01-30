@@ -1,0 +1,159 @@
+# 3.13 — Cost and Latency of Long-Context and Multimodal Prompts
+
+A medical imaging startup exceeded their $180,000 monthly AI budget by 340% in September 2025, triggering an emergency cost audit. The team of seven engineers had deployed a radiology report generation system using GPT-4o to analyze X-rays, CT scans, and MRIs. They estimated costs based on text-only prototypes, assuming image processing would cost "a bit more." Production reality was brutal: each radiology study included 4-12 images at high resolution, and the model processed these through vision encoders that consumed far more tokens than text.
+
+The cost explosion came from misunderstanding multimodal token economics. The team thought one image equals a few thousand tokens. Reality: a single 1024x1024 medical image consumed approximately 5,800 tokens in GPT-4o's pricing model. A typical CT study with 8 images used 46,400 tokens just for images, before any text context. At $0.0025 per 1K input tokens, that's $0.116 per study in image tokens alone. Processing 45,000 studies per month created $5,220 in image costs, but the team had also included physician reports averaging 8,000 tokens, bringing total input to 54,400 tokens per study at $0.136 each, totaling $6,120 per month just for inputs. Output generation added another $3,800. The real killer was long context: some studies included prior imaging for comparison, pushing context to 120K+ tokens and costs to $0.35+ per study. The team had budgeted for 200-token text prompts at $0.0005 each. They learned that multimodal and long-context operations cost 100-700x more than simple text prompts, and ignoring this reality destroys budgets.
+
+## Token Economics of Long Context Windows
+
+Long context prompts cost dramatically more than short prompts because you pay per input token. Understanding the scaling relationship between context length and cost is foundational to building economically viable long-context applications.
+
+Current frontier models price input tokens separately from output tokens, with input tokens typically costing less. Claude 4 Opus charges approximately $0.015 per 1K input tokens and $0.075 per 1K output tokens. GPT-4o charges $0.0025 per 1K input tokens and $0.010 per 1K output tokens. Gemini 2.0 Pro has competitive pricing at similar levels. These numbers change frequently, but the ratio of output to input cost stays around 3-5x.
+
+For long context, input token costs dominate. A 100K token prompt with a 500 token response costs $0.25 in input and $0.0375 in output for Claude 4 (total $0.2875), or $0.25 in input and $0.005 in output for GPT-4o (total $0.255). The response represents only 13-15% of total cost. When context grows to 200K tokens, total costs double to $0.515 (Claude 4) or $0.505 (GPT-4o).
+
+This linear scaling with context length means long context gets expensive fast. A system processing 10,000 queries per day with 100K token contexts spends $2,550 per day on GPT-4o ($76,500 per month). Doubling context length doubles this to $153,000 per month. Scaling to 100,000 queries per day reaches $765,000 per month. These numbers exceed entire engineering budgets for most startups.
+
+The key insight is that context length is a cost multiplier. Every token you add to context costs money across all queries that use it. Optimizing context length is optimizing costs directly. Reducing a 100K prompt to 80K cuts costs by 20% across all queries.
+
+## Prompt Caching and Context Reuse Economics
+
+Prompt caching dramatically changes long-context economics when multiple queries reuse the same context. Modern models offer caching mechanisms that let you process context once and reuse it across multiple queries at reduced cost.
+
+Claude 4's prompt caching charges full price for the initial context processing but only 10% of input token cost for cached tokens on subsequent requests. If you process a 100K token document once at $1.50, then ask 10 questions about it, the first question pays $1.50 for context plus $0.01 for the question tokens, while the next 9 questions pay $0.15 for cached context plus $0.01 for question tokens. Total: $1.51 + 9 * $0.16 = $2.95 for 10 questions, or $0.295 per question. Without caching: 10 * $1.51 = $15.10, or $1.51 per question. Caching provides 5x cost reduction.
+
+Cache effectiveness depends on query patterns. If users ask multiple questions about the same document in quick succession, caching delivers massive savings. If every query is over a different document, caching provides no benefit. If queries cluster around a set of popular documents, caching those documents while processing others normally optimizes costs.
+
+Cache duration affects economics. Caches typically last 5-15 minutes. If your application's query patterns have temporal locality (users ask multiple questions within minutes), caching works well. If queries are evenly distributed over time with long gaps, caches expire before reuse and you pay full processing costs repeatedly.
+
+You can design applications to maximize cache hits. Instead of loading new context for each user session, maintain persistent contexts and route user queries to the correct cached context. A customer support system might cache the 100 most frequently accessed help documents and route 80% of queries to cached contexts, reducing average per-query cost by 4.5x.
+
+## Image Token Costs and Resolution Tradeoffs
+
+Images consume tokens based on resolution, and token consumption scales quadratically with dimensions. Understanding this relationship is critical for managing multimodal costs.
+
+GPT-4o's image tokenization uses a two-stage process. First, the image is resized to fit within 2048x2048 while maintaining aspect ratio. Second, the image is divided into 512x512 tiles. Each tile consumes approximately 170 tokens. A 1024x1024 image requires 4 tiles (2x2 grid), consuming 680 tokens plus 85 base tokens, totaling 765 tokens. A 2048x2048 image requires 16 tiles (4x4 grid), consuming 2,720 tokens plus 85 base tokens, totaling 2,805 tokens.
+
+This quadratic scaling means doubling image dimensions quadruples token cost. A 512x512 image costs roughly 255 tokens. A 1024x1024 image costs 765 tokens (3x more). A 2048x2048 image costs 2,805 tokens (11x more than 512x512, 3.7x more than 1024x1024).
+
+Resolution versus accuracy tradeoffs vary by task. For OCR-heavy tasks like reading text from images, higher resolution improves accuracy significantly. For object detection or scene understanding, medium resolution often suffices. Testing your specific use case at different resolutions reveals the optimal cost-accuracy balance.
+
+You can implement adaptive resolution strategies. "For documents with small text, use high resolution (2048px). For natural images, use medium resolution (1024px). For icons or simple graphics, use low resolution (512px)." This reduces average token consumption while maintaining quality where it matters.
+
+Pre-processing images before sending to models reduces costs. Crop images to regions of interest, removing irrelevant borders or backgrounds. Compress images to reduce file size without losing critical detail. Convert color images to grayscale when color isn't needed for analysis. These optimizations cut token counts by 25-60%.
+
+## Audio Token Costs and Transcription Alternatives
+
+Audio processing through multimodal models consumes tokens based on duration. For many applications, using specialized transcription services before model processing costs less than native audio processing.
+
+When models process audio directly, they typically convert it to a sequence of embeddings, with cost proportional to audio length. A one-minute audio clip might consume 8,000-12,000 tokens depending on the model's audio encoder. At GPT-4o pricing, this is $0.02-0.03 per minute of audio. For a 30-minute meeting recording, audio tokens alone cost $0.60-0.90.
+
+Compare this to transcription-then-text processing. OpenAI's Whisper API charges $0.006 per minute for transcription. A 30-minute recording costs $0.18 to transcribe, producing roughly 5,000-8,000 tokens of text. Processing this text with GPT-4o costs $0.0125-0.02. Total: $0.1925-0.20, versus $0.60-0.90 for direct audio processing. Transcription first is 3-4.5x cheaper.
+
+The accuracy tradeoff depends on task. For transcription-focused tasks (meeting summaries, interview transcripts, podcast notes), transcription-first matches or exceeds native audio processing quality. For tasks requiring audio characteristics beyond words (speaker emotion, tone, emphasis, background sounds), native audio processing provides information that text transcripts lose.
+
+Audio quality affects token consumption. High-quality recordings with clear speech compress more efficiently than noisy recordings with multiple speakers. You can save costs by improving recording quality: use good microphones, minimize background noise, ensure clear speech. Better input audio reduces processing costs by 20-40%.
+
+For long-form audio like lectures or podcasts, chunking saves costs through selective processing. Transcribe everything cheaply, identify high-value segments using text analysis, then process only those segments with the full multimodal model for detailed analysis. This hybrid approach processes 100% of content but only pays premium multimodal costs for the 10-30% that needs it.
+
+## Latency Scaling with Context Length
+
+Long context prompts take longer to process than short prompts because transformer attention mechanisms scale superlinearly with sequence length. Understanding latency characteristics helps you design responsive applications.
+
+Time to first token (TTFT) is the latency from submitting a prompt to receiving the first output token. This reflects context processing time. For GPT-4o, TTFT scales approximately linearly with context length: 1K tokens processes in roughly 0.5 seconds, 10K tokens in 1.5 seconds, 100K tokens in 8-12 seconds, 200K tokens in 16-24 seconds. Claude 4 has similar characteristics with slight variations.
+
+Output generation speed (tokens per second) is relatively constant regardless of context length once generation begins. Most models generate 30-80 tokens per second for typical prompts. This means a 500-token response takes 6-16 seconds to generate regardless of whether your context is 1K or 100K tokens.
+
+Total latency equals TTFT plus output generation time. A 100K context prompt generating 500 tokens takes 10 seconds TTFT + 8 seconds generation = 18 seconds total. A 200K context with the same output takes 20 seconds TTFT + 8 seconds generation = 28 seconds total.
+
+Prompt caching reduces TTFT dramatically for cached contexts. A cached 100K context might process in 0.5-1.5 seconds instead of 10 seconds, cutting TTFT by 85-95%. This makes multi-turn conversations over long contexts feel responsive after the first turn.
+
+Streaming partially mitigates perceived latency. When you stream responses, users see output arriving during generation rather than waiting for completion. An 18-second response feels faster when users see text appearing progressively versus waiting 18 seconds for complete output. But TTFT still creates a gap before streaming begins.
+
+## Video Processing Latency and Throughput
+
+Video analysis combines the costs of multiple images with the latency of sequential processing. Video applications require careful optimization to stay economically viable and responsive.
+
+Processing time scales with frame count and frame resolution. A 30-second video sampled at 1 frame per second yields 30 frames. Each frame at 1024x1024 costs approximately 765 tokens, totaling 22,950 tokens for the video. At GPT-4o pricing, that's $0.057 in input tokens. TTFT for 23K tokens is roughly 3-4 seconds. Add 5 seconds for output generation, total latency is 8-9 seconds.
+
+Increasing sampling density increases both cost and latency linearly. Sampling at 2 frames per second doubles frame count to 60, doubling tokens to 45,900, doubling cost to $0.114, and increasing TTFT to 6-7 seconds. Total latency reaches 11-12 seconds.
+
+Frame resolution multiplies these effects. Using 2048px frames instead of 1024px frames roughly quadruples tokens per frame (2,805 vs 765), increasing total cost and latency by 4x. A 30-second video at 1 fps with 2048px frames costs $0.21 and takes 12-15 seconds TTFT, reaching 17-20 seconds total latency.
+
+Video length creates scalability challenges. A 10-minute video at 1 fps has 600 frames. At 765 tokens per frame, that's 459,000 tokens, which exceeds most models' context windows. You must process long videos in chunks or use aggressive frame sampling (1 frame per 5-10 seconds), trading temporal resolution for feasibility.
+
+Batch processing amortizes latency for non-real-time applications. If you're analyzing surveillance footage for daily reports rather than live monitoring, you can batch process overnight when latency doesn't matter. This lets you use denser sampling and higher resolution without affecting user experience.
+
+## Budget Planning for Multimodal Applications
+
+Building multimodal applications requires different budget planning than text-only applications because costs vary by orders of magnitude based on modality mix and data characteristics.
+
+Start by profiling your expected workload. How many requests per day? What modalities per request (text only, text plus images, text plus video, text plus audio)? What are the input sizes (token counts, image resolutions, video lengths)? Build a detailed model: "We expect 50,000 requests per day. 30% are text-only averaging 2K tokens. 50% are text plus 2 images averaging 4K text tokens plus 1,500 image tokens. 20% are text plus video averaging 5K text tokens plus 30K video tokens."
+
+Calculate baseline costs using current pricing. For the workload above: 15,000 text-only requests at 2K tokens = 30M tokens = $75/day. 25,000 text-plus-image requests at 5.5K tokens = 137.5M tokens = $343/day. 10,000 text-plus-video requests at 35K tokens = 350M tokens = $875/day. Total input cost: $1,293/day or $38,790/month. Add output costs based on expected response lengths.
+
+Plan for variance and growth. Actual usage often exceeds estimates by 30-80%. Users upload higher-resolution images than expected, videos are longer than anticipated, text prompts grow as you add features. Budget 1.5-2x your baseline estimate to handle reality. The $38,790 baseline becomes $58,185-77,580 budgeted monthly spend.
+
+Set cost alerts and monitoring. Configure alerts at 50%, 75%, and 90% of budget. Monitor cost per request, cost by modality, cost by user segment. Detect cost anomalies early: if average cost per request suddenly doubles, investigate before it destroys your budget.
+
+Build cost control mechanisms. Implement rate limiting per user, cap maximum context lengths, restrict video processing to paying tiers, downscale images automatically above certain sizes. These guard rails prevent both accidental cost explosions and malicious attempts to drive up your API costs.
+
+## Optimization Strategies for Cost Reduction
+
+Numerous tactics reduce costs without sacrificing essential functionality. Systematic optimization makes expensive multimodal and long-context applications economically viable.
+
+Context compression removes redundant information. If you're loading multiple similar documents, deduplicate common sections. If documents contain boilerplate, strip it before adding to context. Summarize low-importance sections while preserving high-importance sections verbatim. These techniques cut context size by 20-50%.
+
+Selective multimodal processing uses text analysis to decide what needs expensive multimodal processing. "First, extract text from images using cheap OCR. Second, analyze text to determine if detailed image understanding is needed. Third, only process images with full multimodal models when text analysis indicates it's necessary." This reduces multimodal processing volume by 40-70%.
+
+Tiered processing uses cheaper models for simple cases and expensive models for complex cases. "Route simple queries to GPT-4o Mini. Route complex queries to GPT-4o. Route extremely complex queries requiring maximum context to Claude 4 Opus." Cheaper models handle 60-80% of queries at 10-20x lower cost.
+
+Resolution reduction adapts quality to requirements. Documents with large text can be processed at lower resolution without losing readability. Natural images used for scene understanding don't need maximum resolution. Videos can use aggressive frame sampling for many analysis tasks. Test your minimum viable quality level and reduce costs by matching it.
+
+Caching maximizes reuse. Identify documents, images, or contexts accessed repeatedly and structure your application to cache them. Route queries to cached contexts when possible. For documents accessed more than 5 times, caching breaks even and subsequent accesses are 90% cheaper.
+
+Batch processing amortizes costs when real-time processing isn't required. Instead of processing each request immediately, batch 10-100 requests and process together. Some models offer batch pricing discounts. Even without discounts, batching reduces network overhead and improves throughput.
+
+## When Cost Makes Approaches Impractical
+
+Some combinations of scale, modality, and quality requirements create costs that exceed economic viability. Recognizing these situations prevents expensive failures.
+
+High-frequency video analysis at scale is prohibitively expensive with current pricing. Processing 1,000 hours of video per day at 1 frame per second, 1024px resolution yields roughly 3.6 billion tokens per day, costing $9,000 per day ($270,000 per month) just for input tokens. Unless each video generates revenue exceeding $9, this is economically unsustainable. Reduce frame rate, resolution, or video volume to make it viable.
+
+Real-time multimodal interactions with large contexts struggle with both cost and latency. A video conferencing assistant that processes 4 camera feeds in real-time plus 50K tokens of meeting context, updating every second, generates 400-500 requests per hour per meeting. At $0.35 per request, that's $140-175 per meeting hour. Latency of 8-12 seconds makes real-time interaction impractical. This use case needs specialized models or architectural redesign.
+
+Consumer applications with free tiers can't sustain long-context or multimodal processing. If your business model is freemium with ads, and average revenue per free user is $0.50 per month, you can't afford to process 100K token contexts that cost $0.25 per query. Free users would bankrupt you. Either restrict long context to paid tiers or redesign the experience around shorter contexts.
+
+Mass market image processing at high resolution exceeds sustainable costs for low-margin businesses. A photo editing app with 1 million users generating 10 images per day needs to process 10 million images daily. At 1024px resolution and 765 tokens per image, that's 7.65 billion tokens per day, costing $19,125 daily ($573,750 monthly). If monthly revenue per user is $3, total revenue is $3 million, leaving $2.4 million for all other costs. This might work, but leaves little margin. Reduce resolution or limit daily processing to stay profitable.
+
+When cost analysis shows a use case is economically impractical, you have four options: raise prices, reduce quality (lower resolution, less context, cheaper models), limit volume (caps per user, paid tiers), or redesign the feature to use less expensive approaches. Ignoring cost realities leads to failed products.
+
+## Cost Forecasting and Scaling Projections
+
+As your application grows, costs scale in complex ways. Accurate forecasting prevents budget surprises and informs pricing decisions.
+
+Model cost trajectory over user growth. If you have 1,000 users today generating 100 requests per day at $0.10 per request, daily cost is $10,000 ($300,000 monthly). Growing to 10,000 users at the same per-user usage reaches $100,000 daily ($3 million monthly). Growing to 100,000 users reaches $10 million monthly. At what scale does this exceed revenue? What pricing supports sustainable margins?
+
+Factor in usage growth per user. Users don't maintain constant usage. As features improve and they see value, usage increases 20-50% per year. An application with 50,000 requests per day today might see 75,000 requests per day in a year even with flat user count. Forecast both user growth and per-user usage growth.
+
+Model the impact of model pricing changes. API providers adjust pricing periodically. If GPT-4o input prices drop 30% (as they did several times in 2024-2025), your costs drop 30% for input-heavy workloads. If prices rise 20%, your costs rise accordingly. Plan for both directions: can you sustain a 20% price increase, and how would you deploy savings from a 30% price decrease?
+
+Cache hit rate improvements over time reduce costs non-linearly. As your user base grows and content stabilizes, cache hit rates improve from 20% to 40% to 60%. A 60% cache hit rate with 90% cost reduction on hits creates 54% overall cost reduction. Model how hit rates evolve with scale and factor this into projections.
+
+Volume discounts from API providers change economics at scale. Some providers offer tiered pricing where costs decrease at higher volumes. Others offer enterprise agreements with fixed monthly rates. Factor these into long-term projections: your cost per query at 10M queries per month might be 30% lower than at 1M queries per month.
+
+## Latency Optimization Techniques
+
+Beyond cost, latency determines user experience quality for interactive applications. Several techniques reduce perceived and actual latency for long-context and multimodal prompts.
+
+Speculative processing preloads likely contexts before users request them. If a user opens a document viewer, immediately start processing the document in the background. When they ask a question, the context is already cached and processed, reducing TTFT from 10 seconds to 1 second. This trades compute cost for responsiveness.
+
+Streaming outputs provides incremental results. Instead of waiting 15 seconds for a complete answer, stream tokens as they generate. Users see progress immediately after TTFT, improving perceived responsiveness. A 15-second complete response feels faster as a 10-second TTFT followed by 5 seconds of streaming text.
+
+Parallel processing for multi-document queries reduces latency. If a query requires analyzing 5 documents, process all 5 in parallel rather than sequentially. Five 8-second sequential requests take 40 seconds. Five parallel requests take 8 seconds. This increases cost (no caching benefits) but cuts latency 80%.
+
+Progressive disclosure processes minimum context first, then expands. "First, answer the question using the document summary (2K tokens, 0.5 second TTFT). If confidence is high, return immediately. If confidence is low, process the full document (100K tokens, 10 second TTFT) for a detailed answer." Simple queries get instant responses; complex queries wait longer but get better answers.
+
+Pre-computed answers for common queries eliminate processing latency entirely. If 40% of queries are variations of the same 20 questions, pre-compute answers and serve them from cache. This reduces latency from 15 seconds to 50ms for cached queries and cuts costs to near-zero.
+
+The next chapter addresses tool use and function calling architectures, examining how to give language models the ability to take actions beyond text generation.

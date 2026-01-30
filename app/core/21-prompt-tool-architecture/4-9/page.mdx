@@ -1,0 +1,145 @@
+# 4.9 — Conversation Branching and Rollback Patterns
+
+A Series B productivity software company lost 23% of their power users in January 2026 after shipping a conversational document editor that trapped users in irreversible conversation states. The product team had built an ambitious AI writing assistant where users could ask the model to rewrite paragraphs, adjust tone, or reorganize sections through natural language commands. The feature tested well in internal demos, but production users discovered a fatal flaw within days: once they asked the AI to make a change they did not like, they could not go back. The conversation was linear and permanent.
+
+Users would ask the AI to "make this sound more professional," realize the rewrite lost their voice, and have no way to undo the change except manually rewriting it themselves. They would explore a structural reorganization, decide the original flow was better, and find themselves stuck manually reconstructing what they had before. The product had version control for the final document but no version control for the conversation itself. Every turn was destructive. Power users—writers, researchers, content strategists—abandoned the product for tools that let them explore ideas without commitment. The company's head of product called it "the undo button we forgot existed."
+
+## Conversations as Decision Trees, Not Linear Logs
+
+A conversation is not a single thread. It is a **decision tree** where each user turn branches into possible futures, and the user should be able to navigate that tree forward, backward, and sideways. When you design conversational AI as a linear append-only log, you assume users know what they want before they ask for it. They do not. Users explore, experiment, compare, and change their minds.
+
+Branching allows users to try multiple variations of a response without committing to any of them. If your conversational interface helps users draft emails, the user might ask for three different tone variations—formal, casual, and empathetic—and compare them before picking one. If your interface helps users plan projects, the user might explore two different task sequences and evaluate trade-offs before committing to a timeline. The conversation tree captures all explored paths, not just the path the user ultimately chose.
+
+Rollback allows users to undo bad turns without losing the context that led to them. If the user asks a poorly worded question and gets a confusing answer, they should be able to back up one turn, rephrase, and continue from there. If the user tries an experimental command that produces unexpected results, they should be able to revert to the state before that command. Rollback is not just undo. It is undo with context preservation.
+
+You design conversational systems as trees when users need to explore options, compare outcomes, or recover from mistakes. You design them as linear logs when the conversation is purely transactional and every turn moves toward a single deterministic goal.
+
+## Checkpoint Patterns for Conversation State
+
+A checkpoint is a saved conversation state that the user can return to. Checkpoints are not full conversation replays. They are **state snapshots** that capture enough information to restore the conversation context without re-executing every prior turn.
+
+A checkpoint stores the conversation history up to a specific turn, the system prompt in effect at that turn, any accumulated memory or preferences, and metadata about tool calls or external state changes. When the user rolls back to a checkpoint, you restore the conversation history, reload the system prompt version, and reset any ephemeral state that was modified after the checkpoint. You do not re-run API calls or re-execute tool invocations unless those calls are idempotent and necessary for state consistency.
+
+You create checkpoints automatically at key conversation milestones. If the user completes a multi-turn workflow—selecting a product, configuring options, confirming an order—you checkpoint at each stage. If the user asks the AI to make a major change—rewriting a document section, reorganizing a project plan—you checkpoint before applying the change. The user does not need to manually save checkpoints. The system anticipates points of no return and preserves state before crossing them.
+
+You create checkpoints on demand when users explicitly mark a conversation state they want to preserve. If the user says "save this version" or clicks a bookmark icon, you create a named checkpoint they can return to later. Named checkpoints are useful in collaborative workflows where users want to share a specific conversation state with teammates or compare multiple exploration paths side by side.
+
+You limit checkpoint depth to prevent unbounded storage growth. A reasonable limit is 10 to 20 checkpoints per conversation, retained on a sliding window basis. Older checkpoints are pruned unless explicitly pinned. High-value checkpoints—those associated with completed workflows or user bookmarks—are pinned and exempt from pruning.
+
+## Rollback Mechanics and State Consistency
+
+Rollback is not a simple history pop. It is a **state reconciliation** process that ensures consistency between conversation context, external systems, and user-visible state.
+
+When the user rolls back to turn N, you truncate the conversation history to turn N, discard all subsequent turns, and reset the model's context window to match the truncated history. If turns N+1 through N+5 involved tool calls that modified external state—creating a database record, sending an email, charging a payment method—you need a rollback strategy for those side effects.
+
+The safest rollback strategy is **optimistic execution with compensation**. You execute tool calls during the conversation but mark them as provisional until the user confirms the conversation outcome. If the user rolls back before confirmation, you execute compensation actions—deleting the database record, canceling the email send, refunding the charge. This requires every tool to have a well-defined compensation operation.
+
+The next safest strategy is **deferred execution**. You do not execute side-effect-generating tool calls until the user explicitly commits the conversation. Tool calls return simulated results during exploration, and you execute them for real only when the user says "apply this" or "confirm." This strategy works for workflows with clear commit points—shopping carts, form submissions, approval flows. It does not work for interactive workflows where the user needs real feedback to make progress.
+
+The riskiest strategy is **irreversible execution with warnings**. You execute side effects immediately and warn the user that rollback will not undo external changes. This is appropriate for low-stakes actions—logging an event, updating a cache—but unacceptable for high-stakes actions like financial transactions or data deletion.
+
+You track rollback-safe and rollback-unsafe turns separately in your conversation state. Rollback-safe turns involve only model inference and stateless tool calls. Rollback-unsafe turns involve side effects that cannot be easily undone. When the user attempts to roll back past a rollback-unsafe turn, you surface a warning: "Rolling back past this point will not undo the email sent in turn 7."
+
+## Branching Without Exploding State
+
+Branching creates multiple conversation futures from a single conversation past. If the user is at turn 5 and asks for two different response variations, you create two branches: 5a and 5b. Each branch extends the conversation independently. The user can continue down 5a, switch to 5b, or return to turn 5 and create a third branch.
+
+Naive branching duplicates the entire conversation state for each branch. If your conversation has 20 turns and the user creates 3 branches at turn 10, you store 3 copies of the first 10 turns. This does not scale. A conversation with 50 turns and 5 branch points can produce 30+ state copies.
+
+You optimize branching with **structural sharing**. The conversation state is a tree where each node stores only the delta from its parent. Turns 1 through 10 are stored once. Branch 5a stores only the new content for turn 11a. Branch 5b stores only turn 11b. When you reconstruct the conversation history for a branch, you walk the tree from the branch leaf to the root, collecting deltas.
+
+You assign each branch a unique identifier and store branch relationships in a parent-child graph. When the user navigates between branches, you use the graph to determine the minimal set of turns to add or remove from the current conversation context. Switching from branch 5a to branch 5b requires removing turn 11a and adding turn 11b. The first 10 turns stay in context.
+
+You prune inactive branches after a retention window. If the user creates 5 branches but only actively uses 2, the other 3 expire after 7 days unless pinned. Pinned branches are preserved indefinitely. This prevents exploration-heavy users from accumulating gigabytes of speculative conversation states.
+
+## Undo in Conversational AI vs Traditional UIs
+
+Undo in traditional UIs is local and immediate. You undo a text edit, and the characters reappear. You undo a shape move, and the shape returns to its previous position. The undo operation is deterministic and instant.
+
+Undo in conversational AI is **non-local and context-dependent**. When the user undoes a conversational turn, they are not just removing text from a buffer. They are rewinding the model's understanding of the conversation. The next response the model generates depends on the conversation history, and if you modify that history by removing a turn, the model's behavior changes.
+
+This creates a problem: if the user undoes turn 10 and replaces it with a different input, turn 11 is no longer a valid response to the new turn 10. You have three options. You can discard turn 11 and prompt the user to continue the conversation from the modified turn 10. You can regenerate turn 11 based on the modified history. Or you can preserve both versions as branches and let the user choose.
+
+Discarding is appropriate when the conversation is exploratory and the user expects to re-steer after undo. Regenerating is appropriate when the conversation is goal-directed and the user expects the AI to adapt to the new context. Branching is appropriate when the user wants to compare outcomes or preserve both paths.
+
+You surface undo affordances differently depending on conversation type. In a chatbot interface, undo might be a "revise" button next to each user message. In a collaborative editor, undo might be a timeline scrubber that lets the user jump to any prior conversation state. In a voice interface, undo might be a "go back" voice command that rolls back one turn.
+
+You do not expose every turn as undo-able. Short acknowledgments—"got it," "okay," "thanks"—are not meaningful undo targets. The user wants to undo content changes, not conversational filler. You identify semantic turn boundaries based on intent detection or tool invocations and expose undo at those boundaries.
+
+## Conversation Branching in Multi-Agent Workflows
+
+Branching becomes more complex when conversations involve multiple agents. If the user is talking to a sales agent, hands off to a support agent, and then wants to roll back to a state before the handoff, you need to coordinate rollback across agents.
+
+The simplest approach is **single-agent rollback with handoff reset**. When the user rolls back past a handoff point, you discard the second agent's conversation state and return control to the first agent. The second agent starts fresh if the user triggers another handoff. This works for linear workflows where agents operate in sequence and do not share state.
+
+The more complex approach is **multi-agent branching with shared context**. Both agents share a common conversation history, and each agent has a private state that accumulates during its active turns. When the user rolls back, you restore the shared history and reset each agent's private state to match the rollback point. This works for collaborative workflows where agents need to see each other's contributions.
+
+You track which agent was active at each turn in your conversation metadata. When the user rolls back to turn N, you check which agent was active at turn N and restore that agent's state. If the user then continues the conversation, the active agent picks up from turn N. If the user wants to switch agents after rollback, you trigger a handoff with the rollback context.
+
+You handle conflicts when rollback invalidates agent assumptions. If agent A made a decision based on information provided in turn 15, and the user rolls back to turn 12 and changes that information, agent A's decision is no longer valid. You detect this by versioning agent decisions with the conversation state they depended on. If the conversation state changes, you flag dependent decisions as stale and prompt the agent to reconsider.
+
+## Rollback and Tool Call Consistency
+
+When a conversation includes tool calls, rollback must handle tools that modified external state. If the user rolls back past a turn where the AI called a "create\_order" tool, you need a strategy for the created order.
+
+The most common strategy is **compensating transactions**. Each tool that modifies external state provides a compensation operation. If "create\_order" inserts a database record, the compensation is "delete\_order." If "send\_email" dispatches a message, the compensation is "recall\_email" if the email system supports it, or "send\_cancellation\_email" if not. When the user rolls back past a tool call, you execute the compensation operation.
+
+This requires tools to be designed for rollback from the start. Your tool schema includes a "compensate" field that specifies the compensation operation and parameters. Your conversation runtime tracks executed tool calls in a compensation stack. When the user rolls back, you pop compensations off the stack and execute them in reverse order.
+
+Some tools are **not compensable**. You cannot unring a bell. If the tool sent a Slack message to a public channel, posted to a social media account, or triggered a physical-world action, compensation is impossible or impractical. You mark these tools as rollback-unsafe in your schema. When the user attempts to roll back past a rollback-unsafe tool call, you surface a warning and ask for confirmation.
+
+You optimize compensation by batching operations. If turns 10 through 15 create five database records, you do not execute five separate delete operations on rollback. You batch them into a single transaction. This reduces latency and improves consistency.
+
+You audit compensation failures. If a compensation operation fails—the database record is already deleted, the email cannot be recalled—you log the failure and surface it to the user. Compensation is best-effort, not guaranteed. The user needs visibility into what did and did not roll back.
+
+## User Experience Patterns for Branching
+
+Users do not think in terms of branches and checkpoints. They think in terms of trying things, comparing options, and going back when something does not work. Your UI translates those intuitions into branch and rollback operations.
+
+A **timeline view** shows the conversation as a linear sequence with branch points marked visually. The user sees the main conversation thread and can click on branch points to explore alternate paths. Each branch is labeled with a preview of the divergent turn. This works well for workflows where the user creates a small number of branches and wants to compare outcomes.
+
+A **tabbed interface** treats each branch as a separate tab. The user opens multiple tabs to explore different conversation directions and switches between them. This works well for creative or research workflows where the user wants to pursue multiple threads in parallel.
+
+A **version picker** surfaces branches as numbered or labeled versions: "Version A: Formal tone," "Version B: Casual tone," "Version C: Empathetic tone." The user selects a version to continue working with. This works well for workflows where branches represent variations of a single response rather than different conversation paths.
+
+A **scrubber** lets the user drag a slider to move backward and forward through conversation history. Dragging back triggers rollback. Releasing the slider at a new position lets the user continue from that state. This works well for interfaces where conversation feels more like media playback—exploratory data analysis, iterative design—than traditional chat.
+
+You provide visual feedback when the user is in a branch. A banner, pill, or color change indicates "You are exploring a branch. The main conversation is still available." This prevents users from losing their place.
+
+You auto-merge branches when possible. If the user creates two branches with identical outcomes, you merge them into a single branch. If the user abandons a branch and the system detects no meaningful divergence from the main conversation, you prune the branch and simplify the tree.
+
+## Persistence and Serialization of Branched Conversations
+
+A branched conversation is a tree structure, and trees do not serialize neatly into append-only logs. You need a storage format that preserves parent-child relationships, branch metadata, and turn deltas.
+
+The simplest format is **adjacency list with turn IDs**. Each turn has a unique ID, a parent ID, and a content payload. Turn 1 has no parent. Turns 2 through 10 have turn 1 through 9 as parents. Turn 11a and turn 11b both have turn 10 as parent. You reconstruct the tree by walking parent IDs.
+
+You store branch metadata alongside turns: branch labels, creation timestamps, active status, pin status. When you load a conversation, you reconstruct the tree, identify active branches, and prune expired branches.
+
+You optimize storage with **content-addressable deltas**. Instead of storing full conversation history for each branch, you store only the turns that differ from the parent branch. Shared turns are stored once and referenced by hash. This reduces storage cost for conversations with many branches.
+
+You version the tree structure separately from turn content. If you change your branching logic—add a new metadata field, change pruning rules—you need to migrate existing conversation trees. You version your storage schema and run migrations when loading old conversations.
+
+You handle concurrent modifications when multiple clients edit the same conversation. If user A creates a branch at turn 10 while user B is continuing the main conversation to turn 15, you need conflict resolution. The safest approach is optimistic concurrency control: each client tracks the last-seen conversation version, and writes are rejected if the version has changed. The client refreshes and retries.
+
+## Cost Implications of Branching and Rollback
+
+Branching increases storage cost linearly with the number of branches. If your average conversation is 50 turns and 10KB, and users create an average of 3 branches, you store 30KB instead of 10KB. This is manageable. If users create 20 branches, you store 200KB. At scale, you need pruning strategies.
+
+Rollback increases inference cost if you regenerate responses after rollback. If the user rolls back to turn 10, modifies their input, and continues, you generate a new turn 11. If they do this five times, you generate five versions of turn 11. You pay for all of them. You limit this cost by caching generated responses and reusing them when possible.
+
+Branching does not increase inference cost directly because branches are lazy. You only generate a new response when the user actively continues a branch. Dormant branches cost storage, not compute.
+
+You monitor branch creation rates and rollback frequency as product health metrics. If users create many branches and immediately prune them, they are exploring but not finding value. If users roll back frequently, your AI might be producing low-quality first responses. If users rarely branch or roll back, your branching UI might be undiscoverable or unnecessary.
+
+## When to Offer Branching and When to Keep Conversations Linear
+
+Branching is valuable when users explore, compare, or experiment. Creative workflows—writing, design, brainstorming—benefit from branching. Users try multiple approaches and pick the best. Analytical workflows—research, data exploration, scenario planning—benefit from branching. Users test hypotheses and compare outcomes.
+
+Branching is overhead when conversations are transactional or single-path. A banking chatbot that checks balances and transfers money does not need branching. The user has a single goal and moves linearly toward it. A customer support bot that looks up order status does not need branching. There is one order, one status, one answer.
+
+You enable branching based on user intent, not conversation length. A 100-turn creative brainstorming session benefits from branching. A 100-turn technical support escalation does not.
+
+You hide branching complexity from novice users and expose it to power users. A progressive disclosure approach shows a simple linear conversation by default and reveals branching controls—timeline view, version picker—when the user indicates a need: clicking "try another approach," saying "show me alternatives," or manually triggering undo multiple times in quick succession.
+
+The next subchapter covers how to hand off conversation context between different models or agents, preserving state while adapting to new capabilities or specializations.

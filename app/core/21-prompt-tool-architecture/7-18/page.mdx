@@ -1,0 +1,161 @@
+# 7.18 — Idempotency Keys and Exactly-Once-ish Patterns
+
+A payment processing AI agent cost a SaaS company $180,000 in January 2026 when a network glitch caused duplicate charge attempts. A customer tried to upgrade their subscription. The agent called the payment processing tool. The network hiccupped. The agent didn't receive a response. Following standard retry logic, it called the payment tool again. Both calls succeeded. The customer was charged twice. This happened to 1,200 customers over a three-hour window before monitoring caught the issue. The company refunded all duplicate charges, paid transaction fees twice, handled support tickets, and lost customer trust. The root cause was not the network glitch. Network issues are inevitable. The root cause was that the payment tool was not **idempotent**: calling it twice with the same parameters produced two charges instead of one. The system had no mechanism to distinguish retries from new requests.
+
+**Idempotency** means that performing an operation multiple times has the same effect as performing it once. Idempotent operations are safely retryable. Non-idempotent operations create problems when retried: duplicate charges, duplicate records, duplicate emails, duplicate side effects. AI agents retry tool calls constantly because network failures, timeouts, and model hallucinations happen. Without idempotency, retries cause data corruption and financial loss. With idempotency, retries are safe recovery mechanisms that improve reliability.
+
+## Why Tool Calls Need Idempotency
+
+AI agents operate in unreliable environments. Networks drop packets. Services time out. Models generate invalid parameters that need retries. Exactly-once execution is a myth. You get at-least-once execution with retries, or at-most-once execution without retries. At-least-once requires idempotency to prevent duplicate effects.
+
+Agent frameworks retry failed tool calls automatically. When a tool call times out or returns a transient error, the framework retries. This happens without explicit agent logic. If you build on frameworks like LangChain, AutoGPT, or custom agentic systems, retries are baked in. Your tools must handle retries correctly or face duplicate operations.
+
+Models sometimes generate the same tool call multiple times due to sampling variance or context limitations. If a model is told "call the payment tool to charge $100" and the context length forces truncation of tool results, the model might regenerate the same tool call on its next turn. This is rare but happens, especially in long conversations. Idempotency ensures these duplicate calls don't duplicate effects.
+
+Partial failures create retry ambiguity. A tool call might succeed server-side but the response gets lost due to network failure. The client sees a timeout and retries. The server sees a duplicate request. Without idempotency, both requests execute and create duplicate effects. With idempotency, the second request is recognized as a duplicate and handled safely.
+
+Multi-step agent workflows increase retry complexity. An agent might call tool A, then tool B, then tool C. If tool B fails and gets retried, you need to ensure tool B is idempotent so the retry doesn't duplicate B's effects. If the entire workflow is retried, tools A, B, and C all need idempotency.
+
+## Designing Idempotent Tools
+
+Idempotency must be designed into tools from the beginning. Retrofitting idempotency into non-idempotent tools is difficult and error-prone. Every tool that performs state changes should be idempotent.
+
+**Read-only tools are naturally idempotent.** Querying a database, searching documents, retrieving data from APIs: these operations don't change state. Calling them multiple times returns the same result (assuming the underlying data doesn't change between calls). No special idempotency mechanism is needed. This is why read-only tools are safer than write tools.
+
+**Create operations need idempotency keys.** Creating a record, sending an email, making a payment: these operations change state. Calling them multiple times creates multiple records, multiple emails, multiple payments. Idempotency requires recognizing duplicate requests and returning the result of the original request without performing the action again.
+
+**Update operations can be naturally idempotent if designed carefully.** Setting a field to a specific value is idempotent: "set status to active" has the same effect whether called once or ten times. Incrementing a field is not idempotent: "increment counter" called ten times increments ten times. Design updates as "set to value" rather than "apply delta" where possible.
+
+**Delete operations are often naturally idempotent.** Deleting a record that exists removes it. Deleting it again does nothing because it's already gone. Most delete implementations return success whether the record existed or was already deleted. This makes deletes safe to retry.
+
+**Idempotency requires state tracking.** To recognize duplicate requests, tools must remember previous requests and their outcomes. This requires storing idempotency keys, associating them with operation results, and checking for duplicates before executing. State storage introduces complexity but is necessary for safe retries.
+
+## Idempotency Key Strategies
+
+Idempotency keys are unique identifiers for operations. When a client calls a tool, it provides an idempotency key. The server checks: have I seen this key before? If yes, return the previous result. If no, execute the operation, store the result with the key, and return the result.
+
+**Client-generated keys** are created by the client before making the request. The client generates a UUID, associates it with the intended operation, and sends both. This ensures the client can retry with the same key if the first request times out. Client-generated keys work well when the client controls retry logic.
+
+**Server-generated keys based on request content** use a hash of the request parameters as the idempotency key. If parameters are identical, the hash is identical, and the request is recognized as a duplicate. This works when request parameters uniquely identify the intended operation. It fails if legitimate requests can have identical parameters but different intents.
+
+**Semantic keys based on business logic** use domain-specific identifiers as idempotency keys. For a payment operation, the key might be "user_123_upgrade_2026-01-30". This semantic key captures the business intent: this specific user upgrading on this specific date. Multiple requests with this key represent retries of the same intent, not separate operations.
+
+**Hybrid approaches** combine client-generated keys with semantic validation. The client provides a UUID, but the server also validates that the request parameters match the business intent. This catches cases where clients reuse keys incorrectly or where key collisions occur.
+
+**Key namespacing** prevents collisions across different operations or tools. A payment tool and an email tool should use separate key namespaces. Otherwise, a key collision could cause incorrect idempotency detection. Namespace by tool name, operation type, or user ID.
+
+**Key expiration** limits how long idempotency keys are remembered. Storing keys forever wastes storage. Expiring keys after hours or days (depending on retry window) balances safety and efficiency. Expired keys mean very old retries might not be detected, but practical retry windows are minutes to hours, not days.
+
+Choose key strategies based on your retry patterns and failure modes. If clients control retries and can generate keys, use client-generated keys. If retries happen server-side or across different clients, use semantic keys derived from business intent.
+
+## Handling Duplicate Calls
+
+When a tool receives a request with an idempotency key it has seen before, it must handle the duplicate appropriately without re-executing the operation.
+
+**Return cached result** is the standard approach. The original request executed and produced a result. That result was stored with the idempotency key. The duplicate request returns the stored result. The client cannot tell whether the operation executed now or previously. This is the cleanest idempotency implementation.
+
+**Validate parameter consistency** before returning cached results. If a duplicate request has the same key but different parameters, something is wrong. Either the client is reusing keys incorrectly or there's a collision. Return an error: "idempotency key already used with different parameters." This prevents silent data corruption from key misuse.
+
+**Check operation status** for long-running operations. If the original request is still in progress, the duplicate request should wait for it to complete and return the same result. If the original request failed, the duplicate might retry (depending on failure type). Status tracking ensures duplicates don't interfere with in-progress operations.
+
+**Handle partial failures gracefully.** If the original request partially succeeded (e.g., database record created but email send failed), the duplicate request should recognize the partial state and potentially retry only the failed portion. This requires tracking operation steps and their individual success/failure states.
+
+**Implement appropriate timeouts.** If a duplicate request arrives milliseconds after the original, it might wait for the original to complete. If it arrives hours later, the original is long done. Timeouts prevent duplicate requests from waiting indefinitely for stale operations.
+
+**Log duplicate detection** for monitoring and debugging. When duplicates are detected, log that they occurred, what key was duplicated, and whether parameters matched. This visibility helps you understand retry patterns, detect client bugs, and verify idempotency is working.
+
+## Exactly-Once Semantics in Practice
+
+Distributed systems literature often discusses exactly-once semantics: ensuring an operation executes exactly one time, neither zero nor two. In practice, exactly-once is extremely difficult and usually impossible. What you can achieve is exactly-once-ish: at-least-once execution with idempotency, which appears like exactly-once from the client's perspective.
+
+**At-most-once** is easy: never retry. If an operation fails, give up. This ensures no duplicates but sacrifices reliability. Many operations fail transiently and would succeed on retry. At-most-once wastes these opportunities.
+
+**At-least-once** is achievable: retry until success or permanent failure. This maximizes reliability but risks duplicates. At-least-once plus idempotency gives you exactly-once-ish: the operation executes at least once (for reliability) but has the same effect as if it executed exactly once (via idempotency).
+
+**Why exactly-once is hard:** Distributed systems have split-brain scenarios where it's impossible to know if an operation succeeded. You send a request, the server executes it, the response gets lost, you retry, but you don't know the first request succeeded. Without idempotency, you execute twice. With perfect idempotency, you execute once but retry safely.
+
+**Database transaction idempotency** uses unique constraints and upserts to achieve exactly-once inserts. Insert with a unique constraint on idempotency key. If the key exists, the insert fails but the transaction still commits the existing row. Upsert operations update existing rows or insert new ones. These database primitives provide exactly-once-ish semantics.
+
+**Saga patterns for multi-step workflows** coordinate multiple operations where each step is individually idempotent. If a workflow fails mid-way and retries, each step's idempotency ensures already-completed steps don't re-execute. This achieves exactly-once-ish workflow execution.
+
+**Two-phase commit** protocols provide exactly-once guarantees in theory but are complex, slow, and fragile in practice. Most systems avoid two-phase commit in favor of simpler at-least-once-with-idempotency patterns.
+
+Accept that exactly-once is aspirational. Build at-least-once with idempotency. This pragmatic approach delivers reliability without distributed systems theory PhD requirements.
+
+## Retry Safety and Backoff Strategies
+
+Idempotency makes retries safe, but you still need smart retry logic to avoid overwhelming systems or wasting resources.
+
+**Exponential backoff** increases delay between retries: retry immediately, then after 1 second, then 2 seconds, then 4 seconds, etc. This prevents retry storms where thousands of clients hammer a failing service simultaneously. Exponential backoff spreads load and gives failing services time to recover.
+
+**Jitter** adds randomness to backoff delays to prevent synchronized retries. Pure exponential backoff causes all clients to retry at the same times (1s, 2s, 4s). Adding jitter (retry after 1s ± 0.5s) desynchronizes retries and smooths load. AWS recommends full jitter: random delay between 0 and the exponential backoff time.
+
+**Maximum retry limits** prevent infinite retry loops. If an operation fails 5 or 10 times, stop retrying and escalate to human review or alternative logic. Infinite retries waste resources and delay failure detection. Define retry limits based on operation criticality and expected failure patterns.
+
+**Retry on transient errors only** distinguishes permanent failures from transient failures. Network timeouts are transient: retry. Invalid parameters are permanent: don't retry, return error immediately. Authentication failures might be transient (expired token) or permanent (invalid credentials). Smart retry logic categorizes errors and retries appropriately.
+
+**Circuit breakers** stop retrying when a service is clearly down. If 50% of requests to a service fail, open the circuit: stop sending requests and fail fast. After a timeout, try again (half-open state). If requests succeed, close the circuit and resume normal operation. Circuit breakers prevent retry storms against dead services.
+
+**Idempotency expands safe retry window.** Without idempotency, you can only retry if you're certain the first request didn't execute. With idempotency, you can retry liberally because duplicates are safe. This dramatically improves reliability. Be aggressive about retrying idempotent operations.
+
+## Idempotency for Side Effects
+
+Some tool operations have side effects beyond data changes: sending emails, posting to external APIs, triggering workflows, generating events. These side effects complicate idempotency.
+
+**Email idempotency** requires tracking which emails were sent and preventing duplicate sends. Store a record: "email sent to user_123 with template_upgrade_confirmation and key idempotency_xyz." Duplicate requests check this record and skip resending. The challenge is that email delivery is itself not idempotent: even if you send once, network issues might cause duplicates at the email provider level.
+
+**External API call idempotency** depends on whether the external API supports idempotency. If the external API accepts idempotency keys, pass your key through and rely on their idempotency. If not, wrap external calls in idempotent logic: record that you called the API with specific parameters and key, don't call again for duplicates. This prevents duplicates from your side but doesn't prevent duplicates from external API failures.
+
+**Event publishing idempotency** ensures duplicate tool calls don't publish duplicate events. If a tool publishes an event to a message queue, store the idempotency key with event metadata. Consumers can detect duplicates by checking keys. Alternatively, publish events transactionally with the primary operation so duplicates are prevented at source.
+
+**Async operation idempotency** handles operations that start background jobs. If a tool call kicks off a long-running workflow, duplicate calls should not start duplicate workflows. Track workflow IDs by idempotency key. Duplicates return the existing workflow ID and status.
+
+**Compensation for non-idempotent side effects** means designing compensating actions that undo effects if duplicates occur. If you can't prevent duplicate emails, provide an "ignore duplicate" message in the email or a way for users to report duplicates. If you can't prevent duplicate external API calls, implement reconciliation that detects and corrects duplicates.
+
+Side effects are the hardest part of idempotency because they extend beyond your control. Design side-effect-heavy tools with extra caution and testing.
+
+## Testing Idempotency
+
+Idempotency is not obvious from code inspection. You must test it explicitly with duplicate requests and verify correct behavior.
+
+**Duplicate request tests** call a tool with the same parameters and idempotency key twice and verify the operation executes once. Check that the result is identical for both calls. Check that side effects (database records, emails, API calls) occur only once. This is the basic idempotency test.
+
+**Concurrent duplicate tests** call a tool with the same key from multiple threads or processes simultaneously. Verify that race conditions don't cause duplicate execution. One request should execute, others should wait or immediately return the cached result. This tests idempotency under concurrency.
+
+**Parameter mismatch tests** call a tool with the same key but different parameters and verify it returns an error. Idempotent tools should reject attempts to reuse keys with inconsistent parameters.
+
+**Retry scenario tests** simulate network failures, timeouts, and retries. Execute a tool call, simulate failure before the client receives the response, retry with the same key, and verify the retry returns the original result without re-executing.
+
+**Idempotency key expiration tests** verify that keys expire as expected and that requests with expired keys execute normally instead of returning stale cached results. This prevents unbounded storage growth and ensures keys don't interfere across time.
+
+**Load testing with retries** simulates production-like load with realistic retry rates. In production, 5-10% of requests might be retries. Load tests should include similar retry percentages to verify idempotency holds under realistic conditions.
+
+Build idempotency testing into your CI/CD pipeline. Don't deploy tools without verified idempotency for state-changing operations.
+
+## Idempotency Keys in Multi-Tool Workflows
+
+When agents chain multiple tools together, idempotency becomes more complex. Each tool needs its own idempotency key, and workflow retries need to handle partial completion.
+
+**Per-tool keys** assign each tool call in a workflow a unique idempotency key. Tool A gets key_A, tool B gets key_B, tool C gets key_C. If the workflow retries, each tool is called with the same key. Tools that already completed return cached results. Tools that didn't complete execute normally.
+
+**Workflow-level keys** track overall workflow state in addition to individual tool keys. The workflow has an ID, and each tool call is associated with that workflow. If the workflow retries from the beginning, the system knows which tools already completed for this workflow instance.
+
+**Checkpoint and resume** saves workflow state after each tool call. If the workflow fails, it resumes from the last successful checkpoint using idempotency keys to skip completed steps. This prevents re-executing expensive tools and ensures workflows make progress even through failures.
+
+**Partial success handling** occurs when a workflow completes some tools but fails others. Retrying the workflow should skip successful tools (via idempotency) and retry failed tools. Track which tools succeeded, which failed, and which didn't execute.
+
+**Transactional boundaries** define which sets of tools must succeed or fail together. Sometimes tools within a transaction should all retry together. Sometimes only failed tools should retry while successful tools within the same workflow are preserved. Design transaction boundaries explicitly.
+
+Multi-tool idempotency is complex. Start simple: make each tool individually idempotent. Add workflow-level orchestration as needed for complex agent behaviors.
+
+## The Path Forward
+
+Idempotency transforms tool-using AI agents from fragile systems that break under retries into robust systems that recover gracefully from failures. Every state-changing tool should be idempotent. Every retry should be safe. Every failure should be recoverable.
+
+Design idempotency into tools from day one. Retrofitting is painful. Adding idempotency key parameters, state tracking, and duplicate detection early is easy. Adding them later to tools already deployed and in use is a migration project.
+
+Test idempotency explicitly and continuously. Idempotency bugs are subtle and hard to catch without targeted testing. Build test suites that verify duplicate handling, key expiration, and concurrent access.
+
+Accept that exactly-once is a useful fiction. Build at-least-once with idempotency. This pragmatic approach delivers production reliability without distributed systems complexity.
+
+The next section explores tool side effects in depth: distinguishing transactional from non-transactional tools, designing compensating actions for failures, and implementing saga patterns for multi-tool workflows that span multiple services.

@@ -1,0 +1,109 @@
+# 7.8 — Tool Authorization and Permission Models
+
+In March 2024, a healthcare analytics platform gave every user access to every database query tool without proper authorization checks. Within weeks, a customer service representative used the patient_data_export tool to pull 40,000 medical records they had no business accessing. The breach cost the company $3.2 million in HIPAA fines and triggered a complete security audit that halted product development for six months.
+
+Giving AI models tools is powerful. Giving them tools without authorization is negligent. When you let a model call functions on behalf of users, you inherit all the security responsibilities of traditional API access control, plus new challenges specific to AI systems. The model doesn't understand security boundaries. It will happily call any tool you provide if it thinks that serves the user's request.
+
+## Every Tool Call Is an Authorization Decision
+
+When a user asks your AI assistant to "show me recent sales data," the model might decide to call get_sales_report with parameters specifying last month's data. Before executing that function, you need to verify that this specific user, in this specific context, has permission to access sales data for that time period. This isn't optional security theater. This is the fundamental gate between safe tool use and catastrophic data exposure.
+
+Traditional API authorization happens at endpoints with explicit user context. Tool-based AI systems obscure this because the model intermediates between user intent and function execution. You might have ten tools available, but this particular user should only access three of them. The model doesn't know that. Your authorization layer must enforce it before any tool executes.
+
+The simplest mistake is making authorization a one-time check at session start. A user authenticates, you load their permissions, and then you let the model call any tool for the rest of the conversation. This fails the moment permissions change mid-session or when context matters. Authorization must happen on every single tool invocation, not just at session initialization.
+
+## Role-Based Tool Permissions
+
+Most systems need role-based access control for tools. Your customer_support role gets access to lookup_order, check_inventory, and process_refund. Your analyst role gets access to generate_report, query_database, and export_data. Your administrator role gets everything. This maps cleanly to how you probably already think about permissions in your system.
+
+Implementation requires maintaining a mapping between roles and allowed tools. When a tool call comes in, you check whether the user's role includes that tool in its permission set. If not, you reject the call before it executes. This happens in your tool execution layer, not in the model. The model will attempt to call unauthorized tools if you don't stop it.
+
+The complication comes with parameterized permissions. Maybe customer_support can call lookup_order, but only for orders assigned to them or orders from the last 30 days. Maybe analyst can call query_database, but only against the reporting database, not production. Role-based permissions need to extend into parameter-level authorization, not just tool-level.
+
+Your permission checking code needs access to both the tool name and the parsed parameters. When the model calls query_database with database="production", your authorization layer sees both the tool name and the database parameter. You can then enforce that this user's role permits query_database but only when database="reporting". This requires designing your authorization system to inspect tool call details, not just tool names.
+
+Some teams encode permissions directly in tool descriptions, telling the model "only customer support can use this tool." This is security theater. The model might respect it most of the time, but it's not a security control. It's a suggestion. Real authorization happens in code that the model cannot bypass, checking permissions before execution.
+
+## Tenant-Specific Tool Access
+
+Multi-tenant systems need tool permissions that vary by tenant, not just by user role. Your product might offer premium customers access to advanced_analytics tools while basic customers only get standard_reports. Or you might have enterprise customers who get custom tools built specifically for their integration needs. Tool availability becomes a function of both user identity and tenant configuration.
+
+This means your tool registry cannot be static and global. You need a dynamic tool system that assembles the available tool set based on the current user's tenant and role. When a conversation starts, you determine which tools this user in this tenant can access, and only those tools get registered with the model. The model never even learns about tools outside this permission set.
+
+The architectural challenge is keeping this performant. If you're making database queries to determine tool availability on every conversation turn, you'll introduce unacceptable latency. Most systems cache tenant tool configurations aggressively, invalidating caches only when tenant settings change. The tradeoff is a small window where permission changes might not take effect immediately, but this is usually acceptable.
+
+Parameter restrictions often vary by tenant too. Every tenant can use the query_database tool, but each tenant can only query their own tenant-specific tables. Your tool implementation must enforce tenant isolation at the parameter level. When tenant_a's user calls query_database, the tool execution layer automatically constrains the query to tables prefixed with tenant_a_, regardless of what the model tried to specify.
+
+Some teams make the mistake of trusting the model to respect tenant boundaries by including tenant context in the system prompt. The model will usually get this right, but "usually" isn't good enough for security. Tenant isolation must be enforced in the tool execution layer where the model cannot influence it. The model is an interface, not a security boundary.
+
+## Runtime Authorization Checks
+
+Authorization cannot happen once at the start of a tool call. It needs to happen throughout execution for tools that access multiple resources or make multiple decisions. A tool that generates a report might query five different data sources. Each query is an authorization decision. The user might have permission to access three of those sources but not the other two.
+
+This means your tool implementation needs authorization APIs it can call during execution. When generate_report is about to query the finance database, it calls can_access_resource with resource="finance_db" and gets a yes or no. If no, the tool either skips that data or returns an error, depending on your design. The model never sees unauthorized data, even within a single tool execution.
+
+Fine-grained authorization like this requires designing tools with authorization in mind from the start. You cannot bolt authorization onto tools that were designed assuming full access to everything. Tools need to be written defensively, checking permissions before each privileged operation and handling authorization failures gracefully.
+
+The implementation pattern is usually dependency injection. Tools receive an authorization service as a constructor parameter. When the tool needs to access a resource, it calls authorization_service.check with the resource identifier. This keeps authorization logic centralized rather than scattered across every tool implementation, and it makes tools testable with mock authorization services.
+
+Error handling matters here. When authorization fails, what does the tool return to the model? Some systems return an error message like "Permission denied: You cannot access finance data." Others return partial results with a note about what was omitted. The right choice depends on your use case, but you need to design for authorization failures, not treat them as exceptional cases.
+
+## Principle of Least Privilege for Tools
+
+Every tool should have the minimum permissions required to accomplish its purpose. If a tool needs to read from a database, give it read-only database credentials, not admin credentials. If a tool needs to access one API, give it a scoped API key for that API, not a master key. Tools are code running on behalf of users with potentially hostile intent. Assume they will be exploited.
+
+This principle extends to the model itself. The model should only learn about tools it might legitimately need for the user's request. If you have administrative tools, don't include them in the tool set for regular users. The model cannot call tools it doesn't know about. Limiting tool visibility is your first line of defense against misuse.
+
+Tool composition creates privilege escalation risks. Maybe lookup_customer by itself is harmless, and send_email by itself is constrained to certain templates. But if the model can call both, it might extract customer email addresses via lookup_customer and then spam them via send_email. You need to think about what combinations of tools enable and whether those combinations are safe.
+
+Some teams address this with tool call review workflows. Before executing a tool call that combines multiple privileged operations, the system pauses and asks for human approval. This is appropriate for high-risk actions like financial transactions or data deletion. The model can propose the tool call, but a human makes the final authorization decision.
+
+The challenge is making this usable. If users get prompted for approval on every other tool call, they'll just click through without thinking, and your security benefit evaporates. Review workflows need to be reserved for genuinely high-risk operations where human judgment is essential. For routine operations, automated authorization must suffice.
+
+## Authorization Context Beyond User Identity
+
+User identity isn't enough for authorization decisions. You also need request context. Is this tool call happening during business hours or at 2am? Is it coming from the user's usual location or from a new country? Has this user made fifty tool calls in the last minute or is this their first today? Anomalous patterns should trigger additional authorization scrutiny or rate limiting.
+
+This requires passing rich context to your authorization layer. Not just user_id and role, but timestamp, source IP, recent activity, and any other signals relevant to risk assessment. Your authorization service evaluates this context along with role-based rules to make allow or deny decisions. High-risk patterns might require step-up authentication even if the user is already logged in.
+
+Rate limiting is a form of authorization control. Even if a user has permission to call query_database, they shouldn't be able to call it 1,000 times per minute. Your authorization layer enforces rate limits per user, per tool, and per tenant. When limits are exceeded, subsequent calls fail with rate limit errors, and the model needs to handle this gracefully.
+
+Geographic restrictions apply too for some use cases. Maybe certain tools that access sensitive data should only work from specific countries or regions. Your authorization layer checks the request origin and denies tool calls that violate geographic policies. This is particularly important for GDPR compliance and data residency requirements.
+
+Session context matters as well. If the user authenticated with single sign-on from a corporate domain, you might grant access to internal tools. If they authenticated with a consumer email address, you restrict them to public tools. The authentication method influences authorization decisions, and your tool permission system needs access to this information.
+
+## Dynamic Tool Permission Updates
+
+Permissions change over time, and your tool authorization system needs to handle this without requiring users to restart their sessions. When an administrator revokes a user's access to certain tools, those tools should become unavailable immediately, even in ongoing conversations. This requires checking permissions on every tool call rather than caching them at session start.
+
+The implementation challenge is balancing security with performance. Checking permissions against a database on every tool call adds latency. Most systems use short-lived cached permissions, often 60 seconds or less. Every tool call checks the cache first, and the cache refreshes periodically. This means permission revocations take effect within a minute rather than instantly, which is acceptable for most use cases.
+
+For critical permissions, you might skip caching entirely. Tools that delete data or transfer money should always check permissions in real time against the authoritative source. The added latency is worth the security guarantee. You can make this decision per tool based on risk level, with high-risk tools always doing fresh permission checks.
+
+Audit logging is essential for permission systems. Every authorization decision, success or failure, should be logged with full context: user, tool, parameters, outcome, and timestamp. When security incidents happen, you need to reconstruct what tool calls were attempted and which ones succeeded. Audit logs are your forensic evidence.
+
+Some systems implement permission dry-run modes where tool calls are logged but not executed, or where they're executed but results are only visible to administrators. This lets you test permission changes before rolling them out to all users. You can see which tool calls would fail under new permission rules without impacting production users.
+
+## Authorization Failure Handling
+
+When authorization fails, the model needs clear information about why and what to do instead. An error message like "Permission denied" leaves the model stuck. A better message explains "You do not have permission to access financial reports. Contact your administrator to request analyst role." The model can then relay this to the user productively.
+
+Some teams implement graceful degradation where tools return partial results rather than failing entirely. If a user requests a report that includes some unauthorized data, the tool returns the authorized portions and notes what was omitted. The model can present a useful, if incomplete, response rather than failing entirely.
+
+The risk with this approach is that users might not understand they're seeing partial data. The model needs to make omissions obvious in its response. "I've included sales data for your region, but I don't have permission to show you the company-wide numbers" is clear. Just silently omitting data points without explanation is dangerous.
+
+For some tools, partial results don't make sense, and hard failures are better. If a user requests a financial transaction and lacks permission, you cannot execute "part" of the transaction. The tool must fail clearly, and the model must explain the failure to the user. Design your tools and authorization system with this distinction in mind.
+
+Error responses should never leak information about resources the user cannot access. Don't say "Permission denied for customer_id=12345." Just say "Permission denied for the requested customer." Otherwise, you're confirming the existence of entities the user shouldn't know about, which itself can be a security issue in some contexts.
+
+## Building Authorization-Aware Tools
+
+Tools must be designed from the start to work within an authorization framework. This means accepting authorization context as input and checking permissions before accessing resources. A tool that assumes full access to everything is incompatible with a security-conscious system. You need tools that are aware they might lack permissions and handle that gracefully.
+
+The practical pattern is passing an authorization token or authorization service interface to every tool. The tool uses this to check permissions before operations. This keeps authorization concerns in the tool implementation where they can be tested and audited, rather than scattering permission checks throughout your application.
+
+Tool descriptions should indicate what permissions they require. When tools are registered, they declare the roles or permissions needed to use them. Your tool registry can then filter tools based on user permissions automatically. This prevents the model from even learning about tools the user cannot access, which is cleaner than having the model attempt forbidden tool calls.
+
+Some systems use authorization annotations or decorators on tool implementations. The tool function is marked with requires_permission("read_customer_data"), and the framework automatically enforces this before executing the function. This keeps authorization logic declarative and prevents developers from forgetting permission checks.
+
+The next chapter examines how models interpret and use the results that authorized tools return, and the challenges of keeping responses grounded in actual tool outputs rather than hallucinated elaborations.

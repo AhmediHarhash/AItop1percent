@@ -1,0 +1,137 @@
+# 3.3 — Long-Context Prompt Architecture: Placement, Ordering, and Attention
+
+A Series D healthcare-AI startup discovered a silent quality degradation in their clinical decision support system during a January 2026 audit that reviewed 2,400 model outputs from the previous quarter. The twelve-person ML team had been running a prompt architecture that included patient history, lab results, clinical guidelines, and diagnostic criteria—totaling 80,000 to 120,000 tokens per request. They placed task instructions at the beginning of the prompt, followed by patient data, then clinical guidelines. Output quality had been acceptable during initial testing in August 2025, but by December, their clinical partners were reporting that the system sometimes missed relevant diagnostic criteria that were clearly stated in the included guidelines.
+
+The engineering lead ran a series of controlled experiments and found the pattern. When diagnostic criteria appeared in the first 15,000 tokens or the last 10,000 tokens of the context, the model cited them correctly 94% of the time. When the same criteria appeared between tokens 40,000 and 80,000—the middle of the context—citation accuracy dropped to 67%. The model was not ignoring the middle section entirely, but it was attending to it less reliably than the edges.
+
+The team had assumed that context position did not matter as long as the information was present somewhere in the window. They were wrong. Transformer attention exhibits **position bias**. Models attend more strongly to information near the beginning and end of the context, and less strongly to information in the middle. This is not a bug. It is an architectural property of how attention mechanisms distribute compute across long sequences.
+
+## Primacy and Recency Effects in Transformer Attention
+
+Transformer models exhibit primacy and recency effects analogous to human memory. Information near the beginning of the context receives stronger attention because it is processed first and influences the internal representations that follow. Information near the end of the context receives stronger attention because it is closest to the output generation phase. Information in the middle competes for attention with both earlier and later tokens.
+
+This happens because attention is a weighted sum over all context tokens, and those weights are learned during training. During training, models see many examples where task-critical information appears at the beginning—system prompts, instructions, key context. They also see many examples where task-critical information appears at the end—user queries, final questions. They see fewer examples where task-critical information is buried in the middle of a long document. The learned attention patterns reflect this distribution.
+
+You cannot eliminate primacy and recency effects through prompt engineering alone. They are baked into the model's learned weights. What you can do is design your prompt architecture to exploit these effects rather than fight them.
+
+You place task-critical information at the beginning or end of your context. You place background information, supplementary details, and low-priority material in the middle. You do not randomly order sections and hope the model figures out what matters.
+
+## Where to Place Task Instructions
+
+Task instructions define what the model is supposed to do. They are the most critical part of your prompt because they determine whether the model even attempts the right task. You have two viable placement strategies: beginning or end. Both work, but they work for different reasons.
+
+Placing instructions at the beginning exploits primacy. The model reads the instructions first, internalizes the task, and processes the rest of the context through the lens of that task. This works well when your instructions are short and the task is straightforward. If your prompt says "Summarize the following document" at the top, the model knows its job before it reads the document.
+
+Placing instructions at the end exploits recency. The model reads all the context first, then encounters the task instructions immediately before generating output. This works well when your task is complex, conditional, or requires synthesis across the entire context. If your prompt says "Based on all the case law provided above, identify which precedents apply to this dispute and explain why," the model benefits from having processed all the case law before it encounters the synthesis instruction.
+
+Most production systems use end-placement for long-context prompts. The reason is that long contexts often include multiple documents, data sources, or reference materials. If you place instructions at the beginning, the model reads "analyze the contract for compliance issues," then processes 100,000 tokens of contract text, then starts generating output. By the time it generates, the instructions are 100,000 tokens away. If you place instructions at the end, the model processes the contract, then encounters "analyze for compliance issues" immediately before output generation. The instructions are fresh.
+
+You experiment with both placements and measure which yields better task adherence. Task adherence is whether the model does what you asked. If you asked for a list and got a paragraph, adherence is low. If you asked for citations and got vague references, adherence is low. Placement affects adherence.
+
+## Ordering Reference Documents for Optimal Attention
+
+When you include multiple documents in a long-context prompt, the order matters. Documents placed at the beginning or end receive more attention than documents placed in the middle. You exploit this by ordering documents based on expected importance.
+
+You place the most task-critical document last, immediately before your task instructions. If your task is to analyze a contract dispute and you have the contract, case law, and internal notes, you place the contract last because it is the primary source. The model processes case law and notes first, then reads the contract with that background knowledge, then encounters your analysis task.
+
+You place high-authority sources near the end. If you are including regulatory guidelines, industry standards, and blog posts, you place the regulatory guidelines near the end because they are authoritative. The model should weight regulatory guidance more heavily than blog posts, and end-placement biases attention in that direction.
+
+You place low-priority or background documents early. If you are including a glossary, background primer, or tangentially related reference, you place it in the first 20% of the context. The model can access it if needed, but it does not dominate attention.
+
+You do not interleave high-priority and low-priority documents. If you alternate contract sections with background notes, the model's attention gets diluted. You batch similar documents together and order the batches by priority.
+
+## Structuring Context with Attention Anchors
+
+Attention anchors are structural markers that help the model navigate long contexts and maintain focus on key sections. Without anchors, the model treats the context as an undifferentiated blob. With anchors, the model can reference specific sections, revisit key points, and avoid lost-in-the-middle errors.
+
+You use document headers as anchors. Instead of concatenating documents without separators, you mark each document: "=== Document 1: Employment Agreement ===", "=== Document 2: Severance Policy ===". The model can then generate output like "According to Document 2, severance is calculated as..." instead of vague references like "the policy states."
+
+You use section markers within long documents. If you are including a 40,000-token regulatory code, you preserve or add section markers: "Section 4.2.1: Data Retention Requirements," "Section 4.2.2: Deletion Timelines." The model can cite specific sections instead of gesturing vaguely at "the regulations."
+
+You use numbered lists for multi-part information. If you are providing five policy documents, you number them. If you are listing ten requirements, you number them. Numbered lists create clear reference points. The model can say "Requirement 3 is violated" instead of "one of the requirements."
+
+You use metadata tags to signal document type and priority. "Primary Source: IRS Code Section 401(k)," "Supporting Reference: Company Retirement Policy." Tags guide the model's weighting of information. Primary sources should carry more weight than supporting references.
+
+You avoid deeply nested hierarchies that make navigation difficult. If your document has sections, subsections, sub-subsections, and sub-sub-subsections, the model loses track. Flatten the hierarchy to two or three levels maximum.
+
+## Managing Attention Distribution Across Long Contexts
+
+Attention distribution is how the model allocates its compute budget across the context when generating each output token. In a short context, the model can afford to attend to every token with meaningful weight. In a long context, attention is spread thin. You manage distribution by structuring the context to concentrate attention where it matters.
+
+You use redundancy strategically. If a fact is critical to the task, you state it twice—once near the beginning as context, once near the end as a reminder. This ensures the model sees it in both high-attention zones. You do not use redundancy for low-priority information because it wastes tokens.
+
+You use explicit focus directives. Instead of hoping the model notices that Section 4.2 is important, you write "Section 4.2 is the most relevant section for this analysis." This does not override attention mechanics, but it provides a heuristic the model can use when weighting information.
+
+You compress low-priority sections. If you need to include a 30,000-token background document for completeness but it is not central to the task, you include a 3,000-token summary instead. The model gets the gist without spending attention on details that do not matter.
+
+You front-load critical facts in each section. If Section 4.2 is 5,000 tokens long and the critical fact is in paragraph 12, you add a preamble: "Section 4.2 establishes data retention requirements. Key point: retention period is seven years." The model sees the key point at the start of the section, where attention is stronger.
+
+## Position-Dependent Prompt Templates
+
+You design prompt templates that adapt to the length and complexity of the context. A template that works well for 10,000-token contexts might fail for 100,000-token contexts because attention distribution changes.
+
+For short contexts (under 20,000 tokens), you use a simple structure: instructions, context, task. The model can attend to everything, so you do not need sophisticated placement strategies.
+
+For medium contexts (20,000 to 60,000 tokens), you use: instructions, low-priority context, high-priority context, task restatement. You order context by priority and restate the task at the end to exploit recency.
+
+For long contexts (60,000 to 150,000 tokens), you use: brief context map, low-priority background, medium-priority references, high-priority primary sources, detailed task instructions. You add a context map at the beginning so the model knows what it is working with. You place primary sources and task instructions at the end where attention is strongest.
+
+For very long contexts (150,000-plus tokens), you add explicit navigation aids: "This context includes six documents. Documents 1-3 provide background. Documents 4-6 are primary sources for your analysis. Focus on Documents 5 and 6." You cannot rely on the model to infer priority from position alone at this scale.
+
+## Handling Multi-Document Contexts with Cross-References
+
+When your context includes multiple documents that reference each other, you need to help the model track relationships. If Document A refers to "the provisions outlined in Document B," the model needs to know which document is which.
+
+You label documents consistently. If you introduce a document as "Document 1: Merger Agreement," you refer to it as "Document 1" or "the Merger Agreement" throughout. You do not switch to "the contract" or "the deal terms" mid-prompt. Inconsistent naming forces the model to infer coreference, which wastes attention.
+
+You resolve ambiguous references. If Document A says "see Section 4.2" and both Document A and Document B have a Section 4.2, you clarify: "Document A, Section 4.2" and "Document B, Section 4.2." The model cannot guess which section is referenced.
+
+You provide a reference map for complex contexts. If you have ten documents with cross-references, you include a brief map at the beginning: "Document 1 defines terms used in Documents 2-4. Document 5 supersedes conflicting provisions in Documents 1-4." This helps the model navigate relationships without re-reading everything.
+
+## Attention Heatmaps and Diagnostic Testing
+
+You cannot directly observe attention distributions in production API calls—model providers do not expose attention weights—but you can infer attention patterns through diagnostic testing. You create synthetic test cases where you place the same critical fact at different positions in the context and measure whether the model retrieves it.
+
+You build a test set with 30 to 50 examples where the answer-critical fact appears in the first 10% of the context, the middle 50%, and the last 10%. You run your prompt template against all examples and measure retrieval accuracy by position. If accuracy is 95% for first 10% and last 10% but 70% for middle 50%, you have confirmed position bias.
+
+You use these diagnostics to tune your template. If critical facts often appear in the middle of source documents and you are seeing retrieval failures, you restructure your template to move those documents toward the end, or you add redundancy to ensure critical facts also appear near the end.
+
+You run position diagnostics every time you update your prompt template or switch model versions. Attention patterns can change between model releases. A template that worked well with GPT-4 Turbo might show different attention characteristics with GPT-4.5.
+
+## Cost and Latency Trade-offs in Prompt Ordering
+
+Prompt ordering affects latency but not cost. Reordering sections does not change total token count, so it does not change cost. But reordering can affect how quickly the model finds the information it needs, which affects time-to-first-token.
+
+If you place task instructions at the beginning, the model knows what it is looking for as it processes the context. This can reduce time spent on irrelevant sections. If you place task instructions at the end, the model processes the entire context before it knows the task, which might increase latency slightly.
+
+In practice, latency differences from ordering are small—on the order of a few hundred milliseconds—and are dominated by the total context length. You optimize for quality and attention distribution first, latency second.
+
+You do consider ordering when you use prompt caching. If you cache a 50,000-token regulatory document and place it at the beginning of your context, you can reuse the cache across requests with different task instructions at the end. If you place the task instructions at the beginning, you cannot cache them because they change per request. Ordering affects cacheability.
+
+## Multi-Stage Attention Strategies for Ultra-Long Contexts
+
+When your context exceeds 150,000 tokens, single-pass attention becomes unreliable. The model cannot maintain focus across that much information in one generation pass. You use multi-stage strategies.
+
+You split the task into a two-stage pipeline. Stage one: "Read all documents and identify the three most relevant sections for this task." Stage two: "Given the three sections identified in stage one, perform the detailed analysis." The first stage uses the full long context but has a simple extraction task. The second stage uses a shorter, focused context and performs the complex task. This concentrates attention where it matters.
+
+You use a map-reduce pattern. You split the context into chunks, run a simple analysis task on each chunk in parallel, then aggregate the results. This works well for summarization, extraction, and classification tasks where the output is compositional. It does not work well for tasks that require global coherence or cross-referencing.
+
+You use iterative refinement. You make an initial pass with the full context and get a draft answer. You then make a second pass with a focused context that includes only the sections referenced in the draft. This improves citation accuracy and reduces lost-in-the-middle errors.
+
+## Model-Specific Attention Characteristics
+
+Different models exhibit different attention patterns. Claude models tend to have strong recency bias and perform better with task instructions at the end. GPT-4 models tend to balance primacy and recency more evenly. Gemini 2 models have been observed to have weaker lost-in-the-middle effects in some benchmarks.
+
+You test your prompt template on the specific model you are using. You do not assume that a template optimized for Claude will work equally well on GPT-4. You run position diagnostics, measure retrieval accuracy, and tune ordering for your production model.
+
+You track model updates. When a provider releases a new version—Claude 4.1, GPT-4.6, Gemini 2.5—you re-run your diagnostics. Attention characteristics can change. A prompt template that worked perfectly in November 2025 might degrade in February 2026 after a model update.
+
+## Documentation and Template Versioning
+
+You document why your prompt template uses its specific ordering. Future engineers need to know whether you placed instructions at the end because of recency effects, cacheability, or a legacy decision. Without documentation, they might "optimize" the template in ways that break attention distribution.
+
+You version your templates alongside attention diagnostics. Your template repo includes not just the template code but also the test results that show it works. When someone proposes a reordering, they run the diagnostics first.
+
+You avoid cargo-cult ordering. Some teams copy template structures from blog posts or documentation without understanding why they work. If you do not know why your instructions are at the end, you do not know when that placement is wrong. You make ordering decisions based on measurement, not mimicry.
+
+The next subchapter covers needle-in-a-haystack and lost-in-the-middle mitigation strategies for contexts where critical information can appear anywhere in a long sequence.

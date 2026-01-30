@@ -1,0 +1,137 @@
+# 8.1 — JSON Mode, Schema Enforcement, and Typed Outputs
+
+In March 2025, a legal tech startup lost a 400,000 dollar enterprise contract because their AI contract analysis system produced malformed JSON 3 percent of the time. The system was supposed to extract key terms, dates, and obligations from legal documents and return them as structured data that downstream systems could process. It worked perfectly in testing. But in production, roughly once every 30 documents, the model would return invalid JSON—an extra comma, an unclosed bracket, a string that wasn't properly escaped. The customer's pipeline would crash, manual intervention was required, and SLAs were missed. After six weeks of incidents, the customer terminated the contract. The root cause was simple: the startup had relied on prompt engineering alone to get structured outputs, and language models, even with careful prompting, occasionally hallucinate syntax errors.
+
+The fundamental problem is that language models are generative text systems, not compilers. They don't parse their own outputs for syntactic correctness. They predict tokens based on probability distributions. Most of the time, those predictions produce valid JSON. But occasionally, the model generates a token that breaks the structure, and once the structure breaks, the output is unusable.
+
+This is why **structured output enforcement** has become a critical production requirement. You cannot rely on prompting alone. You need mechanisms that either constrain the model to only generate valid structures or validate and recover from invalid outputs. As of January 2026, providers offer multiple approaches, each with different trade-offs around reliability, performance, flexibility, and cost.
+
+## Provider-Specific JSON Modes
+
+The most straightforward approach to structured output is using provider-specific JSON modes that constrain model generation to only produce valid JSON.
+
+**OpenAI's JSON mode** (available in GPT-4 and GPT-3.5) uses constrained decoding to ensure outputs are valid JSON objects. When you enable JSON mode via the API, the model's token generation is restricted: it can only produce tokens that keep the JSON syntactically valid. If the model is building a string value, it can't generate an unescaped quote. If it's closing an object, it can't add a trailing comma. The constraint is enforced at the token level during generation, not validated after the fact.
+
+The benefit is guaranteed validity. If the API returns a response in JSON mode, you can parse it without try-catch blocks. The limitation is that JSON mode doesn't enforce a specific schema—it ensures the output is valid JSON, but it doesn't ensure the JSON has the fields you need, with the types you expect, in the structure you require. You still need prompting to guide the model toward your desired schema, and you still need validation to check that the schema matches your requirements.
+
+**Anthropic's structured output beta** (available in Claude 3.5 as of late 2025) takes a different approach. You provide a JSON schema describing your desired output structure, and the model uses that schema to constrain generation. The schema defines required fields, types, constraints, and nested structures. The model generates outputs that conform to the schema by construction. This is more powerful than simple JSON mode because you get both syntactic validity and schema compliance.
+
+The limitation is flexibility. Highly constrained schemas can limit the model's ability to express nuance or handle edge cases that don't fit your predefined structure. If your schema requires a "sentiment" field with enum values "positive", "negative", "neutral", the model can't express "mixed" or "ambiguous" unless you anticipated those cases and included them in the schema.
+
+**Google's function calling mode** in Gemini uses structured outputs for tool invocation. When you define tools with typed parameters, the model's output is constrained to match those parameter schemas. This works well for tool-using agents but is less flexible for general structured output needs where you're not invoking tools.
+
+**Open-source constrained generation libraries** like llama.cpp's grammar-based sampling and Guidance's token constraint system let you enforce arbitrary grammars during local model inference. You can define the exact output format—JSON, XML, custom DSLs—and the model is constrained to generate only valid outputs according to that grammar. This offers maximum control but requires running models locally or using inference providers that support these libraries.
+
+The right choice depends on your deployment model and requirements. If you're using hosted APIs and need simple JSON, use the provider's JSON mode. If you need strict schema compliance, use schema-based structured output. If you need custom formats or local deployment, use grammar-based constrained generation.
+
+## Schema Definition and Type Systems
+
+Once you've decided to use structured output, you need to define what structure you want. This means writing schemas that describe your desired output shape.
+
+**JSON Schema** is the standard for describing JSON structures. You define an object with "type", "properties", and "required" fields. Each property has its own type and constraints. For example, extracting structured data from invoices might require a schema with required fields like "invoice_number" (string), "date" (string in ISO 8601 format), "total" (number), and "line_items" (array of objects with "description" and "amount").
+
+Schemas should be as specific as necessary but no more. Over-constraining creates brittleness. If you require exactly five line items, invoices with four or six items will fail. If you require a "customer_id" field, invoices from new customers might not have IDs yet. The schema should reflect genuine business requirements, not arbitrary structure decisions.
+
+**Enum constraints** are powerful for fields with limited valid values. If extracting contract types, your schema might specify an enum: "NDA", "MSA", "SOW", "Amendment". The model is constrained to output one of these values, preventing hallucinated contract types like "Super Agreement" or "Type A Contract".
+
+**Format annotations** add semantic constraints beyond basic types. A string field can have format "email", "uri", "date-time", "uuid". Providers that support format validation ensure outputs match these patterns. This catches models that generate malformed dates or invalid email addresses.
+
+**Nested structures** handle complex data. Extracting customer information might require nested objects: a "customer" object containing "name" (string), "contact" (object with "email" and "phone"), and "addresses" (array of address objects). Your schema defines this hierarchy, and the model generates outputs that respect it.
+
+The challenge is balancing specificity and flexibility. Highly specific schemas catch more errors but are brittle when real-world data doesn't perfectly match your assumptions. Loosely specified schemas are flexible but require more validation logic downstream. The right balance depends on how variable your inputs are and how much control you have over downstream systems.
+
+## When Structured Output Breaks
+
+Even with constrained generation, structured output can fail. Understanding failure modes helps you build robust systems.
+
+**Schema-prompt mismatch** happens when your prompt asks for information that doesn't fit your schema. If your prompt says "extract all relevant details" but your schema only has three fields, the model might struggle to decide what counts as "relevant." The prompt and schema should be aligned: the prompt should clearly specify that you want only the information defined in the schema, nothing more.
+
+**Information extraction impossibility** occurs when the input doesn't contain the information your schema requires. If your schema requires a "due_date" field and the document doesn't mention a due date, the model faces a choice: hallucinate a date, return null, or fail to generate. Different models and configurations handle this differently. You need explicit guidance in your prompt about how to handle missing information: should the model use null values, empty strings, or special sentinel values like "NOT_FOUND".
+
+**Ambiguity and interpretation** creates edge cases. If extracting "contract duration" from a document that says "this agreement lasts for two years or until project completion, whichever comes first," should the model output "2 years", "until project completion", or a complex object describing the conditional? Your schema and prompt need to specify how to handle ambiguity.
+
+**Model capability limits** mean some models struggle with complex schemas. Smaller or older models might handle simple flat objects but fail on deeply nested structures with multiple arrays and optional fields. Test your specific model-schema combination under realistic conditions.
+
+**Context length constraints** can interfere with structured output. If your schema definition is long and your prompt is long and your input document is long, you might exceed the model's context window. The model might generate incomplete outputs or fail to follow the schema because it can't attend to all the constraints simultaneously.
+
+## Validation Layers After Generation
+
+Even with constrained generation, you should validate outputs before using them. Defense-in-depth applies to structured output too.
+
+**Syntactic validation** confirms the output is valid JSON that parses without errors. Even if you're using JSON mode, validation catches edge cases where token limits truncate outputs mid-generation or API errors return partial responses.
+
+**Schema validation** confirms the parsed JSON matches your expected schema. Libraries like Ajv (JavaScript) or jsonschema (Python) validate JSON against JSON Schema definitions. Validation returns detailed errors: which fields are missing, which types are wrong, which constraints are violated. This tells you exactly what the model got wrong.
+
+**Semantic validation** checks business logic constraints that schemas can't express. Maybe your schema says "total" is a number, but you also need to verify that total equals the sum of line item amounts. Maybe your schema says "date" is a string, but you need to verify it's not in the future. Semantic validation is custom code that understands your domain's rules.
+
+**Range and sanity checks** catch hallucinated values that are technically valid but logically impossible. If extracting invoice totals, a value of 0.01 or 10,000,000 might be technically valid numbers but probably indicates an extraction error. Range checks flag these for human review.
+
+Validation should produce actionable error messages. Don't just return "invalid output." Specify which field failed, what was expected, what was received. This helps you debug whether the problem is the prompt, the schema, the model, or the input data.
+
+## Fallback and Retry Strategies
+
+When structured output fails validation, you need a recovery strategy. You can't just surface errors to users or crash downstream pipelines.
+
+**Retry with modified prompts** is the first line of defense. If the output is missing required fields, retry with a prompt that explicitly emphasizes those fields: "You must include the invoice_number field. If no invoice number is present in the document, use the value 'UNKNOWN'." If the output has type errors, retry with examples showing the correct types.
+
+**Partial output salvage** extracts whatever valid data is available. If the output has 8 of 10 required fields, you might accept the 8 valid fields and mark the 2 missing fields as null or unknown. This is better than discarding the entire output. You need logic to decide which fields are critical (must be present for the output to be useful) versus optional (nice to have but not required).
+
+**Degraded output modes** switch to simpler schemas when complex ones fail. If your preferred schema has nested objects and arrays, your fallback schema might be a flat object with string fields. If even simple JSON fails, you might fall back to requesting structured text with clear delimiters that you can parse with regex. Each degradation reduces data quality but increases reliability.
+
+**Human-in-the-loop escalation** routes failures that can't be automatically recovered to human operators. Critical use cases like legal document analysis or medical record extraction might require human review of all failures rather than accepting degraded outputs. The system logs the failed extraction, the raw input, the attempted output, and the validation errors, giving the human reviewer full context.
+
+## Streaming Structured Output
+
+Standard structured output is a request-response pattern: send input, wait for complete output, validate, use. But for user-facing applications, you want streaming: show partial results as they're generated to reduce perceived latency.
+
+Streaming structured output is technically challenging because partial JSON is usually invalid. You can't parse "{"name": "John" until the model generates the closing brace. If you try to render partial data, you don't know which fields are complete and which are still being generated.
+
+**Streaming parsers** handle partial JSON by tracking state. They emit events as complete structures become available: "field started", "field value completed", "object closed". You can render fields as they complete rather than waiting for the entire response. Libraries like stream-json (Node.js) and ijson (Python) provide incremental parsing.
+
+**Schema-aware streaming** knows which fields to expect based on your schema. If the schema says the first field is "name" (string) and the second is "age" (number), the streaming renderer can display "Name: ..." as soon as the name field starts generating, even before it's complete. This creates smooth progressive disclosure instead of sudden appearance of the full object.
+
+**Buffering strategies** balance latency and validity. You might buffer the first few tokens to confirm the output is starting correctly (opening brace, first field name) before rendering anything. This catches immediate failures without waiting for the full response.
+
+The complexity of streaming structured output is worthwhile for user-facing applications where every 100ms of perceived latency matters. For backend batch processing, request-response with validation is simpler and sufficient.
+
+## Choosing Between Structured and Unstructured Approaches
+
+Not every use case requires structured output. Sometimes natural language outputs are more appropriate.
+
+**Use structured output when** downstream systems need to process the data programmatically, when you need reliable field extraction, when you're aggregating outputs across many instances, when you need to join AI-extracted data with database records, or when you're building multi-step pipelines where each stage expects specific input shapes.
+
+**Use unstructured output when** the output is for human consumption only, when flexibility and nuance matter more than parseability, when the information doesn't fit neat schemas, when you're generating long-form content like articles or reports, or when the cognitive overhead of schema design exceeds the value of structured data.
+
+**Hybrid approaches** generate both. The model returns structured data in JSON plus a natural language summary. The structured data feeds automated systems. The natural language summary is shown to users. This gives you reliability for automation and readability for humans.
+
+## Testing Structured Output Robustness
+
+Production structured output systems need rigorous testing across input variability and edge cases.
+
+**Golden dataset testing** uses hand-labeled examples where you know the correct structured output. You run these through your system and compare generated outputs to golden outputs. This catches regressions when you change models, prompts, or schemas.
+
+**Adversarial input testing** uses malformed, ambiguous, or edge-case inputs designed to break structured output. Documents with missing information, conflicting information, unusual formatting, or deliberate obfuscation. Your system should handle these gracefully—returning null values, partial outputs, or error states rather than crashing or hallucinating.
+
+**Schema evolution testing** verifies that changes to your schema don't break existing functionality. If you add a new optional field, existing prompts should continue working. If you change a field from optional to required, you need to verify that the model can reliably provide values for that field across your input distribution.
+
+**Cross-model testing** runs the same structured output task across different models to understand variance. Maybe GPT-4 reliably produces valid outputs but GPT-3.5 fails 10 percent of the time. Maybe Claude handles nested structures better but GPT handles enums better. Cross-model testing informs your model selection and helps you understand which models work for which tasks.
+
+## The Production Structured Output Stack
+
+Putting it all together, a production structured output system has several layers.
+
+**Layer one: provider-level constraints** using JSON mode, schema-based generation, or grammar-based sampling to ensure syntactic validity.
+
+**Layer two: prompt engineering** that clearly specifies the task, provides examples, explains how to handle edge cases, and aligns with your schema.
+
+**Layer three: schema definition** that balances specificity and flexibility, uses appropriate types and constraints, and documents expected semantics.
+
+**Layer four: validation** that checks syntax, schema compliance, semantic correctness, and business rules.
+
+**Layer five: error recovery** that retries with modified prompts, salvages partial outputs, escalates to humans, or falls back to degraded modes.
+
+**Layer six: monitoring** that tracks validation failure rates, identifies common error patterns, and alerts when failure rates spike.
+
+Each layer catches different failure modes. Each layer provides telemetry that helps you improve the system. The companies that succeed with structured output in production treat it as an engineering discipline, not just an API parameter.
+
+The next section examines what happens when structured output fails validation: how to recover from errors, salvage partial data, and build resilient systems that degrade gracefully rather than failing catastrophically.

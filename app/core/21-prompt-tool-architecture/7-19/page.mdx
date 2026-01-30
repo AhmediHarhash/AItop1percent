@@ -1,0 +1,171 @@
+# 7.19 — Tool Side Effects: Transactional vs Non-Transactional Tools
+
+An inventory management AI agent destroyed a retail company's supply chain in November 2025 when a partial failure left the system in an inconsistent state. A store manager asked the agent to transfer 500 units of a product from warehouse A to warehouse B. The agent called three tools: deduct inventory from warehouse A, add inventory to warehouse B, and create a transfer record. The first tool succeeded: 500 units deducted from warehouse A. The second tool failed due to a database timeout. The third tool never executed. The agent reported failure to the user. But the damage was done: 500 units disappeared from warehouse A without appearing in warehouse B or transfer records. The inventory system thought 500 units vanished. The physical units were still in warehouse A, but the database said they weren't. This happened 47 times over a weekend before the inconsistency was discovered. The company spent three weeks and $800,000 on physical inventory audits and database reconciliation to restore accuracy.
+
+The root problem was treating independent tool calls as if they were atomic when they weren't. **Transactional tools** ensure that operations either complete fully or have no effect. **Non-transactional tools** can fail partially, leaving the system in inconsistent states. Multi-tool workflows that combine non-transactional tools need explicit orchestration to handle partial failures. Without understanding transaction boundaries and designing compensating actions, AI agents create data corruption every time workflows fail mid-execution.
+
+## Read-Only vs State-Changing Tools
+
+The first distinction is between tools that read state and tools that change state. Read-only tools are inherently safer because they can't corrupt data. State-changing tools require careful design.
+
+**Read-only tools** query databases, retrieve information, search documents, or call read-only APIs. They observe the world without modifying it. Calling them multiple times doesn't change anything. They can't leave the system inconsistent. They're safe to retry, safe to run in parallel, and safe to call speculatively. Most of your tools should be read-only.
+
+**State-changing tools** modify databases, send emails, make payments, update records, call write APIs, or trigger external actions. They alter the world. Calling them has consequences that persist. They can fail partially and leave inconsistent state. They require idempotency, transaction handling, and careful error management. Minimize state-changing tools and design them with extreme care.
+
+**Distinguish by design, not just by observation.** A database query tool is read-only by design. Even if it happens to query a read-replica that's slightly stale, it's still logically read-only. A tool that updates a cache might seem harmless but is state-changing. Design tools with clear read-only vs state-changing contracts.
+
+**Prefer read-only tools where possible.** If you can achieve your goal with reads, do it. If you need writes, design them carefully. Read-only tools eliminate entire categories of problems: race conditions, inconsistency, transaction management, and rollback complexity.
+
+**Audit state-changing tools more rigorously** than read-only tools. State changes create risk. Every state-changing tool should undergo security review, compliance review, and careful testing. Document transaction boundaries, failure modes, and recovery procedures.
+
+## Transaction Boundaries for Tool Calls
+
+Transaction boundaries define which operations must succeed or fail together. Operations within a transaction are atomic: either all succeed or all are rolled back. Understanding transaction boundaries is essential for building reliable agents.
+
+**Single-tool transactions** are the simplest case. One tool call is one transaction. If the tool succeeds, the transaction commits. If it fails, the transaction rolls back. Database operations with BEGIN/COMMIT/ROLLBACK are classic examples. The tool internally ensures atomicity.
+
+**Multi-tool transactions within a single service** involve multiple tools that call the same underlying service or database. You can wrap them in a single database transaction. Tool A writes record 1, tool B writes record 2, both within the same transaction. If tool B fails, tool A's changes roll back automatically. This requires designing tools to accept transaction contexts.
+
+**Distributed transactions across multiple services** are much harder. Tool A updates service 1, tool B updates service 2. If tool B fails, rolling back tool A requires distributed transaction coordination (two-phase commit) or compensating actions. Distributed transactions are complex, slow, and fragile. Most systems avoid them.
+
+**No transaction boundaries** mean tools are independent. Each tool commits its changes immediately. If later tools fail, earlier tools' changes persist. This is the default behavior when you chain tool calls without explicit transaction management. It's simple but risks inconsistency.
+
+**Explicitly design transaction boundaries** for your workflows. Document which tools are part of the same logical transaction. Decide whether you need atomic behavior or whether eventual consistency is acceptable. Make these decisions consciously, not by accident.
+
+## Compensating Actions for Failed Transactions
+
+When distributed transactions aren't feasible (usually), you need compensating actions: operations that undo the effects of previous operations when later operations fail.
+
+**Compensating action design** requires understanding how to reverse each state change. If tool A debits an account, the compensating action credits it. If tool A creates a record, the compensating action deletes it. If tool A sends an email, the compensating action might send a "please disregard" email or log a cancellation event.
+
+**Not all actions are reversible.** You cannot unsend an email. You cannot un-charge a payment without a separate refund transaction. You cannot un-publish an event consumed by downstream systems. For irreversible actions, compensating actions might be notifications, manual review queues, or best-effort fixes rather than true rollbacks.
+
+**Compensating actions must be idempotent** because they might be executed multiple times if the compensation process itself fails and retries. Deleting a record should succeed whether the record exists or was already deleted. Refunding a payment should check if a refund was already issued.
+
+**Store compensation logs** that record which compensating actions were executed for which failures. This provides audit trails and prevents re-running compensations unnecessarily. Logs also help debug when compensation itself fails.
+
+**Timeout compensating actions** appropriately. If a workflow fails, you might attempt compensation immediately. If compensation fails, retry with backoff. If compensation still fails after multiple attempts, escalate to manual review. Don't let compensation hang indefinitely.
+
+**Test compensating actions** as rigorously as primary actions. Write tests that intentionally fail workflows at each step and verify compensations execute correctly. Compensations are error-path code that might execute rarely but must work when needed.
+
+Compensation is messier than transactions but more practical for distributed systems. Design compensation thoughtfully and you can build reliable multi-tool workflows without distributed transaction coordinators.
+
+## Saga Patterns for Multi-Tool Workflows
+
+Saga patterns coordinate multi-step workflows where each step can be compensated if later steps fail. Sagas provide transaction-like semantics without distributed transaction complexity.
+
+**Forward recovery sagas** attempt to complete the entire workflow, retrying failed steps until they succeed or exhaust retries. If step 3 fails, retry step 3. If it still fails, retry again. Eventually either the workflow completes or you give up and run compensations. Forward recovery works when steps are likely to succeed eventually.
+
+**Backward recovery sagas** immediately compensate when a step fails. If step 3 fails, run compensation for step 2, then compensation for step 1, then report failure. Backward recovery ensures the system returns to a consistent state quickly at the cost of not completing the intended workflow.
+
+**Orchestration sagas** use a central orchestrator that calls each tool, tracks progress, and executes compensations if failures occur. The orchestrator knows the full workflow, the order of steps, and the compensation for each step. This centralization simplifies logic but creates a single point of failure.
+
+**Choreography sagas** have each tool publish events when it completes. The next tool subscribes to those events and executes when triggered. Compensation works similarly: failure events trigger compensation subscriptions. Choreography is decentralized and scalable but harder to reason about and debug.
+
+**Saga state machines** formalize workflows as state machines with states (step1_pending, step1_complete, step2_pending, etc.) and transitions (success, failure, compensate). This makes workflow logic explicit and testable. You can visualize the state machine, generate test cases, and verify correctness.
+
+**Saga persistence** stores workflow state so that if the orchestrator crashes mid-workflow, it can resume. Persistence might use databases, distributed logs, or workflow engines. Without persistence, orchestrator failures abort workflows even if individual tools succeeded.
+
+Sagas are sophisticated but necessary for reliable multi-tool workflows. If your agents chain more than a few state-changing tools, implement saga patterns or use workflow engines that provide saga support.
+
+## Rollback Strategies
+
+When workflows fail, you need strategies for rolling back partial changes. Rollback is the practical implementation of compensation.
+
+**Immediate rollback** executes compensations as soon as a failure is detected. Workflow calls tool A (succeeds), tool B (succeeds), tool C (fails). Immediately compensate tool B, then compensate tool A, then report failure. Immediate rollback minimizes the time the system spends in inconsistent states.
+
+**Delayed rollback** logs the failure and schedules compensation for later execution. This is useful when compensation is expensive or when you want to batch compensations. The downside is longer inconsistency windows. Use delayed rollback only when immediate rollback isn't feasible.
+
+**Manual rollback** escalates failed workflows to human operators who decide whether and how to compensate. This is appropriate for high-stakes operations where automated compensation might make mistakes. Manual rollback trades speed for safety and human judgment.
+
+**Partial rollback** compensates only some steps while preserving others. If a workflow completes step A and B successfully but step C fails, you might compensate only step B while keeping step A's changes. This requires careful design to ensure partial rollback leaves a valid state.
+
+**No rollback with eventual consistency** accepts that some failures leave inconsistency that gets resolved later through reconciliation. You log the partial failure, continue operating, and run periodic reconciliation processes that detect and fix inconsistencies. This is pragmatic when compensation is impossible or too complex.
+
+**Timeout handling for rollback** defines what happens if rollback itself fails or hangs. Retry the rollback. Escalate to alerts. Log for manual review. Don't let rollback failures go unnoticed.
+
+Choose rollback strategies based on operation criticality and consistency requirements. Financial transactions need immediate rollback. Reporting pipelines might tolerate delayed or eventual consistency.
+
+## Designing Stateless vs Stateful Tools
+
+Tool statefulness affects how you handle transactions and failures. Stateless tools are simpler and safer. Stateful tools provide performance and capabilities at the cost of complexity.
+
+**Stateless tools** carry no state between invocations. Each call is independent. The tool receives parameters, performs operations on external state (databases, APIs), and returns results. Stateless tools are easy to scale, easy to retry, and easy to reason about. Prefer stateless tools.
+
+**Stateful tools** maintain state across invocations. A tool might open a database connection, cache data, or remember previous calls. Stateful tools can be more efficient (reuse connections) but complicate failure handling. If a stateful tool crashes mid-workflow, its state is lost and the workflow might become inconsistent.
+
+**Externalize state** to durable storage instead of keeping it in memory. If a tool needs to remember something across calls, store it in a database or cache that survives tool restarts. This makes tools effectively stateless from an orchestration perspective while providing state management benefits.
+
+**Session-scoped state** limits state lifetime to a single workflow or user session. State is initialized at workflow start, used during the workflow, and cleaned up at workflow end. Session state improves efficiency without the indefinite lifetime issues of persistent state.
+
+**State cleanup on failure** ensures that if workflows abort, any state they created is cleaned up. Temporary files are deleted, connections are closed, locks are released. Without cleanup, failures leak resources over time.
+
+Design tools to be as stateless as possible. When statefulness is necessary, externalize state, limit its lifetime, and implement cleanup.
+
+## Isolation Patterns for Multi-Tenant Tools
+
+When multiple users or workflows use the same tools concurrently, you need isolation to prevent interference and ensure consistency.
+
+**User-level isolation** ensures that one user's tool calls don't affect another user's calls. Databases use user IDs to filter queries. Caches namespace by user. Workflows track which user initiated them. User isolation prevents data leakage and interference.
+
+**Workflow-level isolation** ensures that concurrent workflows for the same user don't interfere. Each workflow gets its own transaction context, its own idempotency keys, its own state tracking. Workflow isolation prevents race conditions when users trigger multiple actions simultaneously.
+
+**Tool-level isolation** limits concurrency within individual tools to prevent resource exhaustion. A tool might allow only 10 concurrent executions per user or 1000 globally. This prevents abuse and ensures fair resource sharing.
+
+**Locking for critical sections** protects operations that must be atomic across multiple tool calls. If updating a user's account balance requires reading current balance, calculating new balance, and writing new balance, those steps must be locked to prevent concurrent modifications. Use database row locks, distributed locks, or optimistic concurrency control.
+
+**Optimistic concurrency control** detects conflicts instead of preventing them. Read a record with its version number, perform calculations, write back with version check. If the version changed, someone else modified the record; retry. Optimistic concurrency works well for low-contention scenarios and avoids lock overhead.
+
+**Queue-based serialization** processes tool calls for the same resource serially through queues. All operations on user_123's account go through a queue, ensuring serial execution. This prevents concurrency issues entirely but reduces parallelism.
+
+Choose isolation patterns based on contention levels and consistency requirements. High contention needs strong isolation. Low contention can use optimistic approaches.
+
+## Error Propagation and Failure Modes
+
+When tools fail, how failures propagate through workflows affects consistency and recoverability.
+
+**Fail-fast propagation** aborts workflows immediately when any tool fails. Tool A succeeds, tool B fails, workflow terminates immediately with error. Fast failure prevents cascading problems but commits tool A's changes without completing the workflow. Requires compensation.
+
+**Fail-slow propagation** attempts to complete as much as possible even when some tools fail. Tool A succeeds, tool B fails, tool C attempts anyway. Workflow completes partially. This maximizes progress but makes compensation complex because you must track which tools succeeded and which failed.
+
+**Failure categorization** distinguishes transient failures (retry) from permanent failures (abort). Network timeouts are transient. Invalid parameters are permanent. Retry logic should categorize failures and respond appropriately.
+
+**Error context preservation** ensures that when failures propagate, context is preserved: which tool failed, why it failed, what parameters it received, what state exists. Rich error context enables debugging and recovery.
+
+**Graceful degradation** continues workflow execution with reduced functionality when non-critical tools fail. If step A is critical and fails, abort. If step B is optional and fails, continue without it. Graceful degradation improves reliability for workflows with non-uniform criticality.
+
+**Deadlock detection** identifies when workflows are stuck waiting for each other and breaks the deadlock. Tool A holds lock 1 and waits for lock 2. Tool B holds lock 2 and waits for lock 1. Deadlock detection aborts one workflow to resolve the cycle.
+
+Design failure propagation explicitly. Don't let failures cascade in surprising ways. Make failure behavior predictable and testable.
+
+## Testing Transactional Tool Workflows
+
+Testing multi-tool workflows with transactions and compensation is complex but essential. Failures happen in production; your tests must verify you handle them correctly.
+
+**Failure injection tests** intentionally fail tools at each step of workflows and verify compensation executes correctly. Fail tool A: verify workflow aborts cleanly. Fail tool B: verify tool A is compensated. Fail tool C: verify tools A and B are compensated. Systematic failure injection covers the error-path combinations.
+
+**Concurrent workflow tests** run multiple workflows simultaneously and verify isolation and consistency. Two users update overlapping data concurrently. Verify both workflows complete without corruption or deadlock. Concurrency tests reveal race conditions that unit tests miss.
+
+**Partial failure scenarios** simulate situations where some tools succeed and others fail. Verify that partial success is handled correctly: successful tools are preserved or compensated appropriately, failed tools are retried or aborted.
+
+**Compensation idempotency tests** run compensations multiple times and verify they're safe to retry. If compensation is not idempotent, retries cause problems. Test that compensation works whether executed once or ten times.
+
+**State consistency validation** checks that after workflow completion or failure, the system state is valid. No orphaned records, no missing references, no violated constraints. Consistency validation tests are the ultimate verification that transaction handling works.
+
+**Load testing with failures** simulates production load levels with realistic failure rates. In production, some percentage of workflows will fail. Load tests should include failures and verify system stability under realistic failure conditions.
+
+Build comprehensive test suites for transactional workflows. These are the most failure-prone parts of your system and warrant thorough testing.
+
+## The Path Forward
+
+Understanding and handling tool side effects separates toy agents from production systems. Toy agents assume everything succeeds. Production agents assume failures, design compensations, implement sagas, and ensure consistency.
+
+Design transaction boundaries explicitly for every workflow. Don't chain tools and hope they work. Understand whether operations must be atomic and implement appropriate mechanisms.
+
+Implement compensation for all state-changing tools. Document how to undo each operation. Test that compensation works. Make compensation a first-class concern in tool design.
+
+Use saga patterns for complex workflows. Orchestrated sagas are simpler to reason about. Choreographed sagas scale better. Choose based on your complexity and scale requirements.
+
+Test failure scenarios thoroughly. Most systems are tested for success paths. Production failures happen on error paths. Test error paths as rigorously as success paths.
+
+The next section examines secrets handling: why credentials must never appear in prompts, how to inject credentials at runtime, vault integration patterns, and scoped token strategies for AI systems.

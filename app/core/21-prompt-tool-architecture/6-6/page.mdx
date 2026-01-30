@@ -1,0 +1,203 @@
+# 6.6 — Output Filtering and Post-Processing Safety Layers
+
+In March 2025, a healthcare appointment scheduling platform deployed an AI assistant to help patients book appointments via chat. The system worked well in testing. Prompts were solid. Input validation caught most edge cases. Security reviews passed.
+
+Three days after launch, a patient received a confirmation message containing another patient's medical record number, appointment details, and partial insurance information. The leak happened because the model hallucinated data from its context window—accidentally mixing information from concurrent sessions that shared infrastructure. The prompt never asked for this information. The model just included it.
+
+The breach affected 47 patients before the team caught it. HIPAA violation notices went out. The fine was $125,000. The reputational damage was worse. But here's the part that haunts the team: they had considered building output filtering. They decided it was unnecessary because "the prompt tells it what to output."
+
+Output filtering is your last line of defense. It's the safety layer that protects users from what your prompts failed to prevent and what your model decided to do anyway.
+
+## Why Input Filtering Is Not Enough
+
+Most teams focus security effort on the input side. They sanitize user input. They validate requests. They block prompt injection attempts. This is necessary but insufficient.
+
+Input filtering prevents bad things from getting into your system. Output filtering prevents bad things from leaving your system. You need both because the model sits in the middle, and models do unexpected things.
+
+A model might receive perfectly safe inputs and still produce unsafe outputs. It might hallucinate private information. It might generate toxic content in response to benign prompts. It might leak system instructions. It might produce structurally invalid data that breaks downstream systems.
+
+Input filtering protects your model from users. Output filtering protects your users from your model.
+
+Think of it like airport security. You screen passengers before they board (input filtering). You also have procedures for handling in-flight incidents (output filtering). You need both layers because problems can originate from either side or emerge during the process itself.
+
+## The Output Filtering Stack
+
+Output filtering isn't a single check. It's a layered stack of validations that run in sequence before serving content to users.
+
+Layer one: Structural validation. Before you do anything else, confirm the output matches expected structure. If you expected JSON, parse it. If you expected specific fields, verify they exist. If the structure is wrong, don't proceed to content validation—you don't have valid content yet.
+
+Layer two: Content classification. Run the output through classifiers that detect categories of harmful or inappropriate content. This includes toxicity detection, PII detection, profanity filters, and domain-specific safety classifiers.
+
+Layer three: Policy compliance. Check the output against your content policy rules. Does it make claims you're not allowed to make? Does it include disclaimers you're required to include? Does it reference prohibited topics?
+
+Layer four: Business rule validation. Verify the output satisfies business-specific constraints. For pricing information, confirm it matches your current pricing. For appointment scheduling, verify the time slot is actually available. For product recommendations, ensure recommended items are in stock.
+
+Layer five: Contextual safety checks. Validate the output is safe given the specific user context. Does it leak information about other users? Does it assume permissions the user doesn't have? Does it reveal system details that should stay internal?
+
+Each layer is a gate. If output fails any layer, you don't serve it. You either regenerate, fall back to a safe default, or return an error.
+
+## PII Detection and Redaction
+
+Detecting personally identifiable information in outputs is harder than it looks. You're not just scanning for patterns. You need to understand context.
+
+A social security number in a pattern like "XXX-XX-1234" is obvious. But what about "the last four digits of your social are 1234"? What about "your account number ending in 5678" when account numbers aren't supposed to be in the output at all?
+
+PII detection requires multiple strategies running in parallel.
+
+Pattern matching catches structured PII. Social security numbers, credit card numbers, phone numbers, email addresses. Use regex for these, but make the patterns tight. Loose patterns generate false positives that force you to tune down sensitivity, which then causes false negatives.
+
+Named entity recognition catches unstructured PII. Names, addresses, organization names. Use a NER model trained for your domain. Generic NER models miss domain-specific entities.
+
+Contextual analysis catches implicit PII. "Your diagnosis from last Tuesday" might leak protected health information even though it doesn't contain a name or number. "The account you opened in March" might leak financial data. These require understanding what information is sensitive in your domain.
+
+Allowlist validation prevents over-blocking. If your system is supposed to use the current user's name, allowlist their name specifically. If it's supposed to include their email, allowlist that email. This lets you block PII generally while allowing explicitly permitted disclosure.
+
+When you detect PII, you have three options: redact it, regenerate without it, or block the entire output. Choose based on risk tier and user impact.
+
+Redaction works for low-stakes content where removing PII leaves useful information. "Hello [REDACTED], your appointment is Tuesday" still communicates the appointment time.
+
+Regeneration works when you can add a constraint to the prompt. "Detected PII in output, regenerating with explicit instruction to exclude personal identifiers."
+
+Blocking works for high-risk scenarios where partial information might still cause harm. Medical advice containing patient identifiers gets blocked entirely, not redacted.
+
+## Harmful Content Classification
+
+Your model can generate toxic, biased, or harmful content even with careful prompting. Output classification catches what prompt engineering missed.
+
+Toxicity classifiers detect insults, slurs, threats, and harassment. Use a classifier trained on recent data—language evolves and yesterday's training data misses today's harmful patterns. Run the classifier on the full output and on individual sentences. Sometimes toxic content hides in otherwise benign responses.
+
+Bias detectors identify discriminatory content based on protected characteristics. This is harder than toxicity because bias is often subtle. "You might not be technical enough for this" sounds helpful but can encode gender bias. "This neighborhood is safe" can encode racial bias. Train classifiers on your specific domain and review edge cases manually.
+
+Profanity filters are straightforward but need context awareness. "Fuck cancer" in a support group is different from "fuck you" in a customer service interaction. Don't just pattern match—understand intent.
+
+Domain-specific safety classifiers catch content that's harmful in your context but not universally harmful. Medical misinformation. Financial advice that violates regulations. Legal guidance that differs by jurisdiction. Build custom classifiers for these using labeled data from your domain.
+
+When harmful content is detected, default to blocking. Don't try to automatically fix it by removing the harmful parts—you'll likely make it worse or incoherent. Regenerate with safety constraints or return a safe fallback response.
+
+## Output Validation Pipelines
+
+Validation pipelines orchestrate multiple checks efficiently and handle failures gracefully.
+
+Structure your pipeline for fail-fast behavior. Cheap checks run first. If structural validation fails, don't waste time running expensive classifiers on invalid output. If PII is detected, don't proceed to business rule validation.
+
+Run independent checks in parallel when possible. PII detection and toxicity classification don't depend on each other. Run them concurrently to reduce total latency.
+
+Cache validation results when safe. If you're generating the same output for multiple users—like a weather forecast or news summary—validate it once and cache the result. Don't re-validate identical content.
+
+Set timeouts for each validation stage. A slow classifier that times out shouldn't block the entire pipeline. Decide per-classifier whether timeout means "assume safe and proceed" or "assume unsafe and block."
+
+Log all validation failures with full context. You need to know: what input generated this output? Which validator failed? What was the confidence score? What happened to the request (blocked, regenerated, redacted)? This data drives improvement.
+
+Implement circuit breakers for validators. If your PII detector starts failing every request, that's likely a detector bug, not a sudden PII explosion. Circuit breakers prevent a broken validator from blocking all traffic.
+
+Handle validation failures differently by risk tier. Tier 1 (low risk): log the failure and serve the content anyway. Tier 2 (medium risk): regenerate once, then fall back to generic response. Tier 3 (high risk): block the content and return an error.
+
+## Confidence Thresholds and Escalation
+
+Classifiers return confidence scores, not binary decisions. How you act on those scores matters enormously.
+
+Don't use fixed thresholds across all classifiers. "Block anything above 0.7" sounds reasonable but ignores that different classifiers have different calibration. A PII detector at 0.7 might be very reliable. A bias detector at 0.7 might be guessing.
+
+Calibrate thresholds per classifier using labeled validation data. Measure precision and recall at different thresholds. Choose the threshold that matches your risk tolerance for that specific safety concern.
+
+Create graduated response tiers based on confidence. Very high confidence (0.9+) gets immediate blocking. High confidence (0.7-0.9) triggers regeneration with safety constraints. Medium confidence (0.5-0.7) logs a warning but allows content with additional monitoring. Low confidence (below 0.5) logs for analysis but doesn't affect serving.
+
+Implement human escalation for borderline cases in high-risk systems. If confidence is between 0.6 and 0.8, queue for human review instead of making an automatic decision. This is expensive but necessary for regulated industries.
+
+Use ensemble classifiers for critical decisions. Run multiple PII detectors or multiple toxicity classifiers. If any classifier shows high confidence, treat it seriously. If all classifiers show low confidence, trust that consensus.
+
+## Handling False Positives Without Compromising Safety
+
+Aggressive output filtering generates false positives. Content gets blocked when it shouldn't be. This frustrates users and degrades product quality.
+
+The temptation is to relax filtering to reduce false positives. Resist this. Reducing false positives by lowering safety thresholds increases false negatives—actual harmful content that slips through. That's worse.
+
+Instead, improve precision through better classifiers and better context.
+
+Fine-tune classifiers on your specific domain. Off-the-shelf toxicity detectors trained on social media comments will false-positive on medical content ("this tumor is aggressive") or automotive content ("the brakes are shot"). Train on your actual content.
+
+Provide context to classifiers when possible. "You'll need to verify your identity" looks like a phishing attempt to a generic classifier. With context—this is an official system message in a banking app—it's clearly legitimate.
+
+Implement appeal mechanisms for users. If content gets blocked, let users request review. Track appeals to identify systematic false positive patterns. "Our content about cancer treatment keeps getting flagged as toxic" reveals a training data problem.
+
+Whitelist known-safe patterns in your domain. Medical systems should allow anatomical terms. Financial systems should allow "withdrawal" and "transfer." Legal systems should allow case law citations. Build allowlists carefully and review them regularly.
+
+Monitor false positive rate by category and user segment. If 20% of medical professional outputs get falsely flagged but only 2% of patient outputs do, your classifier has a bias problem. If business users hit false positives more than consumer users, your training data doesn't cover business language.
+
+## Post-Processing for Consistency and Compliance
+
+Beyond safety, output filtering enforces consistency and compliance requirements.
+
+Format standardization ensures outputs match expected patterns. Dates appear in consistent format. Currency amounts include proper symbols and precision. Phone numbers follow regional conventions. This isn't optional for professional products—users notice inconsistency and it erodes trust.
+
+Disclaimer injection adds required legal or safety disclaimers. Medical advice includes "This is not a substitute for professional medical advice." Financial content includes risk warnings. AI-generated content includes disclosure that it's AI-generated if regulations require it.
+
+Localization post-processing ensures outputs respect regional requirements. Temperature in Celsius vs Fahrenheit. Date formats (MM/DD vs DD/MM). Currency symbols. Measurement units. Don't just translate—adapt.
+
+Branding compliance verifies outputs use approved terminology, product names, and voice. "Our app" gets replaced with the official product name. Competitor names get handled per policy (mention allowed, promotion not allowed). Voice and tone match brand guidelines.
+
+Link validation checks that generated links are functional and point to allowed domains. Models sometimes hallucinate URLs or generate malformed links. Validate them before serving. Replace broken links with fallback text or regenerate the content.
+
+Citation formatting ensures generated citations match required style. Academic content uses proper citation format. News content includes source attribution. Product recommendations include disclaimers about affiliate relationships.
+
+## Performance and Latency Considerations
+
+Every validation layer adds latency. Output filtering can easily add 200-500ms to response time. This is often acceptable but requires careful engineering.
+
+Run fast checks first. Structural validation takes single-digit milliseconds. Run it before expensive ML classifiers. Regex-based PII detection is faster than NER models. Run pattern matching before neural networks.
+
+Parallelize independent checks. If you have five different content classifiers, run all five in parallel instead of serially. Five classifiers at 100ms each take 100ms in parallel, not 500ms in series.
+
+Use model batching when traffic allows. If you're validating multiple outputs simultaneously, batch them into a single classifier call instead of five sequential calls. Batching improves throughput at the cost of slightly higher latency per request.
+
+Cache validation results for deterministic outputs. If you generate the same FAQ answer repeatedly, validate it once and cache the result keyed by output hash. Serve cached validation decisions for subsequent identical outputs.
+
+Implement async validation for non-blocking checks. Some validations don't need to block serving—they just need to log issues for review. Run these asynchronously after serving the response.
+
+Set aggressive timeouts. A classifier that takes more than 200ms is too slow. Timeout and make a safe default decision (usually: allow if low-risk tier, block if high-risk tier).
+
+Monitor P50, P95, and P99 latency for validation pipeline. Median latency tells you normal performance. P99 tells you what users experience when classifiers are slow. Set SLOs and alert on violations.
+
+## Monitoring and Continuous Improvement
+
+Output filtering is not set-and-forget. It requires active monitoring and regular updates.
+
+Track block rate by filter type. How often does PII detection block content? How often does toxicity classification trigger? If PII detection suddenly spikes, investigate—it's probably a false positive pattern, not a real PII leak explosion.
+
+Sample blocked content for manual review. You can't review everything, but sample 1% of blocked outputs and verify the block was correct. This catches systematic false positives and validates your classifiers are working as intended.
+
+Track regeneration success rate. When you detect issues and regenerate, how often does the second attempt pass validation? If regeneration mostly fails, your prompts aren't learning from validation feedback.
+
+Measure user impact. Do users retry after blocks? Do they abandon the session? Do they report issues? High abandonment after blocks suggests false positives or poor error messages.
+
+Update classifiers as content evolves. Language changes. New PII patterns emerge. Adversaries find new ways to trigger toxic output. Re-train classifiers quarterly at minimum, monthly for high-risk applications.
+
+Build feedback loops from production. Use blocked content as negative examples for re-training. Use content that passed validation but received user complaints as additional negative examples. Your production traffic is your best training data source.
+
+Document validation logic and keep it current. When someone asks "why was this blocked?" you should be able to explain exactly which filter triggered and why. Documentation also ensures knowledge survives team turnover.
+
+## Integration with Upstream Safety
+
+Output filtering works best when integrated with upstream safety measures, not as the sole safety mechanism.
+
+Prompt engineering is your first defense. Write prompts that constrain outputs to safe patterns. Output filtering catches what prompts miss, but prompts should be doing most of the work.
+
+Input sanitization is your second defense. Block malicious inputs before they reach the model. Output filtering handles model misbehavior, not adversarial attacks that should have been stopped earlier.
+
+Guardrails and policy layers are your third defense. Constitutional AI, rule engines, and policy checks prevent certain outputs from being generated. Output filtering is the final check, not the primary safety mechanism.
+
+Think of output filtering as insurance. You take all reasonable precautions to prevent fires—safety equipment, training, procedures. Fire insurance is what protects you when precautions fail. Output filtering is fire insurance for your AI system.
+
+## The Cost of Skipping Output Filtering
+
+Teams skip output filtering because it adds complexity and latency. This is a false economy.
+
+The healthcare scheduling platform paid $125,000 in HIPAA fines. The engineering cost to build PII detection and redaction would have been roughly $20,000. The latency cost would have been about 50ms per request. They chose to save $20,000 and 50ms. It cost them $125,000, weeks of engineering time responding to the breach, and permanent reputational damage.
+
+You can skip output filtering in exactly one scenario: Tier 1 products where outputs are purely internal, reviewed by experts before use, and have no direct user impact. Even then, it's risky.
+
+For everything else—anything customer-facing, anything in regulated industries, anything handling sensitive data—output filtering is not optional. It's the last line of defense between your model's mistakes and your users' harm.
+
+Build it from day one. Make it fast. Make it reliable. Monitor it continuously. Update it regularly. Treat it as critical infrastructure, not a nice-to-have feature.
+
+Your prompts will fail. Your input validation will miss attacks. Your model will hallucinate. Output filtering is what keeps those failures from becoming user-facing disasters.

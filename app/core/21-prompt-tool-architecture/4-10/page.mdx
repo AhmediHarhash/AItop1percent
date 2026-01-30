@@ -1,0 +1,141 @@
+# 4.10 — Session Handoff: Transferring Context Between Models or Agents
+
+A fintech unicorn lost $340,000 in January 2026 when their AI customer service platform failed to properly hand off context between their triage agent and their specialist fraud investigation agent. The platform had been designed to route customer inquiries through a fast, cheap GPT-4 tier for initial classification, then escalate complex cases to a more expensive Claude Opus tier for detailed investigation. The architecture looked clean on paper: detect escalation need, serialize conversation state, pass to specialist agent, continue conversation.
+
+In production, the handoff broke in subtle ways. The specialist agent received the conversation transcript but lost critical metadata: the customer's risk score, the transaction IDs referenced in earlier turns, the authentication level of the current session, and the triage agent's confidence scores for preliminary classifications. When a customer said "this charge is fraudulent," the specialist agent could see the customer said that, but not which charge they meant. The transcript included the phrase "the one from Tuesday," but the specialist agent did not have access to the transaction timeline the triage agent had retrieved. The specialist agent asked customers to repeat information they had already provided, eroding trust. Worse, the specialist agent occasionally made decisions based on incomplete context, approving fraud claims that should have been rejected or rejecting legitimate disputes.
+
+The engineering team discovered that 23% of escalated conversations required customers to re-explain their issue. The company's head of CX called it "making customers pay for our architectural decisions."
+
+## Handoff as Serialization Problem, Not Routing Problem
+
+Routing is the easy part. You detect that the current agent cannot handle the user's request, you identify which agent should take over, and you transfer control. The hard part is **context serialization**: packaging everything the first agent knows into a format the second agent can understand and use.
+
+Context is not just conversation history. It is accumulated state, retrieved facts, intermediate reasoning, tool call results, user preferences, session metadata, and implicit assumptions. When the first agent says "the customer's account is locked," that statement depends on a tool call that checked account status. When the first agent says "this seems like fraud," that judgment depends on risk scoring logic the second agent might not have access to. When the first agent uses informal language, that choice reflects detected user preferences about communication style.
+
+A naive handoff passes only the conversation transcript. The second agent sees what was said but not why it was said, what data informed it, or what context makes it meaningful. This forces the second agent to either ask the user to repeat themselves or make inferences from incomplete information.
+
+A robust handoff passes the conversation transcript plus a structured context payload: retrieved entities, tool call results, confidence scores, session variables, and agent-specific state. The second agent reconstructs enough context to continue the conversation without re-asking questions.
+
+You design handoff as a serialization format, not a routing decision. Every agent in your system can export its state to a canonical format and import state from that format. Handoff becomes a save-and-load operation.
+
+## Lossy vs Lossless Context Transfer
+
+Lossless transfer preserves all context from the first agent. The second agent receives the full conversation history, all retrieved data, all tool call results, all session variables, and all agent-specific metadata. The second agent can continue the conversation as if it had been handling it from the start.
+
+Lossless transfer is expensive. If the first agent accumulated 50 turns of conversation, retrieved 20 database records, made 15 tool calls, and stored 10 session variables, you serialize and deserialize all of that. The second agent's first inference call includes the full context, which costs more tokens and adds latency. If the first agent and second agent have different context window sizes—GPT-4 with 128k vs Claude with 200k—you might exceed the second agent's limits.
+
+Lossy transfer preserves only the context the second agent needs to continue. You summarize the conversation history, drop irrelevant tool call results, and pass only high-priority session variables. The second agent gets enough context to avoid re-asking basic questions, but not enough to fully reconstruct the first agent's state.
+
+Lossy transfer is cheaper and faster but risks information loss. If you drop a tool call result that turns out to be relevant three turns later, the second agent cannot answer the user's question without re-executing the tool call. If you summarize the conversation too aggressively, you lose nuance that affects the second agent's reasoning.
+
+You choose lossless transfer when handoff is rare and context fidelity is critical. A medical diagnosis agent handing off to a treatment planning agent needs lossless transfer because missing a symptom or test result can lead to incorrect recommendations. You choose lossy transfer when handoff is common and efficiency matters more than completeness. A customer support agent handing off to a billing specialist can summarize the conversation and pass only account ID and issue type.
+
+## Context Serialization Formats
+
+A serialization format defines what context gets transferred and how it is structured. The simplest format is **raw transcript**, which passes the conversation history as an array of user and assistant messages. This works for stateless agents that do not accumulate context beyond the conversation log. It fails for agents that retrieve data, make tool calls, or track session variables.
+
+A better format is **transcript plus metadata**, which includes the conversation history and a key-value store of session variables: user ID, account status, transaction IDs, risk scores, language preference, authentication level. The second agent receives the conversation and the variables. This works for agents that share a common set of session variables. It fails when the first agent's variables are not meaningful to the second agent.
+
+The most robust format is **structured context payload**, which packages conversation history, session variables, tool call results, retrieved entities, and agent-specific state into a schema. The payload includes typed fields: `conversation_history` is an array of messages, `retrieved_entities` is an array of objects with type and ID, `tool_results` is an array of tool call records with timestamps and outputs, `session_vars` is a dictionary of variables with metadata indicating priority and relevance.
+
+You version your serialization format. When you add a new field or change the semantics of an existing field, you increment the version number. Agents check the version number when importing context and handle version mismatches gracefully: ignoring unknown fields, applying migrations for outdated fields, or rejecting incompatible versions.
+
+You compress serialized context when it exceeds size thresholds. A conversation with 100 turns and 50 tool call results might serialize to 200KB. You compress it to 40KB before passing it to the second agent. The second agent decompresses on load. This reduces network transfer time and storage cost.
+
+## Agent-to-Agent Handoff Protocols
+
+A handoff protocol defines the sequence of operations when control transfers from one agent to another. The simplest protocol is **synchronous handoff**: the first agent serializes context, blocks until the second agent confirms receipt, and then terminates. The user sees a single continuous conversation with no indication that agents changed.
+
+Synchronous handoff introduces latency. If serialization takes 200ms and the second agent takes 500ms to initialize, the user waits 700ms with no feedback. You mitigate this with a loading indicator: "Connecting you with a specialist..." The user knows something is happening.
+
+An alternative is **asynchronous handoff**: the first agent serializes context, sends it to the second agent, and immediately returns a transitional response to the user: "Let me connect you with someone who can help." The second agent initializes in the background and posts its first message when ready. This reduces perceived latency but requires the UI to handle messages arriving out of order.
+
+A more complex protocol is **collaborative handoff**: both agents are active simultaneously during the handoff window. The first agent introduces the second agent: "I'm bringing in Alex, our billing specialist." The second agent posts a greeting: "Hi, I'm Alex. I've reviewed your case and I see the issue." Both agents see the conversation history. The first agent can interject if the second agent misunderstands something. This feels more human but requires orchestration logic to prevent the agents from talking over each other.
+
+You log handoff events with timestamps, agent IDs, and serialization payloads. These logs are critical for debugging handoff failures. If the second agent produces low-quality responses after handoff, you inspect the serialization payload to determine whether the context was complete or the second agent misinterpreted it.
+
+## Model-to-Model Handoff and Capability Differences
+
+Handing off between agents running the same model is straightforward. The serialization format is consistent, context window sizes match, and both agents interpret the conversation history identically. Handing off between different models is harder because models have different capabilities, token limits, and interpretation biases.
+
+If you hand off from GPT-4 to Claude Opus, you must account for differences in tool calling conventions, system prompt behavior, and output formatting. GPT-4 uses function calling with JSON schemas. Claude uses tool use blocks with XML-like structure. If the first agent's tool call results are serialized in GPT-4 format, the second agent might not parse them correctly. You normalize tool call results into a model-agnostic format before handoff.
+
+If you hand off from a 128k context model to a 200k context model, you can pass more context. If you hand off from a 200k model to a 128k model, you must truncate or summarize. You detect context window limits before handoff and preemptively compress context if needed.
+
+If you hand off from a model with extended thinking to a model without it, you lose access to the first agent's internal reasoning. If that reasoning was important—"I considered three approaches and chose this one because..."—you need to serialize it explicitly as conversation context or metadata. Otherwise, the second agent makes decisions without understanding the first agent's rationale.
+
+You test handoff behavior across model pairs. If your system supports three models—GPT-4, Claude Opus, Claude Sonnet—you have six handoff pairs to test. Each pair might have different failure modes. You measure handoff quality by asking the second agent to summarize the context it received and comparing that summary to the first agent's final state.
+
+## Escalation Patterns and Tiered Agent Architectures
+
+Escalation is a special case of handoff where the second agent has more capabilities, higher cost, or greater specialization than the first. You escalate from a triage agent to a specialist agent, from a fast model to a slow model, or from a low-cost tier to a high-cost tier.
+
+Escalation happens when the first agent detects it cannot satisfy the user's request. The detection heuristics vary. The first agent might recognize that the user's query requires domain knowledge it lacks: "I need help with tax law." The first agent might detect low confidence in its own responses: "I'm not sure about this." The first agent might observe repeated clarification requests from the user: "Can you explain that differently?" These signals trigger escalation.
+
+You design escalation thresholds based on cost-quality trade-offs. If the first agent is GPT-4-turbo at $2 per million tokens and the second agent is Claude Opus at $15 per million tokens, you escalate only when the quality improvement justifies a 7.5x cost increase. You measure escalation precision: what percentage of escalated cases actually needed the specialist agent. If precision is low, your escalation thresholds are too sensitive. You measure escalation recall: what percentage of cases that needed escalation were escalated. If recall is low, your thresholds are too conservative.
+
+You prevent escalation loops. If the specialist agent also cannot handle the user's request, it should not escalate back to the triage agent. You define escalation chains: triage to specialist to human. Each step moves to a higher capability tier. If the highest tier cannot resolve the issue, you surface that to the user rather than looping.
+
+You track escalation rates as a product health metric. If 50% of conversations escalate, your triage agent is under-powered. If 2% of conversations escalate, your triage agent might be over-powered and you are paying for capabilities you do not need. A healthy escalation rate for most tiered architectures is 10-20%.
+
+## Session Variables and Stateful Handoff
+
+Session variables are key-value pairs that persist across conversation turns: user ID, account ID, transaction ID, language preference, authentication status, risk level. When you hand off between agents, you must transfer session variables so the second agent has the same context the first agent had.
+
+The challenge is that not all session variables are meaningful to all agents. The first agent might track "triage\_confidence: 0.87" which is irrelevant to the second agent. The second agent might need "billing\_account\_id" which the first agent never retrieved. You need a strategy for variable transfer, transformation, and initialization.
+
+The simplest strategy is **pass-through**: the first agent serializes all session variables, the second agent imports all of them, and each agent ignores variables it does not recognize. This works when agents share a common namespace and variable semantics are stable. It fails when variable names collide or when a variable has different meanings in different agents.
+
+A better strategy is **selective transfer with schema**: each agent declares which session variables it produces and which it consumes. The first agent exports only variables the second agent consumes. The second agent initializes missing variables by querying tools or prompting the user. This reduces serialization payload size and prevents namespace pollution.
+
+An advanced strategy is **variable transformation**: the first agent's session variables are mapped to the second agent's expected variables using a transformation function. If the first agent tracks "user\_tier: premium" and the second agent expects "subscription\_level: 3", you map "premium" to 3 during handoff. This requires maintaining transformation rules, but it decouples agents and allows them to evolve independently.
+
+You persist session variables in durable storage, not just in-memory. If the conversation spans multiple servers, server restarts, or long pauses, session variables must survive. You store them in Redis, DynamoDB, or your conversation database alongside the conversation history.
+
+## Handoff in Multi-Agent Orchestration Systems
+
+Multi-agent orchestration systems route user requests to multiple agents in parallel or sequence. A user query might go to an information retrieval agent, then a synthesis agent, then a formatting agent. Each handoff passes context forward.
+
+The key challenge is **context accumulation**. Each agent adds information to the context payload—retrieved documents, extracted entities, intermediate summaries. By the time the user's request reaches the final agent, the context payload is massive. You manage this with context pruning: each agent annotates the information it adds with relevance scores, and downstream agents prune low-relevance information before making inference calls.
+
+You design orchestration handoff as a **pipeline with checkpoints**. Each agent in the pipeline receives the upstream context, performs its task, appends results to the context, and passes the updated context downstream. If an agent fails, you can restart from the last checkpoint rather than re-running the entire pipeline. Checkpoints are serialized context snapshots stored in durable storage.
+
+You monitor end-to-end latency in multi-agent pipelines. If handoff overhead dominates task execution time, you have too many agents or your serialization format is too heavy. You measure handoff latency separately from agent execution latency to identify bottlenecks.
+
+You version agents independently. Agent A might be on version 2.3, agent B on version 1.8, and agent C on version 3.0. Each agent advertises which context schema versions it supports. The orchestrator ensures compatibility by transforming context payloads to match each agent's expected version.
+
+## Handoff Failures and Recovery Strategies
+
+Handoff fails when the second agent cannot import the first agent's context. This happens when the serialization format is incompatible, the context payload is corrupted, the second agent's dependencies are unavailable, or the context exceeds the second agent's capacity.
+
+When handoff fails, you have three recovery options. You can **restart with degraded context**: the second agent initializes with minimal context—user ID and conversation summary—and asks the user clarifying questions to rebuild state. This is slow but recoverable. You can **retry with the first agent**: if the second agent cannot initialize, the first agent continues handling the conversation and logs the escalation failure for later analysis. This keeps the conversation moving but sacrifices the benefits of escalation. You can **fail gracefully to human**: if both the first and second agents cannot handle the user's request, you route to a human agent with full context. This is expensive but ensures the user gets help.
+
+You detect handoff failures with timeout thresholds and health checks. If the second agent does not confirm context receipt within 5 seconds, you assume handoff failed. If the second agent's first response is "I don't have enough context," you flag a serialization problem.
+
+You log handoff failures with full diagnostic information: serialization payload size, schema version, agent versions, error messages, and timing. These logs inform schema evolution and agent compatibility testing.
+
+## Measuring Handoff Quality
+
+Handoff quality is measured by **context fidelity** and **user experience continuity**. Context fidelity is the percentage of relevant information that survives handoff. User experience continuity is the percentage of handoffs where the user does not have to repeat information.
+
+You measure context fidelity by comparing the second agent's understanding of the conversation to the first agent's final state. You prompt the second agent to list key facts it knows about the user's request and compare that list to the first agent's session variables and retrieved entities. If the second agent is missing critical facts, context fidelity is low.
+
+You measure user experience continuity by analyzing conversation transcripts after handoff. You detect whether the second agent asks questions the first agent already answered. You track user frustration signals: "I already told you that," "do I need to repeat myself," or abrupt conversation abandonment. High frustration rates indicate poor handoff quality.
+
+You A/B test handoff strategies. You run half your handoffs with lossless serialization and half with lossy summarization. You measure whether users in the lossy group experience more clarification requests or lower satisfaction. If lossy serialization performs as well as lossless, you adopt it to save cost and latency.
+
+You monitor handoff cost separately from agent cost. If serialization, transfer, and deserialization add $0.02 per handoff and you perform 100,000 handoffs per month, handoff overhead is $2,000. You compare that to the value of multi-agent specialization. If escalation to specialist agents improves resolution rates by 20% and saves $50,000 per month in support costs, the handoff overhead is justified.
+
+## Handoff UI and User Perception
+
+Users should not feel handoff as friction. The ideal handoff is invisible: the conversation continues seamlessly with no interruption, no repeated questions, and no explanation of what just happened. You achieve this with **contextual continuity cues**. The second agent's first message references something from the earlier conversation: "I see you're having trouble with the charge from January 15th. Let me look into that."
+
+When invisible handoff is not possible, you make handoff explicit but low-friction. You notify the user: "Let me connect you with a billing specialist who can help." The user knows the context is shifting. The second agent introduces itself: "Hi, I'm the billing specialist. I've reviewed your case and I see the issue." The user knows who they are talking to and that the new agent is informed.
+
+You avoid making the user wait during handoff. If handoff takes 3 seconds, you show a progress indicator or post an interim message: "Transferring you now..." When the second agent is ready, it posts immediately. The user experiences a short wait but not dead silence.
+
+You let users opt out of handoff. If the user says "I don't want to talk to someone else," you let the first agent continue or gracefully close the conversation. Forced handoffs frustrate users who have built rapport with the first agent.
+
+You track user sentiment before and after handoff. If satisfaction drops after handoff, your handoff experience is poor. If satisfaction rises, your specialist agents are delivering value.
+
+The next subchapter covers how to measure multi-turn conversation quality, tracking metrics at both turn and session levels to identify failure modes and optimize conversational AI systems.

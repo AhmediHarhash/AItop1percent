@@ -1,0 +1,143 @@
+# 4.2 — Context Window Management: Truncation, Summarization, Sliding Windows
+
+A legal document analysis startup burned through $340K in unnecessary API costs in November 2024 while their conversation features degraded into uselessness. Their contract review assistant would forget critical details the user mentioned fifteen turns earlier, contradict its own previous advice, and re-ask questions it had already answered. The team had built sophisticated legal reasoning prompts but ignored context window limits. They sent the entire conversation history with every API call, paying for thousands of tokens of redundant context. Once conversations exceeded 180 turns, they started silently truncating from the beginning to fit within limits. Users lost trust when the AI forgot their jurisdiction, contract type, and specific concerns.
+
+You need **context window management** the moment your AI product supports conversations lasting more than ten turns. Every LLM has a maximum context length: the total tokens it can process in one request, including system prompt, conversation history, current user message, and response. When your conversation history exceeds this limit, something must give. If you don't control what gets discarded or compressed, you'll lose critical information that makes subsequent turns incoherent.
+
+## The Context Window Ceiling
+
+Modern LLMs offer context windows from 8K to 200K tokens, but these aren't unlimited conversation histories. Your system prompt consumes tokens. Tool definitions consume tokens. The user's current message consumes tokens. Retrieved documents or search results consume tokens. What's left for conversation history is often less than half the advertised context window.
+
+For a system with a 32K token context window, you might allocate 2K for system prompt, 4K for tool definitions, 2K for the current user message and expected response, and 4K for retrieved context or documents. That leaves 20K for conversation history. At roughly 150 words per turn (user message plus assistant response), you can fit approximately 50-60 turns before hitting the limit.
+
+Users exceed this faster than you think. Customer support conversations easily reach 40-60 turns. Complex troubleshooting or planning conversations can exceed 100 turns. Coding assistants working through a debugging session accumulate hundreds of turns. If your product encourages ongoing dialogue rather than one-shot queries, you will hit context limits. Planning for this from the start is cheaper than retrofitting later.
+
+Tracking token usage per turn is essential. After generating each response, measure the total tokens in your conversation history. When you approach 80% of your allocated history budget, activate compression strategies. Waiting until you hit 100% means your next turn will fail or require emergency truncation that discards important context.
+
+## Naive Truncation and Its Failures
+
+The simplest context management strategy is truncation: when history exceeds your limit, delete the oldest turns. This requires minimal engineering and guarantees you stay within context limits. It also guarantees conversation quality degrades around turn 60.
+
+Truncation assumes recent context matters more than old context. For many conversations, this is wrong. A user might say "I'm working with Python 3.9 on macOS with the legacy database connector" in turn two, then forty turns later encounter an error related to Python version compatibility. If you truncated turn two, the assistant has no idea what Python version they're using. It will ask again or provide wrong advice.
+
+Truncation also eliminates conversation coherence signals. Users often refer back to earlier points: "Like we discussed before..." or "Going back to the authentication issue..." When the referenced content has been truncated, the assistant can't understand what the user means. It appears to have amnesia, destroying user trust.
+
+Some teams try to fix this with "smart" truncation: identify turns containing questions or important declarations and protect them from truncation. This helps but requires robust turn classification. You'll still lose important context that your classifier didn't recognize. And you're spending inference costs on turn classification to avoid spending inference costs on context. The economics rarely make sense.
+
+Truncation is an emergency fallback, not a strategy. If your only context management is truncation, your product has a hidden time bomb: users who love it for the first fifty turns will experience sudden quality collapse. You need proactive strategies that preserve essential information while managing token budgets.
+
+## Rolling Summarization
+
+**Rolling summarization** compresses old conversation history into summaries while retaining recent turns verbatim. After turn 30, you might summarize turns 1-20 into a 300-word summary, keep turns 21-30 in full, and send this compressed history with turn 31. As the conversation continues, you periodically summarize older sections and extend the verbatim window forward.
+
+The key decision is summarization granularity. Summarize too aggressively and you lose critical details. Summarize too conservatively and you barely reduce token usage. A good starting point: summarize in blocks of 10-15 turns, targeting 50-60% token reduction. If fifteen turns consumed 3K tokens, produce a summary consuming 1.2-1.5K tokens.
+
+Your summarization prompt must focus on information that might be referenced later. Don't create a play-by-play narrative: "The user asked about X, then the assistant said Y, then the user asked about Z." Instead, extract state: "The user is working with Python 3.9 on macOS. They've tried reinstalling the library and restarting their IDE. The authentication error persists with status code 401. The assistant recommended checking API key formatting and confirmed the endpoint URL is correct."
+
+Summarize at conversation milestones, not arbitrary turn counts. If your conversation has clear phases (problem description, attempted solutions, diagnosis, implementation), summarize when transitioning between phases. This preserves the logical flow better than mechanically summarizing every fifteen turns regardless of content.
+
+Test your summarization by simulating long conversations, summarizing early sections, and asking questions that require information from summarized turns. Does the assistant have enough detail to answer correctly? If you summarized a troubleshooting section and later the user says "That solution didn't work," can the assistant remember which solution they mean? Failed tests indicate you're summarizing too aggressively or missing key information types.
+
+## Sliding Window with Anchor Points
+
+A **sliding window** keeps the N most recent turns in full detail, discarding older turns entirely. This is truncation with a fixed window size. To make it effective, you add **anchor points**: specific high-value turns that are never discarded regardless of age.
+
+Identify anchor points programmatically. The first user message often contains context that remains relevant throughout: project details, user goals, constraints. Mark it as an anchor. Any turn where the user provides structured information (form submissions, configuration choices) should be anchored. Tool call results that established facts about the user's environment should be anchored.
+
+Your sliding window then maintains: all anchor points plus the most recent N turns. If N=20 and you have 5 anchors, you're sending roughly 25 turns of context with each request. As the conversation grows, your token usage stays constant, but you've preserved the most critical information from across the entire conversation.
+
+Anchor management requires pruning strategy. You can't infinitely accumulate anchors; eventually they'll fill your context budget. Set a maximum anchor count (maybe 8-10) and rank anchors by relevance or recency. When you need to add a new anchor but you're at the limit, drop the lowest-ranked existing anchor. This requires scoring anchor importance, which might be based on recency, reference count (how often subsequent turns referenced that information), or semantic importance.
+
+One effective pattern: combine sliding windows with lightweight summarization. Your context includes all anchors, a brief summary of turns outside your sliding window, and full detail for the N most recent turns. This three-tier approach balances detail preservation, token efficiency, and coherence across long conversations.
+
+## What to Keep vs. What to Discard
+
+Certain conversation elements are more valuable per token than others. **User intent statements** ("I need to migrate my database to PostgreSQL") provide high value. Retain these even as you compress surrounding discussion. **Concrete facts and decisions** ("We decided to use Redis for session storage") must be preserved. **Small talk and acknowledgments** ("Thanks, that helps") can be discarded immediately.
+
+Tool call results vary in persistence value. A web search result is valuable for 5-10 turns while discussing the found information, then becomes irrelevant. A database query result showing the user's current configuration might remain relevant for 100+ turns. Tag tool results with estimated relevance windows and aggressively discard those outside their window.
+
+Assistant explanations and elaborations are surprisingly compressible. When the assistant provides a 300-word explanation of database indexing strategies, what matters for future turns is: "The assistant explained indexing strategies and recommended B-tree indexes for this use case." The detailed explanation served its purpose in that turn. You rarely need the full text later.
+
+User questions persist longer than assistant answers. If the user asks "How do I handle authentication?", that question signals ongoing concern about authentication. Even after the assistant answers, the user might return to authentication topics twenty turns later. Questions reveal user mental models and priorities. They're worth retaining in at least summarized form.
+
+Track what information actually gets referenced in subsequent turns. Instrument your prompts to log when the LLM's response indicates it's drawing on specific parts of conversation history. Over time, you'll see patterns: turns containing certain keywords or structural elements get referenced frequently, while other turns never get referenced again after turn N+5. Use this data to improve your keep/discard decisions.
+
+## Summarization Timing and Triggers
+
+Summarize proactively based on token budgets, not reactively when you hit limits. When your conversation history reaches 70% of your allocated token budget, trigger summarization. This gives you buffer for token estimation errors and ensures you never hit hard limits mid-conversation.
+
+Summarize at natural conversation boundaries when possible. If you detect topic shifts (the user asks about a completely new subject), that's a good summarization point. If your conversation includes explicit phases or tasks, summarize when completing a phase. This makes summaries more coherent since they cover thematically related content.
+
+Consider incremental summarization for very long conversations. After turn 40, summarize turns 1-20. After turn 60, extend the summary to cover turns 1-40. This creates a growing summary that compresses older content while recent content stays detailed. Each summarization pass can reference the previous summary, creating a layered compression.
+
+Some conversations have episodic structure: the user solves a problem, starts a new problem, solves it, starts another. Each episode is relatively independent. Treat each episode as a separate summarization unit. Store episodic summaries externally (in a database) and only load relevant episodes into context based on the current topic. This is a hybrid approach between pure context management and external memory systems.
+
+## Engineering Summarization Systems
+
+Implement summarization as a separate service or function, not inline in your conversation loop. Your main conversation handler should detect when summarization is needed, call the summarization service with the turns to compress, receive the summary, and update conversation history. This separation makes testing and iteration easier.
+
+Summarization itself uses LLM calls, which have latency and cost. For high-volume products, this matters. Consider batching: when one conversation needs summarization, check if others do too and batch multiple summarization requests. Or use background workers: when summarization triggers, mark those turns for summarization and continue the conversation with full history temporarily, then apply the summary before the next turn.
+
+Store both full and summarized history for some period. If a user reports the AI "forgot" something or gave contradictory advice, you can review the full history to understand what got lost in summarization. This is debugging data, not production data, but it's invaluable for improving your summarization prompts.
+
+Your summarization prompt should evolve based on conversation domain. Technical support conversations need different summarization than sales conversations or creative brainstorming. You might maintain multiple summarization prompt templates and select the appropriate one based on conversation classification. This adds complexity but significantly improves summary quality.
+
+## Sliding Windows for Different Conversation Types
+
+Short-session conversations (fewer than 20 turns) don't need sophisticated context management. Use the full conversation history every turn. The complexity and potential information loss from summarization or truncation isn't worth it. Save your engineering effort for where it matters.
+
+Medium-session conversations (20-50 turns) benefit from simple sliding windows with a few anchors. Keep the first turn, the most recent 15 turns, and any turns flagged as high-importance. This covers 90% of use cases without complex summarization pipelines.
+
+Long-session conversations (50-200 turns) require rolling summarization or hierarchical approaches. Summarize aggressively for turns older than 50, moderately for turns 25-50, and keep turns 1-25 in full detail (with the most recent always in full). This gives you a gradient of detail that matches typical reference patterns.
+
+Very long sessions (200+ turns) should probably be restructured. Can you split the conversation into multiple sessions? Can you extract stable state into external storage and treat each session as relatively independent? If users regularly have 200+ turn conversations, you're probably using conversation history as a database, which is inefficient. Extract facts and decisions into structured storage and use retrieval augmented generation to pull them back as needed.
+
+## Token Estimation and Budget Management
+
+Accurate token counting is critical. Don't estimate tokens by character count or word count; those correlate poorly with actual tokenization. Use the tokenizer library for your specific model. GPT-4's tokenizer differs from Claude's tokenizer. Tokens per word vary by language and domain.
+
+Set token budgets for each context component. Allocate maximum tokens for system prompt, conversation history, current turn, retrieved documents, and expected response. Monitor actual usage against budgets per turn. When conversation history approaches its budget, trigger compression. When retrieved documents exceed their budget, summarize or truncate them.
+
+Reserve emergency buffer tokens. If your context window is 32K, don't budget all 32K. Reserve 2-3K for unexpected variation: user messages longer than anticipated, tool responses larger than expected, tokenization edge cases. Running into hard context limits mid-conversation creates user-facing errors. Buffer space prevents this.
+
+Track token efficiency metrics: tokens per turn, percentage of tokens from conversation history, how often you trigger compression. These metrics reveal optimization opportunities. If 60% of your tokens go to conversation history, you're probably not compressing aggressively enough. If you trigger compression every five turns, you might need a larger context window model or more aggressive initial compression.
+
+## Compression Quality Metrics
+
+Measure compression quality by continuation coherence: after compressing conversation history, does the next turn make sense? Generate test conversations, compress them at various points, and have the LLM continue the conversation. Compare continuations from full history versus compressed history. Significant divergence indicates compression loss.
+
+Track user corrections and confusion signals. When users say "No, I said X, not Y" or "We already discussed this," they're often responding to information loss from context management. Log these signals and review the compression that preceded them. You'll identify patterns: certain information types get lost, or compression at specific turn counts causes problems.
+
+Implement explicit memory verification questions occasionally. After compression, ask the LLM to verify it retained key information: "What Python version is the user working with?" "What was the main problem the user reported?" Compare these answers to the same questions with full history. Failures indicate compression quality issues.
+
+A/B test compression strategies with real users when possible. Route some conversations through aggressive compression and others through conservative compression. Measure conversation length, user satisfaction, task completion rate, and correction frequency. This reveals the real-world impact of your compression choices beyond synthetic tests.
+
+## Handling Context Loss Gracefully
+
+You will lose important context sometimes. Your compression won't be perfect. Users will reference information that was summarized away. Build graceful degradation into your conversation design. When the assistant doesn't have information it should have, it should ask rather than guess or hallucinate.
+
+Teach your assistant to recognize and acknowledge memory limitations: "I don't have the details from earlier in our conversation about X. Could you remind me?" This is better than confidently providing wrong information based on incomplete context. Users understand technology has limits. They don't accept systems that confidently lie.
+
+Allow users to re-provide lost context easily. If the assistant asks for information the user already provided, don't make them search back through conversation history. Let them copy-paste or re-submit it quickly. Consider UI features that let users "pin" important context so it's never compressed: "Keep this information available throughout our conversation."
+
+Log context loss incidents: when users had to repeat information or when the assistant asked for something already provided. These logs drive improvements to your compression strategy. High incident rates indicate you're compressing too aggressively or not preserving the right information types.
+
+## External Memory as Context Supplement
+
+Context windows store working memory, not long-term memory. For conversations that reference information across many sessions or need to access large knowledge bases, external memory systems supplement context. During turn processing, query external memory for relevant facts, inject them into current context, and proceed with limited conversation history.
+
+This hybrid approach means your conversation history doesn't need to contain every fact ever mentioned. It contains recent interactions and references to external knowledge. When the user mentions "the database migration we discussed last week," you query external memory for turns tagged with "database migration" from the relevant time period, retrieve a summary, and inject it into current context.
+
+External memory doesn't eliminate context window management; it complements it. You still need to decide what stays in context versus what lives externally, and when to query external stores. But it changes the economics: instead of compressing 100 turns into your context window, you keep 20 turns in context and query external memory for specific facts as needed.
+
+The trade-off is latency and complexity. External memory queries add latency to turn processing. Relevance ranking for memory retrieval adds complexity and potential failure modes. For most products, start with pure context window management and add external memory only when conversation patterns clearly benefit from it.
+
+## The Context Management Decision Tree
+
+Your context management strategy depends on conversation characteristics. For one-shot QA with no multi-turn requirements, you need nothing. For short conversations (fewer than 20 turns), use full history. For medium conversations (20-50 turns), use sliding windows with anchors. For long conversations (50+ turns), use rolling summarization. For very long conversations (200+ turns), restructure into sessions with external memory.
+
+Choose techniques based on measurement, not speculation. Instrument your current system to understand actual conversation lengths, token usage, and when quality degrades. If 95% of conversations are under 20 turns, don't build complex summarization systems. If 30% exceed 50 turns and show quality issues, invest in robust summarization.
+
+Start simple and add complexity as needed. Launch with sliding windows and anchors. Monitor for information loss. Add summarization when data shows it's necessary. Don't build the most sophisticated context management system possible; build the simplest system that solves your observed problems.
+
+Context window management keeps conversations coherent as they grow, but maintaining richer conversation memory across turns and sessions requires architectural decisions about how to store and retrieve different types of information.

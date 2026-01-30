@@ -1,0 +1,131 @@
+# 7.9 — Tool Result Interpretation and Grounding
+
+In August 2024, a legal research AI returned a memo citing three cases retrieved via its case_lookup tool. The tool had returned correct case names and citations, but the AI elaborated on the holdings, adding precedential weight that didn't exist in the actual tool results. An attorney relied on the memo in a court filing. When opposing counsel checked the citations, they found the case descriptions were fabricated. The law firm faced sanctions, and the AI vendor faced a lawsuit that settled for $1.8 million.
+
+Tools ground AI responses in reality, but only if the model actually uses what the tools return. Models have a persistent tendency to elaborate beyond tool outputs, blending retrieved facts with generated speculation. You cannot simply call tools and trust the model to faithfully represent results. You need architecture and prompting strategies that enforce grounding and detect when models drift from tool-provided data.
+
+## Models Treat Tool Results as Suggestions
+
+When you call a tool and return results to the model, the results appear in the conversation context as another message. The model reads this message the same way it reads anything else. It doesn't treat tool results as sacred truth. It treats them as additional input to consider alongside everything else in the context, including its parametric knowledge and any hallucinations it might generate.
+
+This means a tool can return "Product price: $29.99" and the model might still respond "The product costs around $30." The approximation seems reasonable to the model. But if the user makes a purchasing decision based on "around $30" and gets charged $29.99, that's not a problem. If the actual price is $29.99 and the user expects $30, that's not a problem either. But if the tool returns $29.99 and the model says $25, you have a grounding failure.
+
+The severity of grounding failures depends on your domain. In casual conversation, paraphrasing tool results is usually fine. In legal, medical, or financial contexts, any deviation from tool results can be catastrophic. Your system design must match your domain's tolerance for approximation. High-stakes domains need strict grounding enforcement.
+
+Most models are trained to use tool results when available, but training creates preferences, not guarantees. The model usually grounds responses in tool outputs, especially when prompted to do so. But "usually" isn't enough for production systems. You need to verify grounding, not just hope for it.
+
+## Grounding Responses in Tool Outputs
+
+The first line of defense is prompting. Your system prompt should explicitly instruct the model to base responses on tool results. "When tools return data, use that data directly in your response. Do not elaborate beyond what the tools return. Cite tool results verbatim when presenting facts." Clear instructions improve grounding but don't guarantee it.
+
+Formatting tool results helps. Instead of returning raw data, format it with clear labels. Rather than returning "29.99", return "Tool result - current_price: $29.99 (verified as of 2026-01-30T15:30:00Z)." The explicit framing makes it clearer to the model that this is authoritative data. The timestamp indicates freshness, which also matters for grounding.
+
+Some systems use XML or JSON structures to delimit tool results visibly. The tool returns {"<"}tool_result tool="get_price" status="success"{">"} ... {"{"}"/tool_result"{">"}, creating a clear boundary between tool output and other content. Models with strong structured data training recognize these delimiters and treat enclosed content as factual.
+
+You can also instruct the model to quote tool results. "When presenting prices, quote them exactly from the tool result using quotation marks." If the model responds with "The price is '$29.99' according to the database," you have stronger evidence of grounding than if it just says "The price is $29.99." The quotation marks indicate the model is referencing external data, not generating it.
+
+Chain-of-thought prompting helps too. Ask the model to first summarize what the tool returned, then formulate its response. "Tool returned: Product price is $29.99. User asked about price. Response: The current price for this product is $29.99." Making the reasoning explicit surfaces when the model drifts from tool results.
+
+## Hallucinating Beyond Tool Results
+
+Models hallucinate in predictable ways when they have partial information from tools. A tool returns a customer's name and email address. The model adds "John has been a customer since 2019 and has made 15 purchases." The model generated the purchase history even though the tool didn't return it. This elaboration feels helpful but is often fabricated.
+
+The root cause is the model's training to be helpful and complete. When a user asks about a customer and the tool returns limited information, the model wants to provide a thorough answer. It fills gaps with plausible-sounding details. These details might be statistically likely based on the model's training data, but they're not grounded in your actual data.
+
+Detecting this requires comparing model outputs to tool results. You can implement a verification layer that checks whether facts in the response appear in tool results. If the model mentions "15 purchases" but no tool returned purchase count, you flag this as potential hallucination. This isn't foolproof because paraphrasing is legitimate, but it catches obvious additions.
+
+Another pattern is models embellishing numerical data. A tool returns "Q4 revenue: $1.2M" and the model says "Q4 revenue grew to $1.2M, representing a 15% increase over Q3." The growth percentage wasn't in the tool result. The model might have calculated it from other context, or it might have invented it. Without verification, you can't distinguish legitimate inference from hallucination.
+
+Temporal hallucinations are common too. A tool returns current data without timestamps. The model adds "as of January 2026" or "in the latest report" even though the tool didn't specify timing. Sometimes the model gets this right by context. Other times it fabricates recency. Timestamps in tool results help, but models still sometimes hallucinate temporal claims.
+
+## Result Formatting for Model Consumption
+
+How you format tool results affects how well models use them. Dense JSON is harder for models to parse accurately than structured text. A tool that returns {"cust": {"n": "Alice", "e": "alice@example.com", "ph": "555-1234"}} is less clear than "Customer: Alice, Email: alice@example.com, Phone: 555-1234." Models handle natural language formatting better than compact data structures.
+
+Structured formatting with clear labels works best. Use key-value pairs with descriptive keys. "customer_name: Alice" is clearer than "name: Alice" when the tool might return multiple entities. Verbose keys reduce ambiguity and help models ground responses accurately.
+
+Hierarchical formatting matches how models process information. If a tool returns data about multiple entities, structure it hierarchically:
+
+Customer Information:
+  - Name: Alice Smith
+  - Email: alice@example.com
+  - Account Status: Active
+
+Order History:
+  - Recent Orders: 3
+  - Last Order Date: 2026-01-15
+  - Total Spend: $487.32
+
+This structure makes relationships clear and helps models cite specific sections of tool results accurately.
+
+Some teams format tool results as markdown tables for tabular data. Models handle tables reasonably well, and the format is visually parseable for humans reviewing conversation logs. Tables work well when tools return lists of items with consistent attributes.
+
+Length matters. Tools that return thousands of lines of data overwhelm model context. Models lose grounding when tool results exceed their attention span. Pagination helps: return the first 10 results and offer a tool to fetch more if needed. This keeps tool results concise and focused.
+
+## Teaching Models to Cite Tool Outputs
+
+Citation is stronger grounding than paraphrase. If the model quotes tool results and attributes them, you have verifiable grounding. If the model paraphrases, you need to check whether the paraphrase is faithful. Teaching models to cite requires both prompting and examples.
+
+System prompts should request citations explicitly. "When presenting data from tools, cite the tool by name and quote relevant portions of the result." Then show examples in few-shot prompts. User asks about price, tool returns price data, assistant responds "According to the get_price tool, the current price is $29.99." The example demonstrates the citation pattern.
+
+Some systems implement structured citation formats. The model must respond with claims paired with tool references: "Claim: The price is $29.99. Source: get_price tool, returned 2026-01-30T15:30:00Z." This formalization makes verification easier but feels less natural in conversational interfaces.
+
+You can also add citation as a post-processing step. After the model generates a response, a second pass checks each factual claim against tool results and adds citation tags automatically. "The price is $29.99 [source: get_price]." This approach separates natural language generation from grounding verification.
+
+The challenge is making citations useful without making responses stilted. Users don't want to read "According to the database_query tool invocation at timestamp 15:30:00, the value returned was..." They want to read "The current inventory is 47 units." Balancing grounding rigor with natural conversation is a product design decision.
+
+Some systems expose citations only when users ask for them. The primary response is natural and conversational. If the user questions a fact, the system can then provide "This information came from the inventory_check tool, which reported 47 units as of 30 minutes ago." This gives you verifiable grounding without cluttering every response with citations.
+
+## Multi-Tool Result Synthesis
+
+Complex queries often trigger multiple tool calls. The model needs to synthesize results from several tools into a coherent response. This is where grounding becomes difficult. When information comes from three different tools, models sometimes blend facts in ways that create false implications.
+
+Example: get_customer returns "Alice, email alice@example.com." get_orders returns three orders with order IDs. get_shipping returns "Order #123 shipped to 456 Oak St." The model might respond "Alice at 456 Oak St has placed three orders." But the shipping address was only for order #123, not necessarily Alice's home address. The synthesis introduced an assumption.
+
+Preventing this requires careful prompting about how to combine tool results. "When information comes from multiple tools, present each tool's results separately rather than merging them into unified statements." This makes responses more mechanical but more accurate. Users see distinct facts rather than synthesized narratives.
+
+Another approach is explicit reasoning steps. Prompt the model to identify what each tool returned before synthesizing. "get_customer returned name and email. get_orders returned order IDs. get_shipping returned the shipping address for order #123 specifically. Response: Alice has placed three orders. Order #123 was shipped to 456 Oak St." The reasoning makes the synthesis process visible.
+
+You can also structure tool results to make relationships explicit. Instead of separate tool calls, design tools that return related data together. A get_customer_details tool returns customer info, order count, and most recent shipping address in one structured result. This reduces the synthesis burden on the model.
+
+The risk of multi-tool synthesis is compounding hallucination. Each tool call introduces a chance for the model to drift from results. When you chain three tools, each with 95% grounding accuracy, your overall accuracy drops significantly. Minimizing the number of tools needed per response improves grounding.
+
+## Handling Ambiguous or Incomplete Tool Results
+
+Tools don't always return clean, complete data. A database query might return null fields. An API might return an error. A search might return zero results. Models need to handle these cases without hallucinating fallback data.
+
+When a tool returns null or empty results, the model should say so clearly. "The email address field is not set for this customer" rather than "The customer's email is pending" or worse, inventing an email address. Empty tool results should produce explicit acknowledgments of missing data, not gap-filling.
+
+Error handling is grounding-critical. If a tool call fails, the model should report the failure, not pretend it succeeded. "I attempted to check inventory, but the database query failed" is grounded. "Inventory is approximately 50 units" is not, if the tool didn't return a number. Models often try to help by estimating, which is dangerous.
+
+Ambiguous tool results need careful handling too. A search tool might return ten results, but only the top three are highly relevant. The model should present the most relevant results and note that others exist, rather than cherry-picking facts from low-relevance results to construct an answer.
+
+Partial matches require explicit disclosure. If a user searches for "Alice Johnson" and the tool returns "Alice Johnston" and "Alicia Johnson," the model should present these as near matches, not as exact matches. "I found two similar names: Alice Johnston and Alicia Johnson. Did you mean one of these?" The model must acknowledge uncertainty when tool results are ambiguous.
+
+Some teams implement confidence scoring in tool results. The tool returns data along with a confidence score: "customer_name: Alice (confidence: 0.95)." The model can then qualify responses: "The customer name is likely Alice, based on database records." This makes uncertainty explicit rather than hidden.
+
+## Verification and Grounding Audits
+
+You cannot trust grounding without verification. Production systems need automated checks that compare model responses to tool results and flag discrepancies. This is grounding auditing, and it's essential for high-stakes domains.
+
+The simplest verification is substring matching. Extract factual claims from the model's response and check whether they appear in tool results. If the model says "The price is $29.99" and no tool result contains "29.99," flag it. This catches obvious hallucinations but misses paraphrasing issues.
+
+More sophisticated approaches use a second model call to verify grounding. Pass the tool results and the model's response to a separate prompt that asks "Are all facts in the response supported by the tool results? List any unsupported claims." This verification layer catches paraphrasing issues that substring matching misses.
+
+You can also implement structured claim extraction. Parse the model's response into discrete factual claims, then check each claim against tool results. "Claim: Price is $29.99. Verification: Found in get_price tool result. Status: Grounded." This creates an audit trail for every fact in the response.
+
+Sampling and manual review matters. Automated verification catches clear problems, but human review surfaces subtle grounding issues. Regularly sample conversations, review tool results and model responses, and identify patterns where grounding fails. Use these patterns to improve prompts and verification rules.
+
+When verification detects grounding failures, you have options. You can reject the response and retry with stronger grounding prompts. You can edit the response to remove unsupported claims. You can flag the response for human review. The right approach depends on your use case and risk tolerance.
+
+## Real-Time Grounding Feedback
+
+Some systems implement real-time grounding feedback where users can challenge facts. If the model says "The price is $25" and the user says "That seems wrong," the system shows the tool result that grounded the claim. This transparency builds trust and surfaces grounding failures quickly.
+
+Implementation requires maintaining the linkage between response segments and tool results. When the model generates a response, you track which tool results influenced which parts of the response. This metadata enables you to show users the evidence for any claim they question.
+
+User challenges also improve your system. When users flag incorrect information, log whether the error was a tool failure or a grounding failure. If the tool returned wrong data, fix the tool. If the tool returned correct data but the model misrepresented it, improve grounding prompts. User feedback is your most valuable grounding signal.
+
+Some teams show tool results alongside responses proactively. The user sees both the natural language response and a panel with the raw tool results. This makes grounding verifiable without requiring users to challenge claims. It's more transparent but potentially overwhelming for casual use cases.
+
+The next chapter explores the opposite problem: when models don't just misinterpret tool results but invent entirely fictional tools or parameters that don't exist in your system.

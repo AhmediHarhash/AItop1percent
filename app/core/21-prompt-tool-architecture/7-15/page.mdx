@@ -1,0 +1,183 @@
+# 7.15 — Tool Observability: Logging, Tracing, and Debugging Tool Calls
+
+A healthcare AI startup processing medical records lost $2.8 million in October 2025 when their document processing system silently failed for three weeks. The system used AI agents with tools to extract patient data from PDFs, validate insurance eligibility, and update billing records. Everything appeared normal: the agents ran, the dashboard showed green status, users received completion notifications. But behind the scenes, the insurance eligibility tool was timing out 40% of the time due to a third-party API change. The agent retried, got timeouts, and fell back to marking all claims as "manual review required." Three weeks later, billing staff discovered 12,000 claims stuck in manual review limbo. No alerts fired. No monitoring caught the degradation. The tool was failing, the system was compensating, and no one knew until customers complained about delayed reimbursements.
+
+The problem was not tool failure. Tools fail constantly in production. The problem was **invisible failure**: the system had no observability into tool behavior, no tracing of tool call chains, no logging of tool results, and no debugging capability when things went wrong. Tool observability is not optional instrumentation you add later. It is foundational infrastructure that determines whether you can operate AI systems reliably in production or whether you discover failures only through customer complaints and revenue loss.
+
+## Why Tool Calls Are Different From API Calls
+
+You might think tool observability is just standard application monitoring: log requests, track latency, alert on errors. This works for deterministic systems where you control the caller. It breaks down for AI-driven tool usage where the model decides which tools to call, with what parameters, in what order, and how to interpret results.
+
+Traditional API monitoring assumes you know what endpoints will be called and when. You instrument specific code paths. Tool-using agents are non-deterministic. The same user query might trigger different tool sequences depending on model reasoning, context, or randomness in sampling. You cannot predict which tools will be called or in what order. Your observability must capture actual behavior, not expected behavior.
+
+Traditional monitoring assumes failures are binary: the request succeeded or failed. Tool calls have fuzzy outcomes. A tool might succeed technically but return results the model misinterprets. A tool might fail in ways the model compensates for without surfacing errors. A tool might succeed but return data that leads to downstream failures three tool calls later. You need observability that captures not just success/failure but semantic correctness and causal chains.
+
+Traditional monitoring tracks individual requests. Tool-using agents chain multiple tools together in sequences that span seconds or minutes. A single user query might trigger 15 tool calls across 4 different services. You need distributed tracing that connects these calls into a cohesive narrative showing how the agent reasoned through the problem.
+
+Tool observability requires capturing model reasoning, tool selection logic, parameter binding, execution results, and interpretation steps. It's not just logging that you called an API. It's logging why the model decided to call it, what it expected to learn, what it actually learned, and how that affected subsequent decisions.
+
+## Logging Tool Invocations and Parameters
+
+The foundation of tool observability is comprehensive invocation logging. Every time a tool is called, you log: which tool, what parameters, who initiated it, what context triggered it, and when it happened. This creates an audit trail that lets you reconstruct tool usage patterns and debug unexpected behavior.
+
+Log the tool name and the full parameter set. If the model called `search_database` with `query="patients over 65"` and `limit=100`, log both parameters exactly as provided. Don't log just "search_database was called." You need the specifics to understand what the model attempted. Redact sensitive data in logs, but preserve parameter structure and types.
+
+Log the decision context that led to the tool call. What was the user's query? What was the conversation history? What other tools did the model consider before choosing this one? This context explains why the model selected this tool at this moment. Without it, you see a sequence of tool calls but cannot understand the reasoning that connected them.
+
+Log the model's stated intent if available. Some tool-calling frameworks require or allow the model to explain why it's calling a tool: "I'm calling search_database to find patients matching the eligibility criteria." This intent is invaluable for debugging when tools are called inappropriately or when the model's reasoning diverges from intended behavior.
+
+Log timestamps with high precision. Tool call sequences often happen within milliseconds. You need precise timing to understand order of operations, identify race conditions, and measure latency accurately. Millisecond or microsecond precision timestamps enable detailed performance analysis.
+
+Include correlation IDs that link tool calls to user sessions, requests, or conversation turns. A user's single question might trigger a cascade of tool calls. Correlation IDs let you group related tool calls together, reconstruct the full interaction, and trace causes of failures across the entire chain.
+
+## Logging Tool Results and Errors
+
+Logging invocations tells you what was attempted. Logging results tells you what actually happened. Every tool call must log its result: success or failure, returned data, execution time, and any errors or warnings.
+
+Log success/failure status explicitly. Don't assume that absence of an error means success. Tools might return successfully but with empty results, partial data, or degraded quality. Explicit status fields make filtering and analysis straightforward.
+
+Log result summaries that capture semantic content without overwhelming log storage. If a tool returns 500 database records, don't log all 500 records. Log summary statistics: record count, date range, key fields, or a sample. This provides visibility into what was returned without creating gigabyte log files.
+
+Log full error messages and stack traces when tools fail. "Database error" is not useful. "Database connection timeout after 30s connecting to prod-db-01.internal:5432, connection pool exhausted" is useful. Detailed error information enables rapid diagnosis. Structure errors consistently so automated analysis can categorize failure modes.
+
+Log partial failures and degraded results. A search tool that tries 5 data sources and gets results from 3 succeeded partially. Log which sources failed, why, and how the partial result might affect downstream reasoning. The model might compensate for missing data, but you need visibility into what was missing to understand system behavior.
+
+Log result interpretation by the model if observable. Some frameworks log not just the tool result but the model's summary or interpretation of that result. If the tool returns "42 records found" and the model interprets that as "the database contains relevant patients," logging that interpretation helps you debug cases where the model misunderstood tool results.
+
+## Distributed Tracing for Tool Chains
+
+Individual tool logs show trees. Distributed tracing shows forests. When an agent calls 10 tools in sequence to answer a complex query, you need tracing that connects those calls into a coherent execution path showing dependencies, timing, and causal relationships.
+
+Implement trace IDs that persist across all tool calls in a single agentic interaction. When a user asks a question, generate a trace ID. Every tool call triggered by that question, directly or indirectly, includes that trace ID. This allows you to query your logs for a specific trace ID and see the complete tool usage pattern for that interaction.
+
+Use span-based tracing similar to distributed tracing in microservices. Each tool call is a span with a start time, end time, parent span, and metadata. Spans nest to show which tool calls were triggered by results from previous tools. This hierarchical structure reveals the agent's reasoning flow.
+
+Capture inter-tool dependencies in your traces. If tool A's result was used as input to tool B, the trace should show that causal link. If tool C was only called because tool A succeeded but tool B failed, the trace should capture that conditional logic. These dependencies are critical for understanding complex agent behavior.
+
+Integrate AI tool tracing with your existing distributed tracing infrastructure. If your agent calls tools that invoke microservices, and those microservices have their own tracing, connect the traces. The full execution path from user query through agent reasoning through tool calls through backend services should be one continuous trace. This end-to-end visibility is essential for debugging cross-system failures.
+
+Visualize traces with timeline views that show tool calls, durations, dependencies, and results. Text logs are useful for querying, but visual timelines make complex tool chains comprehensible. You can see at a glance that tool A took 3 seconds, tool B ran in parallel and finished first, tool C waited for both, and the total latency was 5 seconds.
+
+## Debugging Failed Tool Calls
+
+When a tool call fails, you need enough information to understand why it failed, whether the failure was justified, and how to prevent similar failures. This requires structured error logging, context preservation, and failure categorization.
+
+Categorize failures by type: network errors, authentication failures, validation errors, business logic failures, timeouts, rate limits. Each category requires different remediation. Network errors might need retries. Authentication failures need credential rotation. Validation errors need schema updates. Categorization enables automated alerts and responses.
+
+Log the full context that led to failure. What were the tool parameters? What was the model's reasoning? What had happened in previous tool calls? Often failures result from accumulated context: tool A returned data that tool B misinterpreted, leading to invalid parameters for tool C. Without full context, you only see "tool C failed" and miss the root cause.
+
+Preserve failed tool call state for replay and debugging. Store the exact parameters, environment state, and model reasoning so you can replay the failed call in a debugging environment. Replay helps you test fixes, understand intermittent failures, and reproduce issues reported by users.
+
+Implement failure drill-down from high-level metrics to specific instances. Your dashboard shows "search_database tool failed 45 times in the last hour." You click that metric and see the 45 specific failures, their parameters, their error messages, and their context. You notice 40 of 45 have the same error: a missing field in the schema. You fix the schema. This workflow depends on linking metrics to logs to specific instances.
+
+Alert on unexpected failure patterns, not just individual failures. One failed tool call might be normal. A spike in failures, failures concentrated on specific tools or parameters, or failures correlated with specific users or times might indicate systemic issues. Pattern detection separates signal from noise.
+
+## Observability Dashboards for Tool Usage
+
+Real-time dashboards make observability actionable. You need visual interfaces that show tool usage patterns, performance metrics, failure rates, and anomalies at a glance, enabling rapid response to issues.
+
+Build dashboards that show tool call volume over time for each tool. You can see normal usage patterns and detect anomalies: sudden spikes in calls to one tool, unexpected drop-offs in another tool, shifts in which tools are most frequently used. These patterns reveal changes in model behavior, user patterns, or system health.
+
+Display tool latency distributions, not just averages. The average latency might be 200ms, but if the 99th percentile is 30 seconds, some users are experiencing terrible performance. Percentile charts show tail latency that averages hide. You want to see p50, p95, p99 latencies for every tool.
+
+Show tool success rates and failure rates by tool and by failure category. A success rate of 98% sounds good until you see that 2% failure translates to 5,000 failed calls per day affecting real users. Absolute numbers and percentages both matter. Break down failures by type so you know whether failures are network issues, validation errors, or business logic problems.
+
+Track tool selection patterns: how often does the model choose each tool, and how often does it choose the right tool for a given query type. If users ask database questions but the model only uses the database tool 60% of the time, your tool descriptions or model prompting might need improvement. Selection accuracy is a key quality metric.
+
+Monitor tool result quality metrics where feasible. For tools that return data, track metrics like result count, empty results, data freshness, or confidence scores. Declining quality metrics might indicate that external APIs have changed, data sources have degraded, or tool logic needs updates.
+
+## Alerting on Tool Anomalies
+
+Observability without alerting is just data collection. You need automated alerts that notify you when tool behavior deviates from normal patterns, enabling proactive response before users experience significant impact.
+
+Alert on tool failure rate thresholds. If any tool's failure rate exceeds 5% over a 5-minute window, fire an alert. This catches acute failures from API outages, credential expiration, schema breaking changes, or infrastructure issues. Fast alerts enable fast remediation.
+
+Alert on tool latency degradation. If p95 latency for a tool doubles compared to the previous hour, something changed. Maybe an external API slowed down, maybe database queries aren't optimized for current load, maybe network issues emerged. Latency alerts catch performance degradation before it becomes unbearable.
+
+Alert on unexpected tool usage patterns. If a rarely-used administrative tool suddenly gets called 1000 times in a minute, investigate. It might be a bug causing infinite loops, an attacker probing your system, or a legitimate use case you didn't anticipate. Anomaly detection on call volume catches unexpected behavior.
+
+Alert on tool selection anomalies. If the model stops using a critical tool, starts using tools in unusual combinations, or begins calling tools with invalid parameter patterns, alert your team. These anomalies might indicate model degradation, prompt injection attacks, or bugs in tool selection logic.
+
+Alert on cascading failures where one tool failure causes downstream tool failures. If tool A fails and then tools B, C, and D all fail immediately after, the root cause is probably in tool A. Detecting cascading failures helps you focus remediation on root causes rather than symptoms.
+
+Implement alert suppression and grouping to avoid alert fatigue. If 100 tool calls fail due to one database outage, send one alert about the database outage, not 100 alerts about individual failures. Group related alerts, suppress duplicate alerts, and provide context that helps responders understand impact and urgency.
+
+## Debug Logs vs Production Logs
+
+Production logging balances observability with performance and storage costs. Debug logging sacrifices efficiency for completeness. You need both, but at different times and for different purposes.
+
+Production logs should be structured, efficient, and sampled if necessary. Log essential information for every tool call: tool name, parameters (redacted), result status, latency, error messages. Don't log full result payloads unless errors occur. Use log levels appropriately: INFO for normal operations, WARN for degraded results, ERROR for failures. Sample high-volume tools if logging every call creates excessive cost.
+
+Debug logs should be comprehensive and verbose. Log everything: full parameters, full results, model reasoning, alternative tools considered, intermediate states, environmental variables. Debug logs help you understand exactly what happened when investigating specific failures. Enable debug logging on demand for specific users, sessions, or query types.
+
+Implement dynamic log level adjustment. Start with production-level logging. When investigating an issue, temporarily elevate logging to debug level for affected users or tools. Collect detailed information, resolve the issue, and return to production log levels. This gives you deep visibility when needed without constant overhead.
+
+Retain debug logs separately from production logs with different retention policies. Production logs might be retained for 30 days. Debug logs for specific investigations might be retained for 7 days or until the issue is resolved. Separate retention prevents debug logs from inflating storage costs.
+
+Provide self-service log access for debugging. Engineers investigating issues should be able to query logs, filter by trace ID or user ID, and download relevant log segments without waiting for ops team assistance. Self-service accelerates debugging and reduces operational burden.
+
+## Privacy and Security in Tool Logging
+
+Tool logs often contain sensitive information: user queries, tool parameters that include personal data, tool results with confidential information. You must log enough to debug issues while protecting user privacy and complying with regulations.
+
+Redact sensitive data in logs automatically. Before writing logs, run them through redaction that removes or masks PII, credentials, financial information, health data, and other sensitive content. Redaction should preserve structure so logs remain useful: replace "John Smith" with "USER_123" consistently across logs, don't just delete it.
+
+Implement role-based access control for logs. Not everyone needs access to all logs. Support engineers might see redacted logs. Security engineers might see full logs. Compliance officers might see audit logs. RBAC ensures people see only the information they need for their role.
+
+Log to tamper-proof storage that prevents modification or deletion. Audit trails must be trustworthy. Append-only log storage, cryptographic integrity checks, and write-once storage ensure that logs cannot be altered after creation. This is critical for compliance and forensic investigations.
+
+Comply with data retention regulations. GDPR requires deleting personal data upon request. If tool logs contain personal data, implement mechanisms to purge specific user data from logs when required. This is technically challenging but legally necessary.
+
+Consider differential privacy techniques for logging aggregated metrics. Instead of logging individual tool calls with user IDs, log aggregated statistics that preserve privacy while enabling analysis. This reduces privacy risk but limits debugging capability for individual failures. Choose the right balance for your use case.
+
+## Integrating Tool Observability with Incident Response
+
+Tool observability must integrate with your incident response processes. When something goes wrong, responders need quick access to tool logs, traces, and metrics to diagnose and resolve issues.
+
+Create runbooks that link common alerts to specific log queries. When the "database_search tool failure rate high" alert fires, the runbook should include exact log queries to identify affected users, error patterns, and root causes. This reduces mean time to resolution by eliminating guesswork.
+
+Build dashboards specifically for incident response. Normal operational dashboards show trends and patterns. Incident dashboards focus on the current problem: which tool calls are failing right now, what errors are they returning, which users are affected, what changed recently. These focused views accelerate diagnosis during incidents.
+
+Implement log correlation with deployments and configuration changes. When investigating a spike in tool failures, you need to know: was there a deployment in the last hour, did configuration change, did an external API update? Correlating logs with change events reveals causes quickly.
+
+Provide log export and analysis tools for deep investigations. Sometimes you need to download logs, run custom analysis scripts, or share logs with vendor support. Make export easy and fast. Provide analysis tools that handle large log volumes efficiently.
+
+Document common failure patterns and their log signatures. "If you see error X in tool Y logs, the problem is usually Z." This institutional knowledge accelerates incident response, especially for on-call engineers who aren't tool experts.
+
+## Tool Observability as a Development Practice
+
+Tool observability isn't just operational infrastructure. It's a development practice that shapes how you design, test, and iterate on tools.
+
+When designing new tools, define observability requirements upfront. What should be logged? What metrics matter? What failures need alerts? Observability is easier to build in than retrofit. Make logging, tracing, and metrics part of the tool interface contract.
+
+Test tools with observability enabled. Run test suites, observe logs and traces, verify that logged information is sufficient to debug failures. If you can't debug a test failure using only logs and traces, you need better observability before deploying to production.
+
+Use tool observability data to improve tool design. If logs show that a tool fails frequently with invalid parameters, improve parameter validation or tool descriptions. If traces show that tools are often called in inefficient orders, optimize tool selection logic. Observability data drives continuous improvement.
+
+Review tool observability dashboards regularly, not just during incidents. Weekly dashboard reviews reveal trends: tools becoming slower, tools being used in unexpected ways, tools accumulating subtle bugs. Proactive monitoring prevents issues from escalating to incidents.
+
+Share tool observability insights across teams. Product teams learn what features users actually use through tool call patterns. Engineering teams identify performance bottlenecks. Security teams detect abuse patterns. Observability data is valuable beyond operations.
+
+## The Cost-Visibility Trade-off
+
+Comprehensive observability has costs: storage for logs and traces, compute for processing and indexing, latency from instrumentation, complexity from additional infrastructure. You must balance visibility with these costs.
+
+Sample high-volume tools strategically. If a tool is called 100,000 times per hour and has historically stable behavior, sample at 10% and log only 10,000 calls per hour. If that tool starts failing, temporarily increase sampling to 100% for debugging. Adaptive sampling maintains visibility while controlling costs.
+
+Use tiered storage for logs. Keep recent logs in fast, expensive storage for rapid querying. Move older logs to cheaper, slower storage. Archive very old logs to cold storage or delete them when no longer needed. Tiered storage reduces costs without sacrificing short-term visibility.
+
+Aggregate metrics instead of raw logs where appropriate. Store every tool call's latency in logs, but also compute and store aggregate metrics: average latency per hour, failure counts per tool, etc. Aggregates are cheaper to store and query than raw logs, sufficient for many analyses.
+
+Invest in high-value observability and skimp on low-value observability. User-facing tools need comprehensive logging. Internal debugging tools might need less. Critical tools need detailed tracing. Rarely-used tools might get basic logging. Prioritize observability investment based on tool importance and usage.
+
+Continuously evaluate whether observability investments pay off. Are you actually using those traces? Do those debug logs help resolve incidents faster? If observability data isn't being used, reduce the investment. If gaps cause painful debugging, increase investment. Adjust based on actual utility.
+
+## The Path Forward
+
+Tool observability transforms AI agents from black boxes into understandable, debuggable, and improvable systems. Without observability, you discover problems through user complaints and post-mortem analysis. With observability, you detect issues proactively, diagnose them rapidly, and prevent recurrence.
+
+Build observability into your tool infrastructure from day one. Retrofit is expensive and incomplete. Design every tool with logging, tracing, and metrics as first-class requirements. Make observability a non-negotiable part of tool development.
+
+Treat tool observability as an evolving practice. As your agents become more complex, your observability needs will grow. As your scale increases, your observability infrastructure will need optimization. Continuously invest in observability capabilities that match your system's maturity and complexity.
+
+The next section examines tool performance optimization: reducing latency, minimizing costs, and implementing caching strategies that make tool-using agents fast enough for production use cases while controlling operational expenses.

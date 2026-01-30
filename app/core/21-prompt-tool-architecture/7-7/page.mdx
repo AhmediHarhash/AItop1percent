@@ -1,0 +1,191 @@
+# 7.7 — Tool Timeouts, Rate Limits, and Circuit Breakers
+
+A customer support AI platform launched in December 2024 with tools that fetched ticket history, queried knowledge bases, and updated CRM records. They set 30-second timeouts on all tools, assuming generous timeouts would prevent failures. Instead, they created a nightmare: when external services slowed down, every request hung for 30 seconds before failing. Support queues backed up. Users waited minutes for responses. Concurrent requests piled up, exhausting connection pools and bringing down the entire system. By the time they reduced timeouts to 3 seconds and implemented circuit breakers, they had lost $500,000 in service credits and canceled contracts. The tools were capable—the protective infrastructure was catastrophically inadequate.
+
+Timeouts, rate limits, and circuit breakers are the defensive systems that protect AI applications from the chaos of production environments. External services slow down. APIs hit rate limits. Databases get overwhelmed. Without protection, these problems cascade through your system, turning isolated issues into total failures.
+
+Most developers treat these protections as afterthoughts, adding them when problems emerge. But defensive infrastructure must be designed in from the start. You can't retrofit circuit breakers onto a system that's already failing. You can't add rate limiting to tools that are already exhausting API quotas. Protection must be proactive, not reactive.
+
+## Timeout Strategy Design
+
+Timeouts prevent slow operations from blocking your system indefinitely. Every tool call needs a timeout, but the right timeout value depends on tool behavior, user expectations, and system architecture.
+
+**Operation-based timeouts** vary by tool type. Read operations should be fast: 1-3 seconds for database queries, 2-5 seconds for API calls. Write operations can be slightly slower: 3-5 seconds for database writes, 5-10 seconds for complex API operations. Set timeouts based on realistic operation duration, not best-case scenarios.
+
+**Percentile-based timeout setting** uses production data to inform timeout values. Measure tool execution time at the 95th percentile. A tool that completes in 500ms on average but takes 4 seconds at p95 needs a timeout around 5-6 seconds. You're accepting that the slowest 5% of operations will time out, which is often the right tradeoff.
+
+**User experience timeouts** consider how long users will wait. Even if a tool could theoretically complete in 15 seconds, users won't wait that long. For interactive applications, 5 seconds is usually the maximum acceptable delay. Tools that routinely need more time should be redesigned, made asynchronous, or eliminated.
+
+**Cascading timeouts** in multi-tool workflows require careful planning. If a workflow calls three tools sequentially, and each has a 5-second timeout, the total workflow could take 15 seconds to fail. Set an overall workflow timeout shorter than the sum of individual timeouts to fail fast at the workflow level.
+
+Don't use the same timeout everywhere. A lightweight cache lookup might time out at 500ms while a complex report generation times out at 10 seconds. Differentiate based on operation characteristics. Generic timeouts cause fast operations to wait too long and slow operations to fail prematurely.
+
+## Rate Limiting Tool Usage
+
+Rate limits protect both your system and external services from overload. Without rate limiting, a spike in user traffic can exhaust API quotas, overload databases, or trigger external service rate limits.
+
+**Per-user rate limits** prevent individual users from overwhelming your system. A user shouldn't be able to trigger 100 tool calls in 10 seconds, whether accidentally or maliciously. Limit tool calls per user per time window: 10 calls per minute, 100 calls per hour. Adjust based on legitimate usage patterns.
+
+**Per-tool rate limits** protect individual tools from overuse. A tool calling an expensive external API might have stricter limits than one querying a local cache. Set limits based on resource cost, not arbitrary numbers. An API with a 100 requests/minute quota should have tool-level limits that ensure you stay under that quota across all users.
+
+**Global rate limits** protect your entire system from overload. Even if per-user and per-tool limits are reasonable, the aggregate load might overwhelm shared resources like database connection pools. Set system-wide limits based on infrastructure capacity.
+
+**Adaptive rate limiting** adjusts limits based on system health. When error rates increase or latency degrades, tighten rate limits to protect the system. When conditions improve, relax limits. This requires monitoring system metrics and dynamically adjusting rate limit thresholds.
+
+**Token bucket** and **leaky bucket** algorithms implement rate limiting smoothly. Token bucket allows bursts (accumulate tokens over time, spend them on requests) while leaky bucket enforces steady rates (process requests at fixed rate regardless of arrival pattern). Choose based on whether you want to allow occasional bursts or enforce strict rate consistency.
+
+## Circuit Breaker Patterns
+
+Circuit breakers prevent cascading failures by stopping calls to failing services before they waste resources or cause further damage. A circuit breaker monitors tool execution and "opens" when failures exceed thresholds, blocking subsequent calls until the service recovers.
+
+**The three states** of a circuit breaker are closed (normal operation), open (failing, blocking calls), and half-open (testing recovery). Initially, the breaker is closed and passes all requests through. When failures exceed a threshold, it opens and rejects requests immediately without attempting execution. After a timeout, it enters half-open state and allows a few test requests. If these succeed, it closes. If they fail, it reopens.
+
+**Failure thresholds** determine when breakers open. A common pattern is "5 failures within 10 seconds" or "50% failure rate over last 20 requests". The threshold should be high enough to tolerate occasional failures but low enough to detect persistent problems quickly. Set thresholds based on baseline error rates.
+
+**Timeout periods** control how long breakers stay open before testing recovery. Too short, and you'll repeatedly test a still-failing service, wasting resources. Too long, and you'll delay recovery unnecessarily. Start with 30-60 seconds for most tools, adjusting based on observed recovery times for specific services.
+
+**Half-open testing** uses a small number of requests to test recovery. Allow 1-3 requests through in half-open state. If all succeed, the service is likely recovered—close the breaker. If any fail, the service is still unhealthy—reopen the breaker for another timeout period. This gradual testing prevents premature recovery declarations.
+
+Circuit breakers should be per-tool or per-dependency. If your database is down, open breakers for all tools using that database. If an external API is failing, open breakers only for tools calling that API. Granular breakers prevent one failure from affecting unrelated functionality.
+
+## Fallback Behaviors
+
+When timeouts, rate limits, or circuit breakers block tool execution, your system needs fallback behaviors. Failing silently is rarely acceptable—users still need responses.
+
+**Cached data fallbacks** provide stale but valid information when real-time data is unavailable. If get_current_price times out, return the last known price with a timestamp. Users understand that cached data is better than no data, as long as you're transparent about staleness.
+
+**Degraded functionality** offers limited features when full features are unavailable. If recommendation tools fail, fall back to manual search. If personalization fails, provide generic responses. The system continues working, just less optimally.
+
+**Alternative tools** provide different ways to accomplish tasks. If the primary payment processor is circuit-broken, route to a backup processor. If the high-accuracy search is rate-limited, use the fast approximate search. Design redundancy into critical paths.
+
+**Graceful errors** explain to users why functionality is unavailable. "Our product recommendations are temporarily unavailable, but I can help you search manually" sets expectations and offers alternatives. Don't pretend full functionality exists when it doesn't.
+
+The model should participate in fallback decisions. Return information about what's available and unavailable. The model can then choose appropriate fallbacks, explain limitations to users, and adjust its approach. "Note: Real-time inventory unavailable, using cached data from 1 hour ago" helps the model make informed decisions.
+
+## Protecting Downstream Services
+
+Your tool calls affect external services—databases, APIs, third-party systems. Protection isn't just about your system's health but about being a responsible consumer of downstream resources.
+
+**Request coalescing** combines multiple identical requests into one. If three users simultaneously ask for the same product details, make one API call and share the result. This dramatically reduces load on downstream services when traffic patterns are bursty or redundant.
+
+**Request throttling** spreads load over time instead of overwhelming downstream services with bursts. Queue tool calls and execute them at a controlled rate. This might increase individual latency slightly but prevents spikes that trigger downstream rate limits or failures.
+
+**Connection pooling** reuses connections instead of creating new ones for each request. Establishing connections is expensive. Pools of maintained connections reduce overhead and prevent exhausting connection limits on downstream services. Configure pool sizes based on expected concurrency and downstream capacity.
+
+**Retry budgets** limit total retry attempts across the system. If you're hitting an API that's currently failing, allowing every failed request to retry three times might overwhelm it further. Implement a system-wide retry budget: only X% of failed requests can retry simultaneously. This prevents retry storms.
+
+Communicate with downstream service providers about your usage patterns. If your AI product might generate 10x normal API traffic, coordinate with providers. Some might offer dedicated rate limit increases, suggest usage optimization, or provide guidance on their service's capacity.
+
+## Timeout Implementation Patterns
+
+Implementing timeouts correctly is more nuanced than wrapping operations in a timeout handler. Different programming languages and frameworks handle timeouts differently, and subtle bugs are common.
+
+**Network timeouts** require setting both connection timeout (how long to wait for a connection to establish) and read timeout (how long to wait for data once connected). A 5-second timeout should be split: 2 seconds to connect, 3 seconds to read. Slow connections are different from slow responses, and timeouts should reflect this.
+
+**Database timeouts** need careful tuning. A query timeout of 3 seconds protects your application, but what happens to the query? It might continue running in the database, consuming resources. Some databases support query cancellation on timeout; others don't. Understand your database's timeout behavior.
+
+**Partial response handling** deals with operations that time out after partially completing. If you're streaming data and the stream times out mid-transfer, you have partial data. Decide whether to use it, discard it, or flag it as incomplete. The right choice depends on data semantics.
+
+**Cleanup on timeout** ensures resources are released. If a tool times out, close connections, release locks, and free memory. Timeouts that leak resources eventually exhaust system capacity. Implement proper cleanup in timeout handlers.
+
+Test timeout behavior explicitly. Don't just test that timeouts trigger—test what happens to system state when they do. Are resources cleaned up? Are error messages correct? Does retry logic work? Timeout code paths are error-prone because they're not exercised in normal development.
+
+## Rate Limit Response Design
+
+When rate limits are hit, how you respond affects user experience and system stability.
+
+**Backoff and retry** is appropriate for brief rate limit exceedances. If you hit a per-second limit, waiting one second and retrying often succeeds. Implement exponential backoff: wait longer with each successive rate limit hit. This prevents tight retry loops.
+
+**Queue and defer** handles rate limits by queueing requests for later execution. If a user's tool call is rate-limited, queue it and execute when capacity is available. Return a message like "This is taking longer than usual, please wait" to manage expectations. This works for background operations but not real-time user interactions.
+
+**Fail fast** for hard limits means immediately returning an error instead of waiting or retrying. If you've exhausted your daily API quota, retrying or queuing won't help. Tell users that functionality is temporarily unavailable and when it will return.
+
+**Priority queuing** allocates rate-limited capacity to high-value operations first. If you have 100 API calls available and 200 pending, prioritize paid users over free users, or critical operations over nice-to-have features. This requires classifying tool calls by priority.
+
+Communicate rate limit information to the model. "Note: API rate limits are currently tight, responses may be slower" or "This tool is temporarily limited due to high usage" helps the model set user expectations and choose alternative approaches when available.
+
+## Circuit Breaker Implementation
+
+Circuit breakers require state management and coordination across your application instances.
+
+**In-memory circuit breakers** are simple but instance-local. Each application instance tracks circuit breaker state independently. This works for single-server deployments but creates inconsistency in distributed systems—one instance might have an open breaker while another's is closed.
+
+**Distributed circuit breakers** use shared state stores (Redis, memcached) to coordinate breaker state across instances. When one instance detects failures and opens a breaker, all instances see the open breaker. This provides system-wide protection but adds infrastructure complexity.
+
+**Failure detection** in circuit breakers must be accurate. Not all errors should count toward failure thresholds. A validation error (user's fault) shouldn't open a breaker. A 503 Service Unavailable (service fault) should. Classify errors and only count service-side failures.
+
+**Recovery detection** requires careful testing. In half-open state, test with low-risk operations if possible. If you have a read-only health check endpoint, use that for testing instead of a critical write operation. Verify recovery before exposing users to potential failures.
+
+Monitor circuit breaker state in production. Track how often breakers open, how long they stay open, and whether they're opening frequently for the same services. Frequent opening indicates a persistent problem that needs investigation, not just transient issues.
+
+## Monitoring and Alerting
+
+Defensive infrastructure requires comprehensive monitoring to ensure it's working correctly and to detect when problems occur.
+
+**Timeout metrics** track timeout frequency per tool, timeout trends over time, and timeout impact on user experience. A sudden increase in timeouts indicates either increased load, degraded service performance, or infrastructure issues. Set alerts for timeout rate changes.
+
+**Rate limit metrics** measure how often limits are hit, which tools are rate-limited most frequently, and whether limits are too strict (limiting legitimate usage) or too lenient (not protecting adequately). Adjust limits based on real usage patterns.
+
+**Circuit breaker metrics** include breaker open/close events, time spent in each state, and success/failure rates during half-open testing. If breakers frequently open and close (flapping), your thresholds or timeout periods need adjustment.
+
+**Latency distributions** show how timeout and rate limit strategies affect response times. P50, P95, and P99 latencies reveal whether most users experience fast responses or whether defensive measures are creating widespread delays.
+
+**Resource utilization** metrics connect defensive strategies to infrastructure health. When circuit breakers are working, you should see reduced load on protected services. When rate limits are effective, resource usage should plateau at safe levels instead of spiking uncontrollably.
+
+## Balancing Protection and Usability
+
+Aggressive defensive measures make systems highly reliable but potentially frustrating to use. Finding the right balance between protection and usability is an iterative process.
+
+**User feedback integration** reveals when protections are too aggressive. If users complain about slow responses or unavailable features, you might be rate-limiting too strictly or timing out too quickly. If they complain about errors and failures, you're not protecting enough.
+
+**A/B testing defensive strategies** compares different timeout values, rate limits, or circuit breaker thresholds. Test variations with small user segments and measure impact on both reliability metrics (error rates, latency) and user metrics (task completion, satisfaction).
+
+**Gradual tightening** starts with lenient protections and incrementally makes them stricter based on observed problems. Begin with 10-second timeouts and reduce as you identify what's actually necessary. Start with loose rate limits and tighten as you understand real usage patterns and capacity.
+
+**Per-user tier variation** adjusts protections based on user segment. Paid users might get higher rate limits or longer timeouts than free users. Critical operations might bypass certain protections that apply to exploratory operations. Differentiate protection based on value and criticality.
+
+The goal isn't zero failures—it's controlled, predictable failures that degrade gracefully. A system that fails 1% of requests but recovers instantly is better than one that never fails but hangs for 30 seconds when problems occur.
+
+## Testing Defensive Infrastructure
+
+Defensive systems must be tested under realistic failure conditions, not just normal operation.
+
+**Timeout testing** simulates slow services. Mock tools that take 10, 20, 30 seconds and verify timeouts trigger at the right thresholds. Test that timeout errors are handled correctly and that system state remains consistent after timeouts.
+
+**Rate limit testing** generates high request volumes to verify limits are enforced. Test both per-user limits (one user making many requests) and global limits (many users making requests simultaneously). Verify that rate-limited requests receive appropriate errors or queue for retry.
+
+**Circuit breaker testing** simulates sustained service failures. Force a tool to fail repeatedly and verify the breaker opens. Verify it stays open during the timeout period. Verify half-open testing works and the breaker closes when the service recovers.
+
+**Chaos engineering** randomly introduces failures in production-like environments. Slow down random services, fail random requests, hit rate limits unpredictably. Verify that your defensive infrastructure prevents these random failures from cascading into system-wide outages.
+
+**Load testing** validates that defensive measures work under realistic load. A circuit breaker that works fine at 10 requests/second might fail to protect at 1000 requests/second due to race conditions or state propagation delays. Test at production scale.
+
+## Evolution and Adaptation
+
+Defensive infrastructure isn't set-once-and-forget. As your system evolves, your protection strategies must evolve with it.
+
+**Baseline updates** adjust protections as normal system behavior changes. If you optimize a tool and its average latency drops from 500ms to 100ms, reduce its timeout from 3 seconds to 1 second. Protections should track performance improvements.
+
+**Capacity growth** might allow looser rate limits. As you scale infrastructure, you can handle more concurrent requests. Review and increase rate limits as capacity increases. Don't artificially constrain a system that could handle more load.
+
+**New tool onboarding** requires setting initial protections. When adding a new tool, start with conservative protections: short timeouts, strict rate limits, sensitive circuit breakers. Relax them as you observe real behavior and build confidence in the tool's reliability.
+
+**Seasonal adjustment** accounts for predictable load variations. If your system experiences 10x traffic during certain events or seasons, temporarily adjust rate limits and circuit breaker thresholds to handle the load without degrading user experience.
+
+Review defensive infrastructure quarterly. Analyze timeout patterns, rate limit hits, circuit breaker activity. Identify opportunities for optimization—tools that consistently time out might need performance work, tools that never hit rate limits might have overly strict limits.
+
+## Documentation and Team Knowledge
+
+Defensive infrastructure is complex, and its behavior isn't always obvious. Document your strategies so team members understand how the system protects itself.
+
+**Runbook documentation** explains what to do when defensive measures trigger. "If the payment_processor circuit breaker is open, check [monitoring dashboard], verify [external service status], and follow [escalation procedure]." Clear procedures prevent panic during incidents.
+
+**Configuration documentation** records why specific values were chosen. "Product search timeout: 2 seconds (p95 latency is 800ms, we want 2.5x headroom)" explains the rationale. Future developers can make informed adjustments instead of guessing.
+
+**Incident history** connects past outages to defensive improvements. "After the Jan 2025 outage, we added circuit breakers to payment tools." This institutional knowledge helps new team members understand why systems are designed as they are.
+
+**Code comments** explain non-obvious defensive behavior. "Retry with exponential backoff because immediate retry often fails due to downstream connection pool exhaustion" documents learned lessons that aren't obvious from code alone.
+
+Train team members on defensive concepts. Not everyone understands circuit breakers, rate limiting algorithms, or timeout cascades. Shared understanding improves system design and incident response. Defensive infrastructure is a team responsibility, not just an infrastructure concern.
+
+Timeouts, rate limits, and circuit breakers are the immune system of AI applications—protecting against external threats, preventing self-inflicted damage, and enabling graceful degradation under stress. Design them thoughtfully, implement them carefully, test them thoroughly, and monitor them continuously. The difference between a resilient AI system and one that collapses under production load is almost always the quality of defensive infrastructure. Your tools might be perfect, but without proper protections, perfection doesn't matter. Defensive infrastructure is what transforms working code into reliable products.

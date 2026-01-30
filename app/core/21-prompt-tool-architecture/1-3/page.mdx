@@ -1,0 +1,123 @@
+# 1.3 — Single-Shot vs Multi-Turn Prompt Design
+
+A Series C e-commerce company built a product recommendation assistant in August 2025. Their architecture used multi-turn conversations where each user query appended to growing context. Users could ask follow-up questions and the assistant remembered preferences. After two months in production, their median API costs were 340% higher than projections. Investigation revealed that average conversations included 47 messages with 89,000 tokens of context. The assistant was re-reading the entire conversation history on every turn, including outdated preferences and resolved questions. The engineering team spent $120,000 rebuilding with a hybrid architecture that used single-shot prompts for independent queries and selective context retention for genuine multi-turn needs. The root cause was defaulting to multi-turn conversation design without analyzing whether conversation state provided value.
+
+This failure illustrates that conversation design is an architectural decision with cost and performance implications. Teams choose multi-turn conversations because they feel more natural for chat interfaces. Natural does not mean necessary. Most AI interactions do not require conversation memory. Thoughtless multi-turn design wastes tokens, increases latency, and creates state management complexity that single-shot prompts avoid entirely.
+
+## Single-Shot Prompts Treat Every Request as Independent
+
+A **single-shot prompt** provides all necessary context in one request and expects one response. There is no conversation history. No previous turns. No accumulated state. Each request contains everything the model needs: instructions, input data, examples, format requirements. The model generates a response and forgets the interaction.
+
+Single-shot design maximizes simplicity. You have no state to manage, no context to prune, no conversation flow to coordinate. Your prompt is a pure function: same inputs always produce statistically similar outputs. Testing is straightforward because you only need to test individual request-response pairs, not conversation trajectories.
+
+It also minimizes cost. You pay for exactly the tokens you send and receive. No conversation history overhead. No re-processing of previous turns. If your prompt is 2,000 tokens and the response is 500 tokens, you pay for 2,500 tokens. Every request has identical cost regardless of how many requests the user has made previously.
+
+Single-shot prompts work well for independent tasks. Document summarization, data extraction, classification, translation, format conversion. These tasks have clear inputs and outputs. Previous requests do not inform current requests. A user who translates five documents does not need the model to remember the first four while translating the fifth.
+
+The limitation is that single-shot prompts cannot reference previous interactions. If a user asks "what was the summary you just gave me," a single-shot architecture has no answer. You would need to store summaries in your application database and retrieve them separately. This is fine for many use cases. It becomes awkward when users expect conversational memory.
+
+## Multi-Turn Conversations Accumulate Context Across Messages
+
+A **multi-turn conversation** maintains message history across requests. Each new user message appends to the conversation. Each assistant response appends after that. The model receives the entire conversation history on every turn. This creates memory and continuity.
+
+Multi-turn design enables follow-up questions, clarifications, and iterative refinement. A user asks "what are the top selling products this month." The assistant responds. The user asks "which of those have the highest margin." The assistant knows "those" refers to the previously mentioned top sellers. This works because the conversation history provides context.
+
+The cost is linear growth in token consumption. Turn 1 costs 2,000 tokens. Turn 2 costs 2,000 previous tokens plus 500 new tokens. Turn 3 costs 2,500 previous tokens plus 500 new tokens. By turn 10, you are paying 7,500 tokens even if the user only added 500 new tokens. You re-process the entire history every turn because the model is stateless between requests.
+
+Multi-turn conversations also accumulate irrelevant context. A conversation about product recommendations might start with user preferences, move to specific product questions, digress into return policy discussion, then return to recommendations. The return policy discussion is dead weight for subsequent recommendation queries, but it remains in context unless you explicitly prune it.
+
+The architectural challenge is deciding when conversation memory provides value worth the cost. Chat interfaces tempt teams to default to multi-turn because it matches user expectations from consumer chat apps. Business value comes from task completion, not conversation naturalness. If multi-turn memory does not improve task completion, it only adds cost.
+
+## State Accumulation Creates Debugging and Reproducibility Problems
+
+Multi-turn conversations create path-dependent behavior. The same user query produces different responses depending on conversation history. This makes debugging difficult. When a user reports unexpected output, you need the entire conversation history to reproduce the issue. Without it, you cannot recreate the model's state.
+
+Your logging must capture full conversation context for every request. This means storing potentially hundreds of messages per conversation. Your logs grow large quickly. A single-shot architecture logs one prompt and one response per request. A multi-turn architecture logs the entire conversation prefix on every turn. For a 20-turn conversation, you log the first message 20 times, the second message 19 times, and so on.
+
+Reproducibility also suffers from non-deterministic model behavior. Even with temperature set to zero, models exhibit small variations in output. In single-shot prompts, this creates variation between independent requests. In multi-turn conversations, it creates butterfly effects. A small variation in turn 3 changes the context for turn 4, which changes turn 5, which changes turn 6. Conversations diverge from expected paths.
+
+You mitigate this with explicit state management. Instead of letting conversation history accumulate organically, you maintain a structured conversation state. Extract key information from each turn and store it in a database. On subsequent turns, reconstruct only the relevant context from your state store. This is more complex than raw multi-turn, but it gives you control over what persists and what is discarded.
+
+## Context Budget Management Differs Dramatically Between Approaches
+
+Every LLM has a maximum context length. Claude models support 200,000 tokens. GPT-4o supports 128,000 tokens. These limits sound generous until you consider multi-turn conversation growth. A conversation hitting 200,000 tokens after 40 turns seems unlikely. It happens more often than you expect.
+
+Users who paste entire documents into chat consume 50,000 tokens in one message. Add 10 turns of discussion with quoted sections from the document and you reach 150,000 tokens. Add examples, system prompts, and function call history and you approach the limit. When you hit the limit, you must truncate context. Truncation is a lossy operation that breaks conversation coherence.
+
+Single-shot prompts have fixed context budgets. You know exactly how many tokens each request consumes because the prompt template is stable. You design the prompt to fit comfortably within limits with headroom for variable input size. If your prompt template is 5,000 tokens and you allow 20,000 tokens for user input, you know you will never exceed 25,000 tokens.
+
+Multi-turn prompts have unbounded context budgets without intervention. You must implement context windowing, which means deciding what to keep and what to discard. The simplest strategy is keeping the last N messages. This preserves recent context but loses conversation beginning. An alternative is summarizing old messages into condensed context blocks. This preserves information at the cost of summarization errors.
+
+The e-commerce company's cost overruns came from unlimited context accumulation. They never implemented windowing. Conversations grew to 89,000 tokens because users asked dozens of questions across multiple sessions. The company was re-processing questions from sessions that ended days ago. Implementing a 10-message window cut costs by 75% with no measurable impact on user satisfaction.
+
+## When Single-Shot Is the Right Default
+
+Single-shot prompts should be your default architecture unless you have specific reasons to need conversation memory. Most AI features do not require memory. Content generation, data analysis, classification, extraction, transformation tasks all work with single-shot prompts.
+
+You choose single-shot when requests are independent. A user classifying customer support tickets does not need the model to remember previous tickets. Each ticket is a fresh classification task. Conversation memory adds no value. It only adds cost and complexity.
+
+You also choose single-shot when you need predictable performance characteristics. Single-shot prompts have consistent latency and cost. Multi-turn prompts have latency and cost that grow with conversation length. If you need to maintain strict SLAs, single-shot gives you deterministic behavior.
+
+Single-shot is also better for stateless APIs and batch processing. If you are processing 10,000 documents overnight, you do not want conversation state. You want 10,000 independent prompt executions that can parallelize. Multi-turn conversation is inherently sequential. Single-shot is naturally parallel.
+
+The mental model shift is treating the AI as a function, not an agent. Functions take inputs and return outputs. They do not have memory or personality. When your use case maps cleanly to function semantics, single-shot is the right architecture.
+
+## When Multi-Turn Provides Genuine Value
+
+Multi-turn conversations make sense when users genuinely need to reference previous interactions. Iterative refinement workflows benefit from memory. A user brainstorming marketing copy might generate five options, ask for variations on option three, request tone adjustments, and finally ask for the adjusted version in three different lengths. Each step builds on previous steps.
+
+You also need multi-turn for complex research or analysis tasks that span multiple queries. A business analyst exploring sales data might ask for overall trends, then drill into specific regions, then compare those regions to last year, then ask for anomalies. Each query narrows focus based on previous answers. Single-shot prompts would require the user to manually include all previous context in each new query.
+
+Another valid use case is personalization that persists within a session. A user specifies preferences once at conversation start. Subsequent queries should respect those preferences without requiring the user to restate them. "I prefer technical language" becomes session state that informs all responses. This is cheaper than storing preferences in a database and injecting them into every single-shot prompt.
+
+The key distinction is whether conversation memory reduces user effort or improves task completion. If the user would otherwise need to copy-paste previous responses into new queries, multi-turn saves effort. If conversation memory just makes the interaction feel more natural without changing task efficiency, it is waste.
+
+## Hybrid Architectures Offer the Best of Both
+
+Most production systems benefit from hybrid approaches that use single-shot and multi-turn strategically. You analyze each feature to determine whether it needs conversation memory. Features that do use multi-turn. Features that do not use single-shot. This prevents blanket over-engineering.
+
+You also use single-shot prompts within multi-turn conversations for specific subtasks. The conversation maintains user preferences and context, but individual analysis steps execute as isolated prompts. This contains context bloat. Only the conversational elements accumulate state. The computation-heavy elements stay lean.
+
+Another hybrid pattern is session-scoped conversations with explicit reset points. A conversation lasts for one task session. When the user starts a new task, context resets. This prevents infinite context growth while preserving the benefits of memory within task boundaries. You implement this with session IDs that map to conversation histories in your database.
+
+You can also implement conversation summarization at turn thresholds. After every 10 turns, you summarize the conversation into key points and start a new conversation with the summary as initial context. This caps context size at approximately 10 turns worth of messages plus a summary. The tradeoff is that summarization introduces information loss.
+
+The e-commerce company's rebuild used a hybrid approach. Product browsing conversations were multi-turn with a 10-message window. Checkout-related questions were single-shot. Customer service inquiries were multi-turn with explicit session resets when topics changed. This reduced costs while maintaining conversation quality where it mattered.
+
+## Conversation State Management Is Application Responsibility
+
+LLM APIs do not manage conversation state for you. They accept a list of messages and return a response. Your application must store conversation history, append new messages, and send the updated history on the next request. This state management is non-trivial.
+
+You need a data store for conversation histories. Options include relational databases, document databases, or key-value stores. The choice depends on query patterns. If you need to search across conversations, a relational or document database makes sense. If you only retrieve by conversation ID, a key-value store is simpler.
+
+You also need conversation lifecycle management. When do conversations expire? How do you handle conversations that span multiple days? Do you merge conversations from the same user? These are product decisions with data model implications. A conversation table with user IDs, session IDs, message lists, and timestamps gives you flexibility to implement various policies.
+
+Concurrency is another consideration. If a user sends two messages in rapid succession, your system might process them concurrently. Without locking, both requests read the same conversation state, append their message, and write back. One update clobbers the other. You need optimistic locking or message ordering guarantees.
+
+The storage cost of conversation histories adds up. A single message might be 2,000 tokens, or roughly 8,000 characters. Stored as JSON with metadata, that is 10KB per message. A conversation with 50 messages is 500KB. If you have 100,000 active conversations, that is 50GB of conversation data. This is manageable but not free. You need retention policies and archival strategies.
+
+## Testing Multi-Turn Conversations Requires Scenario Coverage
+
+Single-shot prompts are easy to test. You create an evaluation set of inputs and expected outputs. You run the prompt against each input and measure quality. Pass or fail per test case. Multi-turn conversations require scenario testing, which is more complex.
+
+A scenario is a sequence of user messages and expected assistant behavior. "User asks for recommendations, assistant provides three options, user asks about the second option, assistant provides details." You script these scenarios and execute them as integration tests. Each scenario validates conversation flow, not just individual responses.
+
+The challenge is combinatorial explosion. Real conversations do not follow scripts. Users ask unexpected questions, change topics, provide incomplete information. Your test scenarios cannot cover all paths. You need a core set of common scenarios plus edge case scenarios that validate error handling and context management.
+
+You also need to test context window behavior. Create scenarios that deliberately exceed context limits to verify truncation logic works correctly. Create scenarios with irrelevant context accumulation to verify that pruning or summarization maintains conversation coherence. These are infrastructure tests, not feature tests.
+
+Another testing dimension is conversation state persistence. If conversations span multiple sessions, test that state correctly saves and restores. Test that concurrent requests do not corrupt state. Test that expired conversations are handled gracefully. These tests validate your state management infrastructure.
+
+## Latency Characteristics Favor Single-Shot for Interactive Use
+
+Single-shot prompts have predictable, stable latency. The prompt size is known. The generation time depends on response length, which you can estimate or cap. You can provide accurate latency SLAs. This matters for user experience in interactive applications.
+
+Multi-turn conversations have variable latency that increases with conversation length. Turn 1 might take 800ms. Turn 10 might take 2,500ms because the context is larger. Users perceive this as the system getting slower during the conversation. This is poor UX that single-shot avoids.
+
+Prompt caching mitigates multi-turn latency growth by avoiding reprocessing of cached prefixes. But caching works best with stable prefixes. If every turn modifies conversation structure or reorders messages, caching efficiency drops. You need careful conversation state management to maximize cache hits.
+
+For real-time applications like live chat or voice assistants, single-shot prompts with application-managed context are often faster than multi-turn. You send only the new query plus minimal context extracted from previous turns. This keeps prompts small and latency low. The complexity moves to your context extraction logic, but you control that complexity.
+
+The architectural decision is whether you optimize for implementation simplicity or runtime performance. Multi-turn is simple to implement but has worse performance at scale. Single-shot with application-managed context is more complex to implement but performs better. Your choice depends on scale requirements and team capabilities.
+
+The next subchapter examines sampling parameters like temperature and top-p, explaining why these settings are architectural decisions that shape product behavior rather than tuning knobs you adjust experimentally.

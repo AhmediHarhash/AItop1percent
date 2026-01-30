@@ -1,0 +1,137 @@
+# 1.8 — When Prompts Fail: Taxonomy of Prompt Failures in Production
+
+A legal technology startup deployed a contract analysis system in August 2025 powered by GPT-4o. The system extracted key terms, identified obligations, and flagged potential risks across 50 contract types. Testing showed 91 percent accuracy across 5,000 annotated contracts. The product launched to 200 law firms processing 12,000 contracts per week.
+
+Within three weeks, customers reported strange failures. Some contracts returned hallucinated party names that did not appear in the source text. Others triggered safety refusals claiming the contracts contained harmful content. Some responses broke mid-sentence with JSON syntax errors. A few contracts caused context overflow errors despite being under the advertised token limit. Different contracts failed in completely different ways with no obvious pattern.
+
+The engineering team initially treated all failures as a single problem requiring a single solution. They added more examples, clarified instructions, and increased temperature settings. Failure rates barely changed because they were fighting six distinct failure modes with overlapping symptoms but different root causes. Only after building a failure taxonomy and mode-specific detection did they reduce overall failure rates from 14 percent to 3 percent.
+
+## Why Failure Taxonomies Matter
+
+Generic monitoring that tracks "success" versus "failure" provides insufficient signal for diagnosis and remediation. A system with 8 percent failure rate tells you nothing about whether failures are hallucinations, format breaks, refusals, or context issues. Different failure modes require different solutions, making classification essential.
+
+Building a failure taxonomy forces you to think systematically about what can go wrong. The exercise reveals failure modes you had not considered and helps prioritize monitoring investments. It also enables granular SLAs: you might tolerate 5 percent format breaks (easily detected and retried) but zero percent hallucinations (silent and dangerous).
+
+The taxonomy should be specific to your application and prompts while building on common patterns observed across production AI systems. The six major categories are hallucination, refusal, format break, instruction drift, context overflow, and ambiguity collapse. Most production failures fall into one of these categories or a combination.
+
+## Hallucination: Confident Fabrication
+
+Hallucinations occur when the model generates plausible-sounding content that has no basis in provided context or reality. The legal contract analyzer hallucinated party names by generating realistic-sounding company names that never appeared in the contract text. These hallucinations are particularly dangerous because they look correct and the model expresses high confidence.
+
+Hallucinations split into several subtypes. Factual hallucinations invent facts, dates, or statistics. Attribution hallucinations cite nonexistent sources or quotes. Extrapolation hallucinations extend beyond provided information with invented details. Confabulation hallucinations fill gaps in ambiguous inputs with made-up content that seems reasonable.
+
+Detection requires comparing outputs to ground truth when available. For extraction tasks, verify that every extracted value actually appears in the source text using string matching or semantic similarity. For summarization tasks, use NLI models to check whether summary sentences are entailed by source documents. For generation tasks, use fact-checking models or knowledge base lookups to verify claims.
+
+## Hallucination Mitigation Through Prompt Design
+
+You can reduce hallucination rates through defensive prompt design. Add explicit instructions forbidding fabrication: "Extract only information that explicitly appears in the provided text. Do not infer, guess, or generate information not present in the source. If information is not available, return null for that field." This instruction reduces hallucinations by 30 to 50 percent in extraction tasks.
+
+Require the model to cite sources for extracted information: "For each extracted value, include the exact text span from the source where you found it." This forces the model to ground outputs in actual content and makes hallucinations easier to detect. When the model cannot provide a valid citation, it often returns null instead of hallucinating.
+
+Use retrieval augmentation correctly by ensuring retrieved context actually contains relevant information. Hallucinations often occur when the model tries to answer questions using irrelevant retrieved documents. Improve retrieval quality and add instructions: "Answer only if the provided context contains relevant information. If the context is insufficient, respond: {status: 'insufficient_context'}."
+
+## Refusal: Inappropriate Safety Triggering
+
+Refusals occur when the model declines to process legitimate requests because safety filters incorrectly flag content as harmful. The legal contract analyzer triggered refusals on employment contracts containing termination clauses because the model interpreted "termination" as violent content. These false positive refusals block valid use cases and frustrate users.
+
+Refusals typically include explanatory text: "I cannot help with that request" or "This content appears to violate safety guidelines." Some models return error codes instead of explanatory refusals. Detection is straightforward: parse responses for refusal patterns using regex or classifier models.
+
+The challenge is distinguishing appropriate refusals (actual policy violations) from inappropriate refusals (false positives). Logging refused requests with human review reveals patterns. If 90 percent of refusals on employment contracts involve the word "termination," you have identified a specific false positive pattern needing remediation.
+
+## Reducing False Positive Refusals
+
+Prompt engineering can reduce refusal rates when false positives are high. Add context explaining the legitimate purpose: "You are analyzing legal contracts for a law firm. The following contract contains standard legal language including terms like termination, liability, and damages. This is professional legal content, not harmful material." This framing helps models distinguish legal language from actual harmful content.
+
+For known false positive triggers, add explicit override instructions: "The text may contain words like termination, lawsuit, or breach. These are legal terms in proper context, not harmful content. Process them normally." This works because refusal systems often check both the content and the surrounding context when making decisions.
+
+If refusal rates remain high despite prompt engineering, consider switching models or using fine-tuned versions with adjusted safety boundaries. Some models have enterprise tiers with reduced false positive rates for professional use cases. Alternatively, implement your own content filtering that you control rather than relying on model-level safety systems.
+
+## Format Break: Schema Violations and Malformed Outputs
+
+Format breaks occur when model outputs do not match expected schemas or formats. The contract analyzer requested JSON but received responses with trailing text after the closing brace, breaking the parser. Other format breaks include missing required fields, incorrect field types, or responses wrapped in markdown code blocks when raw JSON was specified.
+
+Format breaks are easy to detect through automated validation. Parse responses against expected schemas and flag failures. For JSON outputs, use schema validators. For structured text, use regex patterns or grammar parsers. For classifications, verify that returned categories exist in your allowed set.
+
+The frequency of format breaks varies significantly across models and prompt patterns. Claude models rarely break JSON format when properly instructed but sometimes add explanatory text before or after the JSON. GPT models follow format instructions more literally but occasionally generate invalid JSON with syntax errors. Gemini models sometimes mix formats, returning partial JSON wrapped in markdown.
+
+## Enforcing Output Format Compliance
+
+Specify format requirements with extreme clarity. Instead of "return JSON," use "return valid JSON only, with no markdown formatting, no explanatory text, and no content before or after the JSON object." This reduces ambiguity. Include a format example: "Your response must exactly match this structure: {field1: value, field2: value}."
+
+Use format forcing techniques when available. Some APIs allow you to specify response schemas that the model must follow. OpenAI's function calling and structured outputs feature guarantees JSON schema compliance. Anthropic's tool use system enforces format for tool responses. These API features eliminate format breaks for supported use cases.
+
+Implement retry logic with format-specific error messages. When a response fails validation, retry with an appended instruction: "Your previous response was invalid JSON due to [specific error]. Generate a valid JSON response matching the required schema." This self-correction often succeeds on the second attempt.
+
+## Instruction Drift: Losing the Thread
+
+Instruction drift occurs when models stop following prompt instructions partway through a response or across conversation turns. The contract analyzer sometimes started well-formatted JSON responses but drifted into prose explanations before completing all required fields. In multi-turn conversations, models sometimes forget system message constraints after several exchanges.
+
+Instruction drift manifests as responses that start correct but degrade, responses that follow some instructions but ignore others, or responses that work for simple inputs but fail on complex inputs. Detection requires analyzing response structure and comparing against instruction requirements throughout the entire output.
+
+Long prompts with many requirements are particularly susceptible to instruction drift. When you specify 15 different constraints, models often satisfy 12 to 13 of them but miss 2 to 3. The missed constraints vary across responses, making debugging difficult. Each individual constraint has high compliance, but simultaneous compliance with all constraints is low.
+
+## Preventing Instruction Drift
+
+Reduce prompt complexity by separating concerns. Instead of one prompt with 15 constraints handling all cases, create 3 prompts with 5 constraints each and route inputs to the appropriate prompt. Simpler prompts have higher instruction adherence.
+
+Prioritize instructions explicitly: "Most important: return valid JSON. Secondary: include confidence scores. Optional: add explanatory metadata." This hierarchy helps models make correct trade-offs when they cannot satisfy all requirements simultaneously.
+
+Use structural cues that reinforce instructions throughout the response. For JSON outputs, include the full expected schema in the prompt so the model can reference it while generating. For multi-step tasks, restate key constraints at each step: "Remember: continue to use formal language" or "Maintain JSON format throughout."
+
+## Context Overflow: Exceeding Window Limits
+
+Context overflow occurs when the combined length of prompt plus conversation history plus retrieved context exceeds the model's context window. The contract analyzer encountered overflow on complex contracts approaching 100,000 tokens despite GPT-4o's advertised 128,000-token window. In practice, effective windows are smaller than advertised limits due to internal buffering and tokenization overhead.
+
+Overflow manifests in several ways. Some APIs return explicit errors before processing. Others truncate input silently, causing the model to work with incomplete context. Some models degrade gracefully, prioritizing recent context over older context. Without explicit error handling, overflow causes mysterious failures where inputs work individually but fail when combined.
+
+Detection requires tracking token counts for all prompt components: system message, user message, conversation history, and retrieved context. Log actual token counts (not character counts) using the model's tokenizer. Alert when total tokens approach 80 percent of the advertised limit because effective limits are often lower.
+
+## Managing Context Under Budget
+
+Implement dynamic context management that prioritizes important information when budgets are tight. For conversations, keep the system message and most recent turn while summarizing or dropping middle turns. For RAG systems, rank retrieved documents by relevance and include only the top N that fit within budget.
+
+Use prompt compression techniques that preserve information density. Replace verbose phrasing with concise equivalents. Summarize background context while keeping task-specific details intact. Remove redundant examples when you have limited budget.
+
+Consider chunking strategies for large documents. Instead of processing a 100,000-token contract in one prompt, split it into logical sections (parties, terms, obligations, warranties) and process each section separately. Combine results in a final aggregation step. This approach trades single-pass simplicity for reliable multi-pass processing.
+
+## Ambiguity Collapse: Defaulting to Wrong Assumptions
+
+Ambiguity collapse occurs when prompts contain implicit ambiguities and models resolve them incorrectly. The contract analyzer encountered contracts using "party" to mean both legal parties and social gatherings. Without disambiguation, the model sometimes extracted "party" as an entity when it appeared in clauses about company events.
+
+Ambiguity also appears in instruction interpretation. A prompt requesting "key terms" might mean important terms, contractual terms, or technical terminology depending on context. Models choose one interpretation and execute confidently, even if they chose wrong.
+
+Detection requires semantic analysis of outputs compared to inputs. If you extract "party" from a clause about holiday celebrations in an employment contract, the extraction is technically correct but semantically wrong. This requires understanding domain semantics, not just pattern matching.
+
+## Resolving Ambiguity Through Specificity
+
+Replace ambiguous instructions with precise specifications. Instead of "extract key terms," use "extract defined terms from the Definitions section where terms appear in title case followed by definitions." This eliminates interpretation ambiguity.
+
+Provide disambiguation examples in your prompt: "Party refers to legal entities involved in the contract: Company A and Company B. Do not extract party when it refers to social gatherings or events." This explicit disambiguation prevents common mistakes.
+
+Use structured input formats that separate different content types. If contracts include both legal clauses and metadata, format them distinctly: "`<clauses>[legal text]</clauses>` `<metadata>[contract metadata]</metadata>`." This structure helps models maintain correct context for each section.
+
+## Cascading Failures: When Multiple Modes Interact
+
+The most difficult production failures involve multiple failure modes interacting. A contract that triggers context overflow might get truncated, causing the model to hallucinate missing information, which produces invalid JSON that breaks parsing. The root cause is overflow, but the observed failure is a format break with hallucinated content.
+
+These cascading failures require root cause analysis to fix. Surface symptoms mislead you into treating format breaks when the real issue is context management. Implement monitoring that detects all failure modes and logs their co-occurrence. Patterns like "90 percent of format breaks occur on inputs exceeding 80,000 tokens" reveal cascading relationships.
+
+Address root causes rather than symptoms. If context overflow causes hallucinations, fixing overflow prevents downstream hallucination failures. If ambiguous instructions cause format breaks, clarifying instructions prevents both issues. Symptom-focused fixes create whack-a-mole dynamics where fixing one failure mode exposes another.
+
+## Building Failure Mode Detection Systems
+
+Automated failure detection requires mode-specific classifiers. Build detection logic for each failure mode using rules, heuristics, or small classification models. Run all detectors on every response and log which modes triggered.
+
+For hallucinations, compare outputs to inputs using semantic similarity and fact-checking. For refusals, pattern match on refusal phrases and error codes. For format breaks, validate against schemas. For instruction drift, check compliance with each specified constraint. For context overflow, monitor token counts. For ambiguity collapse, use domain-specific semantic validators.
+
+Aggregate detection results into dashboards showing failure mode distribution over time. Track which modes are increasing or decreasing, which correlate with specific input patterns, and which cause the most customer impact. This visibility enables data-driven prioritization of remediation efforts.
+
+## Failure Mode Remediation Strategies
+
+Each failure mode requires different remediation approaches. Hallucinations need grounding mechanisms and citation requirements. Refusals need context framing and safety threshold adjustment. Format breaks need stricter format specifications and validation. Instruction drift needs simplified prompts and structural reinforcement. Context overflow needs dynamic budgeting and chunking. Ambiguity collapse needs disambiguation and specificity.
+
+Build a remediation playbook mapping each failure mode to recommended interventions. When monitoring detects elevated failure rates for a specific mode, the playbook guides rapid response. This systematization prevents ad hoc debugging and ensures consistent quality.
+
+Test remediation changes against held-out failure examples. If hallucination rate is 8 percent and you implement grounding mechanisms, verify on a test set of historical hallucinations that the new approach reduces failures. A/B test in production to ensure remediation does not introduce new failure modes or degrade other quality dimensions.
+
+The next subchapter examines how to version control prompts and manage prompt evolution as your system scales.

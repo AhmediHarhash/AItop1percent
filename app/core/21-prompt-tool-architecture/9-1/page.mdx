@@ -1,0 +1,113 @@
+# 9.1 — Prompt Observability: Logging, Tracing, and Replay
+
+A Series C healthcare SaaS company deployed an AI-powered medical coding assistant in August 2025. The system worked well in staging but started producing incorrect billing codes in production within 48 hours. The engineering team had no logs of actual prompt inputs or model outputs. They could see API calls succeeded but had no visibility into what prompts were sent or what the model returned. When auditors asked to verify specific coding decisions, the team had no records. The company pulled the feature after five days, refunded $180,000 in incorrect billings, and spent three months rebuilding with proper observability. The root cause was shipping a production AI system with no ability to see what it was actually doing.
+
+Most teams build AI features the same way they build traditional APIs. They log HTTP status codes, response times, and error rates. They assume these metrics provide sufficient visibility. They discover too late that knowing an API call succeeded tells you nothing about whether the AI behavior was correct. You need to see the actual prompts, the actual outputs, and the actual decision paths.
+
+## Why Traditional Logging Fails for Prompts
+
+Your existing logging infrastructure captures structured events. Request received. Database query executed. Response sent. Each event has clear success or failure semantics. A 200 status means success. A 500 status means failure. You can debug most problems by reading through these structured logs.
+
+Prompt-based systems break this model completely. An API call to Claude can return 200 status with a perfectly formatted JSON response that contains completely wrong information. The technical execution succeeded. The semantic behavior failed. Your logs show success. Your users experience failure.
+
+You cannot debug prompt behavior without seeing prompt content. If your summarization prompt suddenly starts producing summaries twice as long as expected, you need to see the actual prompt that was sent. Maybe an engineer added an example that changed the implicit length target. Maybe a parameter interpolation bug is injecting extra instructions. Maybe the model updated and interprets existing instructions differently. You cannot diagnose these issues from metadata alone.
+
+The same applies to outputs. If users report that your classification system misclassifies certain inputs, you need to see the exact model responses for those inputs. Sometimes the model is returning correct information in an unexpected format. Sometimes it is hedging with qualifiers your parsing code does not handle. Sometimes it is correct but your evaluation logic is wrong. You need the raw output to distinguish between model problems and code problems.
+
+## What to Log in Every Prompt Interaction
+
+Every prompt execution needs a comprehensive audit trail. You need enough information to reproduce the interaction, debug unexpected behavior, and verify correct operation. This means logging six categories of information for every model call.
+
+First, log the complete prompt as sent to the model. This includes system messages, user messages, assistant messages in multi-turn conversations, and any templating or variable substitution. You need the exact text the model received, not the template before variable insertion. If you send "Summarize this document: {document_text}" and document_text is 50KB, log the full 50KB prompt. Storage is cheap compared to blind debugging.
+
+Second, log the complete model response. This includes the full text output, any tool calls the model made, and metadata like finish_reason and token counts. Do not log just the parsed result. Log the raw response before any post-processing. If your parsing code extracts a JSON object from the response, log both the raw text and the extracted object. Parsing bugs are common and impossible to debug without raw outputs.
+
+Third, log all configuration parameters. Model name and version. Temperature. Max tokens. Top-p. Stop sequences. Presence and frequency penalties. These parameters affect behavior and change over time. When you investigate a behavior change from three months ago, you need to know what parameters were used then versus now.
+
+Fourth, log request context. User ID. Session ID. Feature flag states. A/B test variant. Upstream request ID. This context lets you correlate prompt behavior with user experiences. When a user reports a problem, you need to find their specific prompt executions. When you run an A/B test on prompt variants, you need to group executions by variant.
+
+Fifth, log timing and performance data. Timestamp when the request started. Time to first token. Total latency. Token throughput. These metrics help you detect performance regressions and understand user experience. If your prompt starts running slower, you need historical data to identify when the slowdown began.
+
+Sixth, log business outcomes when available. Did the user accept the AI suggestion or reject it? Did they edit the output before using it? Did they report the output as incorrect? These signals help you measure prompt quality beyond technical metrics. A prompt that executes successfully but users always reject has a quality problem, not a technical problem.
+
+## Distributed Tracing for Multi-Step Prompt Pipelines
+
+Single prompts are easy to observe. Multi-step prompt pipelines are where observability becomes critical. Your RAG system might execute a query rewriting prompt, a retrieval step, a relevance filtering prompt, and a final synthesis prompt. These steps are connected causally but distributed across different service calls. Traditional logging gives you four disconnected log entries. You need distributed tracing.
+
+**Distributed tracing** creates a causal chain across all steps in a request. Each step gets a unique span ID and references its parent span. When you view a trace, you see the complete execution graph. Query rewrite took 200ms and produced three reformulations. Retrieval took 400ms and returned 15 documents. Relevance filtering took 600ms and kept 5 documents. Final synthesis took 1200ms and generated the response. You can see the full timeline and drill into any step.
+
+This becomes essential for debugging. When users report incorrect answers from your RAG system, you need to see the full pipeline. Maybe the query rewrite misunderstood user intent. Maybe retrieval returned relevant documents but relevance filtering incorrectly discarded them. Maybe synthesis had good context but misinterpreted it. Without a trace showing all steps, you are guessing which component failed.
+
+Trace context also enables powerful analysis. You can measure how query rewrite quality affects final answer quality. You can identify which retrieval parameters correlate with better synthesis results. You can find bottleneck steps that should be optimized first. These insights require connecting prompt executions across the pipeline.
+
+Most teams use OpenTelemetry for distributed tracing. You instrument each prompt execution as a span. System prompt becomes a span attribute. User input becomes a span attribute. Model output becomes a span attribute. You send spans to your tracing backend—Honeycomb, Datadog, New Relic, or self-hosted Jaeger. Your tracing UI shows prompt pipelines the same way it shows microservice calls.
+
+## Privacy and Security in Prompt Logs
+
+Prompt logs contain user data by definition. Your prompts include user inputs. Your outputs include model-generated content based on those inputs. In many applications, this data is sensitive. Medical records. Financial information. Personal messages. Trade secrets. You cannot log everything in plaintext without violating privacy regulations or security policies.
+
+You have four strategies for handling sensitive data in logs. First is redaction. You replace sensitive content with placeholders before logging. A healthcare app might log "Patient presents with [SYMPTOM_REDACTED]" instead of the actual symptom. This preserves prompt structure for debugging while protecting PHI. The downside is you cannot debug issues that depend on specific input content.
+
+Second is encryption. You log everything but encrypt sensitive fields. Your logging system stores encrypted prompts and outputs. When engineers need to debug, they decrypt specific log entries through an audited access control system. This gives you full debugging capability while controlling who can see sensitive data. The implementation complexity is higher and key management becomes critical.
+
+Third is anonymization. You transform data to remove identifying information before logging. Hash user IDs. Remove names and addresses. Generalize specific values to categories. This reduces sensitivity while preserving some semantic content. The challenge is that good anonymization is hard and subtle bugs can leak identifying information through combinations of fields.
+
+Fourth is data retention policies. You log everything but delete logs after a retention period. Maybe you keep full prompt logs for 7 days for debugging recent issues, then delete them. Or you keep logs for 30 days but redact sensitive fields after 7 days. This balances observability needs against long-term privacy risk. You need robust deletion mechanisms and audit trails proving deletion happened.
+
+Most production systems combine strategies. Healthcare apps encrypt prompts containing PHI and delete after 30 days. Financial apps redact account numbers but keep transaction types and amounts. Consumer apps anonymize user IDs but keep full prompt text. Your choice depends on regulatory requirements, security policies, and debugging needs. The worst choice is no strategy—logging everything in plaintext indefinitely.
+
+## Prompt Replay for Debugging and Testing
+
+The medical coding company needed to verify specific coding decisions for auditors. With proper logging, they could have replayed the exact prompts that produced those codes. Feed the logged prompt to the model again and see what it returns. Compare the replay output to the logged output. If they match, the behavior is consistent. If they differ, you have model nondeterminism or version changes.
+
+**Prompt replay** is running a logged prompt through the current model to reproduce behavior. This enables three critical capabilities. First is regression testing. When you update a prompt or model version, replay historical prompts and compare outputs. If 95% of replays produce identical or better outputs, your change probably improved things. If 30% produce worse outputs, you introduced a regression.
+
+Second is what-if analysis. You can replay a prompt with different parameters or different model versions. Take a prompt that produced poor output, replay it with temperature 0.3 instead of 0.7, and see if the output improves. Replay it with Claude Opus instead of Sonnet and compare quality. This helps you identify optimal configurations without waiting for production traffic.
+
+Third is user-reported issue reproduction. When users report a problem, you find their prompt in logs and replay it. If replay reproduces the issue, you have a systematic problem you can debug. If replay works correctly, the original issue might have been a transient model failure or your system state has changed. Either way, you learn something actionable.
+
+Replay requires careful implementation. You need to capture enough context to recreate the original execution. This includes not just the prompt text but all configuration parameters. Model version at the time of original execution. Temperature and other sampling parameters. Any feature flags or system state that affects prompt construction. Without complete context, replay produces different results for reasons you cannot diagnose.
+
+You also need to handle nondeterminism. Language models are probabilistic. Even with temperature 0, you get slight variations in output. Replay will not produce byte-for-byte identical outputs. You need semantic comparison instead of exact string matching. Does the replay output have the same structure? Same key information? Same overall quality? These are fuzzy questions that sometimes require human judgment.
+
+## Observability Platforms and Tooling
+
+Most teams start with custom logging code. They write print statements before and after model calls. They dump prompts to files. They parse outputs and log extracted values. This works for initial prototypes but becomes unmaintainable at scale. You end up with inconsistent log formats, missing fields, and no way to query across executions.
+
+Production observability requires dedicated platforms. Several categories of tools have emerged for prompt observability. General-purpose LLM platforms like LangSmith, Helicone, and Braintrust provide prompt logging, tracing, and replay. They integrate with major model providers and give you a unified view of all prompt executions. You send prompts through their proxy or SDK and get automatic logging.
+
+These platforms provide structured interfaces for viewing prompt traces. You can filter by user, time range, model version, or custom tags. You can compare prompt variants side by side. You can mark executions as good or bad examples and build evaluation sets. The platforms handle storage, querying, and privacy controls so you focus on analyzing behavior instead of managing infrastructure.
+
+Specialized observability tools like Arize and Whylabs focus on ML model monitoring and extend to LLM observability. They provide statistical analysis of prompt performance over time. Drift detection for input distributions. Outlier identification for unusual outputs. Integration with existing ML monitoring workflows. These tools work well if you already have ML infrastructure and want to add prompt monitoring.
+
+Traditional observability platforms like Datadog, New Relic, and Honeycomb have added LLM-specific features. They let you log prompts and outputs as custom events or spans. You get the benefit of unified observability—prompts, APIs, databases, and infrastructure in one platform. The downside is less specialized tooling for prompt-specific analysis like semantic similarity or output quality trends.
+
+Your choice depends on team size, existing infrastructure, and requirements. Small teams often start with LangSmith or similar LLM platforms for fast setup and good defaults. Larger teams with existing observability infrastructure extend those platforms with custom prompt logging. Regulated industries build custom solutions to meet specific privacy and audit requirements. All successful teams have some observability platform. None successfully scale without one.
+
+## Balancing Observability with Cost and Performance
+
+Complete logging has costs. Storage costs for gigabytes of prompt logs per day. Network costs for sending logs to centralized platforms. Performance costs from logging overhead in the hot path. Privacy costs from handling sensitive data. You need to balance observability value against these costs.
+
+The first lever is sampling. You do not need to log every single prompt execution with full detail. Log 100% of errors and low-quality outputs. Log 10% of successful executions for baseline monitoring. Log 1% with full prompt and output text for deep analysis. This reduces storage by 90% while preserving visibility into problems.
+
+The second lever is retention. Keep recent logs hot for fast queries and debugging active issues. Move older logs to cold storage for compliance and long-term analysis. Delete very old logs when retention policies allow. A typical policy might be 7 days hot, 30 days warm, 1 year cold, then delete. Adjust based on your debugging patterns and regulatory requirements.
+
+The third lever is async logging. Do not block prompt execution waiting for logs to write. Send the prompt to the model, log asynchronously while waiting for response, return response to user immediately. This keeps logging overhead out of user-facing latency. The tradeoff is that if your service crashes before logs flush, you lose observability for in-flight requests. This is usually acceptable.
+
+The fourth lever is strategic detail. Always log request IDs, timestamps, model version, and outcome metrics. Conditionally log full prompt text based on sampling rate or error status. Optionally log certain fields based on privacy classification. This gives you metadata for all executions and details for the subset where details matter.
+
+The healthcare company that pulled their medical coding feature could have prevented $180,000 in losses with basic observability. Log every coding decision with the input medical note, the prompt sent, the model output, and the final billing codes. Cost maybe $50/day in storage. Value when you need to verify or reproduce a decision: priceless.
+
+## Building Observability into Your Workflow
+
+Observability is not something you add after building features. It is infrastructure you establish before shipping the first production prompt. The first prompt you deploy gets logged. The second prompt gets traced. The third prompt gets replay tooling. You build muscle memory around observability the same way you build it around testing.
+
+This means establishing standards. Every prompt execution runs through a logging wrapper. Every multi-step pipeline uses distributed tracing. Every feature has a runbook explaining what logs to check for debugging. These standards become automatic. Engineers do not think about whether to add observability. It is already there.
+
+It also means building debugging workflows around logs. When users report issues, your first step is pulling up traces. When you deploy prompt changes, your first validation is replaying historical examples. When you investigate quality regressions, you query logs for patterns. Observability becomes your primary debugging interface.
+
+The healthcare company rebuilt their medical coding feature with observability as a first-class requirement. Every coding decision gets logged with full audit trail. Every unusual output triggers an alert. Every user correction gets recorded for prompt improvement. The feature has been running for six months with zero compliance incidents and continuous quality improvement driven by logged data.
+
+Prompt observability is not optional for production systems. You will need to debug unexpected behavior. You will need to verify correct operation. You will need to reproduce user-reported issues. The only question is whether you build observability proactively or reactively after an expensive failure. Logging, tracing, and replay give you the visibility to run AI systems with confidence instead of hope.
+
+The next subchapter examines how to track and attribute costs for prompt executions, enabling chargeback models that align AI infrastructure spending with the teams and features that generate it.

@@ -1,0 +1,129 @@
+# 1.4 — Temperature, Top-P, and Sampling Strategy as Architecture Decisions
+
+A Series A legal tech startup launched a contract clause extraction service in September 2025. Their product team set temperature to 0.7 during prototyping because that value appeared in most tutorial code they found. The service worked well in testing. In production, the same contract uploaded twice would sometimes extract different clause interpretations, creating compliance risk for law firm clients. One client discovered discrepancies during an audit and threatened litigation. The startup spent $95,000 on incident response, contract review, and system rebuild. They changed temperature to 0 and implemented deterministic output validation. The root cause was treating sampling parameters as arbitrary knobs to tune rather than product requirements that define acceptable behavior variance.
+
+This failure reveals the fundamental misunderstanding that plagues AI product development. Teams think temperature is a performance optimization parameter, like database connection pool size. It is not. Temperature is a product decision about whether your application tolerates variability. Setting it wrong does not just hurt performance. It violates user expectations and creates liability exposure.
+
+## Temperature Controls Randomness and Is a Product Requirement
+
+**Temperature** is a sampling parameter that controls output randomness. At temperature 0, the model always selects the most likely next token. Outputs are deterministic within the constraints of floating-point precision and API implementation details. At temperature 1, the model samples from the probability distribution according to the actual probabilities. Higher temperatures flatten the distribution, making unlikely tokens more likely.
+
+The product question is simple: does your use case tolerate variation in outputs for identical inputs? If the answer is no, temperature must be 0. If the answer is yes, you need to specify how much variation is acceptable, which determines your temperature value.
+
+Deterministic tasks require temperature 0. Data extraction, classification, structured output generation, mathematical reasoning, code generation for production use. These tasks have correct answers. Variation is not creativity. It is incorrectness. A contract clause extraction tool that gives different results on identical inputs is broken by definition.
+
+Creative tasks allow higher temperatures. Content generation, brainstorming, story writing, artistic style transfer. These tasks have no single correct answer. Variation is desirable. A marketing copy generator that produces identical output every time is less useful than one that offers diverse options.
+
+The legal startup's failure came from not asking this product question. They copied temperature 0.7 from examples without considering whether their product tolerated variance. Contract extraction is deterministic. Temperature should have been 0 from day one. The 0.7 setting turned a reliable extraction tool into a probabilistic one, which is unacceptable for legal compliance.
+
+## Temperature Zero Does Not Guarantee Identical Outputs
+
+Setting temperature to 0 makes the model deterministic in the mathematical sense. It always chooses the highest probability token. This does not mean you get byte-for-byte identical outputs across API calls. Several implementation factors introduce variation even at temperature 0.
+
+Floating-point arithmetic has rounding errors. Different GPU architectures round differently. API providers occasionally update their serving infrastructure, which changes hardware and introduces small probability differences. These changes are usually invisible but occasionally cause token selection to flip between near-equal probability options.
+
+Prompt changes also matter. If you modify the prompt even slightly, the probability distribution changes, and temperature 0 may select different tokens. This includes changes you think are irrelevant, like adding whitespace or reordering examples. The model processes every token. Every change affects probabilities.
+
+API providers also make model updates. What they call "GPT-4o" today may be a different model checkpoint than "GPT-4o" six months from now. Temperature 0 gives you consistent behavior within a model version. It does not give you consistent behavior across model versions. You need API version pinning for that.
+
+The practical implication is that temperature 0 gives you functional determinism, not absolute determinism. You can trust that the same prompt will produce the same answer in the same session. You cannot trust that it will produce the same answer byte-for-byte across months of production use. For most applications, functional determinism is sufficient.
+
+## Seed Parameters Provide Reproducibility for Testing
+
+Modern LLM APIs offer **seed parameters** that enable reproducible outputs even at non-zero temperatures. You provide an integer seed value with your request. The API uses that seed to initialize its random number generator. Identical prompts with identical seeds produce identical outputs, even at temperature 1.
+
+Seeds solve the reproducibility problem for testing and debugging. You run your evaluation set with seed 12345. You get a specific set of outputs. You modify your prompt. You re-run with seed 12345. You get a different set of outputs that you can directly compare to the original. This enables A/B testing of prompt variants with controlled randomness.
+
+Seeds also help with user-reported issues. A user reports unexpected output. Your logs include the prompt and seed. You replay the exact request with the same seed and reproduce the issue. Without seeds, you can only approximate reproduction at non-zero temperatures.
+
+The limitation is that seeds only guarantee reproducibility within the same model version and API infrastructure. If the API provider updates their model or serving stack, your seed will produce different outputs. Seeds are session-level reproducibility, not long-term versioning.
+
+You use seeds in testing environments and controlled experiments. You do not typically expose seed control to end users. Letting users set seeds adds complexity without value for most use cases. The exception is creative tools where users want to explore variations but lock in a specific output. Seed becomes a "save this variation" feature.
+
+## Top-P and Top-K Are Alternative Sampling Strategies
+
+**Top-p sampling** (also called nucleus sampling) is an alternative to temperature for controlling randomness. Instead of adjusting the probability distribution, top-p truncates it. The model only considers tokens whose cumulative probability mass reaches p. If p is 0.9, the model samples from the smallest set of tokens that collectively represent 90% probability mass.
+
+Top-p is more stable than temperature for controlling creativity. Temperature affects all tokens equally. Setting temperature to 1.5 might turn reasonable variation into gibberish because it amplifies very low probability tokens. Top-p prevents this by cutting off the tail. Even with aggressive top-p settings, the model only samples from tokens that had non-negligible probability.
+
+You use top-p when you want variability but need to avoid nonsensical outputs. Creative writing with top-p 0.9 gives diverse outputs while filtering extreme randomness. The same task at temperature 1.5 might produce incoherent text. Top-p provides creativity with guardrails.
+
+**Top-k sampling** is a cruder version of top-p. The model considers only the k most likely tokens. Top-k 40 means the model samples from the 40 highest probability tokens and ignores everything else. This is less adaptive than top-p because the cutoff is a fixed count, not a probability mass.
+
+Top-k is rarely used in modern APIs. Top-p is strictly superior for most use cases because it adapts to probability distribution shape. Sometimes the top 10 tokens represent 95% of probability mass. Sometimes you need the top 50 to reach 90%. Top-p handles both cases correctly. Top-k does not.
+
+## Frequency and Presence Penalties Reduce Repetition
+
+**Frequency penalty** and **presence penalty** are parameters that discourage token repetition. Frequency penalty reduces the probability of tokens proportional to how many times they have already appeared. Presence penalty applies a flat reduction to any token that has appeared at least once. Both parameters help avoid repetitive outputs.
+
+You apply frequency penalty when the model tends to repeat phrases or ideas. Long-form content generation often shows this pattern. The model finds a phrase it likes and uses it repeatedly. Frequency penalty breaks this pattern by making repeated tokens less likely each time they appear.
+
+Presence penalty is blunter. It just discourages reusing any token, regardless of how many times it has appeared. This pushes for vocabulary diversity. You use it when outputs feel monotonous or when you need the model to explore more varied phrasing.
+
+Both penalties are typically small values between 0 and 2. Values above 1 create strong anti-repetition pressure. Values below 0.5 are subtle nudges. The right value depends on your use case and how repetitive the model's default behavior is for your prompts.
+
+The architectural consideration is whether repetition is a bug or a feature. Technical documentation benefits from consistent terminology, which means repetition is good. Creative fiction benefits from varied language, which means repetition is bad. You set penalties based on product requirements, not based on experimentation.
+
+## Combining Parameters Creates Complex Behavioral Spaces
+
+Temperature, top-p, frequency penalty, and presence penalty interact. You can set multiple parameters simultaneously, which creates a large configuration space. Most of this space is useless. A few combinations are meaningful.
+
+Temperature 0 with any other parameters set is nonsensical. Temperature 0 makes sampling deterministic, which means top-p, frequency penalty, and presence penalty have no effect. If you see code that sets temperature to 0 and top-p to 0.9, someone copied settings without understanding them.
+
+Temperature with top-p is a valid combination. You use temperature to set overall randomness level and top-p to cap maximum randomness. Temperature 0.8 with top-p 0.9 gives creative sampling that still filters extreme outliers. This is a common setting for content generation.
+
+Frequency penalty with presence penalty is usually redundant. Both discourage repetition through different mechanisms. Setting both creates compounding anti-repetition pressure that often hurts coherence. Pick one based on whether you want proportional or flat discouragement.
+
+The right mental model is that you have one primary randomness parameter (temperature or top-p) and optionally one anti-repetition parameter (frequency or presence penalty). Anything more complex is likely unnecessary and definitely untested.
+
+## Sampling Settings Belong in Version Control with Prompts
+
+Sampling parameters are part of prompt architecture. They define behavior as much as prompt text does. A prompt that works well at temperature 0 may fail at temperature 0.7. When you version control your prompts, you must version control their associated sampling parameters.
+
+The implementation is straightforward. Your prompt definitions in code include both the prompt text and a configuration object with sampling parameters. You never set sampling parameters in application logic separate from prompt definitions. This creates hidden dependencies that break when someone modifies one without the other.
+
+You also document why each parameter is set to its value. "Temperature 0 because contract extraction is deterministic" explains the reasoning. Future engineers understand the decision. "Temperature 0.7 because examples used it" is technical debt. It reveals that no one made a conscious decision.
+
+Sampling parameters also require testing as part of prompt evaluation. Your evaluation set should test with the production sampling parameters. If you evaluate at temperature 0 for speed but deploy at temperature 0.7, your evaluation tells you nothing about production behavior. This mistake is common and dangerous.
+
+## Different Tasks Within One Application Need Different Settings
+
+A complex AI application has multiple prompts for different tasks. Each task may need different sampling parameters. Your contract analysis application might use temperature 0 for clause extraction, temperature 0.7 for summarization, and temperature 0.9 for generating plain-language explanations. This is correct architecture.
+
+The mistake is using global sampling configuration. You set temperature once in an environment variable or config file and apply it to all prompts. This assumes all tasks have identical randomness requirements. They do not. Extraction needs determinism. Creative explanation needs variation. One setting cannot serve both.
+
+You implement per-task sampling by defining parameters with each prompt. Your prompt for extraction includes temperature 0. Your prompt for summarization includes temperature 0.7. Your LLM client reads these settings and applies them per request. This makes sampling parameters explicit and task-specific.
+
+This also enables independent optimization. You can experiment with different temperatures for summarization without affecting extraction. You can update extraction prompts without considering how temperature changes affect other tasks. Each prompt is a self-contained unit with its own behavioral contract.
+
+## Sampling Parameters Are Rarely the Solution to Prompt Problems
+
+When a prompt produces poor outputs, the first instinct is often to adjust temperature. This is usually wrong. Sampling parameters cannot fix prompts that have unclear instructions, insufficient examples, or structural problems. They can only adjust randomness in an already-functional prompt.
+
+If your extraction prompt sometimes misses clauses, lowering temperature will not help. The problem is prompt design, not randomness. You need clearer instructions, better examples, or explicit validation steps in the prompt. Temperature 0 just makes the model confidently wrong in the same way every time.
+
+If your creative content generation feels repetitive, raising temperature might help. But it might also produce nonsense. The better solution is usually improving the prompt to encourage varied structure or providing more diverse examples. Temperature is a last resort after prompt quality is optimized.
+
+The architecture principle is that you design prompts first, then set sampling parameters to match the task requirements. You do not iterate on sampling parameters to compensate for prompt weaknesses. This creates superstition where you believe temperature 0.73 works better than 0.7 for mysterious reasons. The real reason is that you have a mediocre prompt and you got lucky.
+
+## Production Systems Need Sampling Parameter Monitoring
+
+Once you deploy prompts with specific sampling parameters, you need to monitor whether those parameters remain appropriate as your system evolves. User behavior changes. Input distributions shift. Model updates alter default behavior. Sampling parameters that worked at launch may need adjustment over time.
+
+You monitor output diversity metrics. For deterministic tasks at temperature 0, you should see identical outputs for identical inputs. If you start seeing variation, something changed (model update, prompt drift, infrastructure change). For creative tasks at higher temperatures, you measure output uniqueness over time. Decreasing uniqueness suggests you need higher temperature or different prompts.
+
+You also monitor user satisfaction correlated with sampling parameters. If users increasingly report that outputs feel repetitive, your frequency penalty may be too low. If users report nonsensical outputs, your temperature may be too high. These signals guide parameter adjustments.
+
+The key is having telemetry that connects sampling parameters to outcomes. You log which parameters were used for each request. You track which outputs users accepted versus rejected. You correlate these datasets to identify when parameter changes might improve results. Without this data, parameter tuning is superstition.
+
+## Sampling Strategy Is a Product Specification
+
+The legal startup's mistake was treating temperature as an implementation detail. It is not. Temperature defines whether your product gives consistent or varied outputs. This is a core product characteristic that users experience directly. It belongs in product requirements, not hidden in code.
+
+Your product spec should state: "Contract extraction must produce identical results for identical inputs." This requirement translates directly to temperature 0. The spec should also state: "Marketing copy generation should produce at least five distinct options for each request." This requirement suggests higher temperature or multiple samples at lower temperature.
+
+Making sampling parameters explicit in product specs ensures alignment between product intent and implementation. It also makes testing requirements clear. If the spec says outputs must be deterministic, your test suite verifies determinism. If the spec says outputs should be diverse, your test suite measures diversity.
+
+Sampling parameters stop being mysterious tuning knobs when you frame them as product requirements. Temperature is not a performance optimization. It is the answer to "should this feature be consistent or creative?" That is a product question with a clear answer. You make the architectural decision accordingly.
+
+The next subchapter transitions from prompt architecture foundations to the practical design of tool-calling systems, examining how to structure function definitions and tool use patterns for reliable agentic workflows.

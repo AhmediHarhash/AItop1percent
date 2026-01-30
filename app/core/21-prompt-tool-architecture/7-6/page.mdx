@@ -1,0 +1,161 @@
+# 7.6 — Tool Error Handling and Retry Patterns
+
+A ride-sharing startup launched an AI booking assistant in July 2024 that could request rides, check ETAs, and update destinations. When their payment processing tool encountered errors, it returned technical messages like "PAYMENT_GATEWAY_TIMEOUT_ERR_0x4A3F" to the model. The model, having no idea what this meant, told users "I encountered error 0x4A3F processing your payment." Users were baffled and frustrated. Within two months, 30% of transactions were abandoned at payment step due to incomprehensible error messages, costing the company $400,000 in lost rides. The tools worked 98% of the time—the 2% failure handling destroyed user trust.
+
+Error handling in tool calling is where theoretical AI capability meets real-world messiness. Networks fail. APIs return 500 errors. Databases lock. Rate limits trigger. External services go down. Your tools will fail, not occasionally but regularly. How you handle these failures determines whether your AI system feels reliable or broken.
+
+Most developers handle errors as an afterthought—catch exceptions, log them, move on. But in AI systems, errors aren't just logged—they're communicated to a language model that must explain them to users. This three-layer error communication (system → model → user) requires careful design at every step.
+
+## Types of Tool Failures
+
+Tool failures fall into distinct categories, each requiring different handling strategies. Categorizing failures helps you design appropriate responses and recovery mechanisms.
+
+**Validation failures** occur before tool execution when parameters don't meet requirements. Missing required parameters, wrong types, invalid values, or constraint violations all prevent execution. These failures are preventable through better tool schemas and input validation, but they still happen when models misunderstand requirements or users provide ambiguous input.
+
+**Execution failures** happen during tool operation. Database queries time out. API calls return errors. File operations fail due to permissions. External services are unavailable. These failures are often transient—retrying might succeed—but some indicate permanent problems that retrying won't fix.
+
+**Logic failures** occur when a tool executes successfully but can't satisfy the request due to business logic. "Can't cancel order: already shipped" or "Can't apply discount: expired" are logic failures, not execution errors. The tool worked—the operation just isn't allowed given current state.
+
+**Timeout failures** happen when tools take too long. You set a 5-second timeout on a database query, and it doesn't complete. The query might still be running (consuming resources) or might have failed. You don't know—you just know it didn't complete in time. Timeouts are particularly tricky because they're ambiguous.
+
+**Partial failures** plague complex tools that perform multiple operations. A tool might succeed at step 3 of 5 before failing. What happens to the first three steps? Are they rolled back, left in place, or in inconsistent state? Partial failures require careful state management and potentially compensating transactions.
+
+## Error Message Design for Models
+
+Error messages returned to the model are not user-facing text—they're structured information the model uses to understand what went wrong and decide how to proceed. Design these messages for model consumption, not human reading.
+
+**Structured error responses** use consistent formats. Include an error code or category, a description of what failed, why it failed, and what actions might resolve it. "Error: VALIDATION_FAILED. Reason: Missing required parameter 'product_id'. Action: Provide a valid product ID from the user's query or context" gives the model actionable information.
+
+**Context-rich descriptions** help the model understand not just that something failed but why it matters. "Payment processing failed: insufficient funds in account" is better than "Payment failed" because the model can suggest specific user actions like updating payment method or reducing order amount.
+
+**Action suggestions** guide the model's next steps. "Retry with a different shipping address" or "Ask user to verify payment information" or "Use alternative product search tool" help the model recover gracefully. Without guidance, the model might retry the same failing operation indefinitely.
+
+**State information** in errors helps the model understand where the failure occurred in multi-step processes. "Order creation succeeded but payment processing failed. Order ID: 12345. Status: PAYMENT_PENDING" tells the model that partial progress was made and provides identifiers for potential recovery operations.
+
+Avoid technical jargon in error descriptions meant for models. The model doesn't care about exception class names or stack traces. "Database connection pool exhausted" means nothing to the model. "Unable to access data due to high system load. Retry after brief delay" is actionable.
+
+## Retry Strategies
+
+Not all failures should trigger retries. Some errors are permanent and retrying is pointless. Others are transient and retrying often succeeds. Distinguishing between them is critical for efficient error handling.
+
+**Transient failures** are temporary problems that might resolve themselves. Network timeouts, rate limiting, temporary service unavailability, and database deadlocks often succeed on retry. These are good candidates for automatic retry with appropriate backoff.
+
+**Permanent failures** won't be fixed by retrying. Invalid authentication credentials, nonexistent resources, validation errors, and business logic violations are permanent. Retrying these wastes time and resources. Fail fast and provide clear error messages instead.
+
+**Exponential backoff** prevents retry storms. First retry immediately, second after 1 second, third after 2 seconds, fourth after 4 seconds. This gives transient issues time to resolve while limiting retry impact. Without backoff, aggressive retries can overwhelm failing systems, making problems worse.
+
+**Jitter** adds randomness to backoff timing. If multiple tool calls fail simultaneously and all retry at exactly the same time, you've created a thundering herd that might cause further failures. Adding random jitter (e.g., 1 second ± 200ms) spreads retry attempts and reduces load spikes.
+
+**Retry limits** prevent infinite loops. Three retries is a common default—enough to survive transient issues, not so many that users wait forever. Track retry count and fail after the limit. Communicate to the model how many retries were attempted: "Failed after 3 attempts. Recommending alternative approach."
+
+## Graceful Degradation
+
+When tools fail, systems don't have to fail completely. Graceful degradation provides reduced functionality instead of no functionality.
+
+**Fallback tools** provide alternative ways to accomplish tasks. If get_realtime_inventory fails, fall back to get_cached_inventory. The data might be slightly stale, but stale data beats no data. Design tool sets with primary and fallback options for critical functionality.
+
+**Partial responses** deliver what's available even when complete responses aren't possible. If three tools run in parallel and one fails, return results from the two that succeeded along with a note about the missing information. Users often prefer partial answers to no answers.
+
+**Feature degradation** disables optional capabilities when dependencies fail. If recommendation tools fail, continue with manual search. If personalization fails, provide generic responses. Core functionality continues even when enhancements are unavailable.
+
+**Alternative workflows** route users around failures. If automated payment processing fails, offer manual payment options. If real-time booking fails, offer request-based booking. Flexibility in workflow design enables graceful degradation.
+
+The model should be aware of degradation. Don't hide that a fallback was used—the model might make different decisions knowing that data is cached rather than real-time. "Note: Using cached inventory data from 2 hours ago due to real-time system unavailability" provides important context.
+
+## Communicating Tool Failures to Users
+
+The model must translate error information into user-facing messages. Guide this translation through error message design and system prompts.
+
+**User-friendly language** replaces technical errors with plain explanations. "PAYMENT_GATEWAY_TIMEOUT" becomes "Payment processing is taking longer than usual." "RESOURCE_NOT_FOUND" becomes "I couldn't find that item." The model handles this translation, but your error messages should be translatable.
+
+**Actionable guidance** tells users what they can do. "Please verify your payment information and try again" or "This item is out of stock, but I can notify you when it's available" turns failures into next steps. Don't just report problems—suggest solutions.
+
+**Appropriate blame assignment** matters for user trust. If your system failed, acknowledge it: "I'm having trouble accessing our inventory system." If the user provided invalid input, gently correct it: "I don't have a product with that name. Could you provide more details?" Distinguish between system errors and user input issues.
+
+**Transparency about retries and workarounds** builds trust. "I had trouble with the primary system, but I was able to retrieve information from our backup" or "This took longer than usual, but I've got your results" explains delays and builds confidence that the system worked through problems.
+
+System prompts should guide error communication tone. "When tools fail, explain errors in friendly, non-technical language. Focus on what users can do next rather than what went wrong. If the error is on our side, acknowledge it briefly and provide alternatives."
+
+## Error Context and Debugging
+
+Error information serves two audiences: the model (for immediate handling) and developers (for debugging). Design errors to support both.
+
+**Correlation IDs** link user requests to tool executions to logs. When a tool fails, include a correlation ID in the error. Log the full error details with the same ID. This lets developers trace from user complaints to exact failure points without exposing technical details to users.
+
+**Error categorization** tags errors with types: validation, timeout, external_service, permission, rate_limit, unknown. This enables pattern analysis. If 40% of errors are timeouts, you have a latency problem. If 30% are validations, your schemas need work. Category tags make error patterns visible.
+
+**Error context** includes information about what the system was trying to do when the failure occurred. Log the user query, conversation state, previous tool calls, and the specific tool parameters that failed. Context is essential for reproducing and fixing bugs.
+
+**Structured logging** uses consistent formats for errors. JSON logs with standard fields (timestamp, correlation_id, tool_name, error_category, error_message, parameters, retry_count) enable automated analysis. You can build dashboards, set alerts, and identify patterns across thousands of errors.
+
+Don't log sensitive information. Payment details, passwords, personal data—these shouldn't appear in error logs even when tools fail. Redact sensitive parameters before logging. A production incident isn't worth exposing user data.
+
+## Handling Cascading Failures
+
+In systems with multiple tools and dependencies, one failure can trigger others. Cascading failures are particularly dangerous because they can take down entire systems.
+
+**Circuit breakers** prevent cascading failures by stopping calls to failing services. If a tool fails repeatedly, "open" the circuit breaker—stop calling that tool temporarily. After a cooldown period, try again. If it works, close the breaker. If not, keep it open. This prevents one broken tool from causing system-wide issues.
+
+**Bulkheads** isolate failures by partitioning resources. If Tool A exhausts the connection pool, it shouldn't prevent Tool B from working. Use separate connection pools, thread pools, or resource quotas for different tool categories. Isolation contains failures.
+
+**Timeouts** prevent slow failures from blocking other operations. A tool that hangs indefinitely can exhaust resources and cause cascading failures. Aggressive timeouts (2-5 seconds for most operations) ensure that slow failures fail fast instead of hanging.
+
+**Dependency mapping** identifies which tools depend on which services. If a database goes down, immediately mark all tools using that database as unavailable. Don't let each tool fail individually—fail them proactively based on dependency status.
+
+Monitor for cascading failure patterns. If Error A is followed by Error B within 500ms across multiple requests, B might be caused by A. Correlation analysis reveals these patterns. Fix the root cause (A) instead of treating symptoms (B).
+
+## Retry Decision Logic
+
+Deciding whether to retry, how many times, and with what backoff requires logic based on error type and context.
+
+**Error classification** determines retry eligibility. Implement a function that examines errors and returns retry recommendations. HTTP 500 errors: retryable. HTTP 400 errors: not retryable. Timeouts: retryable. Validation failures: not retryable. This classification should be consistent across your system.
+
+**Context-aware retries** consider broader state. If this is the user's third attempt to complete checkout and it keeps failing, stop retrying and offer alternative payment methods. Repeated failures suggest a persistent issue that retrying won't fix. Track failure history per user session.
+
+**Cost-based retry decisions** consider resource implications. Retrying a cheap read operation three times is fine. Retrying an expensive write operation that might have partially succeeded is dangerous. Factor in operation cost when designing retry logic.
+
+**User feedback** during retries keeps users informed. If a retry will take several seconds, tell them. "Payment processing is slow right now. I'm retrying..." manages expectations. Don't leave users wondering whether the system is still working.
+
+Some systems let models make retry decisions. Return an error with retry recommendation, and let the model decide based on conversation context whether to retry automatically, ask the user, or try an alternative. This flexibility enables context-appropriate error handling.
+
+## Testing Error Handling
+
+Error handling is hard to test because errors are rare in development environments. Deliberate error injection and fault testing are essential.
+
+**Fault injection** simulates failures during testing. Force tools to return errors—timeouts, validation failures, external service errors. Verify that your system handles each failure type correctly. Test every error path, not just happy paths.
+
+**Chaos testing** randomly injects failures during normal operation. Tools occasionally fail without warning. Does your system recover gracefully? Do cascading failures occur? Chaos testing reveals resilience issues that controlled tests miss.
+
+**Retry testing** verifies retry logic. Mock a tool that fails twice then succeeds. Verify that your system retries correctly and ultimately succeeds. Test retry limits—ensure that after N failures, retries stop. Test backoff timing—verify that retries don't happen too fast.
+
+**Error message testing** checks that models can interpret and communicate errors. Given various error types, does the model generate appropriate user-facing messages? Do users understand what went wrong and what to do next? This might require human evaluation.
+
+Load testing with error injection reveals how errors behave under scale. A system that handles errors fine with one user might cascade failures under load. Test error handling at production scale.
+
+## Production Error Monitoring
+
+Error handling in production requires continuous monitoring and alerting. You can't fix problems you don't know about.
+
+**Error rate tracking** measures failure percentage over time. A baseline 1% error rate is acceptable. A sudden jump to 5% indicates a problem. Set alerts for error rate changes, not just absolute counts—error volume naturally scales with traffic.
+
+**Error type distribution** shows what's failing. If timeouts suddenly increase, you have a latency issue. If validation errors spike, something changed in user behavior or model behavior. Track error type proportions to identify pattern shifts.
+
+**Tool-specific metrics** reveal problematic tools. If one tool has a 10% error rate while others are at 1%, investigate that tool. It might have implementation bugs, dependencies on unreliable services, or design issues.
+
+**Recovery success tracking** measures how often retry logic succeeds. If 80% of retried operations eventually succeed, your retry logic is working. If only 20% succeed, you're retrying non-transient errors wastefully.
+
+**User impact assessment** connects errors to outcomes. Did users complete their tasks despite errors? Did they abandon sessions? Error rates are abstract—task completion rates and user satisfaction are concrete. Track both to understand error impact.
+
+## Error Handling as Product Strategy
+
+How you handle errors is a product decision, not just a technical one. Error experiences shape user perception of AI reliability.
+
+**Transparent errors** build trust more than hiding problems. "I'm having trouble accessing current inventory, but I can show you what we had in stock yesterday" is honest and helpful. Pretending everything is fine when it's not erodes trust.
+
+**Proactive alternatives** turn errors into service. "That payment method didn't work, but I can offer installment payments or alternative methods" shows the system is helpful even when tools fail. Errors become opportunities to demonstrate capability.
+
+**Error recovery as feature** can differentiate products. If competitors' AI systems fail and give up, but yours tries alternatives and finds solutions, that's a competitive advantage. Invest in error recovery as deliberately as you invest in primary features.
+
+User research should cover error scenarios. What errors do users encounter most? How do they react? What do they wish the system did differently? Use this feedback to prioritize error handling improvements.
+
+Error handling transforms tool calling from a best-effort feature to a production-ready system. Tools will fail—that's guaranteed. How you detect failures, communicate them, retry operations, and degrade gracefully determines whether failures are minor hiccups or trust-destroying disasters. Handle errors well, and users never doubt your system's reliability. Handle them poorly, and no amount of successful operations will rebuild confidence.

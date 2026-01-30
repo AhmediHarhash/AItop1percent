@@ -1,0 +1,155 @@
+# 4.3 — Memory Architecture: Short-Term, Long-Term, and Episodic
+
+A personal AI assistant startup with 40K daily active users faced a crisis in September 2024 when users reported the app "didn't remember them anymore." The product had worked beautifully at launch: it remembered names, preferences, ongoing projects, and conversation context across days. But as the user base grew and conversations accumulated, the engineering team had to cut costs. They reduced context window sizes and purged old conversation data aggressively. Users who'd had 30-day relationships with their AI assistant found it forgot their job title, family members' names, and current goals. Retention dropped 47% in three weeks. The team had treated all memory as interchangeable, discarding long-term personal information to save tokens the same way they discarded yesterday's weather chat.
+
+You need **memory architecture** when your AI product serves users across multiple sessions with different types of information that have different lifespans and retrieval patterns. Not all information is equal. What you talked about two minutes ago (short-term memory) needs different storage and retrieval than facts about user preferences (long-term memory) and specific episodes like "the solution we tried last Tuesday" (episodic memory). Collapsing these into one undifferentiated conversation history creates memory that's simultaneously too expensive and not capable enough.
+
+## The Three Memory Systems
+
+Human cognition uses distinct memory systems: working memory for immediate tasks, semantic memory for facts and knowledge, and episodic memory for specific events. AI conversation systems need analogous separation. **Short-term memory** holds the current conversation turn and recent context. **Long-term memory** stores persistent facts about users, preferences, and established knowledge. **Episodic memory** captures specific past interactions and their outcomes.
+
+These systems differ in capacity, persistence, and retrieval patterns. Short-term memory is high-capacity (thousands of tokens), ephemeral (cleared after session or compressed), and always-active (included in every turn). Long-term memory is bounded (hundreds of facts per user), persistent (stored in databases), and selectively-activated (retrieved based on relevance). Episodic memory is potentially unlimited (all past conversations), persistent, and query-based (retrieved when contextually relevant).
+
+Using one system for all memory types creates trade-offs you can't win. Store everything in short-term context and you hit token limits. Store everything in long-term databases and you lose conversation flow. The solution is thoughtful separation: put each type of information in the memory system that matches its characteristics and use patterns.
+
+Most failed memory architectures fail because they never made this distinction. They treat conversation history as the only memory and try to solve all memory needs by making conversation history bigger or compressing it better. This is like trying to use RAM for long-term file storage. It's the wrong tool for the job.
+
+## Short-Term Memory: In-Context Working Memory
+
+Short-term memory lives in the LLM context window as conversation history. It contains the current conversation turns in full detail: what the user just said, what the assistant just responded, and the previous N turns. This is your working memory for the active conversation.
+
+The primary design decision is window size: how many recent turns to include verbatim. This depends on your conversation's typical reference patterns. If users frequently refer to points made 15 turns ago, you need at least 15 turns in short-term memory. If conversations are mostly forward-looking with rare backwards references, 5-10 turns might suffice.
+
+Short-term memory should include conversation structure, not just text. Tag turns with metadata: timestamp, turn number, whether it contained a tool call, whether the user expressed satisfaction or frustration. This metadata helps downstream processes decide what to promote to long-term memory and how to summarize conversations.
+
+Don't pollute short-term memory with information that belongs elsewhere. If the user says "My email is user@example.com," that fact should be extracted and stored in long-term memory. Short-term memory should contain "User provided their email address (stored)" rather than the email itself repeated in every subsequent turn. This keeps short-term memory focused on conversation flow rather than fact accumulation.
+
+Implement short-term memory with a fixed-size buffer that automatically manages overflow. When turn N+1 arrives and including it would exceed your token budget, compress or discard turn 1, keep turns 2 through N, and add N+1. This should be automatic and invisible to the rest of your system. The conversation handler just adds turns without worrying about capacity management.
+
+## Long-Term Memory: Persistent User Knowledge
+
+Long-term memory stores facts that persist across conversations and sessions: user attributes, preferences, established knowledge about their environment, and ongoing projects or goals. This lives in a database, not in context windows. It's structured data, not conversation text.
+
+Design your long-term memory schema around access patterns. You'll need: user facts (name, role, company), preferences (communication style, technical level, timezone), environment facts (programming languages used, deployment platforms, tools), and goals or projects (ongoing objectives, key tasks). Each category might be a separate table or document collection with different update patterns.
+
+Update long-term memory through explicit extraction, not implicit inference. After each conversation turn, analyze whether the user stated facts that should be stored. "I work at Acme Corp as a senior engineer" should trigger storing company="Acme Corp" and role="Senior Engineer". Don't infer and store "user prefers detailed explanations" based on one conversation. Wait for explicit confirmation or clear behavioral patterns across multiple sessions.
+
+Long-term memory needs update and conflict resolution logic. If your database says user_role="Engineer" but the user mentions they were promoted to "Engineering Manager," you need to detect the conflict and update the stored value. Implement timestamp-based recency: newer information overwrites older information for the same attribute. Log all updates so you can debug cases where incorrect information gets stored and propagates.
+
+Retrieve long-term memory at conversation start and inject it into your system prompt or early context. "You are assisting Jane Doe, a Senior Engineering Manager at Acme Corp working with Python and AWS. She prefers direct, technical explanations and is currently focused on migrating legacy services to containers." This grounds every conversation in established user context without consuming short-term memory capacity.
+
+## Episodic Memory: Conversation History Retrieval
+
+Episodic memory captures specific past interactions: "On Tuesday, we debugged the authentication issue and found it was a misconfigured CORS policy." This isn't a general fact to store in long-term memory; it's a specific episode that might be relevant when the user returns to authentication topics.
+
+Store episodic memory as conversation segments with rich metadata: date, topic tags, outcome (resolved, unresolved, abandoned), entities mentioned (specific files, functions, error codes), and a semantic embedding of the conversation for similarity search. Each episode is a coherent unit: a problem and its resolution, a planning session, a learning exchange.
+
+The key challenge is relevance determination: which past episodes matter for the current conversation? You can't load all episodes into context (too many tokens), and you can't load none (users expect continuity). Implement semantic search: embed the current conversation context, query your episode database for similar embeddings, and retrieve the top 2-3 most relevant past episodes.
+
+Augment semantic search with recency and explicit references. If the user says "like we discussed last week," time-based filtering is more important than semantic similarity. If they mention a specific topic or entity, filter episodes containing that topic. Combine multiple retrieval signals: recency + semantic similarity + entity overlap gives better results than any single signal.
+
+Inject retrieved episodes into context as compressed summaries, not full transcripts. If an episode was 30 turns, summarize it to 200 words highlighting the key points, actions taken, and outcome. Include a reference ID so you can retrieve the full episode if needed. This balances context efficiency with episodic continuity.
+
+## Memory Extraction Pipelines
+
+Moving information from short-term to long-term and episodic memory requires extraction pipelines that run after each turn or at conversation end. These pipelines analyze conversation content and decide what to persist and where.
+
+For long-term memory extraction, use structured prompts: "Based on this conversation turn, extract any facts about the user's background, preferences, or environment that should be stored long-term. Return structured JSON." Parse the LLM's response into database updates. This is an inference call per turn (or per N turns), which has cost implications, but it's essential for memory quality.
+
+For episodic memory creation, segment conversations at boundaries: task completion, topic shifts, or session ends. When you detect a boundary, create an episode summary: "User reported 404 errors on the login page. We examined server logs and found a misconfigured route. User updated the routing configuration and confirmed the issue was resolved." Store this with timestamp, tags (authentication, debugging, routing), and embeddings.
+
+Run extraction asynchronously when possible. The user doesn't need to wait for long-term memory updates or episodic memory creation. Process their next turn immediately, then update memory systems in background workers. This reduces latency while ensuring memory persists.
+
+Implement extraction quality monitoring. Sample extracted facts and episodes, review them manually or with automated checks, and measure accuracy. Are you extracting the right information? Are you missing important facts? Are episode summaries coherent and useful? Failed extractions compound: wrong information stored once pollutes many future conversations.
+
+## Memory Retrieval Strategies
+
+At the start of each conversation turn, you must decide what memory to load into context. This is a multi-stage retrieval: always-load long-term facts, conditionally-load relevant episodes, and maintain short-term working memory.
+
+Stage one: load user-level long-term memory. Every turn should have access to basic user facts and preferences. This is a single database query by user ID. Inject these facts into your system prompt or as a "User Profile" section in context.
+
+Stage two: analyze the current user message for relevance signals. Extract entities (files, projects, people), topics, and temporal references ("last week," "the last time we talked"). Use these as filters for episodic memory retrieval.
+
+Stage three: query episodic memory with semantic similarity, filtered by the signals from stage two. Retrieve the top 2-3 most relevant episodes. If the query returns no highly relevant episodes (similarity score below threshold), don't inject any. Empty retrieval is better than injecting irrelevant episodes that confuse the model.
+
+Stage four: format retrieved memory for injection. Create a context section like "Relevant Past Conversations: [Episode 1 summary] [Episode 2 summary]". Place this after system prompt but before conversation history. This positioning makes it available for the current turn without disrupting conversation flow.
+
+Monitor retrieval quality by tracking when retrieved episodes get referenced in the assistant's response. If you retrieve three episodes but the response never uses any of them, your retrieval is noisy. If users frequently say "we already discussed this" when you didn't retrieve the relevant episode, your retrieval is incomplete. Tune retrieval parameters based on these signals.
+
+## Memory Conflicts and Corrections
+
+Users change jobs, preferences evolve, past solutions stop working. Your memory systems must handle updates and conflicts gracefully. When new information contradicts stored memory, you need policies for resolution.
+
+For long-term memory, implement explicit user corrections: if the user says "Actually, I'm not at Acme Corp anymore, I joined Beta Inc," treat this as an authoritative update. Don't average the old and new values or ask the user to confirm. Update immediately and log the change for audit purposes.
+
+For conflicting facts without clear correction signals, prefer recency but flag ambiguity. If your long-term memory says programming_language="Python" but the current conversation is entirely about Java development, flag that the stored preference might be stale. Don't auto-update based on one conversation, but surface this to human review or ask the user: "I notice you're working with Java, but I have Python listed as your primary language. Has that changed?"
+
+For episodic memory, never delete episodes even if outcomes changed. If an episode says "We fixed the authentication bug with solution X," and a later episode says "Solution X didn't work, we used solution Y," keep both. The history of attempted solutions is valuable. Retrieval should surface both episodes when authentication is discussed, showing the full problem-solving journey.
+
+Implement memory versioning for critical facts. If you store user preferences with timestamps, you can show when things changed. This helps debug cases where users report "the AI used to understand my preferences but doesn't anymore." You can trace exactly when a preference update occurred and what triggered it.
+
+## Memory Privacy and Retention
+
+Memory systems create privacy obligations. You're storing personal information, potentially sensitive conversation details, and behavioral data. Design with privacy from the start.
+
+Allow users to view all stored memory. Provide a UI showing long-term facts you've stored about them and summaries of episodic memories. This transparency builds trust and helps users correct errors. If your long-term memory says they work in healthcare but they're in finance, they need a way to fix it.
+
+Implement deletion controls. Users should be able to delete specific episodic memories ("forget that conversation about X") or wipe all long-term memory. Deletion should be immediate and complete: remove from primary storage, caches, backups, and any derived data like embeddings.
+
+Set retention policies for episodic memory. Do you need conversation history from three years ago? For most products, probably not. Implement automatic purging of episodes older than a threshold (90 days, one year, etc.). Long-term facts can persist indefinitely since they're actively useful, but episodic memory accumulates unbounded and most episodes lose relevance over time.
+
+Encrypt memory at rest and in transit. Long-term facts and episodic summaries often contain PII: names, companies, email addresses, project details. Standard database encryption isn't enough if you're querying with embeddings. Research privacy-preserving similarity search if you need to maintain confidentiality guarantees.
+
+## Memory System Scalability
+
+As your user base grows, memory systems become scaling bottlenecks. Each user has their own long-term facts and episodic memories. Retrieval queries grow proportionally with users. Design for scale from the beginning.
+
+For long-term memory, use standard database scaling techniques: indexing by user ID, sharding if necessary, caching frequently-accessed user profiles. Long-term memory reads are high-frequency (every conversation start) but updates are lower-frequency (once per conversation or less). Read-optimized databases like Redis or memory caches work well as a layer over persistent storage.
+
+For episodic memory with semantic search, scaling is harder. Embedding similarity search over millions of episodes is expensive. Use approximate nearest neighbor search (FAISS, Pinecone, Weaviate) rather than exact search. Partition by user ID so you only search one user's episodes, not all episodes globally. Implement aggressive pre-filtering: filter by recency or topic tags before semantic search to reduce the search space.
+
+Consider tiered episodic memory: recent episodes (last 30 days) in hot storage with fast retrieval, older episodes in cold storage with slower retrieval. If a user explicitly references something from six months ago, the extra retrieval latency is acceptable. Routine retrievals should hit the fast tier.
+
+Monitor memory system performance separately from LLM performance. Track retrieval latency, database query times, and embedding search duration. These can dominate turn processing time if not optimized. Set SLAs for memory retrieval (e.g., p95 latency {"<"} 200ms) and alert when you exceed them.
+
+## Memory-Augmented Prompting
+
+Retrieved memory must be formatted for effective LLM use. Dumping raw database records into context doesn't work. The LLM needs structured, relevant information presented clearly.
+
+For long-term facts, use a consistent format: "USER PROFILE: Name: Jane Doe | Role: Engineering Manager | Company: Acme Corp | Tech Stack: Python, AWS | Communication Preference: Direct technical explanations | Current Focus: Container migration." This structured format is easier for models to condition on than narrative text.
+
+For episodic memory, use narrative summaries with clear outcomes: "PAST CONVERSATION (Jan 15, 2026): User experienced 404 errors on login page. Investigation revealed misconfigured routing. Resolution: Updated route configuration in app.py. Outcome: Issue resolved." Include dates for temporal grounding.
+
+Mark memory clearly as injected context, not part of the current conversation. Use headers like "RELEVANT PAST CONTEXT" or "USER INFORMATION FROM PREVIOUS SESSIONS." This helps the model distinguish between what's happening now versus what happened before.
+
+Test memory injection prompting thoroughly. Inject irrelevant memory intentionally and verify the model doesn't confuse it with current context. Inject conflicting information (memory says one thing, current conversation implies another) and verify the model asks for clarification rather than assuming. Memory should enhance coherence, not create confusion.
+
+## Memory as Product Differentiator
+
+Effective memory systems create product value beyond conversation quality. Users develop relationships with AI that "knows them." This drives retention and engagement. A new user might try your product once, but a user who's had 50 conversations and built up personalized memory has switching costs.
+
+Surface memory value explicitly. When you use long-term memory to provide a personalized response, you can acknowledge it: "Based on your Python/AWS environment, here's an approach..." Users should know the system remembers them. This isn't just good UX; it's teaching users to invest in the relationship by providing more information.
+
+Offer memory as a premium feature. Free tier gets short-term memory only (conversation history during a session). Paid tier gets long-term and episodic memory across sessions. This creates clear value differentiation and revenue justification for the storage and retrieval costs.
+
+Build trust through memory transparency and control. The AI that remembers too much feels creepy. The AI that forgets everything feels useless. The AI that remembers the right things and lets users see and control what it remembers feels trustworthy. Your memory architecture should enable this trust.
+
+## Testing Memory Systems
+
+Test each memory layer independently before integration testing. For long-term memory, verify extraction accuracy: do facts get extracted correctly? Do updates work? Can you retrieve facts by user ID? For episodic memory, verify segmentation: do conversations get split into coherent episodes? Verify retrieval: do relevant episodes surface for given queries?
+
+Integration testing requires multi-session scenarios. Simulate a user having conversation A, then days later having conversation B that references A. Did episodic memory preserve the relevant information from A? Did retrieval surface it during B? Did the LLM successfully use the retrieved information?
+
+Test memory conflicts explicitly. Simulate a user changing jobs, preferences, or environments. Verify your systems detect the change, update appropriately, and don't create confusion by mixing old and new information. Test correction flows: user says "that's wrong, actually..." and verify the correction propagates through your memory systems.
+
+Load testing is critical for memory systems because they're stateful. Unlike stateless LLM calls, memory queries depend on accumulated data. Test with realistic user counts and conversation histories. Does retrieval latency stay acceptable when users have 100 stored episodes? Can your database handle 10K concurrent long-term memory lookups?
+
+## Memory System Evolution
+
+Start with minimal memory architecture: just short-term conversation history. Add long-term memory when user feedback indicates value: "I wish it remembered my preferences" or "I have to re-explain my setup every conversation." Add episodic memory when users reference past conversations: "Like we discussed before..." or "That solution we tried..."
+
+Evolve your memory schema based on observed patterns. You might start with simple key-value pairs for long-term facts, then realize you need nested structures for complex environments. You might start with episodic memory as full conversation dumps, then refine to structured summaries. Let real usage drive schema complexity.
+
+Monitor memory value through conversation quality metrics. Do conversations with memory retrieval score higher on user satisfaction? Do they resolve issues faster? If you can't measure memory value, you can't justify the engineering and infrastructure costs. Instrument everything: retrieval hits, usage in responses, user satisfaction correlation.
+
+Understanding how to maintain memory across conversation turns enables more sophisticated applications, but memory must be refreshed and updated as conversations progress to maintain relevance.

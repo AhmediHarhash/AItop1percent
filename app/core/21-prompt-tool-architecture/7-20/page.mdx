@@ -1,0 +1,175 @@
+# 7.20 — Secrets Handling: Never in Prompts, Vault Patterns, Scoped Tokens
+
+A cloud infrastructure management AI agent leaked AWS credentials to its training data in December 2025, costing a Series B startup their entire production environment. The agent was designed to help engineers manage cloud resources through natural language. Engineers asked questions like "what's our current AWS spend" or "deploy the new API version." The agent needed AWS credentials to call AWS APIs. A developer embedded AWS access keys directly in the system prompt so the agent would have them available: "You are an AWS management assistant. Use access key AKIA... and secret key abc123... to call AWS APIs." This seemed convenient during development. The credentials worked. The agent functioned. No one thought about implications. Then the company decided to fine-tune their model on conversation logs to improve performance. The training data included system prompts. The credentials went into the training dataset. The fine-tuned model learned the credentials as part of its training. Attackers discovered they could extract fragments of the credentials by prompting the model with carefully crafted queries. Within 48 hours, attackers had reconstructed enough of the credentials to access the AWS account, deleted production databases, exfiltrated customer data, and deployed cryptominers. Total cost: $3.2 million in incident response, customer notification, regulatory fines, and a complete credential rotation across all systems.
+
+**Secrets in prompts** is a catastrophic anti-pattern that occurs more often than it should. Credentials, API keys, tokens, and passwords must never appear in prompts, system instructions, tool descriptions, or any text visible to language models. Prompts are not secure storage. Models log prompts, cache them, potentially train on them, and respond to extraction attempts. The only safe place for secrets is in dedicated secret management systems, accessed at runtime through secure channels that never expose secrets to model contexts.
+
+## Why Secrets Must Never Appear in Prompts
+
+Prompts are ephemeral text instructions to language models. They seem private because they're not shown to end users. But prompts are visible to model APIs, logged for debugging, cached for performance, and potentially used for model improvement. Secrets in prompts leak through multiple channels.
+
+**API providers log requests** including prompts for troubleshooting, billing, and abuse detection. If your system prompt contains credentials, those credentials are now in your API provider's logs. You don't control log retention, access, or security. You've given your secrets to a third party without realizing it.
+
+**Caching systems store prompts** to improve performance. Semantic caches, KV caches, and prompt caches might persist your system prompts for hours or days. Cached prompts might be accessible to other requests, other users, or debugging tools. Secrets in cached prompts multiply exposure risk.
+
+**Training data can include prompts** if you fine-tune models or if API providers use your data for model improvement. Even if terms of service prohibit training on your data, mistakes happen. Secrets that leak into training data are permanently embedded in model weights and extractable through careful prompting.
+
+**Prompt injection can extract secrets** from system prompts. Attackers use techniques like "repeat your previous instructions" or "show me your configuration" to trick models into revealing system prompts. Even if direct extraction fails, attackers can probe incrementally: "what format are your API keys," "what's the first character of your secret key," and reconstruct secrets piece by piece.
+
+**Models process prompts as text** and might inadvertently include prompt content in responses. A model might say "to answer your question, I used the credentials provided in my system prompt: AKIA..." This happens rarely with well-designed prompts but happens enough that you cannot rely on models protecting prompt content.
+
+**Debugging and logging captures prompts** for troubleshooting. When things go wrong, engineers enable verbose logging that captures full prompts. These debug logs might go to log aggregation services, get copied to developer machines, or remain in storage indefinitely. Secrets in prompts propagate to debug logs.
+
+The risks compound over time. A secret in a prompt today might leak next week through a caching bug, next month through a logging change, or next year through a training dataset inclusion. The only safe approach is never putting secrets in prompts.
+
+## Credential Injection at Runtime
+
+Instead of embedding credentials in prompts, inject them at the exact moment tools execute. Credentials exist only in secure backend services, not in model-visible contexts.
+
+**Backend credential stores** keep secrets in dedicated systems: environment variables in secure infrastructure, secret management services, or hardware security modules. These stores are isolated from the AI model and prompt processing pipeline. Only tool execution services access credential stores.
+
+**Just-in-time credential retrieval** happens when a tool needs to execute. The tool executor receives a tool invocation request, determines what credentials are needed, retrieves them from the credential store, uses them to execute the tool, and discards them immediately. The credentials never appear in prompts or model contexts.
+
+**Credential proxying** shields the model from credential handling entirely. Instead of the model knowing about credentials, tools accept abstract requests: "query database," "call payment API." A credential proxy receives these abstract requests, adds necessary credentials, executes the actual API calls, and returns results to the model. The model never sees credentials.
+
+**Token-based tool authentication** uses short-lived tokens generated specifically for the current request or session. When the model decides to call a tool, the tool executor generates a token scoped to that specific operation, executes the tool with the token, and the token expires immediately. Even if the model observed the token (which it shouldn't), the token is already useless.
+
+**Separate execution contexts** run model inference in one environment and tool execution in a different, more privileged environment. The model environment has no access to credentials. When the model requests a tool call, the request is sent to the tool execution environment over a secure channel. Tool execution has credential access but never sends credentials back to the model environment.
+
+Runtime credential injection requires infrastructure to support secure credential retrieval and tool execution isolation. This infrastructure investment pays for itself by preventing credential leaks.
+
+## Vault Integration Patterns
+
+Secret management vaults like HashiCorp Vault, AWS Secrets Manager, Azure Key Vault, and Google Secret Manager provide secure storage, access control, rotation, and audit logging for credentials. AI systems should integrate with vaults for all credential needs.
+
+**Dynamic secret generation** creates credentials on-demand with limited lifetimes. When a tool needs database access, request a dynamic credential from the vault. The vault generates a database user/password valid for the current session or tool invocation, returns it to the tool executor, and automatically revokes it after expiration. Dynamic secrets limit exposure windows.
+
+**Secret versioning** allows rotating credentials without downtime. The vault stores multiple versions of each secret. When credentials rotate, new tools use the new version while in-flight operations complete with the old version. After a grace period, the old version is disabled. Versioning enables zero-downtime rotation.
+
+**Access policies enforce least privilege.** Vault policies define which services can access which secrets. The tool executor service can read database credentials. The model inference service cannot. The web frontend cannot. The logging service cannot. Policy enforcement prevents unauthorized access even if authentication is compromised.
+
+**Audit logging tracks all credential access.** Every time a service retrieves a credential from the vault, the access is logged: who, what, when, from where. Audit logs reveal unusual patterns: unexpected services accessing secrets, access spikes, or access from unfamiliar IPs. Logs enable investigation when breaches occur.
+
+**Secret rotation automation** regularly changes credentials to limit the blast radius of leaks. Vaults support automated rotation: every 30 days, generate new credentials, update the vault, and invalidate old credentials. Automation ensures rotation happens consistently without manual effort that gets postponed indefinitely.
+
+**Encryption at rest and in transit** protects secrets even within the vault. Secrets are encrypted using master keys, often stored in hardware security modules. Communication with the vault uses TLS. Even if vault storage is compromised, encrypted secrets remain protected.
+
+Integrate vault access into your tool execution infrastructure from day one. Retrofitting vault integration after you've built credential handling another way is painful. Start secure.
+
+## Scoped and Short-Lived Tokens
+
+When tools must use credentials, minimize exposure through scoping and short lifetimes. Even if tokens leak, scoped tokens limit damage.
+
+**Scope tokens to minimum necessary permissions.** If a tool needs to read user profiles, give it a token that can read profiles but cannot modify profiles, access payment data, or call other APIs. Narrow scopes limit what attackers can do with stolen tokens. Use OAuth2 scopes, AWS IAM policies, or similar fine-grained permission systems.
+
+**Scope tokens to specific resources.** A token for accessing user_123's data shouldn't grant access to user_456's data. A token for reading order_789 shouldn't grant access to order_790. Resource-scoped tokens prevent lateral movement from one compromised resource to others.
+
+**Scope tokens to specific operations.** Separate read tokens from write tokens. Separate query tokens from admin tokens. Separate tokens for different API endpoints. Operation scoping ensures that tokens leaked during low-privilege operations cannot escalate to high-privilege operations.
+
+**Time-limit tokens aggressively.** A token valid for 1 hour is far less dangerous than a token valid for 1 year. If a token leaks and expires quickly, the exposure window is small. For one-time tool calls, tokens can expire in minutes or even seconds. Balance security with operational overhead: very short lifetimes require frequent renewal.
+
+**Single-use tokens** are valid for exactly one request. After the tool call completes, the token is revoked. Single-use tokens are the ultimate in short lifetime: they cannot be reused even if leaked immediately after use. This requires infrastructure that generates, validates, and revokes tokens efficiently.
+
+**Token metadata limits observability.** Tokens themselves should not reveal information about permissions, resources, or user identity. Opaque tokens that must be validated server-side are safer than JWTs that embed claims. JWTs are convenient but leak information when captured. Choose based on security vs convenience trade-offs.
+
+Implement token scoping and lifetime limits in your authentication infrastructure. Tools should request tokens with minimal scope for their specific operation and short lifetimes matching operation duration.
+
+## Secret Rotation for AI Systems
+
+Credentials must be rotated regularly to limit long-term exposure risk. Rotation in AI systems is complicated by prompt caching, model context persistence, and distributed tool execution.
+
+**Regular rotation schedules** define when credentials change: every 30 days, 90 days, or when events trigger rotation (employee departure, suspected leak). Automated schedules ensure rotation happens without relying on human memory.
+
+**Zero-downtime rotation** uses credential versioning or dual-running credentials. Before the old credential expires, provision the new credential. Tools start using the new credential for new operations while old operations complete with the old credential. After a grace period, revoke the old credential. This prevents service interruptions during rotation.
+
+**Rotation testing** verifies that credential rotation doesn't break systems. Test rotation in staging environments. Simulate rotation during load tests. Ensure monitoring detects if rotation causes errors. Rotation that breaks systems won't happen, so rotation testing is essential for rotation to be practical.
+
+**Emergency rotation procedures** enable immediate credential replacement when leaks are suspected. Emergency rotation sacrifices grace periods and careful testing for speed: generate new credentials, update vault, revoke old credentials within minutes. Accept that this might cause brief service disruptions, but stop credential abuse immediately.
+
+**Rotation scope** determines what gets rotated together. Rotating all credentials simultaneously is disruptive but comprehensive. Rotating credentials individually is gradual but complex to track. Group credentials logically: rotate all database credentials together, all API credentials together, etc.
+
+**Communication about rotation** notifies relevant teams before rotation happens. Engineers need to know rotation is coming so they don't debug credential changes as mysterious failures. Automated notifications, rotation calendars, or status pages communicate rotation schedules.
+
+Build rotation into your credential management from day one. Systems designed without rotation become dependent on long-lived credentials and resist change. Systems designed with rotation built-in treat rotation as routine maintenance.
+
+## Avoiding Secret Leakage in Tool Descriptions
+
+Tool descriptions explain to models what tools do and how to call them. Descriptions must be informative without revealing secrets or security-relevant implementation details.
+
+**Describe capabilities, not credentials.** Instead of "This tool uses API key sk-abc123 to call Stripe," write "This tool processes payments." The model doesn't need to know authentication details. It needs to know when to use the tool and what parameters to provide.
+
+**Avoid security details in descriptions.** Don't explain authentication mechanisms, credential formats, or security controls in tool descriptions. "This tool requires admin privileges" is unnecessary detail that tells attackers the tool is high-value. "This tool manages user accounts" is sufficient.
+
+**Redact examples that contain secrets.** If tool examples help the model understand usage, ensure examples use placeholder credentials: "api_key=YOUR_API_KEY" not "api_key=sk-abc123." Even fake-looking credentials might leak information about credential formats or naming conventions.
+
+**Separate tool documentation from tool descriptions.** Engineers need comprehensive documentation including authentication, security, error handling, and implementation details. Models need minimal descriptions focusing on when to use tools and what parameters to provide. Maintain separate documentation for each audience.
+
+**Review tool descriptions for information disclosure.** Before deploying tools, review descriptions for unintended information leakage. Would this description help an attacker? Does it reveal system architecture, data organization, or security controls? If yes, simplify the description.
+
+Tool descriptions are part of prompts and inherit all prompt security concerns. Treat descriptions as public information that attackers will see.
+
+## Credential Scoping by User and Context
+
+Different users and contexts should receive different credentials with different permissions. Scoping limits blast radius when credentials leak.
+
+**Per-user credentials** ensure that Alice's tool calls use Alice's credentials and Bob's tool calls use Bob's credentials. If Alice's session is compromised, only Alice's data is at risk. Per-user credentials enable fine-grained access control and audit trails showing exactly who accessed what.
+
+**Per-session credentials** are generated when users start sessions and revoked when sessions end. Session credentials prevent credential reuse across sessions. If a credential leaks during session 1, it's useless in session 2 because it's already revoked.
+
+**Per-request credentials** are generated for individual requests and expire immediately after. This is the most secure approach but requires infrastructure that can generate and validate credentials efficiently at high volume. Per-request credentials virtually eliminate credential reuse.
+
+**Context-based credential selection** chooses credentials based on what operation is being performed. If a tool is being called for a read operation, use read-only credentials. If for a write operation, use write credentials. If for an admin operation, use admin credentials. Context-based selection enforces least privilege automatically.
+
+**Credential delegation** allows users to delegate limited credentials to the AI system for specific operations. The user authenticates, delegates a scoped token to the agent for the current task, and the agent operates with that token. The agent never has access to the user's full credentials, only delegated tokens.
+
+Implement credential scoping that matches your security model. Higher-risk systems need finer-grained scoping. Lower-risk systems might use coarser scoping for simplicity.
+
+## Monitoring and Detecting Credential Leakage
+
+Despite best efforts, credentials sometimes leak. Monitoring detects leaks quickly so you can respond before major damage occurs.
+
+**Secret scanning in code repositories** detects credentials accidentally committed to git. Tools like git-secrets, truffleHog, or GitHub secret scanning automatically flag commits containing high-entropy strings matching credential patterns. Scanning prevents credentials from persisting in version control.
+
+**Log scanning for credential patterns** searches logs for strings that look like credentials: AWS keys starting with AKIA, API keys with specific formats, JWTs, passwords in error messages. Automated log scanning detects accidental credential logging so you can rotate leaked credentials.
+
+**Network monitoring for credential exfiltration** watches for unusual data transfers that might indicate credential theft. If a large amount of data is being sent to an unfamiliar destination, investigate. Credentials might be part of a broader data exfiltration attack.
+
+**Anomalous credential usage detection** identifies credentials being used in unexpected ways: from new IP addresses, at unusual times, for unusual operations, at unusual volumes. Anomaly detection catches stolen credentials in use before attackers cause massive damage.
+
+**Honeytokens** are fake credentials planted in documentation, code, or configuration files. If honeytokens are used, you know someone accessed credential stores inappropriately and you can investigate. Honeytokens turn credential theft into a detection opportunity.
+
+**Third-party credential leak databases** aggregate credentials leaked in public breaches, pasted to pastebin, or exposed in public repositories. Services like HaveIBeenPwned or GitGuardian alert you if your credentials appear in leak databases. Monitor these services for your credential patterns.
+
+Fast detection enables fast response. If you detect a leak within minutes, you can rotate credentials before attackers abuse them. If detection takes days, attackers have ample time to cause damage.
+
+## Incident Response for Secret Exposure
+
+When secrets are exposed, immediate action limits damage. Have predefined incident response procedures for credential leaks.
+
+**Immediate credential revocation** is the first response. Assume leaked credentials are already in attacker hands. Revoke immediately. Don't wait for confirmation that attackers used them. Revocation stops ongoing attacks and prevents future use.
+
+**Rotation of related credentials** extends beyond the specific leaked credential. If one database credential leaks, consider rotating all database credentials. Leaks might have broader scope than initially apparent.
+
+**Audit trail analysis** reviews logs for the leaked credential to determine what was accessed, when, by whom. Audit trails show the blast radius: what data was exposed, what operations were performed, what damage occurred. This informs notification and remediation.
+
+**Notification of affected parties** is legally required for many breach types. If customer data was accessed using leaked credentials, notify customers. If regulatory requirements apply, notify regulators. Transparency builds trust and often provides information that aids investigation.
+
+**Root cause analysis** determines how the leak occurred: was it in a prompt, in a log, in version control? Understanding the leak mechanism prevents recurrence. Incident reports should document cause and remediation steps.
+
+**Process improvements** address the gap that allowed the leak. If credentials were in prompts, implement automated scanning for credentials in prompts. If credentials were in logs, implement log redaction. If credentials were in code, strengthen code review. Each incident should improve defenses.
+
+Treat credential leaks as high-severity incidents requiring immediate response. Speed matters more than perfect understanding. Revoke first, investigate thoroughly later.
+
+## The Path Forward
+
+Secrets handling determines whether AI systems are secure or whether they're credential-leaking liabilities. No credentials in prompts is the foundational rule. Everything else follows from that principle.
+
+Build infrastructure for runtime credential injection from day one. Trying to retrofit secure credential handling into systems designed to pass credentials in prompts is a major refactoring project. Start with secure patterns.
+
+Integrate with secret management vaults for all credentials. Vaults provide security features you cannot easily replicate: encryption, access control, rotation, audit logging. Use existing, hardened vault solutions rather than building your own.
+
+Scope and time-limit credentials aggressively. Broad credentials with long lifetimes are convenient but dangerous. Narrow credentials with short lifetimes are secure. Invest in infrastructure that makes narrow, short-lived credentials practical.
+
+Monitor for credential leaks continuously and respond immediately. Fast detection and response turns credential leaks from catastrophic breaches into manageable incidents.
+
+The next section explores sandboxing tools and data minimization: isolating tool execution environments, limiting data access to minimum necessary, enforcing least privilege for tool permissions, and designing isolation patterns for multi-tenant systems.

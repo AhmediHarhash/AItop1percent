@@ -1,0 +1,137 @@
+# 8.10 — Output Routing: Sending Results to Different Consumers
+
+In March 2025, a claims processing automation system generated fraud alerts that needed to reach three different systems: the internal investigation dashboard (needed structured JSON), the customer notification service (needed plain text), and the data warehouse (needed CSV format). The engineering team built a single output format and tried to parse it differently for each consumer. Within two weeks, the investigation team missed 12 high-priority alerts because the JSON parser failed on edge cases. The company paid $340,000 in fraudulent claims that should have been flagged. The real problem wasn't output quality but routing and format adaptation.
+
+You're building systems where one model output needs to reach multiple destinations in different formats. Your internal dashboard needs JSON. Your email service needs formatted text. Your data warehouse needs CSV. Your webhook subscribers need custom schemas. Each consumer has different requirements, latency tolerances, and failure modes.
+
+## Multiple Consumers, Single Source of Truth
+
+Your model generates one canonical output. This is your source of truth. You then transform and route this output to multiple consumers. Don't generate different outputs for different consumers. This creates inconsistencies, wastes money on duplicate generation, and makes debugging impossible.
+
+The canonical output should be the richest, most structured format. Generate comprehensive JSON with all fields, metadata, and confidence scores. Then transform downward to simpler formats. It's easy to extract plain text from structured JSON. It's nearly impossible to reconstruct structure from plain text.
+
+Store the canonical output before routing. Save it to your database with a unique identifier. All downstream consumers reference this ID. When consumers need to reconcile data or investigate issues, they can trace back to the authoritative source output.
+
+Version your canonical output schema. As your model capabilities improve or requirements change, your output structure evolves. Consumers need to handle schema evolution gracefully. Include schema version in your canonical output and route different versions to different transformation pipelines.
+
+## Format Adaptation Per Consumer
+
+Each consumer speaks a different language. Your fraud investigation dashboard expects JSON with specific field names. Your email service needs HTML with CSS classes. Your compliance logging system needs line-delimited JSON. Your analytics pipeline needs Parquet files.
+
+Build format adapters as independent, testable components. Each adapter takes the canonical output and produces consumer-specific formats. An adapter for email converts structured fraud alerts into readable HTML. An adapter for the data warehouse converts nested JSON into flat CSV rows.
+
+**Format adapters** should be pure functions without side effects. Given the same canonical output, they always produce the same consumer-specific output. This makes them easy to test, debug, and replay. When a consumer reports incorrect data, you can test the adapter in isolation.
+
+Validate adapter outputs against consumer schemas. If your data warehouse expects specific CSV columns, validate that your adapter produces all required columns in the correct order. If your webhook subscriber expects specific JSON fields, validate against their OpenAPI spec before sending.
+
+## Webhook Patterns for External Distribution
+
+External consumers receive outputs via webhooks. You POST the output to their HTTP endpoint. They process it asynchronously. This pattern scales well but introduces reliability challenges. Endpoints go down. Networks fail. Consumers reject malformed payloads.
+
+Implement retry logic with exponential backoff. When a webhook delivery fails, retry after 1 second, then 2 seconds, 4 seconds, 8 seconds, up to a maximum backoff. After 10 failed attempts over several hours, mark the delivery as failed and alert your operations team.
+
+Track webhook delivery status in your database. Store delivery attempts, HTTP status codes, error messages, and timestamps. When consumers report missing data, you can prove whether delivery succeeded or failed. This evidence is critical for support and debugging.
+
+Provide webhook replay endpoints. When consumers miss deliveries due to downtime or bugs, they need to request redelivery. Build admin APIs that let consumers request outputs by ID or time range. This gives consumers control over their data pipelines.
+
+## Event-Driven Output Distribution
+
+Traditional request-response patterns don't scale for multiple consumers. You generate one output and need to notify 15 different systems. Calling each system synchronously means 15 network round trips, 15 potential failure points, and 15 times the latency.
+
+Use event-driven architecture. When you generate an output, publish an event to a message queue or event bus. Consumers subscribe to relevant event types. Each consumer processes events independently at their own pace. Your core system doesn't wait for consumers or even know how many exist.
+
+**Event buses** like AWS EventBridge, Google Pub/Sub, or Apache Kafka decouple producers from consumers. You publish a "fraud_alert_generated" event with the output ID and canonical output. Subscribers receive events and pull full outputs as needed. This pattern scales to hundreds of consumers without changing your core system.
+
+Events enable replay and reprocessing. When a consumer has a bug that misprocessed outputs, they can replay events from the past week and reprocess with fixed logic. Your core system doesn't need involvement. The consumer manages their own data consistency.
+
+## Consumer-Specific Transformations
+
+Different consumers need different transformations beyond format. Your internal dashboard needs all fraud alerts. Your customer notification service only needs high-confidence alerts. Your data warehouse needs aggregated statistics. Your executive report needs weekly summaries.
+
+Implement filtering at the routing layer. Before sending to each consumer, apply consumer-specific filters. Check confidence thresholds, priority levels, or category filters. Only route outputs that meet consumer criteria. This reduces noise and prevents overwhelming downstream systems.
+
+Some consumers need enrichment. Your webhook subscribers might need additional context like customer account details, historical patterns, or related entities. Enrich outputs before delivery by joining with your database or calling internal APIs.
+
+Other consumers need anonymization. External partners receive fraud patterns but shouldn't see customer PII. Strip sensitive fields before routing. Replace real names with hashed identifiers. Remove addresses and contact details. Your routing layer enforces data governance policies.
+
+## Synchronous vs Asynchronous Routing
+
+Some consumers need immediate delivery. When your fraud detection system generates a high-risk alert, the investigation team needs it within seconds. Synchronous routing calls the consumer directly and waits for acknowledgment. This guarantees fast delivery but couples your system to consumer availability.
+
+Most consumers can tolerate asynchronous delivery. Data warehouses process in batches. Email notifications can wait seconds or minutes. Weekly reports have day-level latency tolerance. Asynchronous routing queues outputs and delivers when consumers are ready.
+
+Classify consumers by latency requirements. Critical consumers (fraud investigators, safety monitors) get synchronous routing with timeouts. Standard consumers (dashboards, notifications) get asynchronous routing with minute-level SLAs. Batch consumers (analytics, reports) get eventual consistency with hour or day-level delivery.
+
+Implement circuit breakers for synchronous consumers. If a consumer fails repeatedly, stop calling them synchronously and fall back to async queue. This prevents cascade failures where one slow consumer degrades your entire system.
+
+## Handling Consumer Failures
+
+Consumers fail. Their servers crash. Their databases fill up. Their APIs change without notice. Your routing layer needs graceful failure handling. Don't lose outputs because a consumer is temporarily down.
+
+Queue failed deliveries for retry. When synchronous delivery fails, write the output to a dead letter queue. A background worker retries delivery periodically. This ensures eventual delivery even through extended consumer outages.
+
+Set maximum retry limits. After 24 hours of failed retries, escalate to human operators. Some failures need manual intervention. APIs might need reconfiguration. Schemas might have changed. Automation can't solve every problem.
+
+Provide consumer health monitoring. Track delivery success rates, error rates, and latency per consumer. Alert when success rates drop below thresholds. This lets you identify consumer problems before they escalate to data loss.
+
+## Routing Rules and Dynamic Configuration
+
+Your routing logic shouldn't be hardcoded. Business rules change. New consumers are added. Output types evolve. Implement configurable routing rules that can change without code deployment.
+
+Store routing configuration in a database or configuration service. Define rules like "send fraud_alert outputs with confidence {">"} 0.8 to investigation_team webhook and all fraud_alert outputs to data_warehouse." Non-engineers can update routing without engineering involvement.
+
+Support dynamic consumer registration. When a new team needs access to outputs, they should be able to register their webhook or subscribe to events without code changes. Provide self-service consumer management portals.
+
+Implement routing rule versioning. When you change routing rules, track what changed and when. If a consumer reports missing data, you can check whether routing rule changes affected their deliveries. Audit trails for routing changes prevent mysterious data gaps.
+
+## Testing Output Routing
+
+Test routing logic independently from output generation. Mock the canonical output and verify that adapters produce correct consumer-specific formats. Verify that routing rules send outputs to correct consumers. Verify that failures trigger retry logic.
+
+Build end-to-end routing tests. Generate a test output, route it through your real infrastructure, and verify delivery to test consumer endpoints. These tests catch integration issues that unit tests miss.
+
+Test consumer failure scenarios. Simulate consumer downtime, network failures, and malformed responses. Verify that your retry logic works. Verify that dead letter queues capture failed deliveries. Verify that alerts fire when consumers are unhealthy.
+
+Load test your routing infrastructure. If you need to route 1,000 outputs per second to 50 consumers, test whether your queue infrastructure can handle the load. Measure latency at each routing stage. Identify bottlenecks before production traffic reveals them.
+
+## Monitoring and Observability
+
+Instrument your routing pipeline comprehensively. Track how many outputs enter routing, how many reach each consumer, how many fail, and how long each stage takes. Build dashboards showing routing health at a glance.
+
+Alert on routing anomalies. If deliveries to a consumer suddenly drop to zero, something broke. If retry queues grow beyond normal bounds, consumers are struggling. If routing latency spikes, investigate infrastructure issues.
+
+Provide consumer-specific observability. Each consumer should have a dashboard showing their delivery metrics. Success rates, failure reasons, latency percentiles, and data volume. This helps consumers debug their own integration issues.
+
+Implement distributed tracing. Tag each output with a trace ID that flows through generation, routing, transformation, and delivery. When investigating issues, trace IDs let you follow an output through your entire pipeline.
+
+## Security and Access Control
+
+Not all consumers should receive all outputs. Sensitive fraud alerts shouldn't reach external partners. Customer PII shouldn't flow to analytics systems. Implement access control at the routing layer.
+
+Classify outputs by sensitivity level. Label outputs as public, internal, confidential, or restricted. Consumers declare their clearance level. Routing rules enforce that restricted outputs only reach authorized consumers.
+
+Encrypt outputs in transit. Use TLS for webhook deliveries. Use encryption at rest for queued outputs. Ensure that sensitive data remains protected throughout the routing pipeline.
+
+Audit access to outputs. Log which consumers received which outputs. When investigating security incidents or data leaks, these logs show exactly where data flowed.
+
+## Cost Optimization for High-Volume Routing
+
+Routing outputs to many consumers can be expensive. Webhook calls cost money. Message queue operations cost money. Data transfer across regions or cloud providers costs money. Optimize routing for cost without sacrificing reliability.
+
+Batch deliveries where possible. Instead of sending 1,000 individual webhook calls, batch outputs and send 10 batches of 100 outputs each. This reduces network overhead and consumer processing costs.
+
+Use regional routing. If a consumer operates in the same cloud region as your system, deliver directly. If they're in a different region, use regional message queues to minimize cross-region data transfer costs.
+
+Compress large outputs before delivery. If you're sending megabytes of data per output, compression can reduce transfer costs by 80%. Use gzip or brotli compression for text-based formats.
+
+## Versioning and Evolution
+
+Your output schema will evolve. New fields are added. Old fields are deprecated. Consumers need time to adapt. Implement schema versioning in your routing layer.
+
+Support multiple schema versions simultaneously. Route v1 outputs to legacy consumers and v2 outputs to updated consumers. Maintain backward compatibility for at least one major version cycle.
+
+Provide schema change notifications. When you plan to deprecate fields or change output structure, notify all consumers weeks in advance. Give them time to update their systems before breaking changes deploy.
+
+Build schema migration tools. When consumers need to process historical outputs with new logic, provide tools that transform old schema outputs to new schemas. This enables reprocessing without maintaining multiple code paths.
+
+Your routing infrastructure is the nervous system of your AI platform, distributing intelligence to every system that needs it in exactly the format they require, with the reliability and speed their business processes demand.
