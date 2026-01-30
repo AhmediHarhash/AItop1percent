@@ -105,20 +105,23 @@ Say: "Read CLAUDE.md and continue writing section 2"
 66. Acknowledges model generations: GPT-4/4o/4.5, Claude 3/3.5/4, Llama 3, Gemini 2
 67. No outdated references — no "in the future AI will..." — AI is here now
 
-### I. MDX SAFETY (68-70)
-68. No `<` characters in prose — MDX parses as JSX tags, causes build errors
-69. Escape or reword: use "under $0.01" not the less-than symbol with $0.01, use "less than" not the symbol
-70. No HTML tags, no JSX components, no imports
+### I. MDX SAFETY (68-72)
+68. No `<` or `>` characters in prose — MDX parses as JSX tags, causes build errors
+69. No `{` or `}` characters in prose — MDX parses as JSX expressions, causes build errors
+70. Reword comparisons: "less than 500ms" or "greater than 0.95" — never use symbols
+71. Describe JSON/objects in prose: "an object with name and email fields" — never write out JSON with braces
+72. Describe template variables in prose: "the tone placeholder" — never write curly-brace placeholders like the word tone wrapped in braces
+73. No HTML tags, no JSX components, no imports, no `{"<"}` escape hacks
 
-### J. WHAT TO NEVER DO (71-78)
-71. Never generic advice: "it depends on your use case"
-72. Never academic hedging: "it could be argued that..."
-73. Never filler: "Let's dive in," "Without further ado"
-74. Never "further reading" or external links
-75. Never footnotes or endnotes
-76. Never images, diagrams, or charts
-77. Never a table of contents within subchapters (only in chapter intros)
-78. Never compress — **expand everything into full prose**
+### J. WHAT TO NEVER DO (74-81)
+74. Never generic advice: "it depends on your use case"
+75. Never academic hedging: "it could be argued that..."
+76. Never filler: "Let's dive in," "Without further ado"
+77. Never "further reading" or external links
+78. Never footnotes or endnotes
+79. Never images, diagrams, or charts
+80. Never a table of contents within subchapters (only in chapter intros)
+81. Never compress — **expand everything into full prose**
 
 ---
 
