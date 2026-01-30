@@ -15,6 +15,9 @@ Say: "Read CLAUDE.md and continue writing section 2"
 - Do not rush. Write each subchapter fully and carefully before moving to the next.
 - If session crashes, re-read this file first to restore all context.
 
+## Section Sizing Rule
+- No max cap on chapters or subchapters per section. Keep adding until the section fully covers all knowledge at elite level for 2026. Quality and completeness over arbitrary limits.
+
 ---
 
 ## ALL 78 WRITING RULES
