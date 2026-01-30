@@ -1,0 +1,414 @@
+# 6.4 — Agent State Truth & Idempotency
+
+Let me tell you about the agent that created 47 duplicate calendar events. A scheduling assistant was integrated with Google Calendar, and a user said "set up my weekly team meeting for Mondays at 10 AM." The agent understood correctly, called the calendar API, and got a network timeout. It retried. Another timeout. It kept retrying, and each retry actually created the event even though the response didn't come back. The user opened their calendar to find 47 identical meetings.
+
+The agent's logs looked perfect. It executed the right tool with the right parameters. The conversation was polite and clear. By the ground truth standards we discussed in the last chapter, this was a success. The agent chose the right tool, extracted parameters correctly, and handled the error gracefully (by retrying).
+
+But the actual state of the world was chaos.
+
+This is the say-do gap: the difference between what the agent said it did and what actually happened in the systems it touched. Your ground truth can't just evaluate the agent's intentions and actions—it needs to verify the outcomes.
+
+## Why State Verification Is Hard
+
+In traditional software, you control both the code and the data. You can write a test that creates a record, then queries the database to verify it exists. Simple.
+
+With agents, you're orchestrating external systems. The agent calls an API, but:
+
+- The API might fail silently
+- The API might succeed but with different results than expected
+- The API might succeed now but the state might change before you can verify
+- The API might be asynchronous (returns success immediately, processes later)
+- The API might have side effects you don't see
+- Multiple agents might be modifying the same state concurrently
+
+Your ground truth needs to handle all of these scenarios. This means state verification is more complex than just "did the record get created?"
+
+## The Three Layers of State Truth
+
+Let me break down state verification into three layers, because your ground truth needs to cover all of them.
+
+**Layer 1: API Response Verification**
+
+Did the API call return success? This is the most basic level. Your ground truth should verify that the agent checks the API response and interprets it correctly.
+
+But here's the catch: success responses can lie. An API might return 200 OK but still fail to actually perform the action due to eventual consistency, async processing, or internal errors.
+
+**Layer 2: Direct State Verification**
+
+Is the intended state actually present in the system? This means querying the system to check. If the agent booked a flight, query the booking system and verify the booking exists with correct details.
+
+This is more reliable than API responses, but it has timing challenges. How long do you wait after the action before checking? Too soon and you might miss async updates. Too long and other changes might have happened.
+
+**Layer 3: Side Effect Verification**
+
+Did the state change produce the expected side effects? If the agent created a calendar event, did attendees receive invitations? If it sent an email, did it appear in the sent folder? If it created a database record, did it trigger the expected webhooks?
+
+This is the most comprehensive but also the most complex to verify. Your ground truth needs to specify which side effects are critical versus optional.
+
+## The Say-Do Gap: What Agents Claim vs What Actually Happened
+
+Here's the most insidious failure mode: agents that confidently claim they did something they didn't do.
+
+This happens because most agents are trained to generate helpful, confident text. They're not trained to carefully verify their actions succeeded before reporting success. So you get responses like:
+
+"I've sent the email to your team with the Q1 report attached."
+
+But maybe:
+- The email failed to send (invalid address)
+- The email sent but without the attachment (file too large)
+- The email sent but went to spam
+- The email sent but to the wrong recipients (agent misinterpreted "your team")
+
+Your ground truth must verify not just that the agent said it did something, but that it actually happened and the agent's description was accurate.
+
+A practical pattern: for each agent action in your ground truth, include two labels:
+
+**Claimed Outcome**: What did the agent say it did?
+
+**Actual Outcome**: What actually happened in the system?
+
+Then measure the gap. A reliable agent has zero gap—its claims always match reality. An unreliable agent frequently claims success when actions failed or partially succeeded.
+
+## Database State Verification
+
+Let's get concrete. How do you verify database state in ground truth?
+
+Imagine an agent that manages a customer database. User says: "Add Maria Garcia as a new customer with email maria@example.com."
+
+The agent executes an insert operation. Your ground truth verification needs to:
+
+**Check Record Existence**
+
+Query the database for a customer record matching the specified details. Did it get created?
+
+**Verify Field Values**
+
+Check that all fields are correct:
+- Name: "Maria Garcia" (not "Maria", not "M. Garcia")
+- Email: "maria@example.com" (not malformed, not a different email)
+- Any auto-populated fields (timestamps, IDs) are sensible
+
+**Verify Constraints**
+
+Did the insert respect database constraints?
+- Is the email unique (no duplicates)?
+- Are required fields populated?
+- Do foreign keys point to valid records?
+
+**Check Timestamps**
+
+Was the record created at the expected time? This helps catch issues where old cached data is inserted or timing bugs cause problems.
+
+Your ground truth should include the exact expected database state after the action, at the field level. Don't just check "record exists"—check that it's exactly right.
+
+## External System Confirmation
+
+When agents interact with external systems (calendar, email, CRM, payment processors), verification gets harder because you don't control the system.
+
+**Calendar System Verification**
+
+Agent creates a calendar event. Your ground truth needs to:
+
+1. Query the calendar API to retrieve the event
+2. Verify all details (time, attendees, title, location, recurrence)
+3. Check that invitations were sent to attendees
+4. Verify the event appears in the right calendar (if managing multiple)
+
+The timing challenge is real here. Calendar APIs might take seconds to propagate changes. Your ground truth framework needs to account for eventual consistency—query multiple times with retries if necessary.
+
+**Email System Verification**
+
+Agent sends an email. Your ground truth needs to:
+
+1. Check the sent folder for the email
+2. Verify recipients, subject, body, attachments
+3. Ideally, confirm delivery (though this is often impossible or unreliable)
+
+The problem: you usually can't verify the recipient actually received it, only that it was sent. Your ground truth should be clear about this limitation.
+
+**Payment System Verification**
+
+Agent processes a payment. Your ground truth needs to:
+
+1. Verify the transaction exists in the payment system
+2. Check the amount, recipient, payment method
+3. Verify the transaction status (pending, completed, failed)
+4. In test environments, verify the transaction is marked as test (don't want real charges!)
+
+This is high-stakes ground truth. Getting it wrong means real money moves incorrectly. Your verification needs to be thorough.
+
+## Idempotency: The Duplicate Action Problem
+
+Remember those 47 duplicate calendar events? That's an idempotency failure. Let's talk about how ground truth should handle this.
+
+Idempotency means an action can be safely repeated without causing duplicates or other unintended effects. For agents, this is critical because:
+
+- Users might repeat requests ("did you send that email?")
+- Agents might misunderstand and repeat actions
+- API calls might timeout and retry
+- Conversation might loop or glitch
+
+Your ground truth should test idempotency explicitly:
+
+**Duplicate Request Scenarios**
+
+Include ground truth examples where the user makes the same request twice:
+
+Turn 1: "Create a task to review the quarterly report"
+Agent: [creates task]
+
+Turn 2: "Create a task to review the quarterly report"
+Expected behavior: Agent recognizes this is a duplicate and either:
+- Says "I already created that task. Would you like me to create another one?"
+- Shows the existing task instead of creating a new one
+
+**Retry Scenarios**
+
+Include scenarios where an API call appears to fail but actually succeeded:
+
+Agent calls create_event, gets timeout error, retries.
+Expected behavior: Agent checks if the event was created before retrying. If it was, don't create again.
+
+**State Checking Before Acting**
+
+Your ground truth should reward agents that check current state before acting:
+
+User: "Schedule a meeting with John tomorrow at 2 PM"
+Good agent: Checks if a meeting with John already exists at that time, warns about conflict
+Bad agent: Creates the meeting without checking, creating double-booking
+
+## Rollback and Compensation
+
+What happens when an agent takes an action, realizes it was wrong, and needs to undo it?
+
+User: "Book the 8 AM flight to Chicago"
+Agent: [books flight]
+User: "Wait, I meant the 10 AM flight"
+Agent: [needs to cancel first booking and book new flight]
+
+Your ground truth for rollback scenarios should verify:
+
+**Cancellation Completeness**: Was the original action fully reversed?
+
+**Compensation Correctness**: If full reversal isn't possible, was appropriate compensation taken?
+
+**State Consistency**: After rollback, is the system in a consistent state?
+
+**Audit Trail**: Is there a record of both the action and the rollback?
+
+A common failure: the agent books the new flight but forgets to cancel the old one. User ends up with two bookings. Your ground truth should include multi-step scenarios where rollback is required.
+
+## Partial State Changes
+
+Actions often change multiple pieces of state, and partial failures are common.
+
+Agent task: "Create a new project for the website redesign, assign it to the design team, and set the deadline for March 1st."
+
+This might involve:
+1. Create project record in database
+2. Create team assignment records
+3. Set deadline field
+4. Send notification to team members
+5. Create calendar milestone
+
+What if step 3 fails? Your ground truth needs to specify the expected behavior:
+
+**All-or-Nothing Approach**: If any step fails, roll back all previous steps. Ground truth verifies nothing was changed.
+
+**Best-Effort Approach**: Complete what you can, report what failed. Ground truth verifies successful steps were completed and failures were communicated.
+
+**Critical vs Non-Critical**: Some steps are essential, others optional. Ground truth specifies which is which.
+
+For example, creating the project is critical. Sending notifications is nice-to-have. If notification fails, that's okay as long as the project is created and the failure is logged.
+
+Your ground truth should be explicit about which approach is correct for each type of action.
+
+## Asynchronous Action Verification
+
+Many modern APIs are asynchronous. The API returns immediately with "request accepted" and processes the action later. This complicates ground truth verification.
+
+Agent calls start_video_processing. The API returns a job ID. The actual processing takes minutes or hours.
+
+Your ground truth needs to specify:
+
+**Immediate Verification**: Was the job successfully queued?
+
+**Eventual Verification**: After waiting appropriate time, did the job complete successfully?
+
+**Progress Tracking**: Did the agent check job status appropriately?
+
+**Timeout Handling**: If the job takes too long, did the agent handle it correctly?
+
+This requires multi-stage ground truth evaluation. You can't just check state immediately after the action—you need to check again later.
+
+A practical pattern: include expected timing in ground truth. "After calling start_video_processing, the job should complete within 5 minutes. Ground truth check at 30 seconds (should be in-progress) and 5 minutes (should be complete)."
+
+## Audit Trails: Verifying Agent Actions Are Logged
+
+In enterprise settings, you need a record of what agents did. Your ground truth should verify audit trails exist and are accurate.
+
+For each agent action, check:
+
+**Action Logging**: Is there a log entry for the action?
+
+**Log Accuracy**: Does the log correctly describe what happened?
+
+**Attribution**: Is it clear that an agent (not a human) performed the action?
+
+**Timestamp Accuracy**: Is the timing recorded correctly?
+
+**Parameter Logging**: Are the action parameters logged (within privacy constraints)?
+
+This is critical for debugging, compliance, and security. If an agent deletes a customer record, there should be a permanent, accurate record of when, why, and on whose behalf.
+
+Your ground truth should include scenarios where you verify not just that the action was correct, but that it was properly logged.
+
+## Concurrency and Race Conditions
+
+Multiple agents (or agents and humans) might modify the same state concurrently. Your ground truth needs to cover this.
+
+Scenario: Two users simultaneously tell their agents to "book the last available hotel room at the conference."
+
+What should happen? Your ground truth might specify:
+
+**Optimistic Locking**: Both agents attempt to book, one succeeds, one fails gracefully and informs the user.
+
+**Pessimistic Locking**: Agents check availability with a lock, preventing race conditions.
+
+**Conflict Detection**: Even if both bookings appear to succeed initially, the system detects the conflict and resolves it (cancel one, confirm the other).
+
+Your ground truth should include concurrent scenarios and specify the expected outcome. This is hard to test because you need to simulate concurrency, but it's critical for real-world reliability.
+
+## State Verification in Test vs Production
+
+Here's a practical challenge: verifying state changes in test environments vs production.
+
+In test, you control everything. You can query databases, inspect API calls, even mock external systems. Easy.
+
+In production, you might not have direct database access. You might not be able to inspect certain systems. Privacy regulations might prevent you from seeing some data.
+
+Your ground truth framework needs different verification strategies for test vs production:
+
+**Test Environment**
+- Direct database queries
+- API call inspection
+- Mock system verification
+- Full state inspection
+
+**Production Environment**
+- API-based verification only
+- Anonymized data checks
+- Aggregate metrics (did the count of records increase by 1?)
+- User-visible confirmation (check email in sent folder)
+
+Design your ground truth to work within production constraints, but use test environments for more thorough verification during development.
+
+## The Verification Loop: Agents That Check Their Own Work
+
+Elite agents don't just take actions—they verify those actions succeeded before reporting to the user.
+
+The pattern:
+1. Execute action
+2. Parse response
+3. If response indicates success, query the system to confirm
+4. Report accurate status to user
+
+Your ground truth should reward this verification behavior.
+
+Example:
+
+User: "Add Sarah to the project"
+Agent:
+- Calls add_team_member(project_id, user_id)
+- Gets success response
+- Queries get_team_members(project_id) to confirm Sarah is listed
+- Reports: "I've added Sarah to the project team."
+
+vs
+
+User: "Add Sarah to the project"
+Agent:
+- Calls add_team_member(project_id, user_id)
+- Gets success response
+- Reports: "I've added Sarah to the project team."
+- (Never verified Sarah is actually on the team)
+
+The first agent is more robust. Your ground truth should distinguish between agents that verify and agents that trust API responses blindly.
+
+## Measuring the Say-Do Gap at Scale
+
+Here's a practical metric for your evaluation framework: the say-do gap rate.
+
+For each agent action in your eval set:
+1. Record what the agent claimed it did
+2. Verify what actually happened
+3. Calculate: gap_rate = (claims that don't match reality) / (total claims)
+
+Track this over time. A well-tuned agent should have a gap rate near zero. If it's high, you have a reliability problem.
+
+You can break this down by action type:
+- Email sending: 2% gap rate (mostly spam filter issues)
+- Calendar events: 0.1% gap rate (very reliable)
+- Database updates: 5% gap rate (various validation failures)
+
+This tells you where to focus your improvement efforts.
+
+## Ground Truth for Multi-Step State Changes
+
+When an agent performs a sequence of actions, each one changes state and the next one depends on the previous state.
+
+Example: "Transfer all high-priority tasks from Project A to Project B and notify the team."
+
+Steps:
+1. Query tasks in Project A with high priority
+2. For each task, update project_id to Project B
+3. Query team members of Project B
+4. Send notification to team members
+
+Your ground truth needs to verify:
+
+**Each Intermediate State**: After step 2, are the tasks correctly associated with Project B?
+
+**Final State**: After all steps, is the complete intended state achieved?
+
+**No Orphaned State**: Are there any partial changes that weren't completed?
+
+**Consistency**: Do all related records reflect the change correctly?
+
+This is complex because you're verifying not one state change, but a series of dependent changes.
+
+## Idempotency Tokens and Deduplication
+
+A technical pattern that affects ground truth: idempotency tokens. APIs often accept a unique token with each request to prevent duplicates.
+
+Agent calls create_payment(amount=100, idempotency_token="unique-token-123")
+
+If the network fails and the agent retries with the same token, the payment system recognizes it's a duplicate and returns the original result without creating a second charge.
+
+Your ground truth should test that agents use idempotency tokens correctly:
+
+**Token Generation**: Does the agent generate a unique token for each logical operation?
+
+**Token Reuse**: Does it reuse the same token when retrying a failed operation?
+
+**Token Scoping**: Does it generate new tokens for actually different operations (even if they look similar)?
+
+This is a technical detail, but it's critical for reliable agent behavior in production.
+
+## The Warning: What Happens If You Skip This
+
+If you evaluate agents based on their actions and conversations without verifying actual state changes, here's what happens:
+
+Your agents will confidently claim they did things they didn't do. They'll create duplicate records, fail to create records at all, or create records with wrong data—all while telling users everything worked perfectly. You'll discover failures only when users report problems, often hours or days later.
+
+Your system will seem to work in testing (where everything is controlled) but fail in production (where networks are unreliable, APIs timeout, and concurrent access causes conflicts). Your error rate will be much higher than your metrics suggest because you're only measuring claimed success, not actual success.
+
+Users will lose trust fast because the agent says one thing but reality shows another. "It said it sent the email but nobody got it." "It said it booked the meeting but it's not on my calendar." "It said it created the task but I can't find it."
+
+I worked with a company that launched an agent without state verification in ground truth. Their conversation success rate was 95%. Their actual task completion rate turned out to be 67%. The gap was invisible until users started complaining en masse.
+
+Don't measure what the agent said. Measure what actually happened.
+
+## Bridge to Voice Systems
+
+We've been talking about agents that take actions in databases and APIs, where state is relatively straightforward to verify—there's a record, or there isn't. But what about agents that operate in real-time, where timing and responsiveness are part of the "state" you need to verify? Voice and real-time systems bring a whole new dimension to ground truth: latency, turn-taking, interruption handling, and the naturalness of conversation flow. These aren't just features to optimize—they're fundamental to whether the system works at all. Let's walk through how ground truth changes when your AI needs to respond in milliseconds, not seconds.
