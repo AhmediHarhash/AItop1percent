@@ -1,0 +1,159 @@
+# 7.13 — Eval Infrastructure for Fine-Tuning Teams: Tooling and Automation
+
+In September 2025, a software-as-a-service company had seven fine-tuned models in production, each serving a different product feature: summarization, classification, extraction, generation, moderation, ranking, and recommendations. Each model had been built by a different team, evaluated using different methods, monitored using different dashboards, and retrained on different schedules. When the VP of Engineering asked for a summary of model performance across the company, it took three weeks to compile because there was no shared infrastructure. One team tracked metrics in spreadsheets. Another used a custom Python script that emailed results weekly. A third had built a dashboard in Grafana but never documented how it worked, and the engineer who built it had left the company. When a critical bug in the classification model caused a production incident, the team discovered that their evaluation pipeline had been silently failing for six weeks because a dependency update broke the ground truth labeling step, and no one noticed because there was no alerting on pipeline health. The company spent $180,000 and four months building centralized evaluation infrastructure that every team could use, standardizing metrics, automating pipelines, and enabling consistent monitoring. The infrastructure paid for itself within nine months by catching issues earlier, reducing duplicate tooling work, and enabling faster iteration. The root cause of the original chaos was treating evaluation infrastructure as an afterthought rather than as a core platform capability.
+
+Evaluation infrastructure is the system that runs evaluations efficiently, consistently, and at scale. It includes pipelines for automated evaluation, integration with CI/CD for pre-deployment gating, dashboards for monitoring production metrics, alerting for anomaly detection, and tooling for managing ground truth data. As the number of fine-tuned models grows, infrastructure becomes the difference between evaluation as a sustainable practice and evaluation as a bottleneck. This subchapter covers how to design and build evaluation infrastructure, what to build versus what to adopt from open-source, and how to scale infrastructure as your organization's fine-tuning practice matures.
+
+## Why Evaluation Infrastructure Matters
+
+Evaluation without infrastructure is manual, error-prone, and does not scale. Engineers run evaluation scripts locally, forget to run them before deploying, or run them inconsistently across models. Metrics are computed differently by different teams, making cross-model comparison impossible. Results are lost when engineers leave or when laptops are wiped. Production monitoring is ad hoc, relying on manual spot checks rather than automated alerting.
+
+Infrastructure makes evaluation systematic. Evaluation pipelines run automatically on every model change, every data change, and every deployment. Metrics are computed consistently using shared libraries and definitions. Results are stored centrally and accessible to everyone who needs them. Production monitoring runs continuously, emitting alerts when thresholds are breached. Engineers can focus on improving models rather than reinventing evaluation tooling.
+
+Infrastructure also makes evaluation auditable. When a regulator asks how you validated your model, you can point to pipeline logs showing exactly which evaluation sets were used, which metrics were computed, what the results were, and who approved deployment. When an incident occurs and you need to understand what changed, you can diff evaluation results between the failing deployment and the previous deployment. When leadership asks for a portfolio view of model quality, you can generate it in minutes rather than weeks.
+
+One financial services company tracked the impact of evaluation infrastructure investment quantitatively. Before building infrastructure, they measured that each model team spent an average of twelve hours per month on evaluation tooling: writing scripts, debugging environment issues, manually running evaluations, and compiling results. After building centralized infrastructure, that time dropped to two hours per month: reviewing automated results and investigating anomalies. With fifteen model teams, infrastructure saved 150 engineer-hours per month, roughly one full-time engineer's capacity. The infrastructure itself required half an engineer to build initially and one-quarter of an engineer to maintain, a clear positive return on investment.
+
+## The Evaluation Pipeline Architecture
+
+An evaluation pipeline is a series of automated steps that ingest a model, an evaluation dataset, and a metric specification, run inference, compute metrics, compare results to baselines, and emit a pass or fail decision along with detailed results. Pipelines run in CI/CD before deployment and on production data after deployment.
+
+The pipeline begins with input validation. It verifies that the model artifact exists and is the expected format, that the evaluation dataset exists and conforms to schema, and that the metric specification is valid. Input validation prevents pipelines from failing halfway through due to missing or malformed inputs, which wastes compute and engineer time.
+
+The second step is environment setup. The pipeline provisions compute resources, loads the model into memory, loads the evaluation dataset, and initializes any dependencies like embedding models, tokenizers, or external APIs. Environment setup is often the slowest and most error-prone step. Use containerization to ensure consistent environments across local development, CI/CD, and production. One team reduced pipeline setup time from eight minutes to ninety seconds by switching from conda environments to Docker containers with prebuilt images.
+
+The third step is inference. The pipeline runs the model on every example in the evaluation set, captures outputs, and logs confidence scores and any intermediate representations. Inference is compute-intensive. Optimize for throughput: batch examples, use GPU acceleration where available, and parallelize across multiple workers if the evaluation set is large. For a model that processes one hundred examples per second, a ten-thousand-example evaluation set requires one hundred seconds of inference. For a model that processes ten examples per second, the same set requires over sixteen minutes. Inference speed determines pipeline latency.
+
+The fourth step is metric computation. The pipeline compares model outputs to ground truth labels, computes accuracy, precision, recall, F1, calibration, and any custom metrics, and aggregates metrics overall and by slices. Metric computation is fast compared to inference, typically seconds even for large evaluation sets. Use well-tested libraries for standard metrics to avoid implementation bugs. One team discovered their custom precision implementation had an off-by-one error that inflated scores by two percentage points, and the bug had been present for five months before a code review caught it.
+
+The fifth step is comparison to baseline. The pipeline retrieves baseline metrics from previous evaluations, compares current metrics to baseline, and determines whether the difference is statistically significant and within acceptable thresholds. Comparison requires storing historical results, which we address in the next section. The comparison step emits a pass or fail decision: pass if all metrics meet or exceed baseline within tolerance, fail otherwise.
+
+The sixth step is reporting. The pipeline writes detailed results to storage, posts a summary to the pull request or deployment ticket, sends notifications to relevant channels, and updates dashboards. Reporting makes results visible and actionable. A pipeline that runs successfully but does not report results might as well not have run.
+
+The seventh step is cleanup. The pipeline releases compute resources, deletes temporary files, and logs pipeline execution metadata like start time, end time, compute cost, and any errors. Cleanup prevents resource leaks and cost overruns.
+
+## Storing and Versioning Evaluation Results
+
+Evaluation results must be stored durably, versioned alongside model versions, and queryable for analysis. Storage design determines whether you can answer questions like "how has accuracy trended over the past six months" or "which model version performed best on edge cases."
+
+Store results in a structured database, not in flat files or spreadsheets. Use a schema that captures model version, evaluation dataset version, metric name, metric value, slice identifier if applicable, timestamp, and any metadata like commit hash, engineer who triggered the evaluation, or deployment environment. Relational databases like PostgreSQL work well for moderate scale. Time-series databases like InfluxDB or Prometheus work well if you are storing high-frequency production metrics.
+
+Version evaluation results alongside model versions. When you deploy model version 3.2, you should be able to retrieve the evaluation results that gated that deployment. Use the same versioning scheme for models, datasets, and results. If your model versioning is semantic versioning like 1.0.0, 1.1.0, 2.0.0, tag evaluation results with the same version numbers.
+
+Enable querying and aggregation. You should be able to query all results for a specific model, all results for a specific metric, all results in a date range, or all results for a specific slice. You should be able to compute trends: how accuracy changed from version 1.0 to version 2.0, or how production accuracy changed week over week for the past quarter. SQL or equivalent query languages make this straightforward.
+
+One e-commerce company stored evaluation results in PostgreSQL with a schema that included model identifier, dataset identifier, metric name, slice identifier, timestamp, value, and metadata JSON. They built a lightweight internal web tool that let engineers query results, plot trends, and compare versions. The tool became the single source of truth for model performance and was accessed hundreds of times per week by engineers, product managers, and data scientists.
+
+## CI/CD Integration and Pre-Deployment Gating
+
+Evaluation pipelines should run automatically in CI/CD, blocking deployment if metrics degrade. Integration with CI/CD ensures that evaluation is mandatory, not optional.
+
+Trigger evaluation pipelines on every pull request that changes the model, the training code, the training data, or the inference code. When an engineer opens a pull request, the CI/CD system checks out the code, builds the model or loads the model artifact, runs the evaluation pipeline, and posts results as a comment on the pull request. The pull request cannot be merged until evaluation passes.
+
+One team configured their CI/CD to run lightweight evaluation on every pull request and comprehensive evaluation on every merge to main branch. Lightweight evaluation used a one-thousand-example subset of the full evaluation set and ran in under five minutes, providing fast feedback to engineers during development. Comprehensive evaluation used the full ten-thousand-example set and ran in forty minutes, ensuring thorough validation before deployment. This two-tier approach balanced speed and rigor.
+
+Define clear pass/fail criteria. Evaluation passes if all primary metrics meet or exceed baseline within tolerance, if no critical metrics regress, and if safety checks pass. Evaluation fails otherwise. Make pass/fail criteria explicit and automated: a human should not need to interpret results to decide whether to merge. The pipeline emits a green check or red X, and that decision is binding.
+
+Include rollback triggers in production deployment pipelines. After deployment, run the same evaluation pipeline on production traffic. If production metrics fall below thresholds within the first hour, the first day, or the first week, trigger automated rollback to the previous model version. Automated rollback prevents prolonged exposure to degraded models.
+
+## Dashboards for Monitoring and Exploration
+
+Dashboards make evaluation results visible. Engineers, product managers, and leadership should be able to see current model performance, trends over time, and comparisons across models without writing queries or running scripts.
+
+Build dashboards that show key metrics at a glance: current accuracy, precision, recall, latency, throughput, error rates, and safety flags. Use visual indicators to highlight when metrics are healthy, degraded, or critical. Green means metrics are within acceptable range. Yellow means metrics are degraded but not critical. Red means metrics are critical and require immediate action.
+
+Show trends over time. Plot accuracy over the past week, the past month, the past quarter. Plot production request volume, latency percentiles, and error rates. Trends reveal patterns that single snapshots miss. A metric that is acceptable today but declining steadily is a warning sign.
+
+Enable slicing and filtering. Dashboards should let users slice metrics by model version, by data slice, by time period, by user cohort, or by any other relevant dimension. A product manager might want to see accuracy for premium users versus free users. An engineer might want to see accuracy for inputs longer than five hundred tokens versus shorter inputs. Build filtering into the dashboard rather than requiring custom queries.
+
+Include links to detailed results. When a metric is red, the dashboard should link to the evaluation pipeline run that generated that metric, to the failing examples, and to the runbook for investigating that type of failure. Dashboards are entry points, not endpoints.
+
+One healthcare technology company built dashboards in Grafana that showed real-time metrics for all deployed models, updated every five minutes. Each model had a dedicated dashboard showing current performance, trends over the past thirty days, breakdowns by hospital site, and alerts. The dashboards were displayed on monitors in the engineering area and reviewed in weekly model health meetings. The visibility drove accountability: no one wanted their model to show red on the public dashboard.
+
+## Alerting and Incident Response Integration
+
+Dashboards show what is happening. Alerts tell you when to act. Integrate evaluation infrastructure with incident response systems so that metric degradation triggers the same workflows as production outages.
+
+Configure alerts for each critical metric. If accuracy drops below threshold, trigger an alert. If latency exceeds SLA, trigger an alert. If safety flags spike, trigger an alert. Use the tiered alerting strategy described in the previous subchapter: yellow alerts for minor degradation, orange alerts for significant degradation, red alerts for critical failures.
+
+Route alerts to the appropriate teams and channels. Yellow alerts might go to a Slack channel where the model team can see them and investigate during business hours. Orange alerts might page the on-call engineer. Red alerts might page the entire engineering leadership and trigger an incident response protocol.
+
+Include context in alerts. An alert should contain the metric name, the current value, the baseline value, the threshold that was breached, the time period over which the breach occurred, and links to dashboards, logs, and runbooks. An alert that says "accuracy alert" is useless. An alert that says "production accuracy for model-v3 dropped to 84%, below the 88% threshold, over the past six hours; baseline is 91%; see dashboard at URL; see runbook at URL" is actionable.
+
+Integrate alerts with incident management tools like PagerDuty, Opsgenie, or Jira. When an alert triggers, automatically create a ticket, assign it to the on-call engineer, and track resolution. This ensures alerts do not get lost and provides an audit trail of incidents and responses.
+
+One logistics company integrated their evaluation alerts with PagerDuty. Orange and red alerts created PagerDuty incidents that paged the on-call ML engineer. The engineer acknowledged the incident, investigated using links in the alert, documented findings in the PagerDuty incident, and closed the incident once resolved. This integration ensured that every metric degradation event was tracked, investigated, and resolved systematically.
+
+## Ground Truth Management and Labeling Workflows
+
+Evaluation requires ground truth. For pre-deployment evaluation, ground truth comes from labeled datasets. For production evaluation, ground truth often requires labeling production data. Ground truth management is a critical but often overlooked component of evaluation infrastructure.
+
+Build tooling to collect, store, version, and serve ground truth data. Ground truth should be stored in the same system as evaluation results, with versioning and provenance tracking. You should know when each example was labeled, who labeled it, what instructions they were given, and whether the label was verified by multiple labelers.
+
+Integrate labeling workflows into production evaluation pipelines. When the pipeline samples predictions for evaluation, it should automatically route them to labelers, collect labels, wait for labels to be completed, and then compute metrics. This integration removes manual handoffs and ensures labeling happens consistently.
+
+Use labeling platforms that support your workflow. For simple tasks, internal tools or spreadsheets might suffice. For complex tasks, dedicated platforms like Label Studio, Prodigy, or Scale AI provide interfaces for annotators, quality control workflows, and integrations with ML pipelines. Choose platforms that fit your labeling volume, task complexity, and budget.
+
+Track labeler agreement and quality. If multiple labelers label the same examples, measure inter-annotator agreement using metrics like Cohen's kappa or Fleiss's kappa. Low agreement indicates ambiguous task definitions or insufficient labeler training. Track individual labeler accuracy by having a subset of examples labeled by expert labelers as gold standard, then measuring how often each labeler agrees with the gold standard. Remove low-quality labelers or provide additional training.
+
+One content moderation platform built an internal labeling tool that presented sampled production decisions to moderators, collected their labels, tracked agreement with the model's decision, and computed weekly quality metrics. The tool handled 5,000 labels per week, employed fifteen part-time moderators, achieved 89% inter-annotator agreement, and fed labeled data back into monthly retraining cycles.
+
+## Build Versus Buy: Choosing Evaluation Tools
+
+Evaluation infrastructure can be built custom or assembled from open-source and commercial tools. The right choice depends on your organization's size, technical sophistication, budget, and specific requirements.
+
+Start with open-source tools for standard components. For metric computation, libraries like scikit-learn, torchmetrics, or Hugging Face evaluate provide well-tested implementations of common metrics. For experiment tracking, tools like MLflow, Weights and Biases, or Neptune track experiments, log metrics, and store artifacts. For model serving and monitoring, tools like Seldon, KServe, or BentoML provide inference endpoints with built-in monitoring. For labeling, tools like Label Studio or Prodigy provide annotation interfaces.
+
+Use open-source tools when they fit your workflow without significant customization. Do not build a custom metric computation library when scikit-learn does what you need. Do not build a custom experiment tracker when MLflow integrates with your stack. Open-source tools are maintained by communities, documented, and battle-tested.
+
+Build custom tools when open-source tools do not fit. Custom metrics that are specific to your domain cannot be found in libraries. Custom evaluation workflows that involve proprietary data sources or approval processes cannot be implemented in off-the-shelf tools. Custom integrations with internal systems like your CI/CD pipeline, your incident management system, or your data warehouse may require custom code.
+
+One financial services company used MLflow for experiment tracking and metric logging, Label Studio for ground truth annotation, and PostgreSQL for storing evaluation results, but built custom orchestration code that integrated these tools with their internal CI/CD system, deployed models to their proprietary inference platform, and enforced their compliance requirements around data retention and access control. The custom code was roughly 5,000 lines of Python. The open-source tools provided 90% of the functionality, and the custom code provided the last 10% that was specific to their environment.
+
+Evaluate commercial tools for comprehensive platforms. Vendors like Arize, Fiddler, WhyLabs, and Arthur provide end-to-end ML observability platforms that include evaluation, monitoring, alerting, dashboards, and integrations. Commercial tools cost money but save engineering time. Evaluate whether the cost is justified by the time saved and the features provided.
+
+The build-versus-buy decision should be revisited as your organization matures. Early-stage companies with one or two models might rely entirely on open-source tools and manual processes. Growth-stage companies with ten models might build lightweight custom infrastructure. Mature enterprises with hundreds of models might adopt commercial platforms or build substantial custom systems with dedicated platform teams.
+
+## Scaling Evaluation Infrastructure as Model Count Grows
+
+Evaluation infrastructure that works for three models often fails at thirty models. Scaling requires architectural changes, not just throwing more compute at the problem.
+
+Centralize infrastructure to avoid duplication. Every model should use the same evaluation pipeline, the same metric definitions, the same storage system, and the same dashboards. Centralization enables consistency, reduces maintenance burden, and allows expertise to be concentrated in a platform team rather than scattered across model teams.
+
+Automate everything. Manual steps do not scale. If an engineer must SSH into a machine to run evaluation, that will not work when you have thirty models each retraining monthly. If someone must manually copy metrics into a spreadsheet, that will not work when you have one hundred evaluation runs per week. Automate pipeline triggers, metric computation, result storage, alerting, and reporting.
+
+Optimize for cost. Evaluation compute costs scale with the number of models, the size of evaluation sets, and the frequency of evaluation. Monitor costs and optimize aggressively. Use spot instances for non-critical evaluation. Cache model artifacts to avoid re-downloading. Batch evaluations to amortize setup costs. Sample evaluation sets intelligently to maintain statistical power while reducing compute.
+
+One company reduced evaluation costs by 60% by switching from on-demand GPU instances to spot instances for pre-deployment evaluation, since evaluation is not latency-sensitive and can tolerate interruptions. They also reduced their standard evaluation set from 50,000 examples to 10,000 examples after analysis showed that 10,000 examples provided 95% confidence intervals that were acceptably narrow for their decision thresholds.
+
+Parallelize pipelines. If ten models each need evaluation, run ten pipelines in parallel rather than sequentially. Use orchestration systems like Airflow, Prefect, or Kubeflow Pipelines to manage dependencies, retries, and resource allocation across many concurrent pipelines.
+
+Standardize interfaces. Define a standard interface for models, for evaluation datasets, and for metric specifications. If every model conforms to the same interface, the evaluation pipeline can treat them uniformly. If every dataset conforms to the same schema, the pipeline does not need custom parsers. Standardization is the key to scaling.
+
+## The Platform Team and Governance
+
+As evaluation infrastructure grows, it requires dedicated ownership. Assign a platform team responsible for building, maintaining, and evolving evaluation infrastructure. This team serves all model teams, ensuring consistency and quality.
+
+The platform team's responsibilities include maintaining the evaluation pipeline codebase, operating the storage and compute infrastructure, defining and publishing standard metrics and datasets, providing self-service tooling and documentation, and supporting model teams when they encounter issues. The platform team does not run evaluations for model teams; model teams run evaluations using the platform. The platform team provides the rails, not the train.
+
+Establish governance for metrics and datasets. Not every model team should invent their own accuracy metric or build their own evaluation set in isolation. Define standard metrics centrally, document their definitions and appropriate use cases, and publish shared evaluation datasets for common tasks. Allow model teams to use custom metrics when necessary, but require documentation and review.
+
+One enterprise software company established a metrics council that met monthly to review proposed new metrics, standardize metric definitions, and deprecate metrics that were no longer useful. The council included representatives from each model team, the platform team, and product leadership. This governance prevented metric proliferation and ensured that when someone said "accuracy," everyone knew what that meant.
+
+Invest in documentation and training. Evaluation infrastructure is only useful if model teams know how to use it. Provide clear documentation on how to run evaluations, how to interpret results, how to add custom metrics, and how to troubleshoot common issues. Provide onboarding for new engineers joining model teams. Provide office hours where the platform team answers questions.
+
+## The Evolutionary Path for Evaluation Infrastructure
+
+Evaluation infrastructure evolves as the organization's fine-tuning practice matures. Do not try to build the perfect system on day one. Build what you need now, and evolve iteratively.
+
+At the single-model stage, evaluation might be entirely manual: an engineer runs a script, reviews results, and merges the pull request. This is fine for the first model. Invest in automation only when manual processes become bottlenecks.
+
+At the few-models stage, build basic automation: a pipeline that runs in CI/CD, computes standard metrics, and posts results to pull requests. Store results in a simple database or even in git-tracked files. This provides consistency without significant infrastructure investment.
+
+At the many-models stage, build centralized infrastructure: shared pipelines, shared storage, dashboards, alerting, and production monitoring. Invest in platform team capacity to support multiple model teams. This is where infrastructure becomes a strategic capability.
+
+At the mature stage, integrate evaluation infrastructure with broader ML platform capabilities: feature stores, model registries, deployment systems, and incident management. Evaluation becomes one component of a comprehensive ML platform that supports the entire model lifecycle.
+
+One company tracked their infrastructure evolution over four years. Year one: three models, manual evaluation, scripts in git. Year two: eight models, CI/CD integration, basic dashboards in Grafana. Year three: twenty models, centralized pipelines, PostgreSQL storage, alerting integrated with PagerDuty, dedicated platform engineer. Year four: fifty models, comprehensive ML platform with evaluation as a core service, three-person platform team, commercial observability tools for production monitoring. Each stage was appropriate for the organization's maturity and scale at the time.
+
+Evaluation infrastructure is not glamorous. It is not the part of ML engineering that gets conference talks or attracts top talent. But it is the part that determines whether your fine-tuned models are trustworthy, whether your evaluations are reproducible, and whether your organization can scale its fine-tuning practice sustainably. Build infrastructure early, invest in it continuously, and treat it as a first-class capability. The returns compound over time.

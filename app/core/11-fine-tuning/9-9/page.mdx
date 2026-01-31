@@ -1,0 +1,107 @@
+# 9.9 — Multi-Model Serving: Routing Between Fine-Tuned Variants
+
+In February 2026, a SaaS company offering AI-powered document analysis had grown to serve three distinct customer tiers: a free tier for individual users, a professional tier for small teams, and an enterprise tier for large organizations with strict compliance requirements. They had started with a single fine-tuned GPT-4o model serving all customers. Over time, they realized that the three tiers had different needs. Free users needed fast, low-cost inference and could tolerate occasional errors. Professional users needed higher accuracy and were willing to pay more. Enterprise users needed the highest accuracy, full auditability, and data residency guarantees. The company decided to train three fine-tuned variants: a small, fast model for free users, a larger, more accurate model for professional users, and a specialized model trained on compliance-heavy data for enterprise users. They deployed all three models and built a routing layer that directed each request to the appropriate model based on the user's tier. The system worked well for two weeks. Then enterprise customers started complaining about slow response times. The engineering team investigated and discovered that the enterprise model, which had been fine-tuned on a much larger dataset, required 3x the compute resources of the other models. During peak usage, all available GPUs were saturated serving enterprise requests, and the load balancer was queueing free and professional requests behind enterprise requests, causing timeouts. The routing layer had no concept of resource limits or prioritization. It simply sent requests to the correct model without considering whether that model had capacity. The root cause was that they had built multi-model routing without multi-model resource management. They had the logic to choose the right model but not the infrastructure to serve multiple models reliably under load.
+
+Multi-model serving is the practice of deploying and routing between multiple fine-tuned model variants simultaneously. This is essential when you serve different customer segments, when you A/B test models, when you need task-specific specialization, or when you want to optimize cost and latency by routing simple queries to cheaper models and complex queries to expensive models. Multi-model serving introduces significant operational complexity. You need routing logic, load balancing, resource management, monitoring across models, and infrastructure to update models independently. Without careful design, multi-model serving leads to cascading failures, resource contention, and unpredictable performance.
+
+## Why Serve Multiple Models
+
+The first reason to serve multiple models is customer segmentation. Different customers have different needs, and a one-size-fits-all model may not be optimal. Free users may not need the accuracy of your most expensive model. Enterprise users may require features such as auditability or data residency that necessitate a separate model. Serving different models to different tiers allows you to optimize cost, performance, and features for each segment.
+
+The second reason is task specialization. A single model may perform well on average across multiple tasks but underperform on specific tasks compared to task-specific models. You might have one model for customer support, one for sales lead qualification, and one for technical troubleshooting. Each is fine-tuned on data specific to its task and optimized for the unique requirements of that task. Routing requests to task-specific models improves overall quality.
+
+The third reason is A/B testing and experimentation. You want to compare two model variants to determine which performs better in production. You deploy both models, route 50% of traffic to each, and measure error rates, latency, and user satisfaction. After collecting sufficient data, you promote the winner to 100% of traffic and retire the other. Multi-model serving is the infrastructure that enables continuous experimentation.
+
+The fourth reason is cost optimization. Large, accurate models are expensive to run. Small, fast models are cheaper but less accurate. For queries that are simple or low-stakes, you can route to a cheap model and save money. For queries that are complex or high-stakes, you route to an expensive model and pay for quality. This is sometimes called cascade serving or tiered inference. Multi-model serving with intelligent routing reduces your overall inference cost while maintaining quality on the queries that matter most.
+
+The fifth reason is gradual rollout and canary deployment. When you deploy a new model version, you do not immediately send 100% of traffic to it. You send 5%, monitor for errors, then increase to 25%, then 50%, then 100%. During the rollout, you are serving both the old and new versions simultaneously. Multi-model serving is the mechanism that enables safe, gradual deployment.
+
+## Routing Strategies
+
+Routing is the logic that decides which model to serve for a given request. The simplest routing strategy is deterministic based on request metadata. You inspect the user ID, account tier, or request headers and apply a fixed rule. If the user is in the enterprise tier, route to the enterprise model. If the user is in the free tier, route to the free model. This is straightforward and predictable but inflexible. It cannot adapt to load or dynamically choose the best model based on query characteristics.
+
+A more sophisticated strategy is feature-based routing. You extract features from the request such as query complexity, token count, language, or topic, and route based on those features. A short, simple query in English might go to a fast, cheap model. A long, complex query in Spanish might go to a slower, more capable multilingual model. Feature-based routing requires defining features and thresholds, and it requires evaluating those features on every request, which adds latency.
+
+Another strategy is confidence-based routing or cascade routing. You send the request to a small, fast model first. If the model returns a high-confidence prediction, you return that result. If the model returns a low-confidence prediction, you escalate to a larger, more accurate model. This optimizes cost by using the cheap model when it is confident and the expensive model only when necessary. Cascade routing requires two inferences per low-confidence request, which increases latency, but it can significantly reduce overall cost.
+
+For A/B testing, you use random or hash-based routing. You assign each user or request to a cohort using a hash function or random assignment, and you route cohort A to model A and cohort B to model B. This ensures that each model receives a representative sample of traffic and that results are comparable.
+
+In practice, you often combine strategies. You use deterministic routing for customer tiers, then apply cascade routing within each tier to optimize cost. You use hash-based routing for A/B tests, but you override it for specific high-value customers who should always receive the best model. Your routing logic is a decision tree or policy that evaluates multiple conditions and selects the appropriate model.
+
+## Load Balancing Across Model Variants
+
+Routing determines which model to use, but load balancing determines which instance of that model to use. If you have deployed three replicas of your enterprise model across three GPUs, the load balancer distributes requests across the replicas to balance load and avoid overloading any single instance.
+
+Load balancing for multi-model serving is more complex than load balancing for a single model. You have multiple models, each with multiple replicas, each with different resource requirements and performance characteristics. A naive round-robin load balancer treats all instances equally, but this can cause problems. The enterprise model may have fewer replicas than the free model, so round-robin would send proportionally more traffic to enterprise replicas, overloading them.
+
+You need resource-aware load balancing. The load balancer tracks the current load on each model's replicas, measured in requests per second, GPU utilization, or queue depth. It routes new requests to the least-loaded replica of the selected model. If all replicas of a model are overloaded, the load balancer either queues the request or returns an error, depending on your policy.
+
+You also need to implement priority-based routing. Enterprise requests may have higher priority than free requests. If your infrastructure is near capacity, you should drop or delay free requests to ensure enterprise requests are served. Priority-based routing requires annotating requests with priority levels and configuring the load balancer to respect those levels.
+
+Autoscaling is essential. When traffic to a specific model increases, you need to automatically spin up additional replicas. When traffic decreases, you scale down to save cost. Autoscaling policies should be per-model, not global. A traffic spike in the free tier should scale the free model, not the enterprise model. Autoscaling based on metrics such as queue depth, average latency, or GPU utilization ensures that you provision enough capacity to meet demand without over-provisioning during low traffic.
+
+## Monitoring Across Multiple Models
+
+Monitoring a single model is straightforward. Monitoring five models deployed across 30 replicas is not. You need observability that tracks metrics per model, per replica, per customer tier, and per request type. You need dashboards that show error rates, latency, throughput, and resource utilization for each model independently and in aggregate.
+
+Your monitoring system should break down metrics by model version. When you deploy enterprise-model-v8 alongside professional-model-v5 and free-model-v3, you need separate dashboards for each. If error rates spike on enterprise-model-v8 but remain stable on the other models, you know the problem is specific to that version. You can roll back enterprise-model-v8 without affecting the other models.
+
+You also need cross-model comparison. You want to see that the enterprise model has a 3% error rate, the professional model has 5%, and the free model has 8%. This tells you that your tiering is working as expected. If the enterprise model starts underperforming the professional model, something is wrong.
+
+Request tracing is critical for debugging multi-model systems. Each request should have a trace ID that follows it through the routing layer, the load balancer, the model inference, and the response. When a user reports a bad result, you query your logs by trace ID and see exactly which model version served the request, what the latency was, and what the model returned. Without tracing, debugging is guesswork.
+
+You should also monitor routing decisions. Track how many requests are routed to each model, what the distribution of customer tiers is, and whether cascade routing is escalating requests as expected. If 90% of requests are being escalated from the fast model to the slow model, your cascade threshold is too aggressive. If only 2% are escalated, you may be underutilizing the slow model.
+
+## A/B Testing Infrastructure
+
+A/B testing is one of the most valuable uses of multi-model serving, but it requires careful infrastructure. The goal is to serve two model variants to similar cohorts of users, measure their performance, and determine which is better. Poor A/B testing infrastructure leads to biased comparisons, incorrect conclusions, and wasted effort.
+
+The first requirement is stable cohort assignment. Each user or request must be consistently assigned to the same cohort throughout the test. If a user receives results from model A on Monday and model B on Tuesday, you cannot attribute their behavior to either model. Cohort assignment is typically done by hashing the user ID and using the hash to assign cohort A or B. The hash ensures that the same user always gets the same model during the test.
+
+The second requirement is balanced cohorts. Cohort A and cohort B should have similar distributions of user characteristics such as account tier, geography, and usage patterns. If cohort A is mostly free users and cohort B is mostly enterprise users, the performance difference may be due to user differences, not model differences. Randomized or hash-based assignment generally produces balanced cohorts if the sample size is large.
+
+The third requirement is instrumentation. You need to log which cohort each request was assigned to and which model served it. You need to record outcomes such as error rate, latency, user feedback, and task completion. You need to aggregate these metrics by cohort and model version so you can compare them.
+
+The fourth requirement is statistical rigor. You need enough traffic and enough time to reach statistical significance. Running an A/B test for two hours on 100 requests will not give you reliable results. You need thousands or tens of thousands of requests, and you need to account for temporal variation such as time of day and day of week. You should use statistical tests such as t-tests or chi-squared tests to determine whether observed differences are significant or due to random variation.
+
+The fifth requirement is isolation from other experiments. If you are running multiple A/B tests simultaneously, you need to ensure they do not interfere. If you are testing model A versus model B and also testing prompt variant X versus prompt variant Y, you need orthogonal cohorts or sequential tests. Running overlapping experiments can produce confounded results where you cannot tell which change caused which effect.
+
+## The Operational Complexity of Multi-Model Serving
+
+Multi-model serving is operationally expensive. You have more surface area for failures, more configurations to manage, more monitoring to maintain, and more complexity in deployment. A single-model system is simple: deploy the model, route all traffic to it, monitor it. A multi-model system requires routing logic, replica management, per-model monitoring, per-model alerting, and coordination across models during incidents.
+
+One challenge is configuration drift. Each model has its own configuration: hyperparameters, serving infrastructure, routing rules, autoscaling policies. Keeping these configurations consistent and up-to-date requires discipline. A common anti-pattern is to configure the free model correctly, copy the configuration to the professional model, and forget to update it. The professional model then inherits the wrong autoscaling policy or the wrong resource limits.
+
+Another challenge is deployment coordination. When you update the enterprise model, you need to ensure that the routing layer, the load balancer, and the monitoring dashboards all know about the new version. If the routing layer still references the old version, requests will fail. If the monitoring dashboard is not updated, you will not see metrics for the new version. Deployment orchestration for multi-model systems requires automation and testing.
+
+A third challenge is incident response. When an alert fires, you need to quickly determine which model is affected, whether the problem is specific to that model or systemic, and whether you can roll back that model without affecting others. Multi-model incidents require more diagnostic steps and more coordination than single-model incidents.
+
+These challenges are manageable with proper tooling and process. You need infrastructure-as-code to manage configurations, automated deployment pipelines to coordinate updates, and runbooks that document how to diagnose and respond to multi-model incidents. You need dashboards that surface the most important metrics and alert policies that escalate when any model degrades. The investment in tooling and process is substantial, but it is necessary if you want to serve multiple models reliably.
+
+## When Multi-Model Serving Is Worth It
+
+Multi-model serving is not free. It increases infrastructure cost, engineering complexity, and operational risk. You should adopt it only when the benefits outweigh the costs. Multi-model serving is worth it when you have clearly differentiated customer tiers with different quality or cost requirements, when you have multiple distinct tasks that benefit from specialization, or when you need robust A/B testing to drive continuous improvement.
+
+Multi-model serving is not worth it when your use case is homogeneous and a single model serves all needs well. Adding a second model just to experiment is not a good reason if you do not have the infrastructure to run reliable experiments. Starting with a single model and adding multi-model serving later when differentiation is needed is a reasonable strategy.
+
+You should also consider alternatives. Prompt-based differentiation can sometimes achieve similar outcomes with less complexity. You can serve a single model but vary the prompt based on customer tier or task type. This is simpler than deploying separate models but less flexible. If prompt variation is sufficient, it is the better choice. If you need truly different behavior that prompts cannot provide, multi-model serving is necessary.
+
+## Multi-Model Serving at Scale
+
+At large scale, multi-model serving becomes a platform capability. You build infrastructure that allows any team to deploy a fine-tuned model, register it in a model registry, configure routing rules, and monitor it independently. The platform handles load balancing, autoscaling, monitoring, and deployment orchestration. Teams focus on training and improving their models, not on managing infrastructure.
+
+Building a multi-model serving platform requires significant upfront investment. You need a model registry, a routing service, a load balancer that understands model-specific policies, monitoring infrastructure that aggregates metrics across models, and deployment tooling that coordinates updates. You also need documentation, training, and support so that teams can use the platform effectively.
+
+The payoff is that teams can iterate quickly. A team that wants to test a new model variant can deploy it, configure a 10% traffic split, and collect data within hours. They do not need to coordinate with infrastructure teams or wait for manual deployment. The platform provides self-service capability, enabling faster experimentation and higher-quality models.
+
+At scale, you also need governance. You need policies that limit how many models can be deployed, how much traffic each can receive, and what quality thresholds must be met before promotion to production. Without governance, teams will deploy too many models, fragment traffic, and create operational chaos. Governance ensures that multi-model serving remains manageable even as the number of models grows.
+
+## Lessons from Multi-Model Serving in Production
+
+Teams that successfully operate multi-model serving infrastructure share several practices. First, they start simple. They deploy two models before deploying ten. They validate that routing, load balancing, and monitoring work reliably for a small number of models before scaling up. Second, they automate everything. Manual routing configuration, manual deployment, and manual monitoring do not scale. Automation is mandatory. Third, they invest in observability. They can quickly answer questions such as which model served this request, why was it routed there, and how did it perform. Observability enables fast debugging and confident decision-making.
+
+Fourth, they maintain discipline around versioning and registry usage. Every model is registered, every deployment references a registry ID, and every rollback is traceable. Fifth, they build fallback logic. If a model is unavailable or overloaded, requests are routed to a backup model or a degraded mode. Fallback prevents total failures and maintains service availability.
+
+Multi-model serving is advanced infrastructure. It is not where you start. It is where you go when your needs outgrow a single model and when you have the engineering maturity to manage complexity. When implemented well, it unlocks customer differentiation, cost optimization, and continuous improvement through experimentation. When implemented poorly, it creates reliability problems and operational burden that outweigh the benefits. The key is to adopt it intentionally, invest in the necessary infrastructure, and maintain the discipline required to operate it successfully.
+
+You have built the infrastructure to deploy, version, monitor, and serve your fine-tuned models. The production lifecycle is complete. In the next chapter, we shift focus to the economics of fine-tuning: how to measure return on investment, how to decide when fine-tuning is worth the cost, and how to optimize for cost efficiency without sacrificing quality.

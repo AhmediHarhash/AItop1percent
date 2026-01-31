@@ -1,0 +1,107 @@
+# 9.12 — Reproducibility Requirements: Configs, Seeds, Data Snapshots, and Provenance
+
+In March 2025, a financial services company was required by their primary regulator to reproduce a credit risk model that had been deployed 18 months earlier. The model, a fine-tuned language model used to assess loan application narratives, had produced inconsistent risk scores for a subset of applications, and the regulator wanted to verify whether the issue was present when the model was originally trained or had emerged later. The team attempted to reproduce the original training run. They had the training code, they had the hyperparameters documented, and they believed they had the training data. After three weeks of effort, they could not produce a model that matched the original. The metrics were close but not identical, and the model's decisions on a held-out test set diverged in 14 percent of cases. They eventually concluded that the training data snapshot they were using was not the same as the original—some records had been updated or deleted in the source database—and they had no immutable snapshot from the original training date. The regulator deemed this a material control failure. The company was required to retrain the model with full reproducibility controls, suspend the existing model, and manually re-review every loan decision made by the original model over 18 months—a process that cost 2.8 million dollars and six months of operational disruption.
+
+The failure was the absence of **reproducibility discipline**—the practices and infrastructure needed to exactly reproduce a training run weeks, months, or years later. Reproducibility is not an academic nicety. It is a regulatory requirement for any model subject to audit, a debugging necessity when model behavior changes unexpectedly, and a baseline professional standard for production ML systems. If you cannot reproduce a training run, you cannot confidently iterate on the model, you cannot diagnose regressions, and you cannot satisfy auditors that your model was trained according to documented procedures. In 2026, reproducibility is non-negotiable for fine-tuned models deployed in regulated or high-stakes environments.
+
+## The Reproducibility Challenge
+
+Perfect reproducibility in deep learning is notoriously difficult. Training involves stochastic processes—random initialization, data shuffling, dropout, gradient noise—that make exact reproduction challenging even when you control all inputs. Hardware differences, library version changes, floating-point rounding variations, and non-deterministic GPU operations can all introduce divergence. A training run on an NVIDIA A100 may produce slightly different results than the same run on an H100, even with identical code and data.
+
+Despite these challenges, you can achieve reproducibility sufficient for regulatory and operational purposes. The goal is not bitwise-identical model weights—that level of reproducibility is impractical and unnecessary. The goal is **functionally equivalent** models: models that produce the same decisions on the same inputs within acceptable tolerance. For most applications, this means models that agree on 99 percent or more of test cases and produce metric values within one percent of the original.
+
+Achieving this requires controlling four categories of variation: code and dependency versions, data snapshots, random seeds and stochastic processes, and hardware and execution environment. If you can capture and reproduce these four elements, you can achieve functional reproducibility.
+
+## Configuration Management
+
+Every training run must be driven by a **configuration file** that captures all hyperparameters, data sources, model architecture settings, and training procedure options in a structured, version-controlled format. The configuration file is the single source of truth for what the training run will do. It must be complete—no parameters hard-coded in the training script that are not also captured in the configuration—and it must be immutable—once a training run begins, the configuration cannot be changed.
+
+The standard format for configuration files is YAML or JSON, stored in version control alongside the training code. Each configuration file specifies the base model identifier, the training dataset identifier and version, the learning rate schedule and optimizer settings, the number of epochs and batch size, the evaluation frequency and early stopping criteria, the random seed for reproducibility, the output directory for checkpoints and logs, and any custom training logic or flags.
+
+When a training run begins, the configuration file is read, validated, and logged. A cryptographic hash of the configuration is computed and included in the lineage record. The configuration file itself is copied to the training output directory and stored with the model checkpoint. This ensures you can always retrieve the exact configuration used for any historical training run.
+
+Some teams implement configuration management using experiment tracking tools like MLflow or Weights and Biases, which automatically log the configuration and hyperparameters for each training run. These tools provide a UI for browsing historical runs and comparing configurations, which simplifies reproducibility investigations.
+
+The key principle is that the configuration file must be the authoritative source. If you need to know what hyperparameters were used for a training run, you read the configuration file, not the training script. The training script should be as generic as possible, with all run-specific settings passed in via configuration.
+
+## Dependency Pinning
+
+Reproducibility requires pinning all software dependencies to specific versions. You cannot reproduce a training run if the training framework, library versions, or system dependencies have changed. A model trained with PyTorch 2.1.0 may produce different results when trained with PyTorch 2.2.0, even with identical code and data. Version changes introduce bug fixes, performance optimizations, and numerical changes that affect training dynamics.
+
+You must pin dependencies in a **lock file** that specifies the exact version of every library and transitive dependency. For Python projects, this means using a tool like Poetry or pip-tools to generate a lock file that captures the full dependency graph. For Docker-based training, this means building a training image with all dependencies installed and tagging that image with a version or hash.
+
+The lock file or image hash is recorded in the lineage record and stored with the model checkpoint. When you need to reproduce a training run, you first recreate the exact software environment by installing from the lock file or pulling the exact Docker image used for the original run.
+
+Some teams maintain a library of pinned training environments, one for each major framework version or training configuration. When they initiate a training run, they select the appropriate environment, ensuring consistency across runs. When a new framework version is released, they create a new pinned environment, validate it, and then use it for future runs. This prevents unintentional version drift while allowing controlled upgrades.
+
+For cloud-based training using managed services like SageMaker or Vertex AI, you must also pin the platform version and runtime environment. These services release updates regularly, and even minor version changes can affect reproducibility. Record the platform version, runtime container image, and any platform-specific settings in your lineage record.
+
+## Data Snapshotting
+
+The most common cause of reproducibility failure is training data drift. If you train on a dataset defined by a query against a live database, the data will change over time as records are updated, added, or deleted. Training on the same logical dataset six months apart will produce different models because the physical data is different.
+
+You must capture an **immutable snapshot** of the training data at the time of training and store that snapshot in a versioned, immutable storage system. The snapshot is the exact data used for training, byte-for-byte. It is not a reference to a database query or a dataset definition. It is the actual data files.
+
+For small datasets—millions of rows, gigabytes of data—the snapshot can be stored as files in object storage like S3, GCS, or Azure Blob Storage with versioning enabled. When training begins, the data is exported from the source system, written to storage, and a cryptographic hash is computed over the files. The hash is recorded in the lineage record, and the files are marked immutable. When you need to reproduce the training run, you retrieve the files by hash, verify the hash matches, and use those files for training.
+
+For large datasets—billions of rows, terabytes of data—storing full snapshots may be cost-prohibitive. In this case, you use **incremental snapshotting** with a data lakehouse architecture like Delta Lake or Apache Iceberg. These systems support time-travel queries, allowing you to query the dataset as it existed at a specific timestamp. You record the snapshot timestamp in the lineage record, and when you need to reproduce the training run, you query the dataset at that timestamp to retrieve the same data.
+
+The critical requirement is that the snapshot must be immutable. Once captured, it cannot be altered or deleted until the retention period expires. This requires configuring object storage with object lock or versioning, or using a data lakehouse with retention policies that prevent deletion or modification of historical snapshots.
+
+## Random Seed Management
+
+Stochastic processes in training—random weight initialization, data shuffling, dropout—are controlled by random number generators seeded with a random seed. If you use the same seed for two training runs, you get the same sequence of random numbers, and the training process is reproducible. If you use different seeds or fail to set a seed, the training process is non-deterministic and reproducibility is impossible.
+
+You must set **explicit random seeds** for all random number generators used during training. This includes the seed for NumPy, PyTorch, TensorFlow, or JAX random number generators, the seed for data shuffling and augmentation, and the seed for any custom random processes like synthetic data generation.
+
+The standard practice is to set a single global seed at the start of the training script and propagate it to all random number generators. The seed is specified in the configuration file, recorded in the lineage record, and logged in the training output. If you need to reproduce a training run, you use the same seed.
+
+Setting the seed does not guarantee bitwise reproducibility, because some operations—particularly GPU operations—are non-deterministic even with a fixed seed. To achieve full determinism, you must also enable deterministic mode in your training framework, which disables non-deterministic algorithms and uses slower but reproducible implementations. PyTorch provides a deterministic mode via torch.use_deterministic_algorithms. TensorFlow provides a similar setting.
+
+Enabling deterministic mode typically reduces training speed by 10 to 30 percent, as it disables optimized but non-deterministic kernels. For most production training, this cost is acceptable, as reproducibility is more important than marginal speed gains. For extremely large training runs where the cost is prohibitive, you may choose to accept approximate reproducibility—models that agree on 99 percent of test cases but are not bitwise identical.
+
+## Hardware and Environment Capture
+
+Training reproducibility can be affected by hardware differences—CPU vs GPU, GPU model, driver versions, CUDA toolkit versions—and execution environment differences like operating system, container runtime, and cloud platform. To maximize reproducibility, you should train on standardized hardware and capture the environment specification.
+
+The most reliable approach is to use **containerized training** with Docker or a similar container system. You build a training container image that includes the operating system, training framework, all dependencies, and the training script. The image is tagged with a version or hash and stored in a container registry. When you initiate training, you run the container image on a specified GPU type. The image hash is recorded in the lineage record.
+
+When you need to reproduce a training run, you pull the exact container image used for the original run and execute it on the same GPU type. This ensures the software environment is identical, eliminating one major source of variation.
+
+For cloud-based training, you also record the cloud provider, region, instance type, GPU model, and driver version in the lineage record. If you need to reproduce a training run, you provision the same instance type in the same region. Cloud providers do not guarantee perfect hardware consistency across regions or over time, but using the same instance type in the same region maximizes reproducibility.
+
+Some teams go further and maintain dedicated training infrastructure—specific GPU nodes with pinned driver versions and system configurations—used exclusively for reproducible training runs. This approach provides the highest level of environmental control but requires significant infrastructure investment.
+
+## Reproducibility Validation
+
+You should validate reproducibility by **reproducing a subset of training runs** as part of your standard operating procedure. This serves two purposes: it verifies that your reproducibility controls are working, and it builds organizational muscle memory for the reproduction process so you can execute it confidently under audit or incident pressure.
+
+A common practice is to reproduce one training run per month, selected randomly from recent production runs. An engineer who was not involved in the original run attempts to reproduce it using only the documented lineage record and stored artifacts. The reproduced model is compared to the original using the same test set, and agreement is measured. If agreement is above the threshold—typically 99 percent—reproducibility is validated. If not, the team investigates the discrepancy and updates their reproducibility controls.
+
+This practice reveals gaps in documentation, missing artifacts, and undocumented manual steps. It also trains the team to execute reproduction under time pressure, which is critical when a regulator requests reproduction with a tight deadline.
+
+## Partial Reproducibility and Justification
+
+In some cases, full reproducibility is not achievable due to practical constraints—data retention costs, hardware availability, or third-party dependencies. In these cases, you must document the **limits of reproducibility** and provide justification for those limits.
+
+For example, if you train on a dataset that includes third-party data that cannot be retained indefinitely due to licensing restrictions, you may not be able to snapshot the full training dataset. In this case, you document the portion of the data that is not reproducible, the reason, and the impact on reproducibility. You may be able to reproduce training on the retained portion of the data and demonstrate that the reproduced model is functionally equivalent, even if not trained on the exact same data.
+
+For extremely large training runs—multi-week runs on hundreds of GPUs—the cost of reproduction may be prohibitive. In this case, you document that full reproduction is not feasible, but you validate reproducibility for a scaled-down version of the training run on a smaller dataset or fewer GPUs, demonstrating that the training process is reproducible in principle.
+
+The key is transparency. If you cannot achieve full reproducibility, you document the gap, explain why, and demonstrate that you have reproducibility controls in place for the portions that can be reproduced. This is far more defensible than claiming full reproducibility and then failing to deliver when audited.
+
+## Reproducibility as Continuous Practice
+
+Reproducibility is not a one-time effort. It is a continuous discipline that must be maintained across the model lifecycle. Every time you update training code, upgrade dependencies, or change training data pipelines, you risk introducing reproducibility breaks. You must validate reproducibility after each change.
+
+Some teams implement **reproducibility tests** in their CI/CD pipeline. When a change is made to the training code, the CI system runs a small-scale training run, reproduces it, and verifies agreement. If the reproduced model diverges from the original, the build fails, and the team investigates before merging the change.
+
+This practice catches reproducibility breaks early, when they are easy to diagnose and fix, rather than discovering them months later during an audit or incident investigation.
+
+Reproducibility also requires operational investment. You must maintain storage for data snapshots, model checkpoints, configuration files, and container images. You must maintain training infrastructure that can execute historical training runs. You must maintain access to historical GPU types and driver versions, which can be challenging as hardware and cloud offerings evolve.
+
+The cost is not trivial, but it is the cost of professional ML operations. Organizations that skimp on reproducibility infrastructure discover, under pressure, that they cannot deliver the evidence needed to defend their models. Organizations that invest in reproducibility from the start operate with confidence that they can answer any question about any model and reproduce any result when required.
+
+Reproducibility is the foundation of trust in ML systems. It enables you to iterate confidently, knowing you can always return to a previous state. It enables you to debug regressions by comparing current models to historical baselines. It enables you to satisfy auditors that your model was trained according to documented procedures. It enables you to comply with regulatory requirements for model validation and conformity assessment. Without reproducibility, you are operating on faith, hoping that your models behave as documented but unable to prove it. With reproducibility, you operate on evidence, able to demonstrate exactly how every model was built and validate that it matches your claims.
+
+In the next subchapter, we examine the fine-tuning maturity model—a framework for assessing your organization's fine-tuning practices and progressing from ad hoc experimentation to systematic, production-grade operations.
