@@ -27,7 +27,7 @@ Say: "Read CLAUDE.md and continue writing section 2"
 - MAX 3 agents at a time (prefer 2-3). Never more than 5. VSCode crashes with too many.
 - Do not rush. Write each subchapter fully and carefully before moving to the next.
 - If session crashes, re-read this file first to restore all context.
-- **RULE #1 — NO THIN FILES. EVER.** Every subchapter MUST be written to full length (150-200+ lines, 2000-3000 words) on the FIRST write. Do NOT compress, rush, or summarize. Agents must be given NO MORE than 3 files at a time to prevent token exhaustion causing short output. Every agent prompt MUST include: "Each file MUST be at least 150 lines of deep, fully-developed prose. Do NOT compress. Do NOT summarize. Write the full depth on the first attempt. If you run low on output tokens, finish the current file completely before moving to the next — never produce a short file." Verify line counts immediately after each agent completes. Any file under 120 lines must be rewritten before moving on. This is the single most important rule — violating it wastes hours on expansion rounds.
+- **RULE #1 — DENSITY OVER LENGTH. NO EXPANSION ROUNDS.** There is NO minimum line count. A tight 80-line file with dense, specific prose is better than a padded 200-line file. Write each subchapter with full depth on the FIRST write — but stop when you've said everything worth saying. Agents must be given NO MORE than 3 files at a time to prevent token exhaustion. **NEVER do expansion rounds.** Expansion rounds produce four types of damage: (1) padding that restates existing points in different words, (2) generic filler sentences like "this cannot be overstated" that add zero information, (3) repetitive examples that make the same point a prior story already made, (4) vaguer claims because the sharpest version was already written. If a file feels short, the fix is adding a MISSING IDEA — a section the file doesn't cover yet — not inflating existing sections. If all ideas are covered, the file is done.
 
 ## Section Sizing Rule
 - No max cap on chapters or subchapters per section. Keep adding until the section fully covers all knowledge at elite level for 2026. Quality and completeness over arbitrary limits.
@@ -42,7 +42,7 @@ Say: "Read CLAUDE.md and continue writing section 2"
 3. Story reveals the root cause, transitions into the lesson
 4. Body uses `##` H2 sections (5-12 per subchapter)
 5. Ends with **bridge sentence** naming the next subchapter's topic
-6. Length: ~150-200 lines, 2000-3000 words
+6. Length: no minimum or maximum — write until the concept is fully taught with dense, specific prose
 7. Chapter intro pages (ch1/page.mdx) are short: title, brief thesis, `---`, bulleted list of subchapters, `---`, closing italicized teaser line
 8. No frontmatter, no imports, no JSX components — pure markdown only
 
