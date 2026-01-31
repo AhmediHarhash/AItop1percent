@@ -106,8 +106,8 @@ Say: "Read CLAUDE.md and continue writing section 2"
 55. Case studies are multi-paragraph deep dives with specific numbers and timelines
 56. Decomposition shown iteratively: "first pass... second pass... third pass..."
 57. Cross-references other sections: "we will explore in Section 5"
-58. References real industry data: "Gartner's 2025 report," "McKinsey's 2025 report," "PwC's 2026 survey"
-59. References real model names: GPT-4, GPT-4o, GPT-4.5, Claude 3.5 Sonnet, Llama 3, Gemini 2
+58. References real industry data — but **every named source with a specific number must be verified**. If citing "McKinsey's 2025 report" or "Gartner's 2025 report," the report and the number must actually exist. Unverified stats must be reworded as general industry trends: "industry surveys consistently show" or "analyst research from 2024-2025 indicates." Anonymized company stories don't need sources — they are teaching tools. Named reports with specific numbers need to be real.
+59. References only current 2026 model names: GPT-4o, GPT-4.5, Claude 3.5 Sonnet, Claude 4, Llama 3, Gemini 2. Do not reference outdated models (GPT-3, GPT-4 base, Claude 2, etc.) unless discussing historical context.
 60. References real regulations: GDPR, HIPAA, EU AI Act, SOX, HITECH
 61. References real tools/platforms: VSCode, JetBrains, GitHub
 62. Each subchapter teaches **ONE concept deeply**, not many concepts shallowly

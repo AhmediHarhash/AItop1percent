@@ -1,0 +1,137 @@
+# 7.1 — Memory for Voice and Real-Time Systems
+
+In March 2025, a consumer electronics company launched a voice assistant for in-car navigation and entertainment. The assistant could remember user preferences, recent destinations, and ongoing conversations across trips. In testing, it performed well, with memory retrieval averaging 340 milliseconds. The team considered this acceptable for a voice interface. Within two weeks of launch, user reviews were brutal. The assistant felt slow and unresponsive. Users reported that it would pause awkwardly mid-conversation, seemingly forgetting what they had just said. The problem was not that memory retrieval failed, but that 340 milliseconds is an eternity in voice interaction. Users expect voice systems to respond as quickly as a human conversation partner, within 200 to 300 milliseconds total, not just for retrieval. By the time the system retrieved memories, processed the query, and generated a response, 800 milliseconds had elapsed. Users perceived this as the assistant being confused or unintelligent. The team had built a memory system optimized for accuracy and coverage, but they had ignored the latency constraints that define voice and real-time systems.
+
+Voice interfaces demand sub-second end-to-end latency. Memory retrieval is one component of that budget, and it typically cannot exceed 50 to 100 milliseconds if you want the overall interaction to feel natural. This constraint reshapes every aspect of memory architecture. You cannot run expensive embedding searches across millions of memories. You cannot retrieve dozens of candidates and rerank them. You cannot afford sequential retrieval from multiple memory stores. Everything must be faster, simpler, and pre-optimized for the specific patterns of voice interaction.
+
+## Sub-Second Retrieval Requirements
+
+Voice interaction latency budgets are brutal. Users tolerate 200 to 300 milliseconds of total latency for simple queries, and up to 500 milliseconds for complex queries. Beyond that, the interaction feels broken. If you are building a voice assistant that also generates responses with a large language model, the model inference might consume 200 to 400 milliseconds depending on the model and response length. That leaves you 50 to 150 milliseconds for everything else: speech recognition, memory retrieval, prompt construction, and any post-processing. Memory retrieval must be a small fraction of this budget.
+
+Compare this to text chat, where users tolerate one to two seconds of latency, or to batch processing, where latency is irrelevant. In chat, you can afford a 300-millisecond memory retrieval phase. In voice, 300 milliseconds for retrieval alone means your total latency will exceed 600 milliseconds, and users will notice. This is not a minor optimization problem. It requires fundamentally different memory architecture.
+
+The most effective strategy is pre-filtering memory to a small candidate set before the user even speaks. You cannot search all memories in real time, so you narrow the search space in advance. For an in-car assistant, you might pre-filter to memories related to the current trip, the current location, and the user's top ten frequent destinations. For a smart home assistant, you might pre-filter to memories about devices in the current room and the user's recent commands. This reduces retrieval from searching millions of memories to searching hundreds, which you can do in tens of milliseconds.
+
+Pre-filtering depends on context signals available before the query. Location is obvious: if the user is in the car, you pre-load car-related memories. Time of day matters: if it is morning, you pre-load commute and breakfast-related memories. Device state matters: if music is playing, you pre-load music preference memories. Conversation state matters: if the user is mid-conversation about restaurant recommendations, you keep restaurant memories loaded. The more context signals you have, the more aggressively you can pre-filter.
+
+You also compress memory representations for faster search. Instead of storing full text and searching with large embedding models, you store smaller embeddings or even keyword indexes. You accept some loss in retrieval precision in exchange for speed. For voice, it is better to retrieve the approximately right memory in 30 milliseconds than the exactly right memory in 200 milliseconds, because the user will not wait for perfection.
+
+## Pre-Fetching Strategies for Voice
+
+Pre-fetching is loading memories into fast-access storage before they are needed. You predict what the user might ask about and load those memories into RAM or a low-latency cache. When the user asks, retrieval is a cache lookup, not a database query. This is the only way to achieve sub-50-millisecond retrieval at scale.
+
+The prediction logic uses conversation context, user patterns, and environmental signals. If the user just asked about nearby coffee shops, you pre-fetch memories about their coffee preferences, recent coffee shop visits, and locations they have rated highly. If they are driving toward home at 6 PM on a weekday, you pre-fetch memories about their evening routines, dinner preferences, and home device states. If they just finished a phone call, you pre-fetch memories related to the person they called. Each of these predictions has a probability, and you pre-fetch the highest-probability memories.
+
+Pre-fetching is speculative and sometimes wrong. You will load memories that the user never asks about. This is acceptable as long as the cost of loading unused memories is lower than the cost of high latency when you guess right. In practice, you can pre-fetch hundreds or thousands of memories without significant resource impact, and even a 30 percent hit rate on predictions dramatically improves average latency.
+
+The in-car assistant team implemented location-based pre-fetching. As the user drove, the system continuously pre-fetched memories related to upcoming locations, nearby points of interest, and recent destinations in the area. When the user asked for a restaurant recommendation, the relevant memories were already in cache, and retrieval took 25 milliseconds instead of 340. The average total response latency dropped from 800 milliseconds to 380 milliseconds, and user satisfaction scores improved immediately.
+
+Pre-fetching requires predicting not just which memories, but when to load them. Loading too early wastes resources on memories that become stale before use. Loading too late defeats the purpose. The optimal timing depends on how long pre-fetching takes and how far in advance you can predict need. If pre-fetching takes 100 milliseconds and you can predict user intent one second in advance, you have plenty of margin. If you can only predict 200 milliseconds in advance, you need faster pre-fetching or more aggressive always-on caching.
+
+Some systems pre-fetch in layers. The first layer is always loaded: core user preferences, identity, and high-frequency memories. The second layer is context-triggered: loaded when certain conditions are met, like entering the car or starting a conversation. The third layer is conversation-triggered: loaded based on the last few turns. This layered approach balances memory coverage with resource constraints.
+
+## Memory Caching for Active Conversations
+
+Active conversations have temporal locality. If the user asks about restaurants, the next query is likely also about restaurants. If they ask about their calendar, the next query might be about scheduling. You exploit this by caching all memories retrieved in the current conversation and keeping them hot for the next several turns. This is conversation-scoped caching, and it is essential for voice.
+
+The cache persists for the duration of the conversation session, which might be defined by a timeout after the last user utterance, or by an explicit end signal like the user saying goodbye. During this session, any memory retrieved once stays in the cache. Subsequent retrievals of the same memory are instant. This is particularly valuable for memories that provide context across multiple turns, like the user's name, preferences, or ongoing tasks.
+
+Cache invalidation is critical. If a memory is updated during the conversation, the cached version must be invalidated and replaced. If the user says "actually, I do not like Italian food anymore," and you have a cached preference for Italian food, you must evict it immediately. Serving stale cached memories is worse than slower retrieval of fresh memories, because it makes the system seem like it is not listening.
+
+Cache size must be bounded. You cannot cache unlimited memories in RAM. A typical conversation might retrieve 50 to 200 distinct memories across ten turns. You can afford to cache this in a voice system running on a phone or embedded device. If you exceed cache size limits, you evict the least recently used memories, keeping the most recent and most frequently accessed in cache.
+
+The in-car system used a 500-memory cache per session. This covered 95 percent of within-session retrievals. For the remaining 5 percent, they fell back to the pre-fetched set, and only if that also missed did they perform a full retrieval. The three-tier architecture, full database, pre-fetched set, and conversation cache, reduced average retrieval latency to under 40 milliseconds while maintaining high recall.
+
+Caching interacts with pre-fetching. Pre-fetched memories populate the cache before the conversation starts. As the conversation progresses, conversation-specific retrievals add to the cache. The cache becomes a blend of predicted and confirmed relevant memories. This hybrid approach gives you both low first-turn latency from pre-fetching and low subsequent-turn latency from caching.
+
+## What to Pre-Load Versus Lazy-Load
+
+Not all memory types have the same latency requirements. User identity and high-level preferences should always be pre-loaded. These are accessed in nearly every interaction, and loading them on-demand would add unacceptable latency. Episodic memories about specific past events can be lazy-loaded when relevant. They are accessed less frequently, and the latency cost is amortized over fewer queries.
+
+The decision depends on access frequency and access latency tolerance. If a memory type is accessed in more than 20 percent of interactions, pre-load it. If it is accessed in less than 5 percent of interactions, lazy-load it. Between 5 and 20 percent, the decision depends on how critical low latency is for that memory type. For voice, you bias toward pre-loading because latency is critical. For text chat, you bias toward lazy-loading because latency is less sensitive.
+
+Pre-loading also depends on memory size. Small memory sets, under 1,000 items, can be pre-loaded in their entirety. Large memory sets, over 100,000 items, must be selectively pre-loaded based on predicted relevance. The in-car assistant pre-loaded the user's top 50 frequent destinations, their music preferences, and their calendar for the next week. Everything else was lazy-loaded based on conversational context.
+
+Lazy-loading in voice systems requires fallback responses. If the user asks about something that requires lazy-loaded memory and retrieval will take 200 milliseconds, you cannot make them wait in silence. You respond immediately with a partial answer or an acknowledgment, then stream the memory-augmented response once retrieval completes. This is the voice equivalent of progressive rendering in web interfaces. The user hears something immediately, so the interaction does not feel broken, even if the full response takes longer.
+
+Some systems use speculative lazy-loading. If the user asks about topic A, you immediately respond while simultaneously lazy-loading memories about related topic B in the background. If the user's next query is about topic B, those memories are already loaded. If not, you discard them. This is a bet that background loading will not impact performance and will improve latency for predicted follow-up queries.
+
+## Memory Compression for Voice
+
+Voice memory should be shorter than text memory. Users tolerate reading a paragraph of context, but they will not listen to a paragraph of preamble before getting an answer. Your memory summaries for voice must be compressed, keeping only the most essential information. This reduces both retrieval size and the amount of context you include in the prompt, which reduces inference latency.
+
+Compression is not truncation. Truncating the first N words of a memory often loses the most important information. Compression is distillation: extracting the key facts and discarding elaboration. A memory about a restaurant visit might store the full review in text systems, but in voice systems, it stores only the restaurant name, the rating, and one key sentiment: "loved the pasta, too loud." This gives the model enough context to personalize without overwhelming the user with detail.
+
+You compress at memory creation time, not retrieval time. When storing a memory, you generate both a full version and a compressed version. Text systems use the full version. Voice systems use the compressed version. This avoids the latency cost of compressing on-demand. The compression can be done by the same model that processes the interaction, or by a smaller specialized model optimized for summarization.
+
+Compression ratios for voice are typically three to five times. A 200-word memory becomes a 40 to 60-word memory. This reduction compounds when you retrieve multiple memories. If you retrieve ten memories, you go from 2,000 words of context to 400 words. That might reduce inference time by 30 to 50 percent, which is critical when your total latency budget is 500 milliseconds.
+
+The in-car assistant stored two versions of every memory: a full version for when users asked follow-up questions requiring detail, and a compressed version for initial retrieval. The compressed versions were used for 80 percent of interactions, significantly reducing average response times. For the 20 percent of cases where users asked for more detail, the system retrieved the full version in a follow-up query, which users tolerated because they explicitly requested elaboration.
+
+Compression loses nuance. You cannot compress without information loss. The trade-off is acceptable in voice because users prioritize speed over completeness. They would rather get a good-enough answer in 300 milliseconds than a perfect answer in 800 milliseconds. If they need more detail, they ask a follow-up question. This is how human conversations work: you start with a concise answer and elaborate only if asked.
+
+## Handling Interruptions and Corrections in Voice Memory
+
+Voice interactions are frequently interrupted. The user starts asking a question, changes their mind mid-sentence, or corrects themselves. Your memory system must handle these gracefully. If the user says "navigate to the, actually, remind me to call Sarah," you cannot store a memory about incomplete navigation intent. You must recognize the correction and store only the reminder.
+
+This requires real-time conversation state tracking. You cannot finalize memory until the utterance is complete and confirmed. If the user interrupts themselves, you discard the partial state. If they correct themselves, you update the state before storing. This is more complex than text systems, where each message is discrete and finalized before sending. In voice, utterances are often revised in real-time.
+
+Corrections also apply to memory retrieval. If the system retrieves memories based on partial speech recognition and the recognition is later corrected, you must re-retrieve with the corrected query. This happens when speech recognition provides incremental results. You might retrieve based on "navigate to the" and pre-fetch navigation memories, but then the user finishes with "nearest hospital," and you need entirely different memories. The system must be robust to re-retrieval without noticeable latency.
+
+Some voice systems use confirmation loops to avoid storing incorrect memories. If the user says something ambiguous, the system confirms before committing to memory: "You want me to remind you to call Sarah, is that right?" This adds a turn of latency but prevents incorrect memory storage. For high-stakes memories like reminders or calendar events, confirmation is worth it. For low-stakes memories like preference signals, you store without confirmation and rely on later corrections if needed.
+
+The in-car assistant implemented a two-second finalization window. If the user interrupted themselves or issued a correction within two seconds, the system discarded the initial interpretation. This reduced false memory creation by 40 percent. For cases where the system had already responded based on the initial interpretation, it issued a brief correction: "Got it, reminding you to call Sarah instead," which signaled to the user that it had updated its understanding.
+
+## The Tradeoff Between Memory Depth and Response Latency
+
+More memory provides better personalization and context, but it increases retrieval and inference latency. You must explicitly choose where on this tradeoff curve to operate. Voice systems operate at the low-latency, shallower-memory end. Text systems can operate at the high-latency, deeper-memory end. There is no universal right answer, only context-specific optimization.
+
+Shallow memory for voice means retrieving fewer memories per query, using shorter memory summaries, and favoring recent over comprehensive context. You might retrieve the three most relevant memories instead of ten. You might include only the last two conversation turns instead of the full session history. Each of these choices reduces context quality but improves latency. The question is whether the latency improvement is worth the quality loss.
+
+User testing determines the acceptable tradeoff. You measure user satisfaction at different latency and memory depth combinations. Often, you find a knee in the curve: a point where additional memory depth provides minimal quality improvement but significant latency cost. Operating just below that knee maximizes value. For the in-car assistant, the knee was at three retrieved memories and 200-millisecond total latency. Retrieving more than three memories or spending more than 200 milliseconds provided measurably better answers, but users rated the slower system as worse overall because latency mattered more than marginal quality.
+
+The tradeoff also depends on query type. Simple queries like "play my favorite music" benefit little from deep memory and should be optimized for latency. Complex queries like "find a restaurant that serves the kind of food I liked at that place we went to last month" require deeper memory and users tolerate higher latency. You can dynamically adjust memory depth based on query complexity, using lightweight retrieval for simple queries and heavier retrieval for complex ones.
+
+Some systems present the tradeoff to users. If a query requires deep memory and will take longer, the system might say "let me think about that for a moment" before retrieving extensively. This sets user expectations and makes the latency feel intentional rather than like a failure. Users tolerate latency they understand, especially if they believe it is producing better results.
+
+## Voice-Specific Memory Formats
+
+Voice memory is not just text memory read aloud. It has different structure, different content, and different metadata. Text memories store what the user said. Voice memories also store how they said it: tone, emphasis, confidence, and emotion signals from audio analysis. These prosodic features provide context that text alone misses.
+
+For example, if the user says "sure, that is fine" in a sarcastic tone, text memory stores positive sentiment, but voice memory stores negative sentiment inferred from tone. If the user says "I love Italian food" with high confidence, voice memory weights this preference more strongly than if they say it hesitantly. These distinctions matter for personalization. A system that ignores tone will misinterpret user preferences and provide worse recommendations.
+
+Voice memory also stores interaction success signals. Did the user complete the task, or did they abandon it mid-flow? Did they repeat themselves because the system misunderstood? Did they express frustration? These signals are harder to capture in text interactions but are obvious in voice. You use them to weight memory reliability. A memory from an interaction where the user was frustrated and repeated themselves multiple times is less reliable than one from a smooth interaction.
+
+Audio context memory is distinct from conversation content memory. Audio context includes background noise levels, whether the user is in a car or at home, whether they are alone or with others. These environmental factors influence how the system should respond. If the user is in a noisy environment, responses should be shorter and more direct. If they are with others, the system should avoid reading aloud sensitive information. This context is part of the memory system because it informs future interactions.
+
+The in-car assistant stored voice-specific metadata for every interaction: audio confidence scores, background noise levels, interruption counts, and prosodic sentiment. They used this to weight memories and adapt responses. Memories from clear, high-confidence interactions were weighted more heavily than memories from noisy, low-confidence interactions. This improved personalization accuracy by 15 percent compared to treating all memories equally.
+
+## Real-Time Streaming and Memory Updates
+
+Voice systems increasingly use streaming responses, where the model generates and speaks output token-by-token rather than waiting for the full response. Streaming reduces perceived latency, but it complicates memory management. You cannot wait until the response is complete to decide what to remember. You must update memory in real-time as the response streams.
+
+This requires incremental memory creation. As the model generates each part of the response, you decide whether it contains information worth remembering. If the user asks "what is on my calendar today" and the system streams "you have a meeting at 10 AM with Alice, then lunch at noon," you store two calendar memories as they are spoken, not after the full response completes. This ensures that if the user interrupts or asks a follow-up immediately, the memory is already available.
+
+Incremental memory creation introduces correctness risks. If the model later contradicts or corrects something it said early in the stream, you have already stored the incorrect version. You need rollback logic to delete or update memories if the response changes. This is rare with high-quality models, but it happens, especially in long responses or when the model is uncertain.
+
+Streaming also affects memory retrieval. In a back-and-forth voice conversation, you might retrieve additional memories mid-response based on what the model has generated so far. If the user asks a vague question and the model starts answering about topic A, you can retrieve additional memories about topic A while the model is still speaking, ready for the next turn. This is predictive retrieval, and it reduces latency for follow-up queries.
+
+The in-car assistant used streaming responses and incremental memory updates for calendar and reminder queries. As the system spoke each calendar event, it stored a memory of that event being mentioned, so if the user interrupted with "cancel that meeting," the system knew which meeting they meant. This required careful state management to ensure memory consistency, but it enabled natural conversational flow.
+
+## Designing for 200-Millisecond Retrieval Budgets
+
+A 200-millisecond total latency budget for voice means retrieval must happen in 50 milliseconds or less. This is not a soft target; it is a hard constraint. If you cannot retrieve in 50 milliseconds, you must change your architecture. The following strategies make this achievable.
+
+First, limit memory size per user. You cannot search a million memories in 50 milliseconds, but you can search 10,000. Cap per-user memory at a size you can search within your latency budget. Delete or archive old memories aggressively. For most consumer applications, retaining the most recent 5,000 to 10,000 memories per user is sufficient.
+
+Second, use fast search infrastructure. Vector databases optimized for low-latency retrieval, like in-memory indexes or GPU-accelerated search, can search tens of thousands of vectors in single-digit milliseconds. You pay for this speed with higher infrastructure costs, but for voice systems, it is not optional.
+
+Third, use smaller embedding models. A 384-dimension embedding searches faster than a 1536-dimension embedding. You lose some retrieval precision, but you gain speed. Test whether the precision loss is acceptable for your use case. Often, it is.
+
+Fourth, pre-compute retrieval for common queries. If you know users frequently ask about their calendar, pre-compute the top calendar memories and cache them. When the query arrives, retrieval is a cache hit. This works for high-frequency query patterns and reduces average retrieval latency significantly.
+
+Fifth, use hybrid retrieval with fast filters. Run a cheap filter first, like keyword matching or metadata filtering, to narrow candidates to a few hundred. Then run semantic search on only those candidates. This two-stage approach is faster than single-stage semantic search over the full memory set.
+
+The in-car assistant used all five strategies. They capped memory at 8,000 items per user, used a GPU-accelerated vector database, switched to a 384-dimension embedding model, pre-cached frequent queries, and implemented two-stage hybrid retrieval. This brought average retrieval latency to 35 milliseconds, within budget even at the 95th percentile.
+
+Voice and real-time systems force you to make tradeoffs that batch or text systems do not. You sacrifice memory depth, retrieval coverage, and sometimes accuracy in exchange for speed. But these tradeoffs are not failures. They are the correct optimization for the user experience you are building. A voice assistant that responds instantly with a good answer is better than one that responds slowly with a perfect answer. Your architecture must reflect this priority, from retrieval to caching to memory formats. The next subchapter extends these principles to multi-agent systems, where memory must be shared and coordinated across agents with different roles and goals.
