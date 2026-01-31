@@ -1,0 +1,137 @@
+# 5.12 — Rate Limits, Quota Shaping, and Backpressure: Queueing and Load Shedding
+
+In July 2025, a legal research platform serving 3,000 attorneys experienced a service outage during a major regulatory deadline when hundreds of users submitted document analysis requests simultaneously. The platform was calling OpenAI's GPT-5 API on a standard tier account with a limit of 10,000 tokens per minute and 500 requests per minute. During the spike, the platform received 1,200 requests in the first minute, each averaging 3,000 tokens. The system sent all 1,200 requests to the API immediately. OpenAI's rate limiter rejected 700 requests with 429 status codes. The platform had no retry logic, no queue, no backpressure mechanism. Those 700 requests failed silently. Users saw error messages, assumed their documents were being processed, and moved on. Six hours later, attorneys discovered that their analysis requests had failed, and they had no time to resubmit before the regulatory deadline. The company faced legal exposure from 120 clients and lost $1.8 million in contract penalties. The root cause was not the rate limit itself but the complete absence of quota shaping and backpressure strategy. The engineering team had tested the system with 50 concurrent users and never considered what happens when 400 users arrive at once.
+
+Rate limits are not obstacles to work around. They are capacity signals that must be integrated into your system design. Every provider has rate limits. Every tier has different limits. Exceeding those limits does not just slow you down, it causes failures that impact users. This subchapter covers provider rate limits in 2026, how they vary by tier and provider, quota shaping strategies, backpressure patterns, request prioritization under constraint, token bucket and sliding window implementations, rate limit monitoring, and multi-provider load balancing.
+
+## Provider Rate Limits in 2026
+
+Rate limits in 2026 are expressed in three dimensions: **tokens per minute**, **requests per minute**, and **concurrent requests**. All three must be respected simultaneously. Exceeding any one of them results in a 429 rate limit error.
+
+**Tokens per minute** limits the total number of input and output tokens you can process in a rolling 60-second window. For example, OpenAI's GPT-5 standard tier allows 200,000 tokens per minute as of January 2026. If you send a request with 50,000 input tokens and receive 30,000 output tokens, you have consumed 80,000 tokens. You can send two more requests of that size before hitting the limit. The limit resets on a sliding window, not at the top of each minute. If you consume 80,000 tokens at 10:00:30, those tokens fall off the window at 10:01:30, not at 10:01:00.
+
+**Requests per minute** limits the number of API calls you can make in a rolling 60-second window, regardless of token count. OpenAI's GPT-5 standard tier allows 5,000 requests per minute. If you send 5,000 requests with 100 tokens each, you hit the request limit even though you have only consumed 500,000 tokens out of your 200,000 token limit. This limit exists to prevent abuse from high-frequency small requests.
+
+**Concurrent requests** limits the number of in-flight requests at any moment. Anthropic's Claude Opus 4.5 standard tier allows 50 concurrent requests. If you have 50 requests currently being processed by the API and you send a 51st request, it will be rejected with a 429 error even if you are under your tokens-per-minute and requests-per-minute limits. This limit exists to prevent resource exhaustion on the provider's infrastructure.
+
+Rate limits vary significantly by provider and tier. As of January 2026, here are representative limits for standard paid tiers, not free tiers:
+
+OpenAI GPT-5 standard tier: 200,000 tokens per minute, 5,000 requests per minute, 100 concurrent requests. Enterprise tier: 2,000,000 tokens per minute, 10,000 requests per minute, 500 concurrent requests.
+
+Anthropic Claude Opus 4.5 standard tier: 400,000 tokens per minute, 4,000 requests per minute, 50 concurrent requests. Enterprise tier: 4,000,000 tokens per minute, 10,000 requests per minute, 200 concurrent requests.
+
+Google Gemini 3 Pro standard tier: 300,000 tokens per minute, 3,000 requests per minute, 60 concurrent requests. Enterprise tier: 3,000,000 tokens per minute, 8,000 requests per minute, 300 concurrent requests.
+
+Meta Llama 4 Maverick via Replicate or Together AI standard tier: 100,000 tokens per minute, 1,000 requests per minute, 20 concurrent requests. These are third-party hosting limits, not Meta's limits.
+
+DeepSeek V3.2 via their API standard tier: 150,000 tokens per minute, 2,000 requests per minute, 30 concurrent requests.
+
+These limits change frequently. Providers adjust limits based on infrastructure capacity, pricing changes, and competitive pressure. Always check the provider's documentation for current limits. Do not hardcode rate limits into your application. Fetch them from the provider's API or configuration endpoint if available.
+
+Free tiers and trial accounts have much lower limits, typically 10-20% of standard tier limits. If you are building a production system, you must be on a paid tier. Free tier limits are for experimentation only.
+
+## What Happens When You Hit Rate Limits
+
+When you exceed a rate limit, the provider returns an HTTP 429 status code with a message indicating which limit you hit and when the limit will reset. The response usually includes headers like retry-after, x-ratelimit-remaining-tokens, x-ratelimit-remaining-requests, and x-ratelimit-reset-tokens. These headers tell you how long to wait before retrying.
+
+If you hit the **tokens per minute** limit, the retry-after header tells you how many seconds until enough tokens fall off the sliding window to allow your request. This is typically 10-60 seconds depending on your recent usage. If you consumed 200,000 tokens evenly over the last 60 seconds and your limit is 200,000 tokens per minute, you must wait 60 seconds for the window to clear. If you consumed 200,000 tokens in a 10-second burst, you must wait 10 seconds for that burst to fall off the window.
+
+If you hit the **requests per minute** limit, the retry-after header tells you how many seconds until enough requests fall off the window to allow your request. This is typically 1-60 seconds depending on your request rate.
+
+If you hit the **concurrent requests** limit, there is no retry-after header because the limit is not time-based. You must wait until one of your in-flight requests completes, then retry. The provider does not know when your requests will complete, so it cannot tell you when to retry.
+
+Some providers implement **quota burst allowances**, where you can briefly exceed your rate limit if you have unused quota from previous minutes. For example, if your limit is 100,000 tokens per minute and you only used 50,000 tokens in the previous minute, you might be allowed to use 150,000 tokens in the current minute. This is not guaranteed and varies by provider. Do not rely on burst allowances for production traffic shaping.
+
+The worst thing you can do when you hit a rate limit is retry immediately without backoff. This creates a **retry storm** where every failed request retries instantly, all retries fail again, and you flood the provider with requests that will never succeed. Always respect the retry-after header. If no header is provided, use exponential backoff starting at 1 second.
+
+## Quota Shaping: Smoothing Traffic to Stay Under Limits
+
+**Quota shaping** is the practice of spreading your requests evenly over time to stay under rate limits rather than sending bursts of traffic that hit limits. This is also called **traffic smoothing** or **rate smoothing**.
+
+The simplest quota shaping strategy is a **request queue** with a controlled send rate. Instead of sending all requests to the provider immediately, you place them in a queue and send them at a fixed rate that stays under your limit. If your limit is 5,000 requests per minute, you send one request every 12 milliseconds. If your limit is 200,000 tokens per minute, you send 3,333 tokens per second. The queue absorbs bursts of incoming requests and smooths them into a steady outgoing stream.
+
+Quota shaping is essential for batch processing workloads. If you need to process 10,000 documents and each document requires one API call with 2,000 tokens, you will consume 20 million tokens. If your limit is 200,000 tokens per minute, you need 100 minutes to process the batch. Without quota shaping, you send all 10,000 requests at once, 9,900 of them fail with 429 errors, and you spend the next two hours retrying. With quota shaping, you send 83 requests per minute for 120 minutes, zero requests fail, and the batch completes smoothly.
+
+Quota shaping is also important for user-facing workloads with unpredictable traffic. If your application has 1,000 active users and each user sends an average of 2 requests per minute, your average load is 2,000 requests per minute, well under your 5,000 request limit. But if all 1,000 users send a request in the same second due to a shared event like a product launch or a breaking news alert, you have a 1,000 request spike that exceeds your limit. Quota shaping absorbs the spike into the queue and sends requests at a controlled rate.
+
+The tradeoff with quota shaping is **latency**. If you have 500 requests queued and you are sending one request every 12 milliseconds, the last request in the queue waits 6 seconds before being sent. You must communicate this delay to users. For synchronous user-facing requests, a 6-second queue delay is unacceptable. For background batch processing, a 6-second delay is irrelevant. Quota shaping works best for asynchronous workloads.
+
+## Backpressure Patterns: Queue, Shed, or Degrade
+
+When incoming request rate exceeds your rate limit capacity, you have three options: **queue the requests**, **shed the requests**, or **degrade gracefully**. The right choice depends on the request priority, user expectations, and system capacity.
+
+**Queueing** means accepting the request, placing it in a queue, and processing it when capacity becomes available. This works when users can tolerate delay and when the queue has bounded size. If your queue grows to 10,000 requests and each request takes 2 seconds to process, the last request waits 5.5 hours. That is unacceptable for most workloads. You must implement a **maximum queue size** and **maximum queue time**. If the queue reaches 1,000 requests or if a request has been queued for more than 60 seconds, reject new requests with a 503 service unavailable error. This prevents unbounded resource consumption and gives users honest feedback that the system is overloaded.
+
+**Load shedding** means rejecting the request immediately with an error when capacity is full. This works when it is better to fail fast than to queue indefinitely. For example, if your system is processing real-time trading signals and a signal arrives when the queue is full, it is better to reject the signal than to queue it for 30 seconds and execute a stale trade. Load shedding is also appropriate when the request is low priority and can be retried later by the user.
+
+**Graceful degradation** means accepting the request but returning a lower-quality response. For example, if your primary model is at capacity, fall back to a faster, cheaper model. If your summarization service is at capacity, return a cached summary or a rule-based summary instead of a model-generated summary. If your chatbot is at capacity, return a canned response with a link to self-service documentation. Graceful degradation keeps the system responsive while reducing the quality bar during overload.
+
+The choice between queue, shed, and degrade depends on request priority. High-priority requests should be queued or served with degraded quality. Low-priority requests should be shed. The next section covers prioritization.
+
+## Request Prioritization: Which Requests Get Served First
+
+When capacity is constrained, not all requests are equal. You must decide which requests get processed immediately, which requests get queued, and which requests get rejected. This requires a **request prioritization scheme**.
+
+The simplest scheme is **first in, first out**. Requests are processed in the order they arrive. This is fair but ignores business value. A free-tier user's request is processed before a paying enterprise customer's request if it arrives first. This is rarely the right answer.
+
+A better scheme is **priority tiers** based on user or request type. Define three to five priority levels: critical, high, normal, low, background. Assign each request to a priority level based on criteria like user subscription tier, request type, or business impact. Critical requests are processed immediately. High requests are queued with a short timeout. Normal requests are queued with a longer timeout. Low requests are queued with a very long timeout or shed if the queue is full. Background requests are always queued and processed during idle capacity.
+
+For example, a customer support chatbot might prioritize requests as follows: critical priority for paid enterprise customers, high priority for paid standard customers, normal priority for free trial users, low priority for anonymous users, background priority for analytics and enrichment tasks. During peak load, enterprise customers get instant responses, standard customers wait 5 seconds, trial users wait 15 seconds, anonymous users see an error, and analytics tasks are delayed until off-peak hours.
+
+Priority must be enforced at the queue level. Implement separate queues per priority tier and process critical queue first, high queue second, and so on. If the critical queue is empty, process from the high queue. This ensures that high-priority requests never wait behind low-priority requests.
+
+Priority must also be enforced at the rate limit level. If you have 5,000 requests per minute of capacity and you allocate 3,000 to critical, 1,500 to high, and 500 to normal, you can process critical requests at full speed even when the system is overloaded with normal requests. This requires tracking quota consumption per priority tier.
+
+A common mistake is implementing priority without enforcement, where all requests go into the same queue and priority is only used for logging. This does not help during overload. Priority must change which requests are processed and which are rejected.
+
+## Token Bucket and Sliding Window Implementations
+
+The two most common algorithms for enforcing rate limits are **token bucket** and **sliding window**. Both have tradeoffs in accuracy, implementation complexity, and burst handling.
+
+**Token bucket** is a rate limiting algorithm where you have a bucket that holds a fixed number of tokens. Each token represents permission to send one request or consume one unit of quota. The bucket starts full. Every time you send a request, you remove tokens from the bucket equal to the cost of the request. The bucket refills at a constant rate. If you try to send a request and the bucket does not have enough tokens, the request is delayed until tokens become available.
+
+For example, if your rate limit is 5,000 requests per minute, your bucket holds 5,000 tokens and refills at 83.3 tokens per second. If you send 1,000 requests in the first second, you consume 1,000 tokens, leaving 4,000 in the bucket. Over the next second, the bucket refills by 83 tokens, bringing it to 4,083 tokens. You can send another 4,083 requests before the bucket is empty.
+
+Token bucket allows **bursts** up to the bucket size. If you have not sent any requests in the last minute, your bucket is full with 5,000 tokens, and you can send 5,000 requests instantly. This matches how most providers implement rate limits. The downside is that token bucket requires maintaining state for the bucket size and refill rate, and the refill calculation can drift over time if not implemented carefully.
+
+**Sliding window** is a rate limiting algorithm where you track the timestamp and cost of each request over a rolling time window. Every time you want to send a request, you calculate the total cost of all requests in the last 60 seconds. If adding the new request would exceed the limit, the request is delayed until enough old requests fall off the window.
+
+For example, if your rate limit is 5,000 requests per minute and you have sent 4,950 requests in the last 60 seconds, you can send 50 more requests before hitting the limit. Requests that were sent 61 seconds ago do not count. Sliding window is more accurate than token bucket because it directly tracks actual usage over the exact time window. The downside is that it requires storing the timestamp and cost of every request in the window, which can be memory-intensive for high-traffic systems.
+
+Most production systems use token bucket because it is simpler to implement and uses constant memory. Sliding window is used when precise rate limit enforcement is critical, such as enforcing contractual SLAs or preventing abuse.
+
+Both algorithms must be implemented per rate limit dimension. If you have three dimensions, tokens per minute, requests per minute, and concurrent requests, you need three separate token buckets or three separate sliding windows. The request is allowed only if all three checks pass.
+
+## Rate Limit Monitoring and Alerting
+
+Rate limits are not static. Providers change them, your traffic changes, and your usage patterns change. You must monitor rate limit consumption and alert when you are approaching limits.
+
+Monitor **quota consumption rate** as a percentage of your limit. If you are consistently using 80% or more of your tokens per minute limit, you are at risk of hitting the limit during traffic spikes. Alert when consumption exceeds 80% for more than 5 minutes. This gives you time to scale up to a higher tier or optimize usage before you hit the limit.
+
+Monitor **rate limit errors** as a percentage of total requests. If more than 1% of your requests are returning 429 errors, your quota shaping is insufficient or your traffic exceeds your tier. Alert when the error rate exceeds 1% for more than 1 minute. This indicates active user impact.
+
+Monitor **queue depth** for your request queue. If the queue is consistently over 50% of maximum size, you are at risk of shedding requests or exceeding queue time limits. Alert when queue depth exceeds 50% for more than 5 minutes.
+
+Monitor **queue wait time** at p95 and p99. If the p95 wait time exceeds 10 seconds for user-facing requests, users are experiencing unacceptable delay. Alert when p95 queue wait time exceeds your target latency.
+
+Monitor **per-tier quota consumption** if you implement priority tiers. If your critical tier is consuming 95% of its allocated quota, you may need to reallocate quota from lower-priority tiers or upgrade your plan.
+
+Log every rate limit error with context: which limit was hit, which user or request triggered it, what the retry-after value was, and whether the retry succeeded. This helps you diagnose whether rate limit errors are caused by burst traffic, sustained overload, or misconfigured quota shaping.
+
+Set up alerts that fire before you hit limits, not after. If you alert only when errors occur, users are already impacted. Alert when you hit 80% of capacity so you can take action before errors happen.
+
+## Multi-Provider Load Balancing to Increase Effective Throughput
+
+If a single provider's rate limits are insufficient for your traffic, you can increase effective throughput by **load balancing across multiple providers**. This requires that multiple providers offer models with comparable quality for your task.
+
+For example, if your application uses a frontier reasoning model and you determine that GPT-5, Claude Opus 4.5, and Gemini 3 Deep Think all produce acceptable results for your task, you can route requests across all three providers. If each provider gives you 200,000 tokens per minute, your effective limit is 600,000 tokens per minute.
+
+Load balancing can be **round-robin**, where you rotate through providers in order, or **least-loaded**, where you send each request to the provider with the most available quota. Least-loaded balancing is more efficient but requires tracking quota consumption per provider in real time.
+
+Multi-provider load balancing also provides **redundancy**. If one provider experiences an outage or rate limit issues, traffic automatically shifts to other providers. This reduces your dependence on any single provider and improves reliability.
+
+The downsides of multi-provider load balancing are **cost** and **consistency**. You must pay for accounts and quota on multiple providers. You must test and validate that all providers produce acceptable quality. You must handle subtle differences in model behavior, prompt format, and output structure. For tasks where consistency is critical, such as content moderation or legal analysis, using multiple models may introduce unacceptable variance.
+
+Another approach is **model tiering with overflow**. Use your primary model for all requests until you hit 80% of quota, then overflow to a secondary model. This keeps most requests on the primary model for consistency while using the secondary model as a safety valve during spikes. This is simpler to implement than full multi-provider load balancing but provides less total throughput.
+
+Rate limit management is not a one-time configuration. It is an ongoing operational discipline that requires monitoring, tuning, and adjustment as your traffic grows and provider limits change. Every rate limit is a constraint on your system's capacity, and every constraint must be managed with quota shaping, backpressure, and prioritization. The next subchapter will cover cost tracking and budget enforcement, the financial complement to rate limit management.

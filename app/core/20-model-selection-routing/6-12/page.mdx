@@ -1,0 +1,97 @@
+# 6.12 — Multi-Model Testing: Evaluating the System Not Just Individual Models
+
+In September 2025, a financial services company deployed a three-stage document processing pipeline: Claude Opus 4.5 for extracting transaction data from bank statements, GPT-5.1 for reconciling transactions against ledger entries, and Gemini 3 Pro for generating compliance summaries. Each model had been tested independently against golden datasets, achieving 96% accuracy for extraction, 94% accuracy for reconciliation, and 92% accuracy for summarization. The team was confident. In production, end-to-end accuracy measured from input document to final compliance report was 71%. After two weeks of investigation, they discovered the problem: Claude's extraction occasionally output dates in European format when processing international bank statements, GPT's reconciliation expected ISO format dates and silently failed to match transactions when dates did not parse, and Gemini's summarization then reported incorrect missing transaction counts based on GPT's failed matches. Each component worked perfectly in isolation, but the integration points between models had never been tested as a system.
+
+The root cause was treating multi-model architectures as collections of independent components rather than integrated systems with dependencies, handoffs, and emergent failure modes. They had optimized each model's performance on its individual task without validating that the outputs of one model were actually consumable by the next. This is the central challenge of multi-model testing: component-level quality does not guarantee system-level quality, and the interactions between models create failure modes that do not exist when testing models in isolation.
+
+## Why Component Testing Is Not Enough
+
+When you test a single model on a single task, you control both the input format and the evaluation criteria. Your test harness feeds carefully formatted inputs to the model, collects outputs, and compares them against ground truth labels. If the model achieves 95% accuracy, you know that model performs well on that task given those inputs.
+
+In a multi-model system, the inputs to downstream models are the outputs of upstream models. You no longer control the exact format, the edge cases, or the error modes of those inputs. If your extraction model occasionally outputs malformed JSON when processing scanned documents with poor OCR, and your downstream reconciliation model expects perfectly structured JSON, the system fails even though both models are individually high-quality.
+
+The failure modes multiply at integration points. Format mismatches, as in the date format example, are common. Schema drift happens when you update one model's prompt to output additional fields that downstream models are not expecting. Encoding issues appear when one model outputs Unicode characters that another model's tokenizer handles poorly. Confidence score incompatibility occurs when one model outputs calibrated probabilities and another outputs uncalibrated logits, and your routing logic expects consistent confidence semantics.
+
+Error propagation is the most insidious problem. If your extraction model has a 4% error rate, your reconciliation model has a 6% error rate, and your summarization model has an 8% error rate, the naive assumption is that end-to-end error rate is roughly the sum or perhaps the max of these individual rates. In reality, errors compound. A single extraction error can cause multiple reconciliation errors, which then produce a completely incorrect summary. Your end-to-end error rate may be 20% even though no individual component exceeds 8% error.
+
+Null and missing value handling differs across models. Claude might output an empty string for a missing field, GPT might omit the field entirely, Gemini might output the string "null". If your downstream model expects one of these conventions and receives another, it either fails or misinterprets the missing data as present data. You only discover this when testing the full pipeline.
+
+Performance interactions matter. If your extraction model takes 800 milliseconds and your reconciliation model takes 1200 milliseconds, you might assume end-to-end latency is 2000 milliseconds. But if the extraction output is large enough that serializing and deserializing it adds 300 milliseconds, and your orchestration layer adds 200 milliseconds of overhead per handoff, actual latency is 2500 milliseconds. Individual component benchmarks do not reveal these system-level costs.
+
+## System-Level Evaluation Strategy
+
+System-level evaluation means testing the entire pipeline from initial input to final output, treating the multi-model architecture as a single black box. Your test harness provides raw inputs exactly as they would arrive in production: unprocessed documents, user queries, event streams. Your evaluation measures the final output against ground truth, ignoring intermediate results.
+
+Build end-to-end golden datasets that cover realistic production distributions. For the financial services pipeline, your golden set includes bank statements with various formats: PDFs, scanned images, CSV exports, international statements with non-US date formats, statements with OCR errors, statements with missing pages. Each golden input has a ground truth final compliance report that you manually verified. You run the full three-model pipeline on each input and compare the generated report to ground truth.
+
+This reveals problems invisible in component testing. You discover that scanned statements with poor OCR cause the extraction model to output partial data, which causes the reconciliation model to flag false positive missing transactions, which causes the summary to report incorrect compliance violations. None of this appears when you test extraction against clean OCR, reconciliation against perfect extractions, and summarization against correct reconciliations.
+
+Measure multiple quality dimensions at the system level. Accuracy is obvious, but also measure completeness, did the system process all inputs or did some fail silently. Measure consistency, do identical inputs produce identical outputs across runs. Measure latency distribution, not just mean latency but p95 and p99, because multi-model systems have longer-tailed latency distributions than single-model systems. Measure cost, the sum of all model API calls plus orchestration overhead. Measure error recovery, when one component fails, does the system degrade gracefully or cascade into complete failure.
+
+System-level evaluation also needs adversarial testing. Test inputs designed to stress integration points: documents with every field missing, documents with malformed data in every field, documents that are 10x longer than typical, documents in unexpected languages, documents that are completely unrelated to the expected type. These adversarial inputs reveal brittleness at model boundaries. If your extraction model returns an error message as a string when it cannot parse a document, and your reconciliation model tries to reconcile the error message text against your ledger, you have a problem.
+
+## Integration Testing Across Model Boundaries
+
+Integration testing focuses on the handoff points between models. For each pair of models in your pipeline, build tests that validate the contract between them: the output schema of the upstream model must match the expected input schema of the downstream model, the error handling of the upstream model must be understood by the downstream model, the performance characteristics must be compatible.
+
+Start with schema validation tests. Define the exact schema that each model promises to output. For the extraction model, the schema specifies field names, types, required versus optional status, allowed values, format constraints. Write integration tests that run the extraction model on diverse inputs, collect all outputs, and validate that every output conforms to the schema. When an output violates the schema, the test fails and you fix either the model prompt or the schema definition.
+
+Then validate that downstream models can actually consume the schema-compliant outputs. Just because the extraction outputs valid JSON does not mean the reconciliation model handles it correctly. Run integration tests that feed real extraction outputs to the reconciliation model and verify correct behavior. Test edge cases: extractions with all optional fields missing, extractions with maximum-length string fields, extractions with Unicode in every text field, extractions with the minimum and maximum numeric values.
+
+Error handling integration is critical. When the extraction model encounters an unparsable document, what does it output? An error object with a status field and a message field? A null value? An exception that propagates up? Whatever the answer, the reconciliation model must handle it correctly. Write integration tests that deliberately trigger extraction errors and verify that reconciliation either processes the error gracefully or fails with a clear error message rather than silently producing wrong results.
+
+Performance integration testing ensures that the timing characteristics of upstream and downstream models are compatible. If your extraction model occasionally takes 10 seconds to process complex documents, and your reconciliation model has a 5-second timeout on inputs, you have an integration problem. Load testing should include realistic distributions of upstream model latency, not just average-case timing.
+
+## Regression Testing When You Change One Model
+
+In a multi-model architecture, changing one model can break the entire system even if the new model is individually better than the old one. Regression testing must validate not just that the new model performs well on its task, but that it integrates correctly with all upstream and downstream models.
+
+When you upgrade your extraction model from Claude Opus 4.5 to Claude Sonnet 4.5 for cost savings, you cannot just test extraction accuracy. You must test the full pipeline. The new model might output dates in a slightly different format, field names in different casing, floating point numbers with different precision, or error messages with different structure. Any of these changes can break downstream models.
+
+Build a regression test suite that runs the full end-to-end pipeline on your golden dataset using both the old model configuration and the new model configuration. Compare not just final output quality but also intermediate outputs. If the new extraction model outputs dates in a different format than the old one, your regression tests catch this before it reaches production. You can then decide whether to update the extraction prompt to match the old format, update the reconciliation model to handle both formats, or implement a normalization layer between the models.
+
+Regression tests should also validate performance. If the new model is 30% faster at extraction but outputs more verbose JSON that adds serialization overhead, the end-to-end latency improvement may be smaller than expected. If the new model uses different terminology in its outputs and the downstream model's prompts reference the old terminology, accuracy may degrade even though extraction accuracy improved.
+
+Canary testing is essential for model changes in production. Deploy the new model to a small percentage of traffic, run the full pipeline, and compare system-level metrics to the baseline. Monitor not just the changed component but all downstream components. If you upgrade extraction and see reconciliation error rates increase, the upgrade caused a regression even if extraction accuracy improved.
+
+## The Combinatorial Testing Problem
+
+Multi-model systems face a combinatorial explosion of test configurations. If you have five tasks in a pipeline and three candidate models for each task, you have 243 possible system configurations. If each model has multiple versions that you need to support during migration periods, the combinations multiply further.
+
+Exhaustive testing of all combinations is not feasible. The professional approach is risk-based testing. Identify the highest-risk configurations: the production configuration you are currently running, the configuration you plan to migrate to, and the configurations that represent plausible fallback options. Test these thoroughly. For other combinations, use smoke tests that validate basic functionality without exhaustive quality measurement.
+
+Prioritize testing configurations that differ in high-impact components. If your pipeline has a cheap classification step and an expensive reasoning step, and you are considering model changes for both, test all combinations that involve changing the reasoning model and only test a few combinations for the classification model. The reasoning model has higher impact on system quality and cost.
+
+Use component-level mocks to reduce combinatorial complexity. When testing a new reconciliation model, you do not need to test it with every possible extraction model. Instead, create a mock extraction component that outputs a representative sample of real extraction outputs, including edge cases and error cases. Test the new reconciliation model against the mock. This validates that the new model handles the upstream contract correctly without requiring expensive end-to-end runs through all extraction model variants.
+
+Maintain a compatibility matrix that documents which model versions work together. When you discover that Claude Opus 4.5 extraction version 2.1 is incompatible with GPT-5.1 reconciliation version 1.3 because of a date format issue, document this. When someone tries to deploy that combination, your testing infrastructure flags it as a known incompatibility.
+
+## Monitoring System-Level Metrics Versus Component-Level Metrics
+
+In production, you need both system-level and component-level monitoring. System-level metrics tell you whether the overall pipeline is healthy. Component-level metrics help you diagnose problems when system-level metrics degrade.
+
+System-level metrics measure the end-to-end experience. Accuracy of final outputs compared to ground truth in production evaluation sets. Latency from initial request to final response. Cost per request summed across all model calls. Error rate counting any request that fails to produce a valid final output. User satisfaction if you have human feedback mechanisms.
+
+Component-level metrics measure each model in isolation. Accuracy of each model on its specific task. Latency of each model call. Error rate of each component. Token usage and cost per model. Confidence distributions for each model's outputs.
+
+The critical insight is that component-level metrics can look healthy while system-level metrics degrade. Your extraction accuracy might be stable at 96%, your reconciliation accuracy stable at 94%, and your summarization accuracy stable at 92%, but your end-to-end accuracy drops from 85% to 78% because the distribution of extraction errors shifted in a way that creates more downstream reconciliation failures. You only see this in system-level metrics.
+
+Conversely, system-level metrics can degrade for reasons that are not visible in component-level quality metrics. If your orchestration layer starts adding 500 milliseconds of latency to every model handoff because of a database performance issue, your end-to-end latency degrades even though every model's individual latency is unchanged. You need infrastructure-level monitoring in addition to model-level monitoring.
+
+Build alerting that triggers on both component and system metrics. Alert when any individual model's accuracy drops below threshold, but also alert when end-to-end accuracy drops even if all components are individually healthy. This helps you catch emergent system problems early.
+
+## When Model Upgrades Improve Components But Degrade Systems
+
+The most counterintuitive failure mode in multi-model testing is when upgrading a model improves its individual performance but degrades overall system performance. This happens more often than you would expect, and it reveals deep assumptions in your pipeline design.
+
+A concrete scenario: you upgrade your extraction model from Claude Opus 4 to Claude Opus 4.5, and extraction accuracy improves from 94% to 97%. You deploy to production. End-to-end accuracy drops from 85% to 81%. Investigation reveals that Claude Opus 4.5 is more aggressive about extracting optional fields, filling in plausible values when the document is ambiguous, while Claude Opus 4 left those fields empty. Your reconciliation model was trained on data from Claude Opus 4 and learned to treat empty fields as low-confidence extractions requiring human review. When Claude Opus 4.5 fills in plausible values with high confidence, the reconciliation model trusts them, but many are wrong, leading to incorrect reconciliations.
+
+The component improved, the system degraded, because the downstream model had adapted to the upstream model's error modes. This is an implicit dependency that component testing does not reveal. You only discover it through system-level evaluation.
+
+Another scenario: you upgrade your reconciliation model from GPT-5 to GPT-5.1, and reconciliation accuracy improves from 92% to 95%. End-to-end latency increases from 2.1 seconds to 3.8 seconds. GPT-5.1 achieves higher accuracy by using more reasoning tokens, but your summarization model is slow, and the longer reconciliation outputs take longer to process. The quality improvement in one component created a performance regression in the overall system.
+
+A third scenario: you upgrade your summarization model from Gemini 3 Pro to Gemini 3 Flash for cost savings. Summarization quality drops slightly from 91% to 89%, which you consider acceptable. But end-to-end error rate increases from 12% to 24%. The new model produces shorter summaries that omit details the old model included. Your downstream compliance checking system depends on those details and fails when they are missing. The component quality drop was small, the system impact was large.
+
+These scenarios all point to the same lesson: multi-model systems develop hidden dependencies between components, and those dependencies only become visible when you test the system as a whole. Component-level improvements are necessary but not sufficient. Every model change requires full system validation.
+
+The combination of robust prompt portability and comprehensive multi-model testing gives you the foundation to operate complex multi-provider architectures in production with confidence. You can change models, optimize costs, and adopt new capabilities without breaking your systems, because you have abstracted the intent from the implementation and validated that the implementation works as an integrated whole. This is the difference between building AI features and building AI systems.

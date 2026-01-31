@@ -1,0 +1,127 @@
+# 5.11 — Timeout Strategies: Graceful Degradation When Models Are Slow
+
+In March 2025, a customer service automation platform processing 40,000 support tickets per day experienced a cascade failure that locked up their entire queue for six hours. The incident began when Anthropic's Claude Opus 4 API experienced regional latency spikes, pushing response times from the usual 2.3 seconds to over 45 seconds. The platform had no timeout configured on model calls. Each support ticket waited indefinitely for a response, worker threads stayed blocked, and the thread pool exhausted itself within twelve minutes. New tickets piled up at 280 per minute with nowhere to go. The platform had no fallback strategy, no circuit breaker, no partial response mechanism. When engineers finally deployed a hard timeout six hours later, they discovered that 18% of those timed-out calls had actually completed on the provider side but the responses arrived after the platform had given up waiting. The company paid for 2,100 wasted completions that were never used. The root cause was not the provider slowness itself but the complete absence of timeout strategy. The engineering team had assumed model calls would always complete in under five seconds because that had been true during testing with GPT-4o-mini. They never planned for what happens when models are slow.
+
+Timeout strategy is not optional infrastructure. It is a core product decision that defines how your system behaves under stress. Every model call must have a timeout. Every timeout must trigger a defined behavior. That behavior must be designed for your users, not your convenience. This subchapter covers timeout value selection, graceful degradation patterns, fallback strategies, circuit breaker design, timeout cascades in multi-step workflows, and the critical distinction between provider slowness and infrastructure slowness.
+
+## Hard Timeouts vs Soft Timeouts
+
+A **hard timeout** terminates the model call immediately when the time limit is reached. The request is abandoned, the connection is closed, and your system moves on to its fallback behavior. A **soft timeout** allows the model call to continue in the background while your system simultaneously triggers fallback behavior. The soft timeout response is shown to the user, but if the original call completes, the result is cached for future use or logged for quality analysis.
+
+Hard timeouts make sense when the model response has time-sensitive value. A chatbot message that arrives after 15 seconds is worthless if the user has already closed the chat window. A real-time content moderation decision that arrives after 10 seconds is useless if the post has already gone live. A code completion suggestion that arrives after 5 seconds is irrelevant because the developer has already typed the next line. In these cases, abandon the call and move on.
+
+Soft timeouts make sense when the model response has durable value even if it arrives late. A document summarization task that times out at 30 seconds can still cache the result if it completes at 40 seconds, making the next request for that same document instant. A batch processing job that times out individual items can still store completed results for quality review even if they missed the user-facing deadline. A background analysis task that times out can still log the completion for model performance tracking.
+
+The choice between hard and soft timeout is a product decision, not an infrastructure decision. Ask: does this response have value after the timeout? If yes, soft timeout. If no, hard timeout. Most user-facing interactive surfaces require hard timeouts. Most batch and background jobs benefit from soft timeouts.
+
+You also need to decide whether the timeout applies to the entire request or just the model call. If you have a workflow that calls a model, processes the result, writes to a database, and returns to the user, where does the timeout apply? The safest pattern is to set an end-to-end timeout for the entire user request and a separate model-specific timeout that is 60-70% of the total budget. If your user-facing timeout is 10 seconds, your model timeout should be 6 seconds, leaving 4 seconds for processing, retries, and fallback logic. This prevents a scenario where the model completes in 9.8 seconds but your processing logic times out at 10 seconds before you can return the result.
+
+## Timeout Values by Product Surface
+
+Timeout values must be set based on user expectations for the product surface, not based on what the model can do. A model that typically responds in 2 seconds should not get a 30-second timeout just because the provider SLA allows it. Users will not wait 30 seconds.
+
+For **synchronous chat interfaces**, the timeout is 8-12 seconds maximum. Users will wait up to 10 seconds for a thoughtful response, but beyond that they assume the system is broken. If your model typically responds in 2-3 seconds, set a timeout at 8 seconds and trigger a fallback. If the model is consistently slow, switch to a faster model or rethink the task decomposition.
+
+For **real-time content moderation**, the timeout is 1-3 seconds maximum. Content that waits longer than 3 seconds creates user experience problems. If moderation is blocking user actions, 3 seconds feels like an eternity. Set the timeout at 2 seconds and fall back to rule-based moderation or a faster model.
+
+For **code completion and autocomplete**, the timeout is 500 milliseconds to 2 seconds. Suggestions that arrive after 2 seconds are ignored by users. Most developers expect autocomplete to feel instant. If your model cannot complete in under 1 second at p95, you need a faster model or a smaller prompt.
+
+For **document processing and summarization**, the timeout is 20-60 seconds depending on document length. Users understand that processing a 50-page PDF takes time, but they will not wait two minutes. Set a timeout proportional to document size and show progress indicators during processing.
+
+For **batch background jobs**, the timeout is 2-10 minutes depending on task complexity. Batch jobs can tolerate longer model calls, but you still need a timeout to prevent infinite hangs. If a single item in a batch times out, log it and move on. Do not block the entire batch.
+
+For **background analysis and enrichment**, the timeout is 5-30 minutes depending on the task. These tasks are not user-facing, but they still need timeouts to prevent resource exhaustion. A background task that hangs for six hours consumes memory, thread pool slots, and database connections that could be used for other work.
+
+The key principle is this: set the timeout based on the user's patience, not the model's capability. If the model cannot consistently meet the user's patience threshold, you need a different model or a different task design.
+
+## What to Show the User During a Timeout
+
+When a timeout occurs, the user must see something. A blank screen is unacceptable. A generic error message is lazy. The timeout message must explain what happened, what the system is doing about it, and what the user should do next.
+
+For **chat interfaces**, show a fallback response that acknowledges the delay and provides partial value. If the timeout occurs on a complex question, return a simplified response or a canned answer that addresses the most common interpretation of the question. For example, if a user asks "what are the tax implications of selling my house in California" and the model times out, return a message like "I am having trouble generating a detailed response right now. Generally, California homeowners may qualify for capital gains exclusions on primary residence sales. For specific tax advice, consult a tax professional or try rephrasing your question." This provides some value while being honest about the limitation.
+
+For **content moderation**, show nothing to the user but log the timeout and apply a default policy. If moderation times out on a post, either block the post and notify the user that it is under review, or allow the post and flag it for human review. The choice depends on your risk tolerance. High-risk content categories should default to block. Low-risk categories can default to allow with review.
+
+For **code completion**, show nothing. Do not display a partial suggestion or an error message in the autocomplete dropdown. Users expect autocomplete to either show a suggestion or show nothing. A timeout is the same as no suggestion available.
+
+For **document processing**, show a progress indicator and a timeout message. If a document summarization times out, display "This document is taking longer than expected to process. You can wait, try a shorter document, or check back later." Give the user agency. Let them decide whether to wait or move on.
+
+For **batch jobs**, log the timeout and continue processing the next item. Do not surface individual item timeouts to the user unless the timeout rate exceeds a threshold. If 2 out of 1,000 items time out, that is noise. If 200 out of 1,000 items time out, that is a system problem that should trigger an alert.
+
+The worst thing you can do is show a technical error message that blames the model provider. Messages like "Claude API timed out" or "OpenAI is slow right now" make your system look fragile and out of your control. The user does not care which provider you use. Frame the message around the task, not the infrastructure.
+
+## Fallback Strategies: Retry, Switch Models, Cache, or Partial Results
+
+When a timeout occurs, you have four primary fallback strategies: retry with the same model, switch to a faster model, return a cached response, or return a partial result. The right choice depends on the task, the timeout cause, and the user's tolerance for degraded quality.
+
+**Retry with the same model** makes sense when the timeout is likely transient. If your model calls typically complete in 2 seconds but this one timed out at 8 seconds, it may be a temporary latency spike. Retry once with the same timeout. If the retry also times out, switch strategies. Do not retry more than once for user-facing requests. Two timeouts in a row is a signal that the model or provider is having a problem, not a transient spike.
+
+**Switch to a faster model** makes sense when you have a tiered model setup. If your primary model is Claude Opus 4.5 but it times out, fall back to Claude Sonnet 4.5 or GPT-5-mini. The faster model will return a response in under 2 seconds, and the quality degradation is usually acceptable for a timeout scenario. This strategy requires that you have already tested the faster model on the same task and confirmed that it produces acceptable results. Do not blindly fall back to a model you have never tested.
+
+**Return a cached response** makes sense when the user's request matches a previous request closely enough. If the timeout occurs on a question like "what is your return policy" and you have a cached response for that question from ten minutes ago, return the cached response. This works well for FAQ-style questions, common support queries, and repeated document processing requests. The cache hit rate for timeout fallback is usually low, but when it works, it provides instant value.
+
+**Return a partial result** makes sense when the model produced some output before timing out. If you are generating a summary of a 30-page document and the model times out after summarizing 20 pages, return the partial summary with a note that it is incomplete. If you are generating a list of recommendations and the model times out after generating five out of ten, return the five with a note that more were requested. Partial results are better than no results as long as you clearly communicate the incompleteness.
+
+Some systems combine strategies. A common pattern is: retry once, then switch to a faster model, then return a cached response, then return an error message. This cascade gives you three chances to provide value before giving up. The key is to execute this cascade quickly. If each step takes 8 seconds, the user waits 24 seconds before seeing anything. Design your cascade to complete within your original timeout budget by using shorter timeouts for each fallback step.
+
+## Circuit Breaker Patterns for Consistently Slow Endpoints
+
+A **circuit breaker** is a pattern that stops sending requests to a failing or slow endpoint after a threshold of failures is reached. Instead of timing out on every request, the circuit breaker fails fast and immediately returns a fallback response until the endpoint recovers.
+
+The circuit breaker has three states: closed, open, and half-open. In the **closed** state, requests flow normally to the model endpoint. If the failure rate or timeout rate exceeds a threshold over a time window, the circuit breaker trips to the **open** state. In the **open** state, all requests immediately return a fallback response without calling the model. After a cooldown period, the circuit breaker enters the **half-open** state, where a small number of test requests are sent to the endpoint. If those requests succeed, the circuit breaker returns to the **closed** state. If they fail, it returns to the **open** state.
+
+Circuit breakers prevent timeout cascades. If Claude Opus 4.5 is consistently timing out at 15 seconds per request and you are sending 100 requests per minute, you will exhaust your thread pool in under two minutes. The circuit breaker detects the pattern after 10 timeouts in one minute, trips to open, and immediately falls back to Sonnet 4.5 for all subsequent requests. Your thread pool stays healthy, your users get faster responses with slightly lower quality, and your system does not collapse.
+
+The threshold for tripping the circuit breaker must be tuned to your traffic patterns. A threshold of 5 timeouts in 1 minute works for high-traffic systems processing 1,000 requests per minute. A threshold of 2 timeouts in 5 minutes works for low-traffic systems processing 10 requests per minute. The key is to trip fast enough to prevent resource exhaustion but slow enough to avoid false positives from isolated transient failures.
+
+The cooldown period must be long enough for the provider to recover but short enough to avoid unnecessarily degraded quality. A 30-second cooldown works for transient provider issues. A 5-minute cooldown works for planned provider maintenance windows. A 30-minute cooldown works for major provider outages. You can implement exponential backoff where the cooldown period doubles after each failed recovery attempt.
+
+Circuit breakers should be implemented per model endpoint, not per provider. If Claude Opus 4.5 is slow but Claude Sonnet 4.5 is fast, trip the circuit for Opus only. Do not trip the circuit for all Claude models. Similarly, if OpenAI's GPT-5 endpoint in us-east-1 is slow but the us-west-2 endpoint is fast, trip the circuit for the slow region only.
+
+## The Timeout Cascade Problem in Multi-Step Workflows
+
+A **timeout cascade** occurs when a timeout in one step of a multi-step workflow causes timeouts in all subsequent steps, multiplying the user-facing delay. This is one of the most common and most damaging timeout anti-patterns.
+
+Consider a workflow that performs three model calls in sequence: extract entities from a document, classify each entity, and generate a summary. Each step has an 8-second timeout. If the first step times out at 8 seconds, your system retries and the retry completes at 6 seconds. Total time so far: 14 seconds. The second step runs and completes at 4 seconds. Total time: 18 seconds. The third step starts but your end-to-end timeout was 20 seconds, so it times out after 2 seconds even though the model could have completed in 4 seconds. The user sees a failure after 20 seconds, and you have wasted the work from the first two steps.
+
+The solution is to treat the end-to-end timeout as a hard budget and allocate sub-budgets to each step. If your end-to-end timeout is 20 seconds and you have three steps, allocate 6 seconds per step with 2 seconds of buffer. If step one times out at 6 seconds and the retry completes at 5 seconds, you have consumed 11 seconds total, leaving 9 seconds for the remaining two steps. Adjust the timeout for step two to 4 seconds and step three to 3 seconds to stay within budget. This requires dynamic timeout adjustment based on elapsed time.
+
+Another solution is to make steps parallel where possible. If the entity classification step does not depend on the output of the entity extraction step, run them in parallel. If both complete, proceed to the summary step. If either times out, fall back to a partial result or a degraded path. Parallelization reduces the total workflow time and reduces the risk of cascade timeouts.
+
+A third solution is to break long workflows into asynchronous steps with user feedback. Instead of running all three steps synchronously, run the first step, show the user the extracted entities, and let them confirm before proceeding. This breaks the timeout cascade because each step is independent. The user sees progress, and the system has time to recover from transient slowness.
+
+The timeout cascade problem is worse in agent workflows where the number of steps is dynamic. An agent that plans to execute five tool calls but times out on the third call has wasted the first two calls and has no result to show the user. Agent workflows must implement aggressive timeout budgeting and partial result handling to avoid this.
+
+## Timeout Monitoring and Tuning
+
+Timeout values are not set once and forgotten. They must be monitored and tuned continuously based on observed model performance. What works in January may not work in June when the provider changes infrastructure or when your traffic patterns change.
+
+Monitor **timeout rate** per model endpoint. This is the percentage of requests that hit the timeout. A timeout rate below 1% is healthy. A timeout rate above 5% indicates that your timeout is too aggressive or the model is too slow for the task. A timeout rate above 20% indicates a serious problem that requires immediate mitigation.
+
+Monitor **timeout rate by percentile**. A model that completes 95% of requests in under 3 seconds but times out on 5% of requests at 10 seconds has a different problem than a model that completes 50% of requests in under 3 seconds and times out on 50% at 10 seconds. The first case suggests that 5% of requests are unusually complex or hitting a slow code path. The second case suggests that the model is fundamentally too slow for the task.
+
+Monitor **timeout rate by time of day**. If timeouts spike between 9 AM and 11 AM Pacific time, you may be hitting provider rate limits or competing with other high-traffic customers. If timeouts spike randomly throughout the day, the issue is more likely transient provider problems or network latency.
+
+Monitor **timeout rate by request size**. If timeouts correlate with prompt length or response length, the issue is that larger requests take longer and your fixed timeout does not account for size variation. Consider implementing dynamic timeouts based on estimated response time.
+
+Tuning timeouts is a balancing act. If you set the timeout too short, you time out on requests that would have completed, wasting money and degrading quality. If you set the timeout too long, you make users wait unnecessarily and risk resource exhaustion. The right timeout is the p95 or p99 response time plus a small buffer. If your p95 response time is 4 seconds, set your timeout at 6-8 seconds. If your p99 response time is 12 seconds, set your timeout at 15 seconds and investigate why 1% of requests are so slow.
+
+Re-tune timeouts monthly or after any major change to prompts, models, or traffic patterns. What worked last month may not work this month.
+
+## Provider Slowness vs Infrastructure Slowness
+
+When a model call times out, the root cause is either provider slowness or infrastructure slowness. These require different mitigation strategies, and confusing them leads to wasted effort.
+
+**Provider slowness** occurs when the model API itself is slow to respond. You send a request, the request reaches the provider's servers quickly, but the model takes 20 seconds to generate a response. This is measured by the time between when the provider receives your request and when it returns the first token. Provider slowness is caused by model complexity, provider infrastructure issues, regional outages, or traffic spikes.
+
+**Infrastructure slowness** occurs when the delay happens before the request reaches the provider or after the response leaves the provider. This includes DNS resolution time, TLS handshake time, network latency, connection pool exhaustion, thread pool exhaustion, and database query time before or after the model call. Infrastructure slowness is measured by the difference between your end-to-end timeout and the provider-reported response time.
+
+To distinguish between the two, log both your client-side timeout and the provider's server-side timing headers. Most providers return headers like x-request-duration or x-processing-time that show how long the model call took on their infrastructure. If your client-side timeout is 15 seconds but the provider header shows 3 seconds, you have 12 seconds of infrastructure slowness. If your client-side timeout is 15 seconds and the provider header shows 14 seconds, you have provider slowness.
+
+If the problem is provider slowness, your mitigations are: switch to a faster model, reduce prompt size, simplify the task, add caching, or switch providers. You cannot fix the provider's infrastructure from your side.
+
+If the problem is infrastructure slowness, your mitigations are: optimize DNS resolution with caching, use persistent HTTP connections, increase connection pool size, reduce database query time, optimize serialization and deserialization, or move to a region closer to the provider. These are infrastructure problems you can fix.
+
+A common mistake is assuming all timeouts are provider slowness and switching models unnecessarily. If your infrastructure is adding 8 seconds of overhead due to a misconfigured connection pool, switching from GPT-5 to GPT-5-mini will not solve the problem. Measure both sides before deciding on a mitigation strategy.
+
+Timeout strategy is not an afterthought. It is a core product decision that defines how your system behaves when models are slow, when providers are overloaded, and when infrastructure is stressed. Every timeout must have a value, a fallback, and a monitoring plan. The next subchapter covers rate limits, quota shaping, and backpressure, the complementary strategies for handling capacity constraints when models are fast but you have too many requests.

@@ -1,0 +1,119 @@
+# 9.13 — A/B Testing Models in Production: Statistical Rigor, User Consistency, and Holdout Groups
+
+In March 2025, a B2B collaboration platform ran what they called a model A/B test. They split traffic 50-50 between GPT-4o and the newly released Claude Opus 4, measured for one week, and declared Claude the winner based on a 2.3 percent improvement in user satisfaction scores. Two weeks after switching all traffic to Claude, they noticed response quality had declined, user complaints had increased, and their task completion rate was down 4.1 percent. When they dug into the test data, they discovered the problems: their sample size was too small to detect anything but massive differences, the same users had received responses from both models creating inconsistent experiences, their week-long test had captured a holiday when usage patterns were atypical, and they had measured only one metric while ignoring latency and cost. They had not run an A/B test. They had run a coin flip with extra steps. The rollback cost them three weeks of degraded user experience, $47,000 in wasted API costs, and the trust of their engineering leadership in their ML team's competence.
+
+Running a proper A/B test for model comparison is not the same as running a feature A/B test. Models affect every interaction, create compound effects over sessions, and require specialized methodologies to produce valid results. Most teams treat model testing like feature testing and get garbage conclusions.
+
+## Why Naive Traffic Splitting Fails
+
+The simplest approach to model comparison is random request splitting: each incoming request gets randomly assigned to model A or model B, you measure some metrics, and you pick the winner. This approach is wrong for models because it ignores three fundamental properties of LLM-based systems: consistency matters to users, models have different failure modes that affect different request types differently, and the effects of model choice compound over multi-turn interactions.
+
+When you randomly split traffic at the request level, individual users get inconsistent experiences. A user asks a question, gets a response from GPT-4o, asks a follow-up, gets a response from Claude Opus 4.5 that does not quite align with the previous answer, and experiences the system as confused or unreliable. The user attributes this inconsistency to your product quality, not to your testing methodology. You are measuring user satisfaction while actively degrading it through the test design itself. Request-level randomization is a methodological self-own.
+
+Different models have different strengths and failure modes. GPT-5 might excel at structured data extraction but produce overly formal tone in conversational tasks. Claude Opus 4.5 might generate more natural dialogue but occasionally miss edge cases in parsing. If you randomly split requests, high-value users who happen to hit one model's weak spots disproportionately will give you misleading aggregate metrics. A single bad experience from model B on a critical task might cause a user to churn, but that signal gets averaged away in aggregate metrics that show model B winning overall. You are measuring average performance when you should be measuring worst-case risk.
+
+Multi-turn interactions create compounding effects. If a user has a three-turn conversation, and each turn randomly uses a different model, the final outcome depends on the specific sequence of models, not on any single model's capabilities. You cannot attribute success or failure to model A or model B when every session is a random blend. Your test measures nothing coherent.
+
+The correct approach is **user-level randomization** with **sticky assignment**: when a user enters your test, they are assigned to model A or model B, and they get that same model for every request during the test period. This preserves consistency, isolates model effects, and lets you measure what actually matters: how does the user's overall experience differ based on which model they consistently interact with.
+
+## Statistical Rigor: Sample Size, Significance, and Effect Size
+
+Most teams eyeball their A/B test results. Model A has a 2.1 percent higher satisfaction score than model B, so model A wins. This is statistical malpractice. The 2.1 percent difference might be noise. It might be real but too small to matter. It might be driven by three outlier users. Without proper statistical analysis, you are guessing.
+
+Before you start a model A/B test, you calculate required sample size. This requires four inputs: your baseline metric value, the minimum effect size you care about detecting, your desired statistical power, and your significance threshold. If your current model produces a task success rate of 87 percent, and you only care about switching models if the new model improves success by at least 3 percentage points, and you want 80 percent power to detect that difference at a 0.05 significance level, you need approximately 1,800 users per group. If you run your test with 200 users per group, you have massively underpowered your test, and any conclusion you draw is unreliable.
+
+Minimum detectable effect size is not arbitrary. A model that costs twice as much must deliver a large improvement to justify the cost. A model that adds 200 milliseconds of latency must deliver quality gains that offset the user experience degradation. A model that improves task success from 87 percent to 88 percent delivers minimal business value and is not worth the migration risk and operational overhead. You decide the minimum meaningful improvement before the test starts, and you size your test to detect it.
+
+Statistical significance tells you whether an observed difference is likely real or likely noise. If your test shows model B with a 2.1 percent higher satisfaction score and a p-value of 0.18, that means there is an 18 percent chance you would see a difference this large even if the models were actually identical. You cannot conclude model B is better. If the p-value is 0.03, there is only a 3 percent chance of seeing this difference by random chance, and you have evidence that model B truly differs from model A. Standard practice uses a 0.05 threshold: p-values below 0.05 are considered statistically significant.
+
+Effect size tells you whether a statistically significant difference actually matters. With a large enough sample, you can detect tiny, meaningless differences with high statistical confidence. A test with 50,000 users per group might show that model B improves satisfaction by 0.4 percentage points with p equals 0.001, which is highly significant but operationally irrelevant. Effect size quantifies the practical magnitude of the difference. For binary metrics like task success, effect size is often the absolute difference in rates. For continuous metrics, it is often Cohen's d, which measures difference in standard deviation units. An effect size below 0.2 standard deviations is generally considered small and may not justify action even if statistically significant.
+
+You report three numbers from every A/B test: the observed difference, the p-value, and the effect size. If any responsible member of your team sees results reported without all three, they should reject the analysis and demand it be redone properly.
+
+## User Consistency Through Sticky Assignment
+
+Sticky assignment means once a user is assigned to a model, they stay on that model for the test duration. Implementation requires a deterministic mapping from user ID to test group. The standard approach is hashing: you take the user's ID, append a test-specific salt to prevent correlation across different tests, hash the combined string, and use the hash modulo 100 to assign users to groups. Users with hash values 0 through 49 get model A, users with hash values 50 through 99 get model B.
+
+The salt matters. If you run multiple concurrent A/B tests using the same hash function without salts, users assigned to group A in test one will also be assigned to group A in test two, creating correlation between tests and confounding your results. Every test gets a unique salt, ensuring independent randomization across tests.
+
+Sticky assignment persists across sessions. If a user logs in on Monday and gets model A, then logs in again on Thursday, they still get model A. If you re-randomize on every session, you reintroduce the inconsistency problem you were trying to avoid. The assignment is stable for the test duration, which might be two weeks or six weeks depending on your sample size requirements and metric stability.
+
+New users entering during the test get randomized immediately on their first request. Existing users who were active before the test started get randomized on their first request after test launch. You do not retrospectively assign users who have not been active during the test period, because you cannot measure their outcomes.
+
+Anonymous users create a challenge. If your product allows unauthenticated usage, you cannot use user ID for assignment because there is no stable user ID. The alternatives are device fingerprinting, which is unreliable and privacy-invasive, or session-level assignment, which is better than request-level randomization but worse than user-level. If a significant portion of your traffic is anonymous, you may need to run separate tests for authenticated and anonymous users, or you may need to accept session-level granularity for the anonymous segment.
+
+User consistency also means no mid-test reassignment. If a user is in the model A group, they do not get moved to model B halfway through the test, even if you notice model A is performing poorly. Mid-test changes invalidate your statistical analysis. You commit to the assignment for the test duration.
+
+## Holdout Groups and Control Stability
+
+A **holdout group** is a subset of users who remain on the current production model for the entire test, serving as a stable control. In a two-model A/B test, you actually create three groups: 45 percent of users get model A, 45 percent get model B, and 10 percent stay on the current production model. The holdout group protects you against external validity threats.
+
+Why you need a holdout: during a two-week A/B test in November 2025, a SaaS company compared GPT-5 against Claude Opus 4.5 and saw both models outperform expectations with task success rates of 91 percent and 89 percent respectively. They chose GPT-5 and rolled it out. One month later, they realized their task success rate had been 84 percent before the test. Both models had appeared to improve outcomes, but the improvement was not due to the models, it was due to a product change their team had shipped during the test period that simplified the user interface and made tasks easier across the board. Without a holdout group on the original model measured during the same time window, they had no way to separate model effects from confounding changes.
+
+Holdout groups are your control for time-based confounds. User behavior changes seasonally. Your product changes continuously. External events like holidays, news cycles, or competitor launches affect engagement. The holdout group experiences all these confounds while staying on the stable baseline model, giving you a true counterfactual for what would have happened without a model change.
+
+Holdout size is typically 10 to 20 percent of traffic. Larger holdouts give you more stable control measurements but reduce the sample size for your treatment groups, forcing you to run longer tests. Smaller holdouts reduce control precision. Ten percent is a reasonable default.
+
+Holdout groups persist after the test if you are uncertain about the winner. If your test shows model B winning on quality but losing on latency, and you decide to ship model B, you might keep the 10 percent holdout on the original model for an additional month to monitor for delayed effects or metric drift. If model B causes a slow degradation in user retention that takes three weeks to appear, the persistent holdout will reveal it.
+
+Some teams run **always-on holdouts** where 5 percent of traffic permanently stays one model version behind, providing continuous control data for all production changes. This reduces the ability to make claims about small improvements, because you are measuring only 95 percent of users in the new model group, but it provides ongoing protection against confounded conclusions and makes it easy to roll back if a new model degrades experience.
+
+## Metrics Selection: What to Measure in a Model A/B Test
+
+Model A/B tests require multi-dimensional metrics because models affect multiple aspects of system performance simultaneously. You measure quality, speed, cost, and user engagement. Optimizing one while ignoring the others is how you ship a model that is technically better but commercially worse.
+
+**Quality metrics** measure whether the model produces correct, useful outputs. For structured tasks, quality is task success rate: the percentage of requests where the model output meets the defined success criteria. For generative tasks, quality is often human evaluation scores on dimensions like accuracy, relevance, and coherence. For retrieval-augmented tasks, quality includes both retrieval precision and generation faithfulness. You define your quality metrics during problem framing, and those same metrics become your primary A/B test metrics.
+
+**Latency metrics** measure user-facing response time: p50, p95, and p99 latency from request submission to complete response. Model B might produce higher quality outputs but take 40 percent longer to respond, degrading user experience and increasing timeout rates. You measure end-to-end latency, not just model API latency, because the model change might affect prompt size, output length, or retry logic that adds overhead beyond the API call itself.
+
+**Cost metrics** measure your per-request or per-user expense. If model B costs three times as much as model A per request, it must deliver substantial quality or engagement improvements to justify the cost increase. You calculate cost per successful task, not just cost per request, because a cheaper model that fails more often might actually be more expensive in total cost of ownership.
+
+**Engagement metrics** measure how the model change affects user behavior: session length, messages per session, return rate, feature adoption. A model that produces faster, cheaper responses but causes users to disengage because the responses feel robotic or unhelpful is a net negative. Engagement metrics lag quality metrics by days or weeks, so you need longer test durations to measure them reliably.
+
+**Task completion metrics** measure whether users accomplish their goals: conversion rates, form completion rates, successful checkouts. These are business outcome metrics that matter more than any model-level quality score. A model might score higher on accuracy benchmarks but confuse users with overly technical language, reducing task completion. You measure what users do, not just what the model outputs.
+
+You define a **primary metric** before the test starts. This is the single metric that determines the winner if you must choose. Typically, the primary metric is task success rate or task completion rate. All other metrics are secondary: they provide context and might trigger a no-ship decision if they degrade badly, but they do not override the primary metric. Declaring the primary metric upfront prevents post-hoc rationalization where you search through ten metrics and pick whichever one makes your preferred model look best.
+
+## Test Duration: How Long to Run a Model A/B Test
+
+Test duration is determined by two factors: the time required to reach your target sample size, and the time required for your metrics to stabilize. Most teams underestimate both.
+
+If you need 1,800 users per group to achieve statistical power, and your product has 5,000 active users per week, and you are running a 50-50 split, you will collect 2,500 users per group per week. You will hit your sample size target in one week. But if you have only 800 active users per week, you need more than two weeks to gather sufficient sample.
+
+Metric stabilization takes longer than sample size collection for engagement and outcome metrics. Quality and latency metrics stabilize within hours or days: if model B produces better outputs, you will see the difference in task success rate within the first day. Engagement metrics like return rate and session frequency require at least one full user activity cycle. If your users typically engage with your product weekly, you need at least two weeks of data to measure whether model B increases or decreases return rates. If users engage monthly, you need at least six weeks.
+
+Seasonal effects require even longer durations. If you run a model A/B test during the two weeks before a major holiday, user behavior during that period may not generalize to normal periods. If your test includes a holiday, you either extend the test to include pre-holiday and post-holiday periods, or you exclude the holiday period from analysis entirely and run longer to compensate for the lost data.
+
+**Minimum test duration is two weeks** for most products. This captures at least one full week of typical user behavior and smooths out day-of-week effects. Tests measuring engagement or retention often run four to six weeks. Tests measuring long-term outcomes like churn might run eight to twelve weeks, though at that point you are often better off using a small-scale rollout with ongoing monitoring rather than a formal A/B test.
+
+You do not peek at results daily and stop the test as soon as you see a significant p-value. This is **early stopping bias**, and it inflates your false positive rate. If you check your test results every day for two weeks, you run 14 hypothesis tests, and the probability of seeing at least one spurious significant result is much higher than your 0.05 threshold. You either commit to a fixed test duration upfront and analyze results only at the end, or you use a **sequential testing** procedure with adjusted significance thresholds that account for multiple looks at the data.
+
+Most teams are not sophisticated enough to implement sequential testing correctly, so the safe default is fixed-duration tests with a single analysis at the end.
+
+## Interpreting Results: Wins, Losses, and Trade-offs
+
+The easy case is clear dominance: model B wins on quality, has similar latency, costs the same, and shows no degradation in engagement. You ship model B. This happens approximately never.
+
+The common case is trade-offs: model B improves task success rate by 4.2 percentage points, p-value less than 0.01, but increases p95 latency from 1.8 seconds to 2.6 seconds and costs 35 percent more per request. Model B is statistically significantly better on quality and statistically significantly worse on latency and cost. What do you do?
+
+You return to your business priorities. If your product's primary problem is quality and users have been complaining about incorrect outputs, and latency is acceptable as long as it stays under 3 seconds, and your margins can absorb a 35 percent cost increase, you ship model B. If your product differentiates on speed, and 2.6 second latency crosses a threshold where users perceive the system as slow, you do not ship model B regardless of quality improvement.
+
+You quantify trade-offs in business terms. A 4.2 percentage point improvement in task success might increase conversion rate by 2 percent, generating an additional $18,000 per month in revenue. A 35 percent cost increase might add $6,000 per month in expenses. Net impact: positive $12,000 per month. The latency increase might reduce session length slightly, costing $3,000 per month in engagement-driven revenue. Net impact: still positive $9,000 per month. You ship model B because the business case is positive even after accounting for all trade-offs.
+
+Sometimes the answer is no-ship: the improvements are statistically significant but too small to matter, or the trade-offs are unfavorable, or the test revealed that model B has a rare but severe failure mode that affects high-value users. Statistical significance is necessary but not sufficient for shipping. You need statistical significance, meaningful effect size, acceptable trade-offs, and business value.
+
+If results are ambiguous, you have three options: run a longer test to gather more data and reduce uncertainty, run a hybrid test where certain user segments or task types get model B while others stay on model A, or defer the decision and revisit in three months when newer models might offer better trade-offs.
+
+## Decision Framework for Acting on A/B Test Results
+
+You ship the new model if all five conditions hold: the primary metric shows statistically significant improvement with meaningful effect size, secondary metrics show no statistically significant degradation or acceptable trade-offs, the business case is positive accounting for all cost and revenue impacts, the operational risk of migration is acceptable, and you have a rollback plan if post-launch monitoring reveals issues the A/B test missed.
+
+You do not ship if any of these conditions fail: the primary metric does not reach statistical significance, the effect size is too small to matter commercially, secondary metrics degrade in ways that outweigh primary metric gains, the cost increase is unjustifiable, or the new model introduces unacceptable risk such as rare severe failures or compliance concerns.
+
+You run additional tests if results are inconclusive: the test was underpowered and you need more sample, the test captured an atypical time period and you need to retest during normal conditions, or the test revealed that different user segments respond differently and you need segmented analysis.
+
+You document every decision with the supporting data. When you ship a new model, you record the A/B test results, the business case, the decision rationale, and the rollback criteria. When you choose not to ship, you record why, so that in six months when someone asks why you are still on the old model, the answer is documented and defensible.
+
+Model A/B testing is not a one-time gate before launch. It is a continuous discipline. Every time you consider switching models, upgrading versions, or changing providers, you run a proper test. Every time you run a test, you apply statistical rigor. Every time you make a decision, you document it. This is what separates teams that manage models systematically from teams that thrash between models based on vibes and regret.
+
+The next question is what happens when you decide to make the switch: how do you execute a model migration without breaking production, losing data, or creating an operational crisis that could have been avoided with a runbook.

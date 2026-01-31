@@ -1,0 +1,151 @@
+# 4.4 — Caching Strategies: Prompt Caching, Semantic Caching, and KV Cache Reuse
+
+In March 2025, a legal research platform processing 800,000 queries per month discovered they were regenerating the same analysis repeatedly. Their system allowed attorneys to ask questions about case law, statutes, and regulations. The same foundational legal texts appeared in 60% of queries—state civil codes, federal regulations, landmark cases—but the platform treated each query as independent, re-processing these lengthy documents from scratch every time. Their monthly inference costs were $67,000, of which roughly $40,000 was spent re-encoding text they had already processed thousands of times. When they implemented Anthropic's prompt caching in April, their costs dropped to $31,000 per month while response latency improved by 35%. The same information retrieval system, the same quality, the same user experience—but $36,000 per month saved by caching the repetitive portions of their prompts. The team had optimized every other dimension of their system yet overlooked the most obvious inefficiency: paying repeatedly for identical computation.
+
+Caching is the highest-leverage optimization for LLM systems with repetitive patterns. Three distinct caching layers exist in 2026: provider-level prompt caching that reuses computed attention states, application-level semantic caching that returns stored responses for similar queries, and infrastructure-level KV cache reuse in self-hosted deployments. Each operates at a different level of the stack, each has different tradeoffs, and the most sophisticated systems use all three in combination.
+
+## Provider-Level Prompt Caching: KV Cache Reuse
+
+When a model processes a prompt, it computes attention states—key-value pairs—for every token in the context. These computations are expensive, representing the majority of the work during the prefill phase before token generation begins. For a 5,000-token prompt, the model must compute attention over all 5,000 tokens before it can generate the first output token. If the next request includes 4,800 of those same 5,000 tokens in the same order, the model must recompute attention over those 4,800 tokens despite having just done the identical computation moments ago.
+
+Prompt caching solves this by storing the computed key-value cache for a prompt prefix and reusing it when the same prefix appears in subsequent requests. If your prompt has a 3,000-token system message that never changes and a 200-token user query that varies per request, caching the system message saves recomputing 3,000 tokens of attention on every call. You pay full price for the initial computation, then pay a dramatically reduced rate—typically 10% to 20% of the input token price—for cache reads on subsequent requests.
+
+Anthropic introduced prompt caching for Claude 3.5 Sonnet in June 2024 and expanded it to Claude Opus 4, Opus 4.5, Sonnet 4.5, and Haiku 4.5 in 2025. The mechanism is straightforward: mark portions of your prompt with cache control markers, and the API automatically caches the KV states for those sections. Cache entries persist for five minutes of inactivity. If a cached prefix is reused within five minutes, you get a cache hit. If six minutes elapse, the cache expires and the next request pays full price to rebuild it.
+
+OpenAI launched a similar feature in late 2025 for GPT-5, GPT-5.1, and GPT-5.2, calling it cached tokens. The implementation differs slightly—caching is automatic for any prompt prefix that repeats across requests without explicit markers—but the economics are comparable. Cached input tokens cost approximately one-tenth the price of standard input tokens. Google's Gemini 3 Pro and Gemini 3 Flash introduced context caching in early 2026 with a fifteen-minute TTL and even lower cache read costs, approximately 5% of standard input prices.
+
+The cost savings scale with cache hit rate and cached prefix length. If 70% of your requests hit the cache and your cached prefix is 4,000 tokens, you save computation on 2,800 tokens per request on average. At GPT-5.1 pricing of $2.50 per million input tokens and $0.25 per million cached tokens, you reduce input costs from $10 per 4,000 tokens to $1 per 4,000 cached tokens on cache hits—a 90% reduction on the cached portion. For a system serving 10 million requests per month with a 4,000-token cached prefix and a 70% hit rate, this saves $63,000 per month.
+
+Latency improvements are equally significant. Skipping the prefill computation for 4,000 tokens can reduce time-to-first-token by 40% to 60% depending on model size and hardware. Users perceive this as dramatically faster responses because the delay before streaming begins is where impatience sets in. A system that takes 1.8 seconds to start responding and then generates quickly feels slower than a system that starts responding in 0.7 seconds and generates at the same rate. Prompt caching directly attacks the prefill latency.
+
+## How Prompt Caching Works Technically
+
+Understanding the mechanics of prompt caching helps you design prompts that maximize hit rates. The cache key is the exact sequence of tokens in the prompt prefix. If a single token changes or if token order changes, the cache misses. This means you must structure your prompts with stable, unchanging content at the beginning and variable content at the end.
+
+Consider a RAG system that retrieves documents and asks the model to answer a question. A poorly structured prompt might look like: user question, followed by system instructions, followed by retrieved documents. The user question changes on every request, so the cache misses on every request despite the system instructions and documents being identical. A well-structured prompt puts system instructions first, retrieved documents second, and user question last. Now the system instructions and documents are cached, and only the user question is reprocessed on each request.
+
+Multi-turn conversations require careful cache management. If you append each turn to a growing context, the cached prefix grows with each turn. Turn one caches the system message. Turn two caches the system message plus turn one. Turn three caches everything through turn two. This works well for conversations where each turn builds on the previous context. It works poorly for conversations where context is pruned or reordered, as any modification to earlier turns invalidates the cache.
+
+The cache granularity is at the provider level, not the user level. If two different users send requests with the same prompt prefix, they can benefit from the same cache entry. This means shared context across users—like system prompts, few-shot examples, or reference documents—gets cached once and reused across your entire user base. A system with 100,000 users asking questions about the same knowledge base pays to encode that knowledge base once every five minutes, not 100,000 times.
+
+Cache warming is the practice of proactively populating the cache before user traffic arrives. If you know your system will receive a surge of requests against a new document set, send a dummy request that includes the full document context before the surge begins. This ensures the first real user request hits the cache rather than paying the full prefill cost. For scheduled workloads, cache warming prevents the first request after a cache expiration from being slow and expensive.
+
+Cache invalidation is the hard problem. When source data changes, cached content becomes stale. If your knowledge base is updated but your cache still contains the old version, users get outdated answers. Provider-level caching does not know about your data semantics. It caches token sequences with no understanding of whether they represent current information. You must manage invalidation externally, either by letting the TTL naturally expire the cache or by changing the prompt content to force a cache miss.
+
+One effective invalidation strategy is versioning. Include a version identifier in your cached prefix: "Knowledge Base v2024-11-15." When you update the knowledge base, increment the version: "Knowledge Base v2024-11-22." The token sequence changes, the cache misses, and new requests build a cache with fresh content. The old cache expires after five or fifteen minutes of disuse. This gives you explicit control over when cache entries turn over without waiting for TTL expiration.
+
+## Cache Hit Rates and What Drives Them
+
+Cache hit rate is the percentage of requests that successfully reuse a cached prefix. A hit rate of 80% means 80% of requests benefit from caching and 20% either miss the cache or are the first request to establish a cache entry. Hit rate determines the realized savings from caching. A 90% hit rate on a 5,000-token prefix saves far more than a 30% hit rate on the same prefix.
+
+Hit rates depend on traffic patterns. Systems with high query volume on a small set of contexts achieve hit rates above 90%. A customer support chatbot where 70% of questions relate to the same five help articles will cache those articles and hit the cache repeatedly. Systems with diverse queries on unique contexts achieve hit rates below 20%. A creative writing assistant where every user provides a different story outline and asks for different suggestions has little repetition to cache.
+
+The cache TTL interacts with request rate. If you receive 1,000 requests per minute, a five-minute TTL means the cache stays warm continuously. If you receive 10 requests per minute, the cache expires between bursts of traffic and hit rates drop. Anthropic's five-minute TTL works well for systems with steady load. Gemini's fifteen-minute TTL works better for systems with bursty traffic patterns. Design your caching strategy around your traffic distribution.
+
+Prefix length affects both savings and hit rates. A longer cached prefix saves more tokens per hit but requires more consistency to hit the cache. A 10,000-token prefix that is identical across requests saves dramatically on each hit, but if 5% of requests have a slight variation in that prefix, those requests miss entirely. A 2,000-token prefix that is stable across 95% of requests may save less per hit but achieves a higher hit rate. The optimal prefix length balances stability and coverage.
+
+Measuring hit rates requires instrumentation. Anthropic's API returns cache hit statistics in response headers. OpenAI's API includes cached token counts in usage metadata. Log these metrics per request, aggregate by task type and time window, and track trends. A hit rate that declines over days or weeks indicates your prompts are becoming less stable or your traffic patterns are becoming more diverse. Investigate what changed and adjust prompt structure or caching strategy accordingly.
+
+Segmenting hit rates by task type reveals optimization opportunities. If your summarization tasks hit the cache at 85% but your question-answering tasks hit at 40%, focus caching improvements on question-answering. Perhaps you can standardize the knowledge base format or reorder prompt components to increase prefix stability. Aggregate metrics obscure this detail. Per-task metrics drive action.
+
+## Application-Level Semantic Caching
+
+Provider-level prompt caching optimizes computation for identical prefixes. Application-level semantic caching optimizes for similar queries, storing previous responses and returning them when a new query is semantically close to a cached query. This operates one layer above the model API, at the application logic layer, and it avoids calling the model entirely for cache hits.
+
+The implementation is conceptually simple. When a user submits a query, compute an embedding vector for that query using a fast embedding model. Search your cache for previously answered queries with embeddings above a similarity threshold—typically cosine similarity above 0.92 or 0.95. If a match exists, return the cached response immediately without calling the LLM. If no match exists, call the LLM, store the response with its query embedding in the cache, and return the response to the user.
+
+The cost savings are total for cache hits. You pay only for the embedding computation, which costs a fraction of a cent per query, rather than the LLM inference, which might cost several cents. A semantic cache with a 40% hit rate on a system averaging 10 cents per LLM call saves 4 cents per request on average, or $40,000 per month on a million requests. The latency savings are even more dramatic—returning a cached response takes 50 to 200 milliseconds versus 2 to 8 seconds for LLM generation.
+
+The quality risk is returning a cached response that does not actually answer the new query despite high embedding similarity. Two questions can be semantically close but require different answers. "What is the return policy for electronics?" and "What is the return policy for clothing?" have similar embeddings but different answers if your policies differ by category. A semantic cache might incorrectly return the electronics policy for a clothing query.
+
+Mitigating this risk requires careful similarity threshold tuning. A threshold of 0.98 reduces false positives but also reduces hit rates, as only near-identical queries match. A threshold of 0.90 increases hit rates but increases false positives. The optimal threshold depends on your task tolerance for errors. A question-answering system for critical compliance information should use 0.97 or higher. A general knowledge chatbot can safely use 0.92 or 0.93.
+
+Query normalization improves hit rates without lowering thresholds. Before computing embeddings, normalize queries by lowercasing, removing punctuation, expanding contractions, and trimming whitespace. "What's the return policy?" and "What is the return policy" become identical after normalization. Small variations in phrasing that do not affect meaning no longer cause cache misses.
+
+User context complicates semantic caching. If responses are personalized based on user attributes, you cannot cache and return the same response to different users even for identical queries. A query "What is my account balance?" has a user-specific answer. The cache must be keyed by both query embedding and user identity, fragmenting the cache and reducing hit rates. For highly personalized systems, semantic caching provides limited value. For impersonal systems answering factual questions, it provides immense value.
+
+## Cache Invalidation Challenges
+
+Semantic caches face the same staleness problem as provider-level caches but with less automatic expiration. A cached response remains in your cache until you explicitly remove it or until you implement a TTL eviction policy. If your knowledge base updates, cached responses based on old information become incorrect, but the cache has no way to know which entries are stale.
+
+Time-based expiration is the simplest strategy. Set a TTL of 24 hours, 7 days, or 30 days depending on how frequently your underlying data changes. Cached responses expire after the TTL regardless of whether the data changed, which means you may invalidate fresh entries unnecessarily. But it guarantees that stale entries do not persist indefinitely. For systems where correctness is critical, shorter TTLs are safer. For systems where approximate answers are acceptable and data changes infrequently, longer TTLs are more efficient.
+
+Content-based invalidation is more precise but more complex. Track which cache entries depend on which source documents or data entities. When a document updates, invalidate only the cache entries that referenced that document. This requires maintaining a dependency graph between cached responses and source data, which adds storage and lookup overhead. For large-scale systems with frequently updated knowledge bases, this complexity is justified. For smaller systems, time-based expiration is simpler.
+
+Version tags provide a middle ground. Tag each cache entry with the version of the data it was generated from. When data updates, increment the version. Cache lookups require both semantic similarity and version match. Entries with old versions are effectively invisible and eventually evicted. This gives you explicit control over invalidation without tracking fine-grained dependencies.
+
+Monitoring cache accuracy is essential. Randomly sample cache hits and verify that the cached response still correctly answers the query given current data. If accuracy drops below your quality threshold, your cache is too stale and you need more aggressive invalidation. Track cache hit rate and accuracy together—a 60% hit rate with 95% accuracy may be better than an 80% hit rate with 85% accuracy depending on your error tolerance.
+
+## KV Cache Reuse in Self-Hosted Deployments
+
+Teams running their own inference infrastructure with open-source models have access to lower-level caching mechanisms unavailable in API-based systems. vLLM, TensorRT-LLM, and other inference engines support KV cache management strategies that optimize memory and computation for batched requests and multi-turn conversations.
+
+Continuous batching with shared prefixes is one approach. If multiple users are asking questions about the same document set, the inference engine can compute the document prefix once and reuse the KV cache across all users in the batch. A batch of 32 requests all querying a 6,000-token knowledge base only computes attention over that knowledge base once, not 32 times. The savings scale with batch size and prefix commonality.
+
+Prefix caching in vLLM works similarly to provider-level prompt caching but with more control. You can explicitly manage cache entries, control eviction policies, and optimize cache layouts for your specific hardware. This enables advanced strategies like multi-level caching where frequently accessed prefixes stay in GPU memory, moderately accessed prefixes stay in CPU memory, and rarely accessed prefixes are recomputed on demand.
+
+The tradeoff is complexity. Managing your own inference infrastructure requires expertise in GPU memory optimization, batching strategies, and performance tuning. For most teams, provider-level caching through APIs is simpler and more cost-effective. For teams with extremely high volumes, specific latency requirements, or unique caching patterns, self-hosted infrastructure with custom cache management provides more control and potentially lower costs at scale.
+
+## Cost Savings from Each Caching Strategy
+
+The realized savings from caching depend on your traffic patterns, prompt structure, and task types. Quantifying the impact requires measurement before and after implementation, but typical ranges provide guidance.
+
+Provider-level prompt caching typically reduces input token costs by 40% to 70% for systems with stable prompt prefixes and high traffic volume. A system with 4,000-token prefixes, 70% hit rate, and 90% cost reduction on cached tokens sees a net input cost reduction of 63%. If input tokens were 30% of total costs, overall costs drop by 19%. If input tokens were 60% of total costs because output tokens are constrained, overall costs drop by 38%.
+
+Application-level semantic caching typically reduces total inference costs by 20% to 50% depending on hit rates. A 30% cache hit rate avoids 30% of LLM calls entirely, saving 30% of costs if cache maintenance overhead is negligible. A 60% cache hit rate saves 60% of costs. Systems with highly repetitive queries—FAQs, common support issues, standard knowledge lookups—achieve hit rates of 50% to 70%. Systems with diverse creative queries achieve hit rates of 10% to 25%.
+
+Combining both strategies compounds the savings. Requests that miss the semantic cache but hit the prompt cache still save on input token costs. Requests that hit the semantic cache avoid inference entirely. A system with a 50% semantic cache hit rate and a 70% prompt cache hit rate on semantic cache misses saves 50% of costs from semantic hits plus 30% to 40% of the remaining 50% from prompt cache hits, totaling 65% to 70% overall cost reduction.
+
+The incremental cost of operating caches is small compared to inference costs. Semantic caching requires embedding computation, vector similarity search, and cache storage. Embedding a query costs roughly $0.0001 with modern embedding models. Vector search costs depend on your vector database but typically add 10 to 50 milliseconds of latency and fractional costs. Cache storage costs dollars per million entries. For inference costs measured in cents per request, cache overhead measured in fractions of a cent is negligible.
+
+## Cache Warming Strategies
+
+Proactive cache warming ensures that high-value cache entries are populated before user traffic needs them, avoiding the cold-start cost and latency on the first request. This is particularly valuable after deployments, cache expirations, or knowledge base updates.
+
+Scheduled warming works for predictable traffic patterns. If your system sees a spike in traffic every weekday at 9 AM as employees start work, run a cache warming job at 8:45 AM that sends representative queries to populate the cache. By the time real traffic arrives, the cache is hot and all requests benefit from cache hits. The warming job costs you one request per cached prefix, which is trivial compared to the thousands of requests that will reuse those entries.
+
+Event-driven warming works for data updates. When your knowledge base ingests new documents, trigger a warming process that generates representative queries against those documents and caches the results. This prevents the first users who query the new content from experiencing slow responses while the cache builds. The warming process can be async and does not block the data update.
+
+User behavior warming uses analytics to identify the most common queries and ensures those are always cached. If your logs show that 40% of queries are variations of the same twenty questions, maintain cache entries for those twenty questions permanently. Refresh them before TTL expiration so they never go cold. This guarantees that the highest-traffic paths through your system always hit the cache.
+
+The cost of cache warming is small if targeted. Warming 100 cache entries costs the same as 100 user requests. If those entries serve 100,000 user requests before expiring, the ROI is 1,000 to 1. Avoid warming entries that are rarely accessed. Focus on the top 20% of queries by volume, which typically account for 60% to 80% of traffic.
+
+## Multi-Turn Conversation Caching
+
+Conversational systems accumulate context across turns, creating both opportunities and challenges for caching. Each turn adds user input and assistant output to the context, growing the prompt for the next turn. Provider-level caching can reuse the growing prefix, but only if the conversation structure is stable.
+
+Appending each turn to a conversation array and passing the full array on each request maximizes cache hits. Turn one caches the system message. Turn two caches the system message plus turn one. Turn three caches everything through turn two. Each turn pays only to process the new user message and generate the new response, while all previous turns are cached. This works elegantly for linear conversations with no edits.
+
+Conversation editing breaks this pattern. If a user edits their message from turn two, everything after turn two must be recomputed because the token sequence changed. The cache for turn three and beyond is now invalid. Systems that allow editing must either accept cache misses after edits or implement branching conversation structures where each branch has its own cache lineage.
+
+Context pruning for long conversations also disrupts caching. If you truncate old turns to stay within context limits, the prompt prefix changes and the cache misses. One solution is to prune at fixed intervals with fixed logic, so the pruned prefix is predictable and cacheable. If you always keep the system message, the most recent five turns, and a summary of earlier turns, that structure is stable and cacheable even as the underlying conversation grows.
+
+Streaming responses in multi-turn conversations require special handling. Provider APIs return cache hit information in response headers or metadata, but this arrives after the response is fully generated. For streaming, you do not know if you hit the cache until the stream completes. This prevents real-time cache-aware UI updates but does not affect the cost or latency savings. Monitor cache hit rates in your backend logging, not in frontend logic.
+
+## When Caching Does Not Help
+
+Not all workloads benefit from caching. Systems with high query diversity and low repetition see minimal cache hit rates and should not invest heavily in caching infrastructure. Creative writing assistants, personalized recommendation engines, and exploratory research tools rarely generate the same query twice. Semantic caching might achieve 10% to 15% hit rates, which may not justify the complexity.
+
+Real-time data queries cannot be cached safely. If your system answers questions about live stock prices, current weather, or breaking news, cached responses become stale within seconds or minutes. Time-based expiration is too coarse, and event-driven invalidation is too complex for rapidly changing data. Skip caching for real-time use cases and optimize other dimensions like model selection and output length instead.
+
+Highly personalized responses also resist caching. If every response is customized based on user preferences, history, or permissions, you cannot reuse responses across users. You can still cache shared prompt prefixes like system messages or knowledge base content, but you cannot cache the final responses. Provider-level caching still helps, but application-level semantic caching does not.
+
+Very low-volume systems do not benefit economically. If you serve 1,000 requests per month, caching might save you $10 per month while adding complexity in cache management, monitoring, and invalidation logic. The engineering effort is not justified. Caching becomes worthwhile at tens of thousands of requests per month where the absolute savings are large enough to matter.
+
+## Implementing Caching in Production
+
+Effective caching requires instrumentation, monitoring, and continuous optimization. Treat cache hit rate as a first-class operational metric alongside latency, error rate, and cost. Track it per task type, per user cohort, and over time to identify trends and regressions.
+
+Start with provider-level prompt caching if you use API-based models. It requires minimal code changes—just restructuring prompts to put stable content first—and delivers immediate cost and latency improvements. Anthropic, OpenAI, and Google all provide detailed documentation and usage examples. Implement it for your highest-volume task types first to maximize impact.
+
+Add application-level semantic caching for tasks with high query repetition. Build or use a vector database like Pinecone, Weaviate, or Qdrant for similarity search. Implement a conservative similarity threshold initially, monitor false positive rates, and tune the threshold based on your accuracy requirements. Start with a 24-hour TTL and adjust based on data update frequency.
+
+Instrument everything. Log cache hits, misses, latency, and cost savings per request. Build dashboards showing cache hit rate trends, cost savings over time, and cache size growth. Set alerts for sudden hit rate drops, which indicate prompt structure changes or traffic pattern shifts. Make cache performance visible to your team so regressions are caught quickly.
+
+Regularly audit cache accuracy. Sample cached responses and verify they are still correct. If you find stale entries, tighten your TTL or improve your invalidation logic. Cache correctness is more important than cache hit rate. A 50% hit rate with 98% accuracy is better than a 70% hit rate with 90% accuracy in any system where errors are costly.
+
+Revisit your caching strategy as your system evolves. Traffic patterns shift, data update frequency changes, and prompt structures are refactored. A caching approach that worked well six months ago may be suboptimal today. Quarterly reviews of cache hit rates, cost savings, and invalidation effectiveness ensure your caching remains effective as the system grows.
+
+The combination of provider-level prompt caching and application-level semantic caching, implemented thoughtfully and monitored continuously, can reduce your inference costs by 50% to 70% while improving latency and user experience. It is the highest-leverage optimization after output length control, and the two complement each other perfectly: caching avoids computation entirely, and length control minimizes the cost of computation you cannot cache.
+
+With caching in place to handle repetitive queries and response length controls to minimize output costs, the next frontier is selecting the right model for each task to optimize the quality-cost-latency tradeoff.

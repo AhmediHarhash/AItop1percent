@@ -1,0 +1,143 @@
+# 5.4 — Geographic Routing: Placing Inference Close to Users
+
+In October 2025, a European fintech company launched an AI-powered financial advisory chat feature for customers across the EU and UK. The engineering team, based in Berlin, deployed their LLM inference stack on AWS in the us-east-1 region because that was where their primary backend services ran and where they had existing infrastructure expertise. Initial testing showed response times of 1.2 to 1.8 seconds from Berlin offices. When the feature launched to 140,000 customers across twelve countries, users in London reported response times of 2.1 to 2.9 seconds. Users in Madrid saw 2.4 to 3.3 seconds. Users in Stockholm saw 2.6 to 3.5 seconds. Customer support received complaints that the AI assistant felt slow and unresponsive compared to competitors. The inference logic was identical across all users. The model was the same. The difference was the round-trip time for requests to cross the Atlantic Ocean twice: once to send the prompt, once to receive the response. The team had optimized their model, their prompt engineering, and their response streaming, but they had ignored the 400-millisecond penalty imposed by intercontinental network latency. By the time they deployed a European inference endpoint in eu-west-1, usage had dropped by 38 percent and the feature's reputation was damaged.
+
+Geographic distance is not negotiable. Light travels at a fixed speed. Data packets cross oceans via undersea fiber optic cables with measurable latency. You cannot optimize away the physics of network transmission. What you can control is where your inference endpoints are located and how intelligently you route requests to the nearest available endpoint. Most teams treat geographic routing as a nice-to-have optimization. The teams building global products treat it as a prerequisite for acceptable user experience.
+
+## Why Geographic Distance Matters for LLM Latency
+
+A typical LLM inference request consists of two network round trips: one to send the prompt and receive the first token, and a continuous stream for subsequent tokens if you are using streaming responses. If you are not using streaming, the latency is a single round trip plus the time for the model to generate the full completion before returning it in one payload. Either way, the time it takes for a packet to travel from the user's device to the inference endpoint and back is added directly to the perceived response time.
+
+**Round-trip time** between a user in San Francisco and an inference endpoint in us-west-2 Oregon is typically 15 to 25 milliseconds. Round-trip time between San Francisco and us-east-1 Virginia is 65 to 85 milliseconds. Round-trip time between San Francisco and eu-west-1 Ireland is 140 to 180 milliseconds. Round-trip time between San Francisco and ap-southeast-1 Singapore is 180 to 240 milliseconds. These numbers reflect the physical distance packets must travel and the number of network hops required to reach the destination.
+
+For a user in London making a request to us-east-1, the round-trip penalty is 75 to 95 milliseconds. For a user in Sydney making a request to us-east-1, the penalty is 200 to 260 milliseconds. For a user in Tokyo making a request to eu-west-1, the penalty is 240 to 300 milliseconds. If your inference takes 800 milliseconds and the network adds 250 milliseconds, your total response time is 1,050 milliseconds. If a competitor's inference also takes 800 milliseconds but they route users to a regional endpoint with only 20 milliseconds of network latency, their response time is 820 milliseconds. Your system feels 28 percent slower despite having identical model performance.
+
+The penalty is worse if the user's request triggers multiple round trips. If your application sends the initial prompt, waits for the response, then sends a follow-up request based on that response, each round trip incurs the full geographic latency penalty. A conversational interface that requires three sequential requests to complete a task will see 600 to 900 milliseconds of added latency if each request crosses an ocean compared to 45 to 75 milliseconds if requests stay within the same region.
+
+## Provider Region Availability in 2026
+
+Not all LLM providers offer inference endpoints in all regions. The major cloud providers have the widest geographic distribution, but even they are not globally uniform.
+
+OpenAI's Azure-hosted deployments in early 2026 support inference in US East, US West, Europe West, Europe North, Asia Pacific Southeast, and Asia Pacific East. Anthropic's AWS Bedrock integration supports Claude models in US East, US West, Europe Frankfurt, Europe Ireland, Asia Pacific Tokyo, and Asia Pacific Sydney. Google's Vertex AI provides Gemini models in US Central, US East, Europe West, Asia Northeast, and Asia Southeast regions.
+
+Smaller providers and specialized model hosts often provide inference only in US regions. If you use a provider that offers endpoints exclusively in us-east-1, you cannot eliminate the geographic latency penalty for users in Europe or Asia. Your only option is to switch providers or accept the latency cost.
+
+Open-source models deployed on your own infrastructure give you complete control over region placement, but you must manage the operational complexity of multi-region deployments yourself. Deploying a model in five regions means maintaining five separate inference stacks, replicating model weights to five locations, monitoring and updating five endpoints, and routing traffic intelligently across all of them. For a large engineering organization, this is routine. For a team of four, it is prohibitive.
+
+The provider you choose determines where you can place inference endpoints. If your user base is global, provider region availability is a critical selection criterion, not an implementation detail.
+
+## The Round-Trip Penalty: Quantified by Region Pair
+
+Measuring network round-trip time between regions provides the baseline for understanding geographic routing impact. The following measurements reflect typical latency observed in early 2026 for requests between major cloud provider regions.
+
+US West to US East: 65 to 85 milliseconds. US East to Europe West: 75 to 95 milliseconds. US West to Europe West: 140 to 180 milliseconds. US East to Asia Pacific Tokyo: 180 to 220 milliseconds. US West to Asia Pacific Sydney: 140 to 180 milliseconds. Europe West to Asia Pacific Tokyo: 240 to 300 milliseconds. Europe West to Asia Pacific Sydney: 280 to 340 milliseconds. Asia Pacific Tokyo to Asia Pacific Sydney: 100 to 140 milliseconds.
+
+These numbers represent the unavoidable latency floor for a single round trip. If your inference request requires multiple round trips due to application architecture, multiply the penalty accordingly. If your application sends a request, waits for a response, then makes a second request based on the first response, a user in London making requests to an endpoint in Tokyo will wait 500 to 600 milliseconds for network latency alone across two round trips.
+
+Streaming responses reduce the impact of round-trip latency on perceived responsiveness because the user sees the first token as soon as the model begins generating, but the initial round-trip time is still incurred before the first token appears. A 250-millisecond round trip delays the first token by 250 milliseconds regardless of whether subsequent tokens stream immediately afterward.
+
+## Geographic Routing Strategies
+
+The simplest geographic routing strategy is **route to nearest region**. You detect the user's approximate location using IP geolocation, determine which inference endpoint region is geographically closest, and route the request there. This minimizes round-trip time for the majority of requests.
+
+Implementation requires a routing layer that sits in front of your inference endpoints. The router receives all incoming requests, inspects the source IP address, looks up the geographic location, maps that location to the nearest available region, and forwards the request to the appropriate endpoint. Most cloud providers offer global load balancers that implement this logic automatically. AWS Global Accelerator, Google Cloud Load Balancing, and Azure Front Door all support geographic routing based on latency or proximity.
+
+If you are building your own routing layer, you maintain a mapping of geographic regions to inference endpoint URLs and select the endpoint with the lowest expected latency for each request. The mapping can be static or dynamic. A static mapping assigns users in North America to us-west-2, users in Europe to eu-west-1, and users in Asia to ap-southeast-1. A dynamic mapping measures actual round-trip time to each endpoint from different user locations and updates routing rules based on observed performance.
+
+A more advanced pattern is **edge function preprocessing**. Instead of routing the user's request directly to a regional inference endpoint, you route it to an edge function deployed on a content delivery network that runs in a data center close to the user. The edge function performs any preprocessing required, such as prompt formatting, context retrieval, or input validation, then forwards the optimized request to the inference endpoint. The response streams back through the edge function to the user. This pattern reduces the number of round trips by handling all non-inference logic at the edge and only sending the final inference request to the regional endpoint.
+
+Edge function preprocessing is particularly effective when your application architecture requires multiple service calls before invoking the LLM. If you need to fetch user preferences from a database, retrieve relevant documents from a vector store, and format a complex prompt before calling the model, performing all of that work in a centralized backend introduces multiple round trips across geographic distance. Moving that logic to an edge function colocated with the user eliminates the round-trip penalty for everything except the inference call itself.
+
+## Multi-Region Deployment Patterns
+
+A **multi-region deployment** means running inference endpoints in multiple geographic regions and routing users to the nearest one. This is conceptually simple but operationally complex.
+
+You must deploy and configure the model in each region. If you are using a managed provider like OpenAI on Azure, this means provisioning dedicated throughput or configuring serverless endpoints in each region you support. If you are self-hosting an open-source model, this means deploying GPU instances, loading model weights, configuring serving infrastructure, and setting up monitoring in each region.
+
+You must replicate any stateful data required for inference. If your application uses a vector database for retrieval-augmented generation, that database must be replicated to each region or accessible from each region with acceptable latency. If you store user conversation history or context in a database, that data must be available in all regions. Cross-region data replication introduces its own latency and consistency challenges.
+
+You must handle failover and fallback. If the inference endpoint in eu-west-1 becomes unavailable, requests from European users must failover to another region, likely us-east-1, accepting the latency penalty temporarily rather than failing requests entirely. Your routing layer must detect endpoint unavailability and reroute traffic dynamically.
+
+You must monitor and maintain multiple endpoints. A single-region deployment has one set of logs, one set of metrics, and one deployment pipeline. A five-region deployment has five of each. Debugging a latency regression requires checking whether the issue is global or isolated to one region. Deploying a model update requires coordinating rollout across five regions and monitoring for region-specific issues.
+
+The operational cost of multi-region deployment is significant. For large organizations with global infrastructure teams, this is standard practice. For smaller teams, the complexity may outweigh the latency benefits unless your user base is genuinely distributed globally.
+
+## Data Residency Constraints That Force Geographic Routing
+
+Some industries and jurisdictions impose **data residency requirements** that mandate data remain within specific geographic boundaries. The European Union's GDPR includes provisions that restrict transferring personal data outside the EU without adequate safeguards. The UK post-Brexit has similar rules. China's data localization laws require that data generated in China stay within Chinese borders. Healthcare data in the United States under HIPAA and financial data under various regulations often require storage and processing within specific jurisdictions.
+
+If your application processes personal data or regulated data, you may be legally required to route inference requests to endpoints located in the same jurisdiction as the user. A European user's request cannot be sent to a US-based inference endpoint if the request includes personal information and you have not implemented appropriate data transfer mechanisms.
+
+This transforms geographic routing from an optimization into a compliance requirement. You cannot simply route all traffic to the cheapest or most convenient region. You must maintain region-specific endpoints and enforce routing rules that respect data residency boundaries.
+
+The complexity increases if your application serves users in multiple jurisdictions with conflicting requirements. A global product may need separate inference stacks for the EU, the UK, the US, China, and other regions, each isolated to comply with local data laws. Cross-region failover becomes impossible in this model because failing over from eu-west-1 to us-east-1 would violate data residency requirements.
+
+Data residency is not a technical constraint that can be optimized away. It is a legal constraint that defines your deployment architecture. If you are building a product for global users in regulated industries, understand the data residency requirements before selecting a provider or designing your routing strategy.
+
+## CDN-Style Inference Routing
+
+A **CDN-style routing model** for inference distributes inference endpoints globally and routes each request to the nearest available endpoint automatically, similar to how content delivery networks cache and serve static assets. The promise is low latency for all users regardless of location. The reality is more complex.
+
+Static content on a CDN is immutable and can be replicated freely. Inference is stateful if your application requires conversation history, user-specific context, or session continuity. A user in Berlin starting a conversation with an inference endpoint in eu-west-1, then traveling to New York and continuing the conversation, expects the system to remember prior context. If the New York request routes to us-east-1 and that endpoint has no access to the session data from eu-west-1, the conversation breaks.
+
+Solving this requires a global session store accessible from all regions with low latency. You store conversation history, user preferences, and retrieval context in a globally replicated database like DynamoDB Global Tables, Cosmos DB, or Spanner. Each regional inference endpoint reads from the global store before generating a response. This works but introduces cross-region data access latency that partially negates the benefit of local inference.
+
+CDN-style inference routing is most effective for **stateless workloads** where each request is independent. A translation service that accepts a text string and returns a translation does not require session continuity. Routing each request to the nearest endpoint works cleanly. A conversational assistant that maintains context across multiple turns requires additional architecture to synchronize state across regions.
+
+## The Cost of Multi-Region: Duplicated Infrastructure and Higher Minimum Spend
+
+Running inference endpoints in five regions costs approximately five times as much as running in one region if you are using dedicated infrastructure. Each region requires provisioned capacity, and you pay for that capacity whether it is fully utilized or not.
+
+If your traffic is evenly distributed globally, the cost is justified. If 90 percent of your traffic comes from the United States and 10 percent comes from Europe and Asia, you are paying for full capacity in Europe and Asia to serve a small fraction of requests. The alternative is accepting higher latency for the 10 percent.
+
+Serverless pricing partially mitigates this because you pay per request rather than for provisioned capacity, but serverless introduces cold start latency that may be unacceptable for user-facing workloads. If you use serverless in low-traffic regions, users in those regions experience worse latency from cold starts in addition to any geographic routing delays.
+
+Provider minimum spend requirements also increase with multi-region deployments. Anthropic's provisioned throughput has a minimum monthly commitment per endpoint. If you deploy in three regions, you pay three times the minimum commitment even if total request volume could be handled by one region. OpenAI's Azure deployments have similar per-region minimums for dedicated capacity.
+
+The cost trade-off is clear: multi-region deployment provides better user experience for globally distributed users but increases infrastructure cost significantly. You must decide whether the latency improvement justifies the cost based on your user distribution and latency sensitivity.
+
+## When Geographic Routing Matters
+
+Geographic routing is essential when your user base is **globally distributed** and when **latency directly impacts user experience**. A consumer chat application with users in North America, Europe, and Asia cannot deliver acceptable performance from a single US-based endpoint. Users in Tokyo waiting 220 milliseconds for every round trip will perceive the application as slow compared to local competitors.
+
+A real-time collaboration tool where multiple users interact with AI-generated content simultaneously requires low latency for all participants. If half the team is in San Francisco and half is in London, you need inference endpoints in both us-west and eu-west to provide consistent experience.
+
+A voice-based AI assistant where users speak and expect immediate transcription and response cannot tolerate 300-millisecond round-trip penalties. Every millisecond of added latency makes the conversation feel less natural.
+
+Geographic routing also matters when **data residency requirements** mandate that data not leave specific jurisdictions. If you serve European customers and are subject to GDPR, you may be required to route EU users to EU-based endpoints regardless of performance considerations.
+
+## When Geographic Routing Does Not Matter
+
+If your user base is concentrated in a single geographic region, multi-region deployment adds cost and complexity without meaningful benefit. An internal tool used exclusively by employees in North America does not need inference endpoints in Asia or Europe. The added latency from routing all requests to us-east-1 is 65 to 85 milliseconds for users on the West Coast, which is imperceptible in most applications.
+
+If your application is **asynchronous** and users do not expect real-time responses, geographic latency is less critical. A document analysis tool that processes uploaded files and emails results an hour later does not benefit from 50-millisecond latency reduction. A batch summarization job running overnight is completely insensitive to whether the inference endpoint is local or halfway around the world.
+
+If your **latency budget is large**, geographic routing becomes a second-order optimization. If your inference takes 8 to 12 seconds due to model size and complexity, the difference between 20 milliseconds and 200 milliseconds of network latency is 2 to 3 percent of total response time. Optimizing model performance or switching to a faster model yields far greater latency improvement than geographic routing.
+
+The decision depends on user distribution, latency sensitivity, and whether the cost and complexity of multi-region deployment are justified by the user experience improvement.
+
+## Monitoring Geographic Routing Performance
+
+Tracking latency **by user region** is essential for understanding whether your geographic routing strategy is working. Aggregate latency metrics obscure regional differences. A global p95 latency of 1.2 seconds may look acceptable, but if users in Asia see p95 of 2.8 seconds while users in the US see p95 of 800 milliseconds, you have a geographic routing problem.
+
+Segment your latency metrics by user location. Measure p50, p95, and p99 response times for users in North America, Europe, Asia Pacific, and any other regions you serve. Compare those numbers to the expected latency based on network round-trip time plus inference time. If observed latency is significantly higher than expected, investigate whether requests are being routed to the wrong region.
+
+Monitor **routing decisions** explicitly. Log which inference endpoint each request is routed to and verify that the routing logic is making correct decisions. If you discover that 15 percent of European users are being routed to us-east-1 because your geolocation database has incomplete coverage, you have identified a fixable issue.
+
+Track **failover frequency** if you implement cross-region failover. If your primary endpoint in eu-west-1 becomes unavailable and traffic fails over to us-east-1, you should see a spike in latency for European users during the failover window. If failovers are frequent, the reliability of your primary endpoints is insufficient.
+
+Measure **cost per region** to understand whether multi-region deployment is economically sustainable. If your Asia Pacific endpoint handles 3 percent of total traffic but accounts for 18 percent of infrastructure cost because of low utilization, you can make an informed decision about whether to maintain that endpoint or consolidate traffic to fewer regions.
+
+## The Second-Order Effects of Geographic Routing
+
+Geographic routing interacts with other infrastructure decisions in non-obvious ways. If you implement **request retries** to handle transient failures, retrying a request to the same region that just failed may not be optimal. Retrying to a different region introduces higher latency but may succeed if the failure was region-specific.
+
+If you use **caching** to store frequently requested results, a multi-region deployment requires either replicated caches or acceptance that cache hit rates will be lower because each region maintains a separate cache. Replicating caches adds complexity and cost. Accepting lower hit rates means more inference requests and higher overall cost.
+
+If you implement **rate limiting** to control costs, rate limits applied per region are more complex to manage than global rate limits. A user traveling between regions may be rate-limited separately in each region, or you may need a globally consistent rate limit store accessible from all regions.
+
+These interactions do not invalidate geographic routing. They illustrate that multi-region deployment is an architectural decision with implications across your entire system, not just inference endpoints.
+
+## What Happens Next
+
+You have selected models based on capability and cost, chosen a latency target, managed cold starts through serverless or dedicated deployment, and routed requests to geographically appropriate endpoints. The next layer of optimization is **batching and request parallelization**: how to process multiple requests efficiently, when to batch them together to amortize inference overhead, and when to process them in parallel to minimize total latency. The next subchapter explores the trade-offs between throughput and latency when handling multiple concurrent requests.
