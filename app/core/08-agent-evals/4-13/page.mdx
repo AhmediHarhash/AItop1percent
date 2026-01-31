@@ -1,0 +1,153 @@
+# 4.13 — Tool Observability: Logging and Tracing Agent Tool Calls
+
+On November 14, 2025, a healthcare AI company called MediSync discovered that their patient intake agent had been hallucinating insurance authorization codes for three weeks. The agent was supposed to verify insurance coverage by calling a tool that queried their insurance provider database, but somewhere along the way, the tool had started timing out intermittently. The agent, instead of failing gracefully, had learned to generate plausible-looking authorization codes on its own. The company only discovered the problem when a billing specialist noticed that none of the codes from the past month were working. The financial impact was catastrophic: over two thousand patient visits had invalid authorizations, requiring manual review and reprocessing. The technical postmortem revealed that the tool had been logging errors to a file that no one was monitoring, the tracing system did not connect tool failures to agent decisions, and there were no alerts configured for tool error rates or latency anomalies. The team had observability in theory—logs existed, traces were captured—but in practice, they were flying blind.
+
+You are building agent systems in 2026, and observability is not optional. When your agent calls a tool, you need to know what happened, how long it took, whether it succeeded, and what impact it had on the agent's behavior. This is not just for debugging. It is for understanding your system in production, identifying performance bottlenecks, catching subtle failures before they cascade, and continuously improving your agent's effectiveness. Tool observability is the difference between discovering problems when users complain and catching them in real time before anyone notices.
+
+## What to Log for Each Tool Call
+
+The foundation of tool observability is comprehensive logging. Every tool invocation should generate a log entry with enough information to reconstruct exactly what happened. This sounds obvious, but most teams underlog at first, capturing only the bare minimum, and then spend months incrementally adding fields as they encounter failures they cannot diagnose.
+
+Start with the basics: tool name, timestamp, and invocation ID. The tool name tells you which capability the agent is using. The timestamp lets you correlate with other events and calculate latency. The invocation ID is a unique identifier for this specific call, critical for distributed tracing. These three fields are non-negotiable.
+
+Next, log the inputs. Capture the exact parameters that were passed to the tool. If the tool is querying a database, log the SQL query or the filter criteria. If it is calling an external API, log the endpoint and request payload. If it is performing a calculation, log the numbers being processed. Be careful with sensitive data—mask or redact fields like passwords, API keys, or personally identifiable information—but log everything else. When a tool call fails or returns unexpected results, the first question you will ask is what inputs triggered it. If you did not log them, you are guessing.
+
+Log the outputs too. Capture the result the tool returned, whether it succeeded or failed. For successful calls, this means the actual data: the rows returned from the database, the response from the API, the calculated value. For failures, log the error message, the error code if available, and the stack trace. Truncate very large outputs to avoid filling up your logs with megabytes of data per call, but make sure you log enough to understand what the tool produced.
+
+Latency is critical. Log both the start time and the end time of the tool execution, and calculate the duration. Break it down if possible: time spent on network requests, time spent on computation, time spent waiting for locks or rate limits. Tools that take longer than expected are often the root cause of agent slowness, and you cannot optimize what you do not measure.
+
+Cost is increasingly important. Many tools involve paid API calls, database queries with compute costs, or LLM inference for tool selection. Log the cost of each invocation, even if it is just an estimate. Sum these costs across all tool calls to understand your total agent operating expense. In production, cost anomalies—a sudden spike in tool usage, a tool that becomes unexpectedly expensive—can blow your budget before you notice.
+
+Errors and retries deserve special attention. If a tool call fails, log why it failed: timeout, rate limit, invalid input, internal server error. If your system retries the call, log each retry attempt, how long you waited between retries, and whether the retry succeeded. Retry behavior often reveals hidden issues. A tool that fails once and succeeds on retry might have a race condition or an overloaded backend. A tool that exhausts all retries indicates a more serious problem.
+
+Finally, log the context in which the tool was called. What was the agent trying to accomplish? What step of the workflow triggered this tool call? What was the user's original request? This context is what distinguishes a raw log from an actionable diagnostic signal. Without it, you have a list of tool calls with no understanding of why they happened or what they were supposed to achieve.
+
+The format of your logs matters as much as their content. Use structured logging with consistent field names and data types. Logs should be machine-readable, not human-readable first. You can always pretty-print structured logs for humans, but you cannot easily parse free-form text for machines. JSON is the de facto standard format in 2026, but any structured format that your logging infrastructure supports works.
+
+## Distributed Tracing: Connecting Tool Calls to Agent Steps
+
+Logging individual tool calls is necessary but not sufficient. What you really need is distributed tracing: the ability to follow a single user request through the entire agent system, seeing every tool call, every LLM inference, every decision point, and how they relate to each other.
+
+In a simple agent, this is straightforward. The user asks a question, the agent decides to call a tool, the tool executes, the result is fed back to the agent, and the agent responds. The trace is linear, and you can follow it by matching timestamps. But real agents are not simple. They call multiple tools in sequence, sometimes in parallel. They loop, retrying tasks with different approaches. They spawn sub-agents to handle specialized subtasks. They cache tool results and reuse them across multiple steps. Tracing these complex flows requires instrumentation and infrastructure.
+
+The key concept is the trace ID, a unique identifier for an entire user request. When a user asks your agent a question, you generate a trace ID and attach it to every log entry, every tool call, every LLM invocation related to that request. When you query your logs for that trace ID, you get the complete story of what the agent did. You see the sequence of operations, the timing, the results, and the decisions.
+
+Within a trace, you have spans. A span represents a single operation: an LLM call, a tool invocation, a database query. Each span has a start time, an end time, and a parent span. The parent-child relationship creates a hierarchy that mirrors the execution flow. The root span is the user request. Its children are the agent's top-level steps. Those steps have their own children: the tools they called, the sub-agents they spawned. By visualizing this hierarchy, you can see at a glance what happened and where time was spent.
+
+Distributed tracing systems like OpenTelemetry, Jaeger, and Honeycomb provide the infrastructure to capture, store, and query traces. You instrument your agent code to create spans, attach metadata, and propagate trace context across process boundaries. When your agent calls a tool that runs in a separate service, you pass the trace ID in the request headers so the tool can create its own spans under the same trace. When the tool calls another service, it propagates the trace ID again. The result is a complete, end-to-end view of the request, even when it spans multiple agents, multiple tools, and multiple infrastructure components.
+
+The value of distributed tracing becomes apparent when things go wrong. A user reports that the agent took thirty seconds to respond, which is unusually slow. Without tracing, you are reduced to checking logs, guessing which component was slow, and hoping you find the bottleneck. With tracing, you pull up the trace for that request and immediately see that 27 of the 30 seconds were spent in a single tool call. You drill into that span, see what inputs were passed, and realize the tool was querying a database with an inefficient query that scanned millions of rows. You optimize the query, redeploy the tool, and the problem is solved. What could have been hours of investigation took minutes.
+
+Span metadata is where you capture the rich context that makes traces useful. Each span should include not just timing information but also the parameters passed, the results returned, the errors encountered, and any relevant state. For tool calls, this means logging the tool name, the arguments, the response, the latency breakdown, and the cost. For LLM calls, log the prompt, the completion, the token counts, and the model used. For database queries, log the SQL, the number of rows returned, and the execution plan. The more metadata you attach, the easier it is to diagnose problems and understand behavior.
+
+## Tracing Multi-Agent Systems
+
+Tracing gets significantly harder when you have multiple agents collaborating on a single task. Imagine a customer support system where a triage agent handles the initial request, decides the issue requires escalation, and hands off to a specialist agent that uses different tools and models. The user experience is a single conversation, but under the hood, two agents are involved. You need to trace the entire interaction, preserving the context that one agent handed off to the other.
+
+The solution is to propagate the trace ID across agent boundaries. When the triage agent decides to escalate, it passes the trace ID to the specialist agent as part of the handoff. The specialist agent continues the trace, creating new spans under the same root. When you query the trace, you see both agents' work, clearly delineated but connected.
+
+This requires coordination. Both agents need to use the same tracing infrastructure, generate compatible spans, and agree on how to propagate trace context. If the agents are built by different teams or use different frameworks, you need to establish conventions and ensure everyone adheres to them. In practice, this means adopting a standard like OpenTelemetry and mandating its use across all agent projects.
+
+Multi-agent traces also need to capture the relationships between agents. When one agent calls another, is it a delegation, where the first agent waits for the second to finish? Or is it a handoff, where the first agent exits and the second takes over? Or is it a collaboration, where both agents work in parallel and merge their results? These relationships matter for understanding how the system behaves. A delegation that takes ten seconds tells you the first agent was blocked waiting for the second. A handoff that takes ten seconds tells you the second agent was slow. The trace needs to make this distinction clear.
+
+Agent handoffs often involve state transfer. The triage agent has gathered information about the user's problem, and the specialist agent needs that context to continue the conversation. This state should be logged as part of the handoff span: what information was passed, how large it was, and whether it was complete or partial. If the specialist agent fails because it did not receive critical context from the triage agent, the trace should make that visible.
+
+## Tool Performance Dashboards
+
+Once you have comprehensive logging and tracing, the next step is to aggregate and visualize the data. Tool performance dashboards give you a real-time view of how your tools are behaving across all agents and all users. You should be able to answer questions like: Which tools are called most frequently? Which tools are slowest on average? Which tools have the highest error rates? Which tools are most expensive?
+
+Start with a table that lists every tool, sorted by invocation count. This immediately shows you which tools are critical to your system. If a tool is called thousands of times per hour, it is a high-leverage target for optimization. If a tool is called once a week, improving it will not move the needle.
+
+Add a column for median and p95 latency. Median tells you the typical performance. P95 tells you the worst case that users experience regularly. A tool with low median latency but high p95 latency is unreliable. It is fast most of the time but occasionally slow, which creates unpredictable user experiences. You need to investigate why and either fix the variability or set expectations with the agent that this tool can be slow.
+
+Include error rate and success rate. A tool with a 99 percent success rate sounds good until you realize it is called a million times a day, which means ten thousand failures. Are those failures retried successfully? Are they causing agents to give up and return errors to users? The dashboard should break down failures by error type: timeouts, rate limits, invalid inputs, internal errors. Each type requires a different remediation strategy.
+
+Cost per invocation and total cost are essential for managing your budget. If a tool costs one cent per call and is invoked a hundred thousand times a day, it is costing you a thousand dollars daily. Maybe that is justified because the tool is critical and irreplaceable. Or maybe there is a cheaper alternative, or maybe you can cache results and reduce the call volume by 80 percent. The dashboard should highlight the most expensive tools and track cost trends over time. If a tool's cost suddenly doubles, you need to know immediately.
+
+Dashboards should also show tool usage by agent. If you have multiple agents, you want to see which agents are using which tools and how their usage patterns differ. Maybe one agent is calling a database tool a hundred times per request, which suggests it is doing something inefficient. Maybe another agent never calls a tool you expected it to use, which suggests a prompt issue or a missing capability.
+
+Temporal trends are critical for spotting regressions. Chart tool latency, error rates, and costs over time. A sudden spike in latency might correlate with a code deploy, a traffic surge, or a backend outage. A gradual increase in costs might indicate that usage is growing faster than expected or that a tool's pricing changed. These trends are only visible when you look at data over hours, days, or weeks, not individual invocations.
+
+## Alerting on Tool Anomalies
+
+Dashboards are great for exploring data and identifying trends, but they require someone to look at them. Alerts are what wake you up when something goes wrong at three in the morning. Good tool observability includes proactive alerting on anomalies that indicate problems.
+
+Latency spikes are the most common alert trigger. Define a threshold for each tool—say, p95 latency should be under 500 milliseconds—and alert when it is exceeded for more than a few minutes. Occasional spikes are normal, caused by network hiccups or backend load. Sustained spikes indicate a real problem: a code change that made the tool slower, a database index that was dropped, a rate limit that was lowered.
+
+Error rate increases are equally critical. If a tool has a baseline error rate of 0.5 percent and suddenly jumps to 5 percent, something changed. Maybe the external API the tool calls had a deploy that broke compatibility. Maybe the database the tool queries is under heavy load. Maybe the input validation logic has a bug that rejects valid inputs. The alert should trigger an investigation before the error rate climbs higher and impacts users at scale.
+
+Cost increases can be subtle but dangerous. If your tool costs have been steady at a thousand dollars a day and suddenly jump to two thousand, you might not notice for weeks unless you have an alert. The alert should compare current costs to a baseline—rolling average over the past week, for example—and trigger when the delta exceeds a threshold.
+
+Retry exhaustion is a strong signal of a systemic issue. If a tool is configured to retry failed calls up to three times, and you start seeing a spike in cases where all three retries fail, the underlying problem is not transient. Maybe a dependency is down, or a configuration change broke the tool. This alert should page someone immediately, because it often means user-facing functionality is degraded.
+
+Missing tool calls can also be anomalous. If an agent is supposed to call a specific tool as part of its workflow, and you notice it has stopped calling that tool, it might indicate a prompt regression or a logic bug. This is harder to detect because it requires understanding the expected behavior, but for critical tools, it is worth setting up heuristics. For example, if your fraud detection agent has not called the fraud scoring tool in the past hour, something is wrong.
+
+Alert fatigue is a real risk. If you configure too many alerts with thresholds that are too sensitive, your team will be paged constantly for non-issues and start ignoring alerts. The solution is to tune thresholds carefully, require sustained anomalies before alerting, and regularly review alert effectiveness. An alert that fires frequently but never corresponds to a real problem should be removed or adjusted.
+
+## Using Tool Observability Data to Improve Agent Design
+
+Observability is not just for operations. It is also a product development tool. The data you collect about tool usage reveals how your agent actually behaves in the wild, as opposed to how you think it behaves or how it behaves in controlled tests.
+
+One common pattern is discovering that the agent overuses a tool. You designed the agent to call a tool when it needs specific information, but in production, you see it calling the tool repeatedly with the same inputs. This suggests the agent is not caching results or is not maintaining context properly across turns. The fix might be to add caching logic, or to improve the prompt so the agent remembers previous tool outputs.
+
+Another pattern is discovering that the agent underuses a tool. You added a tool expecting it to be critical, but the agent rarely calls it. Maybe the tool is redundant because another tool already provides the same information. Maybe the agent does not understand when to use the tool because the description is unclear. Maybe the tool is too slow or too expensive, and the agent has learned to work around it. Observability data helps you decide whether to fix the tool, improve the prompt, or remove the tool entirely.
+
+You can also identify opportunities for new tools. If you see the agent struggling with a task, calling multiple tools in sequence to cobble together information that could be provided by a single, purpose-built tool, that is a signal. The observability data shows you the usage pattern, and you can design a tool that fits that pattern exactly. This is much better than guessing what tools might be useful based on intuition.
+
+Tool observability also feeds into A/B testing. If you are experimenting with a new version of an agent, you can compare tool usage patterns between the control and the treatment. Does the new version call tools more efficiently? Does it have a higher success rate? Does it complete tasks faster or at lower cost? These questions are answerable with observability data, and the answers guide your decision about whether to ship the new version.
+
+Error patterns in tool calls often reveal prompt engineering issues. If a tool is rejecting inputs because the agent is passing malformed parameters, the root cause is usually that the agent does not understand the tool's schema. You might need to improve the tool description, add examples to the prompt, or even fine-tune the model on examples of correct tool usage.
+
+## The Balance Between Comprehensive Logging and Performance Overhead
+
+Logging everything comes with costs. Storing logs requires disk space or cloud storage, which costs money. Writing logs takes CPU time, which can slow down your tools. Transmitting logs over the network consumes bandwidth and adds latency. In high-throughput systems, logging overhead can become significant enough to impact performance.
+
+The key is to log at the right granularity. For production systems, you want to log every tool invocation with full details. For extremely high-frequency tools—tools called hundreds of times per second—you might sample instead, logging only a fraction of calls but ensuring you still capture enough data to detect anomalies. A sampling rate of 10 percent means you log one out of every ten calls, which reduces overhead by 90 percent while still giving you visibility into trends.
+
+Another strategy is to use different logging levels for different environments. In development and staging, log everything at maximum verbosity. In production, log at a level that balances observability and performance. Use dynamic logging, where you can increase the verbosity of a specific tool temporarily when you are debugging an issue, without needing to redeploy.
+
+Asynchronous logging is essential for minimizing performance impact. Do not block tool execution while writing logs. Instead, buffer log entries in memory and flush them to disk or a remote logging service in the background. This ensures that logging overhead does not add latency to the critical path. The tradeoff is that if your process crashes, you might lose buffered logs, so make sure to flush frequently enough that the window of potential data loss is acceptable.
+
+Structured logging is a best practice that pays dividends. Instead of writing log messages as free-form strings, use JSON or another structured format with well-defined fields. This makes logs machine-readable and queryable. You can easily filter for all tool calls with a specific error code, or all calls that exceeded a latency threshold, or all calls from a specific user. Structured logs integrate seamlessly with modern observability platforms that index and search log data at scale.
+
+Log retention policies matter. You do not need to keep detailed tool invocation logs forever. Define retention periods based on use case: maybe you keep high-resolution logs for seven days, aggregate them into summaries for ninety days, and then delete them. This balances the need for recent detailed data with the cost of long-term storage.
+
+## Integrating Tool Observability with Broader System Observability
+
+Tool observability does not exist in isolation. Your tools are part of a larger system that includes agents, LLM providers, databases, external APIs, and infrastructure. To get a complete picture, you need to integrate tool observability with the observability of all these other components.
+
+This means using a common tracing framework across the entire stack. If your agent uses OpenTelemetry for tracing, your tools should too. When the agent calls a tool, the tool creates a span under the agent's trace. When the tool queries a database, the database client creates a span under the tool's trace. The result is a single, unified trace that shows the entire request flow, from user input to final response.
+
+It also means correlating logs across components. When a tool fails, you want to see not just the tool's error log, but also the agent's log showing why it called the tool, and the database's log showing what query was executed. This requires ensuring that all components log the same trace ID and span ID, and that your logging infrastructure can join logs from multiple sources.
+
+Metrics are another dimension. While logs and traces give you detailed, event-level data, metrics give you aggregated statistics: requests per second, average latency, error rate, resource utilization. Tool observability should include metrics that roll up to the agent level and the system level. You should be able to see not just that a specific tool is slow, but that overall agent latency has increased and tools are the bottleneck.
+
+Infrastructure metrics are critical for diagnosing tool performance issues. If a tool is slow, is it because the code is inefficient, or because the server it runs on is overloaded? You need to correlate tool latency with CPU utilization, memory usage, disk I/O, and network throughput. This often reveals that the problem is not the tool itself but the environment it runs in.
+
+## Real-World Observability Wins
+
+Teams that invest in tool observability see concrete benefits. One e-commerce company discovered through tool latency dashboards that their product recommendation tool was slower during peak shopping hours because the underlying database was not scaled to handle the load. They added read replicas and cut tool latency by 70 percent, which improved agent response time and increased user satisfaction scores.
+
+A legal tech company used tool error rate alerts to catch a breaking change in an external court records API. The API provider had changed the authentication scheme without notice, and the tool started failing. The alert fired within minutes, the team rolled out a fix in under an hour, and most users never noticed the disruption. Without the alert, the failures would have accumulated for hours or days before someone reported them.
+
+A financial services firm analyzed tool usage patterns and found that their fraud detection agent was calling a third-party identity verification service even when the transaction was clearly legitimate, wasting money on unnecessary API calls. They refined the agent's decision logic to only call the service when the fraud score was ambiguous, cutting costs by 60 percent without impacting detection accuracy.
+
+These are not edge cases. They are the norm. Tool observability turns your agent from a black box into a system you understand, control, and continuously improve. You see what is working, what is not, and where to invest effort for maximum impact.
+
+A SaaS company building a coding assistant agent noticed through distributed tracing that tool calls were often nested three or four levels deep, with the agent calling a planning tool, which called a code generation tool, which called a syntax validation tool. Each layer added latency, and the total response time was unacceptable. They refactored the architecture to flatten the tool hierarchy, combining related capabilities into single tools, and cut end-to-end latency by 40 percent.
+
+## Building an Observability Culture
+
+Tool observability is as much about culture as it is about technology. The best logging and tracing infrastructure in the world does not help if no one looks at the data or acts on the insights. You need to build a culture where observability is a first-class concern, not an afterthought.
+
+Start by making observability part of the definition of done. A tool is not finished until it logs comprehensively, emits traces, and has alerts configured. Code reviews should check for observability. If a pull request adds a new tool without instrumentation, it should be rejected.
+
+Make observability data accessible. Dashboards should not require specialized knowledge to use. Logs should be searchable without needing to write complex queries. Traces should be visualizable with clear, intuitive interfaces. The easier it is to explore observability data, the more people will use it.
+
+Celebrate observability wins. When someone uses tool logs to debug a tricky issue, share the story with the team. When an alert catches a problem before it impacts users, highlight it in standups or retrospectives. Reinforce the message that observability is valuable and worth the investment.
+
+Train your team on how to use observability tools. Not everyone knows how to read a distributed trace or write a log query. Run workshops, create documentation, and provide examples. The goal is to make observability a skill that everyone on the team has, not just the senior engineers or the SRE team.
+
+Finally, iterate. Observability is not something you set up once and forget. As your system evolves, your observability needs will change. New tools will be added, old tools will be deprecated, usage patterns will shift. Regularly review your logging, tracing, and alerting strategies to ensure they still serve your needs. Ask your team what observability gaps they are experiencing and prioritize filling them.
+
+Tool observability in 2026 is a solved problem technically. The infrastructure exists, the best practices are well-known, and the tooling is mature. What separates successful teams from struggling ones is not access to technology—it is the discipline to implement observability rigorously, the culture to value it, and the commitment to act on the insights it provides. Your tools are doing work on behalf of your agent, and you owe it to yourself, your users, and your business to know exactly what that work is and how well it is going. When a tool fails silently, when latency creeps up unnoticed, when costs spiral out of control, the root cause is not the tool—it is the lack of observability that would have caught the problem early.
