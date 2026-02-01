@@ -1,0 +1,163 @@
+# 2.3 — Building Intake Pipelines: Schema, Validation, and Routing
+
+In mid-2024, a customer support technology company launched an AI-powered ticket categorization system trained on historical support conversations. The team collected nine months of data from their ticketing platform, labeling 14,000 examples across twelve categories. After three weeks of model development, they achieved 91% accuracy on their test set and deployed to production. Within seventy-two hours, the system began routing high-priority enterprise tickets to the wrong queues. Investigation revealed that 18% of the training data contained malformed timestamps, missing customer tier labels, and inconsistent category tags that had been entered freeform by different support managers. The data had been exported directly from the database and fed into the training pipeline without any validation layer. The company spent six weeks cleaning the dataset, rebuilding the model, and implementing a proper intake pipeline with schema enforcement. The delay cost them a major enterprise renewal worth $840,000.
+
+The failure was not a labeling error or a model architecture mistake. It was a data engineering failure. The team treated dataset collection as a one-time export operation rather than a structured pipeline with validation, rejection, and routing logic. Every AI dataset needs an intake pipeline that enforces structure, catches errors before they contaminate training data, and routes valid records to the right destination. Without this layer, your dataset accumulates silent corruption that surfaces only after you have already invested weeks in model development.
+
+## The Intake Pipeline as Data Contract Enforcement
+
+An intake pipeline is the first layer of defense between raw data sources and your training dataset. It receives data from upstream systems, validates every record against a defined schema, rejects anything malformed, and routes clean records to storage or downstream processing. The pipeline is where your data contract gets enforced in code. If your schema says every record must have a timestamp, a user identifier, and a label, the intake pipeline rejects any record missing those fields. If your schema defines label values as a closed set of twelve categories, the pipeline rejects records with freeform category strings.
+
+You define the schema first, then build the pipeline to enforce it. The schema is not documentation. It is executable specification. Every field has a name, a type, nullability rules, and validation constraints. Timestamp fields must be ISO 8601 formatted or Unix epoch integers. User identifiers must match a regex pattern or reference a valid user table. Labels must be members of an enumerated set. Text fields have maximum length constraints. Numeric fields have range constraints. The schema captures every structural requirement your downstream training and evaluation systems depend on.
+
+The intake pipeline validates every record against this schema before accepting it. Validation happens synchronously at ingestion time, not asynchronously during training. If a record fails validation, it gets rejected immediately with a structured error message that identifies the field, the constraint violation, and the rejected value. Rejected records go to a dead letter queue or error log where your data operations team can investigate, fix upstream issues, or manually correct and resubmit. The training dataset never sees malformed data.
+
+## Why Synchronous Validation Prevents Silent Corruption
+
+This discipline prevents the silent corruption pattern where bad data gets ingested, sits unnoticed in your dataset for months, and eventually degrades model performance in ways you cannot trace back to the source. A recommendation system ingested user interaction logs with missing item identifiers for three months before anyone noticed. By the time the corruption was discovered, 120,000 training examples were unusable, the model had been retrained twice on corrupted data, and production recommendation quality had degraded by 15%. If the intake pipeline had rejected records with missing item identifiers at ingestion time, the problem would have been caught immediately.
+
+Synchronous validation also provides immediate feedback to upstream systems. If a data source starts producing malformed records, the intake pipeline rejects them and alerts the upstream team. The upstream team fixes the issue before millions of bad records accumulate. Asynchronous validation, where records are accepted first and validated later, means bad data is already in your dataset by the time you detect the problem. You then face the expensive task of identifying and removing corrupted records.
+
+## Schema Design for AI Datasets
+
+AI dataset schemas differ from application database schemas in three ways. First, they are append-only. You never update or delete records in a training dataset. Every record represents a snapshot of reality at a point in time. If you need to correct a label, you append a new version of the record with a version number or timestamp, you do not overwrite the original. This immutability requirement shapes schema design. Every record needs a created timestamp and a record identifier that remains stable across versions.
+
+Second, AI schemas include metadata fields that application schemas rarely need. You track who labeled the data, when it was labeled, what labeling interface or tool was used, and what instructions the labeler followed. You track data provenance: which upstream system the record came from, what version of the extraction query was used, what sampling logic selected this record. You track splits: whether this record is assigned to train, validation, or test sets. All of this metadata is first-class schema fields, not afterthought annotations.
+
+A sentiment analysis dataset schema includes not just the text and label, but also annotator ID, annotation timestamp, annotation interface version, data source identifier, sampling stratum, schema version, and split assignment. When a label quality issue arises, you can trace it back to a specific annotator, time period, or data source. When distribution shift occurs, you can identify which upstream source changed. Without this metadata, debugging is guesswork.
+
+## Handling Nested and Semi-Structured Data
+
+Third, AI schemas often include nested or semi-structured fields that application schemas avoid. A conversational AI dataset might have a messages array where each message has a role, content, timestamp, and metadata object. A document classification dataset might have a document object with text, title, author, and tags. Your intake pipeline needs to validate these nested structures recursively. Every message in the messages array must have a role field that is one of system, user, or assistant. Every tag in the tags array must match a controlled vocabulary. The validation logic descends into nested structures and enforces constraints at every level.
+
+You version your schema explicitly. The schema version is a field in every record. When you evolve the schema to add new fields, change validation rules, or expand label sets, you increment the version number. The intake pipeline can then handle multiple schema versions simultaneously, applying the correct validation rules based on the version field in each incoming record. This versioning discipline is critical when you have long-running data collection pipelines that span schema changes.
+
+Old data remains valid under the old schema. New data conforms to the new schema. Your training code can filter by schema version if needed. A named entity recognition dataset evolved from schema version 1 with four entity types to version 2 with twelve entity types. Records from version 1 are still valid and useful for training on the original four types. Records from version 2 enable training on the expanded type set. Without explicit versioning, the team could not distinguish old and new records.
+
+## Validation Rules Beyond Type Checking
+
+Type checking is the minimum bar. Your schema says this field is a string and that field is an integer. The intake pipeline rejects records where the types are wrong. But type checking alone is not sufficient. You need semantic validation rules that enforce domain constraints. A timestamp field might be a valid ISO 8601 string but represent a date in the year 2037. A user identifier might be a valid UUID but reference a test account that should never appear in production training data. A label might be a valid string but use inconsistent casing or spacing compared to your canonical label set.
+
+Semantic validation rules catch these issues. You define range constraints on timestamps: records must have created dates between January 2023 and the current date. You define reference constraints on identifiers: user IDs must exist in a known user table or match a pattern that excludes test accounts. You define normalization rules on labels: convert all label strings to lowercase, strip whitespace, and map common misspellings to canonical forms before checking against the allowed set. These rules go in the schema definition and get enforced at intake time.
+
+A customer service dataset rejected timestamps in the future, user IDs starting with test underscore, and labels that did not exactly match one of twelve canonical values after normalization. This caught 4% of incoming records that had valid types but invalid semantics. Without semantic validation, these records would have corrupted the training data.
+
+## Cross-Field Validation Rules
+
+Cross-field validation rules enforce relationships between fields. If the priority field is set to enterprise, the customer tier field must be enterprise or strategic. If the language field is set to French, the locale field must be a French-speaking locale. If the conversation contains more than five turns, the conversation type field cannot be single-turn. These rules prevent logically inconsistent records that would pass individual field validation but represent impossible states. You encode them as validation predicates in your intake pipeline.
+
+A medical records dataset enforced cross-field rules like: if diagnosis severity is critical, the record must have a specialist review flag set to true. If patient age is less than 18, the consent type must be parental. If procedure code indicates surgery, the record must have an operating room identifier. These rules caught 2% of records that were individually valid but logically inconsistent. The inconsistencies indicated data entry errors or upstream processing bugs that needed to be fixed.
+
+You also validate statistical properties when appropriate. If your dataset is supposed to be balanced across twelve categories, you can configure the intake pipeline to emit warnings when the rolling proportion of any category exceeds 15% or falls below 5%. If your dataset is supposed to include records from at least twenty distinct data sources, you can track the distinct source count and alert when it drops below threshold. These statistical checks do not reject individual records, but they give you early warning when your data collection process is drifting away from design intent.
+
+## Designing Validation Rules Based on Downstream Requirements
+
+Validation rules should be derived from downstream training and evaluation requirements. If your training pipeline expects every record to have a confidence score, the schema must require that field and the intake pipeline must reject records without it. If your evaluation pipeline stratifies metrics by user tier, the schema must require user tier and the intake pipeline must reject records with invalid tier values. The intake pipeline enforces the data contract that the rest of your system depends on.
+
+A document classification system required every document to have a language code because evaluation metrics were computed separately per language. The intake pipeline rejected any document without a valid ISO 639-1 language code. This ensured that every record could be assigned to a language-specific evaluation bucket. Without this validation, some records would have been excluded from evaluation or assigned to an undefined bucket, corrupting the metrics.
+
+## Rejection Handling and Dead Letter Queues
+
+When a record fails validation, the intake pipeline rejects it. Rejection means the record does not enter the training dataset. It gets written to a separate dead letter queue or error log with metadata explaining why it was rejected. The metadata includes the schema version, the validation rule that failed, the field name, the rejected value, and the full original record. This structured error output lets your data operations team diagnose and fix upstream issues without guessing what went wrong.
+
+Dead letter queues need retention policies. You cannot keep rejected records forever. Set a retention window based on your data operations cadence. If your team reviews rejected records daily, a seven-day retention window is sufficient. If you review weekly, use thirty days. After the retention window expires, purge old rejected records. The dead letter queue is a diagnostic tool, not a permanent archive.
+
+A content moderation dataset had a 14-day retention policy for rejected records. The data operations team reviewed the dead letter queue every Monday morning, identified patterns in rejections, and worked with upstream teams to fix data quality issues. After 14 days, rejected records were deleted. This policy kept the dead letter queue manageable while providing enough time for investigation and remediation.
+
+## Monitoring Rejection Rates and Circuit Breakers
+
+You monitor the rejection rate continuously. A low baseline rejection rate is normal. Maybe 0.5% of incoming records fail validation due to transient upstream issues or edge cases in your data sources. But if the rejection rate suddenly spikes to 8%, something broke upstream. Your intake pipeline should emit metrics on rejection rate overall and per validation rule. If timestamp validation failures jump from 0.1% to 6%, you know the upstream system changed its timestamp format. If label validation failures spike, you know someone introduced a new freeform label value.
+
+Some teams implement a circuit breaker pattern in their intake pipeline. If the rejection rate exceeds a threshold over a rolling window, the pipeline stops accepting new data and pages the on-call engineer. This prevents a broken upstream system from flooding your dead letter queue with millions of invalid records. The threshold depends on your baseline rejection rate and tolerance for data loss. A reasonable starting point is to trip the circuit breaker if the rejection rate exceeds five times the baseline rate over a fifteen-minute window.
+
+A financial transaction labeling pipeline had a baseline rejection rate of 0.3%. They configured a circuit breaker to trip if the rejection rate exceeded 1.5% over a 15-minute window. When an upstream schema change caused 40% of records to be rejected, the circuit breaker tripped within minutes, stopping the flood of invalid data and alerting the team. Without the circuit breaker, 12 million invalid records would have been rejected before anyone noticed.
+
+## Routing Logic for Multi-Destination Pipelines
+
+Simple intake pipelines have one destination: a training dataset storage bucket. More complex pipelines route records to different destinations based on metadata. Records labeled by expert annotators go to a high-quality gold set. Records labeled by crowd workers go to a silver set that gets validated before merging into gold. Records from production traffic go to a monitoring dataset separate from training. Records flagged as sensitive go to a restricted-access storage tier with encryption and audit logging.
+
+Routing logic is deterministic and based on metadata fields. You do not route based on content analysis or heuristics. You route based on explicit fields in the record: the source system, the labeling method, the data sensitivity tier, the intended use case. The routing rules are part of your schema definition and pipeline configuration. A record with source field set to expert-annotation and sensitivity tier set to public routes to the public gold dataset. A record with source set to production-traffic and sensitivity tier set to pii routes to the restricted monitoring dataset.
+
+## Multi-Destination Routing and Audit Trails
+
+You can route a single record to multiple destinations. A high-quality expert-labeled record might go to both the gold training set and the evaluation benchmark set. A production traffic record might go to both the monitoring dataset and a sampling pool for future labeling. The intake pipeline duplicates the record and writes it to each destination with appropriate metadata tags. Each copy is independent. If you later remove a record from one destination, it remains in the other.
+
+Routing decisions get logged. Every record that enters the intake pipeline generates a routing log entry that records the record identifier, the timestamp, the routing decision, and the destination. This log is your audit trail. If you later need to trace where a specific record ended up, you query the routing log. If you need to verify that all records from a specific source went to the correct destination, you aggregate the routing log by source and destination. The routing log is append-only and retained for the same duration as your training dataset.
+
+A medical imaging dataset routed records to three destinations: a training set, an evaluation set, and a compliance archive. The routing log tracked every routing decision. When a regulatory audit required proof that all patient data was stored in the compliance archive, the team queried the routing log and demonstrated 100% coverage. Without the routing log, they would have had to manually verify millions of records.
+
+## Pipeline Monitoring and Alerting
+
+You monitor your intake pipeline the same way you monitor any production service. You track throughput, latency, error rate, and data quality metrics. Throughput is records per second ingested successfully. Latency is the time from when a record arrives at the pipeline to when it is written to the destination. Error rate is the percentage of records rejected due to validation failures. Data quality metrics include schema version distribution, source system distribution, and label distribution.
+
+You set alerts on deviations from baseline. If throughput drops by 40%, something upstream stopped sending data. If latency spikes, your storage system is overloaded or your validation logic is running slowly. If error rate jumps, upstream data format changed. If the distribution of labels shifts suddenly, your data collection process changed without coordination. All of these conditions deserve immediate investigation.
+
+## Staleness and Backpressure Metrics
+
+You also monitor the age of the most recent record in each destination. If your intake pipeline is supposed to receive data continuously, the most recent record should never be more than a few minutes old. If the most recent record is three hours old, your pipeline is stalled or upstream data flow stopped. This staleness metric catches silent failures where the pipeline is running but not receiving data.
+
+Backpressure and queue depth are critical metrics for high-throughput pipelines. If your intake pipeline uses a queue to buffer incoming records before validation, you monitor the queue depth. A growing queue depth means validation is slower than ingestion. If the queue grows without bound, you will eventually run out of memory or disk space. When queue depth exceeds a threshold, you either scale up validation workers or apply backpressure to slow down the ingestion rate.
+
+A real-time recommendation system processed 50,000 user interactions per second. The intake pipeline used a Kafka queue with a target depth of 10,000 messages. When queue depth exceeded 50,000, the pipeline scaled up validation workers automatically. When queue depth exceeded 100,000, the pipeline applied backpressure to upstream systems. This prevented the queue from growing unbounded during traffic spikes.
+
+## Common Failures When Intake Is Ad Hoc
+
+The most common failure mode is no intake pipeline at all. Teams export data directly from production databases, ticketing systems, or logs, save it to CSV or JSON files, and hand those files to the training pipeline. There is no schema validation, no rejection handling, no routing logic. The training pipeline assumes the data is clean and well-formed. This assumption breaks silently. Malformed records cause training crashes, but only after hours of preprocessing. Invalid labels corrupt the dataset, but you do not discover this until evaluation shows unexpectedly low performance.
+
+Another common failure is validation that happens too late. The intake pipeline accepts all records and writes them to storage. A separate batch validation job runs daily or weekly to check data quality. This delayed validation means bad data already contaminated your dataset by the time you detect it. If you ingested 50,000 records since the last validation run and the validation job finds 4,000 invalid records, you now have to identify and remove those records from storage, rebuild any indexes or aggregates, and possibly retrain models that used the corrupted data. Validation must happen synchronously at ingestion time.
+
+## The Illusion of Safety from Non-Rejecting Validation
+
+Some teams implement validation but do not reject invalid records. Instead, they log warnings and accept the data anyway. This pattern is worse than no validation because it creates the illusion of safety without actually preventing corruption. Your logs fill up with validation warnings that nobody reads. The training dataset accumulates invalid records. When the model performs poorly, you have no easy way to identify which records were invalid because they are mixed in with valid data.
+
+Another failure is missing versioning. The schema evolves over time, but old records do not include a schema version field. When you change the schema, you have no way to distinguish records that conformed to the old schema from records that conform to the new schema. Your intake pipeline either rejects all old records as invalid under the new schema, or it accepts all records without proper validation. The correct design is to version the schema explicitly and store the version in every record so that the intake pipeline can apply the correct validation rules.
+
+A sentiment analysis dataset evolved its schema three times over two years, adding new fields and changing label definitions. Because the team did not version the schema, they could not determine which records were labeled under which definition. When they discovered label inconsistencies, they had to manually review thousands of examples to identify which schema version each record followed. If they had versioned the schema from the start, this manual review would have been unnecessary.
+
+## When to Build vs Buy Intake Infrastructure
+
+You can build your own intake pipeline using standard data engineering tools: message queues, stream processors, schema validation libraries, and storage connectors. You can also use managed services like AWS Glue, Google Dataflow, or Azure Data Factory that provide schema validation and routing as built-in features. The build versus buy decision depends on your team's data engineering maturity and the complexity of your validation logic.
+
+If your schema is simple, your validation rules are straightforward type checks and range constraints, and you need only basic routing, a managed service is the right choice. You define your schema in the service's configuration format, configure validation rules, set up routing logic, and point the service at your data sources and destinations. The service handles scaling, monitoring, and retries. You focus on schema design and data quality rather than infrastructure operations.
+
+## When Custom Validation Logic Requires Building
+
+If your validation logic includes complex cross-field constraints, custom normalization rules, or integration with external reference data, you likely need to build a custom intake pipeline. Managed services support only a limited set of validation predicates. Custom logic requires writing code. In this case, you use a stream processing framework like Apache Kafka with a validation service written in your team's primary language. You still use managed infrastructure for queues and storage, but you own the validation logic.
+
+A legal document processing company needed to validate contract records against a reference database of valid jurisdiction codes, contract types, and party identifier formats. The validation logic included 40 custom rules that queried external systems. No managed service supported this complexity. They built a custom intake pipeline using Kafka and a Python validation service that enforced all 40 rules synchronously at ingestion time.
+
+Regardless of whether you build or buy, you invest in schema design upfront. The schema is the foundation. A well-designed schema with clear validation rules prevents most data quality issues. A poorly designed schema with vague constraints lets corruption through no matter how sophisticated your pipeline infrastructure is. Spend time defining your schema, reviewing it with domain experts and data annotators, and encoding all implicit assumptions as explicit validation rules. The intake pipeline enforces the schema, but the schema itself is where you encode your understanding of what constitutes valid training data.
+
+## Schema Design as Cross-Functional Collaboration
+
+Schema design should involve domain experts, annotators, ML engineers, and data engineers. Domain experts define what fields are required and what values are valid. Annotators explain what information they need to do their job. ML engineers specify what features the model requires. Data engineers design the technical structure and validation rules. A schema designed in isolation by one group will miss critical requirements from the others.
+
+A medical diagnosis dataset schema was designed by ML engineers alone. They included fields for symptoms and diagnoses but forgot to include patient demographics, which the clinical domain experts considered essential for interpreting the diagnoses. When the model was trained, it performed poorly because it lacked demographic context. The schema had to be revised and six months of data re-collected with demographic fields. If domain experts had been involved in schema design from the start, this costly mistake would have been avoided.
+
+The collaboration should happen early, during initial schema design, and continue throughout schema evolution. Domain experts identify which fields capture essential domain knowledge. Annotators identify which fields help them make labeling decisions. ML engineers identify which fields the model needs as features or context. Data engineers identify which fields enable efficient storage, querying, and compliance.
+
+## Testing Your Intake Pipeline Before Production
+
+Before deploying an intake pipeline to production, you test it with synthetic and historical data. Generate test records that violate every validation rule and verify that the pipeline rejects them with correct error messages. Generate test records that satisfy validation but represent edge cases and verify that the pipeline accepts them and routes them correctly. Replay historical data through the pipeline and verify that it produces the same results as your manual validation process.
+
+A fraud detection intake pipeline was tested with 500 synthetic records representing every combination of valid and invalid field values, every edge case, and every routing scenario. The test suite verified that validation rules caught all invalid records, that routing logic sent records to correct destinations, and that monitoring metrics were emitted correctly. When the pipeline went live, it operated flawlessly because all failure modes had been tested upfront.
+
+You also test failure scenarios. What happens if the storage system is unavailable? What happens if validation is slow? What happens if the rejection rate spikes? Your intake pipeline should handle these failures gracefully: dropping logs rather than crashing, applying backpressure rather than overwhelming downstream systems, and alerting operators rather than failing silently. Failure testing reveals whether your error handling works.
+
+## Evolving Your Intake Pipeline Over Time
+
+Your intake pipeline is not a one-time setup. You evolve it as your data sources change, your schema evolves, and your data quality requirements tighten. You add new validation rules when you discover new failure modes. You adjust routing logic when you introduce new dataset tiers. You tune performance when your ingestion volume grows. Treat the intake pipeline as production infrastructure with the same operational rigor you apply to your model serving systems. It is the foundation of your dataset quality, and dataset quality is the foundation of your model performance.
+
+A customer service ticketing system started with a simple intake pipeline that validated basic field types. Over two years, they added 30 additional validation rules as they discovered edge cases and data quality issues. They added routing to separate high-priority tickets from routine tickets. They added schema versioning when they expanded the label set. They added backpressure handling when traffic grew 10x. The intake pipeline evolved from 200 lines of code to a 2,000-line production system with comprehensive validation, routing, monitoring, and alerting.
+
+When you evolve the pipeline, you maintain backward compatibility where possible. New validation rules should apply only to new schema versions unless you explicitly decide to reject old data. New routing logic should handle old records that lack new metadata fields. New monitoring metrics should not break existing dashboards. Evolution should be additive, not disruptive. You version the pipeline code the same way you version the schema, and you deploy changes incrementally with rollback plans.
+
+## Documentation and Knowledge Transfer
+
+Your intake pipeline is not self-explanatory. You document the schema, the validation rules, the routing logic, the monitoring metrics, and the operational procedures. Documentation explains why each validation rule exists, what failure mode it prevents, and what to do when it triggers. Documentation explains the routing logic and where each type of record ends up. Documentation explains the monitoring dashboards and what alerts mean.
+
+A document classification intake pipeline had 60 validation rules. The documentation explained each rule: what field it applied to, what values were allowed, what edge cases it handled, and which production incident motivated its addition. When a new data engineer joined the team, they read the documentation and understood the entire validation logic in two hours instead of spending weeks reverse-engineering the code.
+
+Documentation also covers operational procedures. How do you review the dead letter queue? How do you manually resubmit corrected records? How do you add a new validation rule? How do you route records to a new destination? How do you investigate a spike in rejection rate? Operational documentation ensures that the team can maintain the pipeline even when the original authors are unavailable.
+
+The next step after building a robust intake pipeline is deciding how often that pipeline runs. Some systems need continuous real-time ingestion. Others work perfectly well with daily or weekly batch loads. The choice between streaming and batch ingestion has major implications for architecture, cost, and data freshness, and that is the topic of the next subchapter.

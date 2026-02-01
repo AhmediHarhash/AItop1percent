@@ -1,0 +1,115 @@
+# 5.10 — Data Contracts: Fields, Allowed Values, Null Rules, and Latency SLAs
+
+In mid-2024, a fraud detection model at a payments company experienced a sudden 19 percentage point drop in precision over a three-day period, flagging thousands of legitimate transactions as suspicious and triggering manual review queues that overwhelmed the operations team. The model had not changed. The code had not changed. What changed was the upstream transaction dataset, which silently began including test transactions from the staging environment in the production feed. The test transactions had realistic schemas but artificial patterns: sequential user IDs, round-number amounts, and timestamps clustered in five-minute bursts. The model, trained only on production traffic, interpreted these patterns as fraud signals. No one detected the issue for three days because no schema validation existed, no value range checks existed, and no contract defined what the upstream producer was required to deliver. The fix was a one-line filter to exclude test transactions. The recovery required retraining the model, backfilling corrected data, and auditing 11,000 flagged transactions. The cost exceeded 280 hours of engineering and operations time. The root cause was not a bug. It was the absence of a contract.
+
+The diagnosis revealed a cultural failure disguised as a technical one. The team assumed that upstream data producers understood the requirements of downstream consumers and would maintain compatibility. They did not. The producer team added test data to simplify their own debugging workflow, unaware that downstream systems consumed the same dataset. No contract existed to specify what data was valid, what data was prohibited, or what guarantees the producer must uphold. Without contracts, every integration is implicit, every assumption is unvalidated, and every upstream change is a potential production incident. Data contracts formalize the expectations between producers and consumers. They define schema, allowed values, null handling, freshness, and quality guarantees. They enable automated validation, breaking change detection, and explicit contract evolution. Organizations that operate without contracts experience silent data quality degradation. Organizations that enforce contracts catch violations before they propagate.
+
+## What a Data Contract Is and Why It Exists
+
+A data contract is a formal specification of what a data producer promises to deliver and what a data consumer is entitled to expect. It defines the schema, including column names, types, and descriptions. It defines semantic constraints, such as allowed value ranges, enum sets, and null policies. It defines quality guarantees, such as freshness, completeness, and uniqueness. It defines SLAs, such as maximum latency from event occurrence to data availability. The contract is versioned, machine-readable, and enforced through automated validation.
+
+The contract serves three functions. First, it documents intent. The producer explicitly states what the dataset contains and what guarantees it provides. The consumer explicitly states what they require. Mismatches are identified before integration, not after deployment. Second, it enables validation. Automated systems check that produced data conforms to the contract and reject writes that violate it. Third, it enables evolution. When requirements change, the contract is updated, and the system detects whether the change is backward-compatible or breaking. Breaking changes require coordination. Compatible changes deploy seamlessly.
+
+Contracts are not new. APIs have used contracts for decades, enforced through OpenAPI specs, Protocol Buffers, or GraphQL schemas. Databases enforce contracts through table schemas and constraints. Data pipelines, however, have historically operated without them, relying instead on implicit assumptions and tribal knowledge. This worked when teams were small and pipelines were simple. It fails at scale.
+
+The absence of contracts manifests as runtime errors, silent data corruption, and unexpected model behavior. A column type changes from integer to string, and the training pipeline crashes. A column that was never null starts containing nulls, and feature engineering logic produces invalid outputs. A dataset that updated hourly starts updating daily, and models train on stale data. Contracts prevent these failures by making expectations explicit and enforceable.
+
+## Contract Schema Design: Beyond Column Names and Types
+
+The contract schema defines the structure and semantics of the dataset. At the most basic level, it specifies column names and data types. This is necessary but insufficient. Types describe syntax, not semantics. A column of type integer could represent user IDs, transaction amounts in cents, or UNIX timestamps. The contract must capture semantic meaning.
+
+Each column in the contract includes a name, type, description, and constraints. Name is the identifier used in queries. Type is the data type: string, integer, float, boolean, timestamp, or structured types like arrays and maps. Description is human-readable text explaining what the column represents and how it should be interpreted. Constraints define allowed values, null policies, uniqueness, and relationships.
+
+Constraints are where contracts provide value beyond schema definitions. A transaction-amount column might have a constraint that values must be greater than zero and less than 10 million. An event-type column might have a constraint that values must be one of a defined enum set. A user-id column might have a constraint that it cannot be null and must be unique within a partition. A timestamp column might have a constraint that it must be within the past 30 days. These constraints encode business logic and data quality rules that types alone cannot capture.
+
+The contract also specifies required versus optional columns. Required columns must be present in every record. Optional columns may be absent or null. This distinction is critical for backward compatibility. Adding an optional column is a compatible change. Adding a required column is a breaking change because existing consumers do not provide it.
+
+Contracts may also define relationships between columns. For example, if a refund flag is true, the refund-amount column must be non-null and positive. If a country-code column is US, the state column must be one of the 50 US state codes. These cross-column constraints are harder to enforce than single-column constraints but critical for maintaining semantic correctness.
+
+## Enforcement Mechanisms: Validation at Write Time
+
+Defining a contract is useful only if the contract is enforced. Enforcement happens at write time, before data enters the dataset. The producer writes data, the enforcement layer validates it against the contract, and the write succeeds only if validation passes. Violations are rejected, logged, and surfaced to the producer for remediation.
+
+Enforcement can be implemented at multiple layers. The most common is a validation step in the data pipeline. Before writing to the target dataset, the pipeline reads the contract, applies validation rules to the DataFrame, and checks for violations. If violations exist, the pipeline halts, emits an alert, and writes the violating records to a dead-letter queue for manual inspection.
+
+For datasets backed by transactional table formats like Delta Lake or Iceberg, schema enforcement is built in. Delta Lake rejects writes that do not match the table schema. You extend this by adding custom validation logic before the write. Iceberg supports similar validation through write schemas and schema evolution policies.
+
+Some organizations implement enforcement at the ingestion layer, before data reaches the pipeline. If data is ingested via Kafka, a schema registry enforces schema compatibility. If data is ingested via API, the API validates payloads against the contract before accepting them. This shifts enforcement earlier in the data flow, reducing the risk that invalid data propagates downstream.
+
+The enforcement mechanism must be fast and reliable. Validation adds latency to the write path, which is acceptable if latency is milliseconds but problematic if it is seconds. For high-throughput streaming pipelines, validation must run in parallel and scale horizontally. For batch pipelines, validation runs as a pre-write step and can be more exhaustive.
+
+Violations must be actionable. Logging that 5% of records failed validation is not actionable. Logging which specific records failed, which constraints were violated, and how to reproduce the issue is actionable. The enforcement system emits structured logs or metrics that teams can query, alert on, and debug.
+
+## Breaking Change Detection: Identifying Incompatible Contract Updates
+
+Contracts evolve. New columns are added, old columns are deprecated, constraints are tightened or relaxed. Some changes are backward-compatible, meaning existing consumers continue to work without modification. Other changes are breaking, meaning consumers must update their code to remain functional. The contract system must distinguish between these and prevent accidental breaking changes.
+
+Adding an optional column is compatible. Existing consumers ignore columns they do not recognize. Removing a column is breaking. Consumers that reference the removed column fail. Renaming a column is breaking unless the old name is aliased to the new name. Changing a column type is almost always breaking, with rare exceptions like widening integer to long or float to double.
+
+Constraint changes are context-dependent. Relaxing a constraint is usually compatible. If a column previously required values between 0 and 100 and now allows 0 to 200, existing consumers that expect 0 to 100 still work. Tightening a constraint is breaking if it invalidates existing use cases. If a column allowed nulls and now prohibits them, consumers that relied on null handling logic break.
+
+The contract system detects breaking changes by comparing the new contract version to the current version. It identifies added, removed, and modified fields and applies compatibility rules. If a breaking change is detected, the system rejects the update and requires the producer to follow a deprecation process. The producer either reverts the change, makes it compatible, or coordinates with all downstream consumers to migrate.
+
+Some contract systems support explicit versioning. The producer publishes version 2 of the contract alongside version 1. Consumers opt in to version 2 when ready. Both versions coexist until all consumers migrate, at which point version 1 is deprecated. This approach minimizes disruption but increases operational complexity.
+
+## Contract Testing: Validating Producer and Consumer Assumptions
+
+Contract testing validates that both producers and consumers adhere to the contract. Producer contract tests verify that the data being produced conforms to the contract. Consumer contract tests verify that the consumer's code correctly handles all data permitted by the contract.
+
+Producer tests run as part of the data pipeline or as a standalone validation job. They read a sample of produced data, apply contract validation rules, and fail if violations are found. These tests run in CI/CD before deploying pipeline changes, ensuring that code changes do not introduce contract violations.
+
+Consumer tests run as part of the consumer's test suite. They generate synthetic data that conforms to the contract, including edge cases like null values, boundary values, and maximum cardinality for enums. The consumer processes this synthetic data, and the test asserts that the consumer handles all cases correctly. If the contract allows nulls, the test verifies that the consumer does not crash on null inputs. If the contract defines an enum, the test verifies that the consumer handles all enum values.
+
+Contract testing catches integration issues before they reach production. If the producer changes the contract in a way that is technically compatible but breaks consumer assumptions, consumer contract tests fail. If the consumer assumes a column is always non-null but the contract allows nulls, producer contract tests generate null values and consumer tests catch the failure.
+
+The test suite must be maintained as the contract evolves. When the contract adds a new optional column, consumer tests are updated to include that column. When the contract tightens a constraint, producer tests verify that new data adheres to it. This maintenance burden is the cost of contract-driven development, but it is far lower than the cost of runtime failures.
+
+## Null Handling: Explicit Policies for Every Column
+
+Null handling is one of the most common sources of silent data quality issues. A column that was never null starts containing nulls, and downstream logic that assumes non-null values produces incorrect results or crashes. Contracts must explicitly define null policies for every column.
+
+The three policies are non-null, nullable, and conditionally nullable. Non-null columns never contain nulls. The contract enforces this, and writes with null values in non-null columns are rejected. Nullable columns may contain nulls, and consumers must handle them. Conditionally nullable columns contain nulls only under specific conditions, defined by cross-column constraints.
+
+Non-null policies are enforced at the schema level. Delta Lake and Iceberg support non-null constraints in table schemas. Violating a non-null constraint causes the write to fail. This is the strongest guarantee and the easiest to enforce.
+
+Nullable policies require consumer-side handling. Consumers must check for nulls before processing and define fallback behavior. The fallback might be to skip the record, use a default value, or impute the missing value based on other features. The contract should document recommended fallback behavior, but enforcement is the consumer's responsibility.
+
+Conditionally nullable policies are harder to enforce and should be avoided unless necessary. For example, a refund-reason column might be nullable except when the refund-flag is true. Enforcing this requires cross-column validation logic, which is more complex than single-column checks. If conditionally nullable policies are unavoidable, the contract must document them clearly, and validation logic must enforce them rigorously.
+
+Null handling is also relevant for schema evolution. If a new optional column is added, it is implicitly nullable for existing records that do not contain it. Consumers must handle this. If a previously nullable column is changed to non-null, existing records with nulls violate the contract. The change is breaking, and existing data must be backfilled or cleaned before the contract update deploys.
+
+## Latency SLAs: Defining Freshness Guarantees
+
+Latency SLAs define how quickly data becomes available after the corresponding event occurs. For real-time systems, latency might be seconds. For batch systems, latency might be hours or days. The contract specifies the SLA, and the producer is responsible for meeting it.
+
+Latency SLAs are defined as percentiles. For example, a contract might specify that 95% of records are available within 10 minutes of event occurrence and 99% within 30 minutes. This accounts for occasional delays without requiring perfect reliability, which is unattainable at scale.
+
+Enforcement of latency SLAs requires instrumentation. The producer emits timestamps when events are generated and when they are written to the dataset. Monitoring systems compute latency distributions and alert when SLAs are violated. Violations trigger investigation and remediation, not automatic rollback, because latency issues are typically transient and caused by infrastructure load, not code bugs.
+
+Consumers rely on latency SLAs to design their systems. If the SLA guarantees data within 10 minutes, the consumer can run inference pipelines every 15 minutes and expect fresh data. If the SLA degrades, the consumer knows their inference may be stale and can surface warnings to end users.
+
+Latency SLAs also interact with data quality. Late-arriving data can violate partition assumptions. If a dataset is partitioned by day and records arrive up to two hours late, records from the previous day may appear in the current day's partition. The contract must specify whether late arrivals are allowed and how they are handled. Some systems use event time for partitioning, others use ingestion time. The choice affects how consumers interpret the data.
+
+## Contract Registries: Publishing and Discovering Contracts
+
+Contracts are useful only if consumers can discover them. A contract registry is a centralized catalog where all data contracts are published, versioned, and searchable. The registry integrates with the dataset registry, linking each dataset to its contract.
+
+When a producer creates a dataset, they define a contract and publish it to the registry. The registry validates the contract schema, assigns a version, and stores it. Consumers search the registry to find datasets, review their contracts, and assess whether the dataset meets their requirements.
+
+The registry supports contract evolution. When a producer updates a contract, the registry validates compatibility with the previous version. If the change is breaking, the registry blocks the update and notifies the producer. If the change is compatible, the registry publishes the new version and notifies downstream consumers that a new version is available.
+
+The registry also tracks which consumers use which contract versions. This enables impact analysis. When a producer plans a breaking change, they query the registry to identify all affected consumers and coordinate migration. Without this tracking, breaking changes are deployed blindly, and failures are discovered in production.
+
+Contract registries can be built on top of schema registry systems like Confluent Schema Registry or custom solutions integrated with the dataset registry. The implementation details vary, but the core requirement is the same: contracts must be discoverable, versioned, and linked to datasets.
+
+## Enforcement Trade-Offs: Strictness Versus Flexibility
+
+Strict contract enforcement prevents data quality issues but increases operational friction. Every schema change requires contract updates, validation, and potentially consumer coordination. Flexible enforcement allows rapid iteration but risks silent failures. The optimal balance depends on the criticality of the dataset and the maturity of the organization.
+
+For production datasets consumed by critical systems, strict enforcement is non-negotiable. Breaking changes are blocked, validation is mandatory, and SLA violations trigger alerts. For exploratory or experimental datasets, flexible enforcement is acceptable. Validation is advisory, breaking changes are allowed, and consumers are responsible for handling schema drift.
+
+The enforcement level should be configurable per dataset. The contract includes an enforcement mode field: strict, advisory, or disabled. Strict mode rejects writes that violate the contract. Advisory mode logs violations but allows writes. Disabled mode performs no validation. Most datasets should default to strict mode. Advisory mode is for datasets in active development. Disabled mode is for legacy datasets that predate contracts and cannot be easily migrated.
+
+Over time, as contract adoption matures, the organization shifts toward stricter enforcement. Early in adoption, contracts are optional and advisory to minimize friction and encourage experimentation. As teams internalize the benefits and processes stabilize, contracts become mandatory and strict. This gradual tightening prevents the contract system from being perceived as bureaucratic overhead.
+
+The next step is completing the dataset framing handoff with instrumentation plans, ensuring that every dataset emits the events and logs necessary for evaluation and monitoring, covered in 5.11.

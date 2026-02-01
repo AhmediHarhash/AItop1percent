@@ -1,0 +1,97 @@
+# 6.6 — Contamination Prevention: Keeping Eval Data Out of Training
+
+In November 2025, a financial services company prepared to deploy a transaction categorization model that had achieved 96.4% accuracy on their evaluation dataset, a 9-point improvement over the baseline. The model had been in development for five months, trained on 8 million historical transactions, and had passed every quality gate. Three days before launch, a senior ML engineer ran a spot-check analysis and discovered that 340 examples from the 5,000-example evaluation set had been included in the training data. The inclusion was not intentional. The training data pipeline pulled from a data warehouse view that was supposed to exclude flagged eval examples, but a schema migration six weeks earlier had dropped the exclusion filter. The contaminated model had memorized the eval set answers. Its true production performance, measured after retraining on clean data, was 89.1%—better than baseline, but nowhere near the 96.4% claimed. The company delayed launch by four weeks, retrained the model, and rebuilt trust with stakeholders who now questioned every eval result. The root cause was the absence of systematic contamination prevention—no hashing, no access control, no pre-training validation to ensure eval and training data were truly disjoint.
+
+Contamination occurs when evaluation data leaks into training data. If your model is trained on examples that also appear in your eval set, the model memorizes those examples. Its eval performance no longer measures generalization; it measures memorization. Every metric becomes meaningless. Accuracy, precision, recall, F1, AUC—all inflated. You cannot trust your launch decision, your A/B test, your regression detection, or your model comparison. Contamination is not a minor data quality issue. It is a complete invalidation of your evaluation infrastructure. Preventing it requires treating eval data as strictly separate from training data and implementing multiple layers of defense.
+
+## Direct Leakage: The Obvious Failure Mode
+
+Direct leakage is when the exact same examples appear in both training and eval sets. This happens through pipeline bugs, manual errors, or lack of partitioning discipline. A common scenario: you split your dataset into train and eval sets at the start of a project. Six months later, you refresh your training data by pulling all examples from a data warehouse. You forget that the original eval set came from that same warehouse and has since been added back. Now your training data includes your eval set.
+
+Another scenario: you use a shared labeling platform where annotators label examples for both training and eval purposes. The platform does not distinguish between the two use cases. Someone exports all labeled examples and uses them for training. The eval set is now contaminated. A third scenario: you use publicly available datasets that have both training and test splits. Someone on your team downloads the full dataset, combines the splits for more training data, and accidentally trains on the test split.
+
+Direct leakage is preventable through partitioning and tagging. Before any labeling or training begins, you split your raw data into disjoint partitions—train, eval, and holdout. You assign a partition ID to every example. You store that ID as metadata in your data warehouse. You configure your training pipeline to filter on partition ID and exclude eval and holdout examples. You configure your eval pipeline to pull only eval partition examples. You never modify partition IDs after assignment. Once an example is marked as eval, it stays eval forever.
+
+You enforce partitioning at schema level. Your training data table does not have access to the eval partition. They are separate tables, separate schemas, or separate databases. If someone wants to add an eval example to training, they must go through a formal process that requires approval and re-partitioning. This adds friction, which is the point. Contamination often happens because it is too easy to accidentally merge datasets.
+
+## Indirect Leakage: Near-Duplicates and Paraphrases
+
+Indirect leakage is more insidious. It occurs when training data contains examples that are not exact duplicates of eval examples but are extremely similar—paraphrases, near-duplicates, or minor variations. If your eval set contains the question "What is the capital of France?" and your training set contains "What city is the capital of France?" the model can learn the association between "capital" and "Paris" from training and apply it to eval without true generalization. The eval example is not technically contaminated, but the signal is compromised.
+
+Near-duplicates are common in web-scraped data, user-generated content, and multi-source datasets. Users ask the same question in different words. Documents are copied and slightly modified. Invoices from the same vendor have nearly identical layouts. If you deduplicate within your training set but not across training and eval, you leave yourself vulnerable.
+
+Detection requires fuzzy matching. You compute similarity scores between every eval example and every training example using embeddings, edit distance, or n-gram overlap. If similarity exceeds a threshold—typically 0.85 to 0.95 depending on task—you flag the pair for review. You manually inspect flagged pairs and decide whether they are similar enough to constitute leakage. If yes, you remove the training example. If no, you adjust your threshold.
+
+This process is computationally expensive for large datasets. If you have 10 million training examples and 5,000 eval examples, you are computing 50 billion similarity scores. You can optimize by using approximate nearest neighbor search—index your training examples with FAISS or Annoy, query with each eval example, and retrieve the top 10 most similar training examples for manual review. This reduces the problem from 50 billion comparisons to 50,000 manual reviews.
+
+You also use hashing to detect exact and near-exact duplicates efficiently. You compute locality-sensitive hashes (LSH) for each example—MinHash or SimHash—and compare hash buckets. Examples in the same bucket are likely duplicates. You review those examples and remove duplicates from training. This is faster than embedding-based search but only catches high-similarity duplicates, not paraphrases with different wording.
+
+## Temporal Leakage: Training on Future Data
+
+Temporal leakage occurs when training data includes examples that are timestamped after eval examples, but the model has access to information it should not have based on task logic. This is most common in time-series tasks, forecasting, and tasks where temporal order matters. If you are training a model to predict stock prices and your training data includes prices from dates later than your eval data, the model can learn patterns that would not be available at inference time.
+
+The fix is strict temporal partitioning. You define a cutoff date. Training data must be timestamped before the cutoff. Eval data must be timestamped after the cutoff. You never train on data from the future relative to your eval period. You enforce this with SQL filters or pipeline validation—every training example has a timestamp, and examples with timestamps after the cutoff are rejected.
+
+Temporal leakage also occurs in non-time-series tasks if you are not careful. If you refresh your training data monthly and your eval set contains recent production examples, you might accidentally train on last month's production data that overlaps with this month's eval set. The solution is maintaining a temporal buffer. Your eval set is always drawn from data that is at least 30 days newer than the most recent training data. This ensures no overlap.
+
+## Contamination from External Datasets and Pretrained Models
+
+If you use publicly available datasets or pretrained models, contamination risk extends beyond your own data. Many popular benchmarks—GLUE, SuperGLUE, SQuAD, MMLU—have been used to train or evaluate widely used foundation models. If you fine-tune GPT-4, Claude, or Llama on your task and then evaluate on a public benchmark, the base model might already have seen that benchmark during pretraining. Your eval scores reflect base model memorization, not fine-tuning effectiveness.
+
+This is particularly problematic for older benchmarks. SQuAD 1.1 was released in 2016. Nearly every language model since 2018 has been trained on data that includes SQuAD examples or close paraphrases. If you evaluate a 2026 model on SQuAD, you are measuring memorization, not reading comprehension. The benchmark is saturated.
+
+The solution is using private, domain-specific eval sets that have never been published. If your task is contract analysis, you build your eval set from proprietary contracts that are not available on the web. If your task is customer support, you use internal support tickets. External models have not seen this data. Your eval measures true task performance, not benchmark memorization.
+
+If you must use public benchmarks—for comparability with published research or vendor claims—you should also run private benchmarks and compare. If a model scores 94% on a public benchmark and 78% on your private benchmark, the 16-point gap likely reflects contamination or overfitting to the public benchmark. You trust the private benchmark.
+
+## Prevention Strategies: Hashing, Isolation, and Access Control
+
+The most robust contamination prevention strategy is cryptographic hashing of eval examples. Before any training run, you compute a hash—SHA-256 or similar—for every eval example. You store those hashes in a secure registry. Before training, you hash every training example and check it against the eval hash registry. If any hash matches, the training run is aborted and the matching example is removed from training data. This catches exact duplicates with zero false positives.
+
+Hashing does not catch near-duplicates or paraphrases, so you combine it with fuzzy matching as described earlier. You run fuzzy matching once during dataset construction and hashing before every training run. Hashing is fast—millions of examples per second—so it adds negligible overhead.
+
+Isolation is the second layer. You store eval data in a separate, access-controlled environment. Training engineers do not have read access to the eval data warehouse. Evaluation engineers do not have write access to the training data warehouse. The only process that touches both is the contamination check script, which runs in a restricted environment and logs every access. If someone needs to inspect eval examples for debugging, they request access through a formal process, access is granted for a limited time, and all queries are logged.
+
+Access control extends to version control. Eval datasets are stored in a separate repository with restricted permissions. You do not commit eval data to the same repository as training code. If you must share eval data with external partners—vendors, auditors, research collaborators—you share only aggregated statistics or a small sample, never the full set.
+
+## Detection Methods: Auditing and Post-Hoc Analysis
+
+Even with prevention, you should periodically audit for contamination. One method is model fingerprinting. You train two models—one on the full training set and one on a subset that excludes 10% of training examples. You evaluate both models on your eval set. If the full model significantly outperforms the subset model on certain eval examples, and those examples are suspiciously similar to the excluded training examples, contamination is likely. You investigate those examples.
+
+Another method is memorization testing. You evaluate your model on your eval set and also on a separate holdout set that was never used for any purpose. If eval set performance is significantly higher than holdout set performance—more than 3-5 points—you suspect contamination or overfitting. You review the eval set for leakage.
+
+A third method is inspecting high-confidence predictions. You run your model on the eval set and identify examples where the model is extremely confident—prediction probability above 0.99. You manually review those examples to determine whether the model is genuinely solving the task or memorizing something. If you find patterns—specific phrases, formats, or entities that appear in both high-confidence eval examples and training data—you investigate for indirect leakage.
+
+## Recovery When Contamination Is Discovered
+
+If you discover contamination after a model is already trained or deployed, you must assess impact and remediate. First, you quantify the extent. How many eval examples were contaminated? What percentage of the eval set? What is the overlap with training data? You recompute eval metrics on the clean subset of eval examples—the ones that definitely did not appear in training. If the clean subset is large enough (at least 500 examples), you use it to estimate true performance. If it is too small, you build a new eval set from scratch.
+
+Second, you determine whether the contamination affected launch decisions. If you launched a model based on inflated eval scores, you must assess production performance. You run the model on live traffic for a controlled period, measure production metrics, and compare to the original eval claims. If production performance is significantly lower, you escalate to stakeholders and decide whether to roll back.
+
+Third, you retrain the model on clean data. You remove the contaminated examples from training, retrain from scratch, and re-evaluate on a clean eval set. This is expensive but necessary. You do not patch a contaminated model. You replace it.
+
+Fourth, you update your contamination prevention process to ensure the same failure mode does not recur. If the contamination was due to a schema migration, you add schema validation to your pipeline. If it was due to manual error, you add automated checks. If it was due to fuzzy matching gaps, you tighten your similarity thresholds. You document the incident and the fix in a postmortem.
+
+## Contamination in Iterative Development and Data Flywheels
+
+Contamination risk increases in systems with data flywheels—where production outputs are used to generate new training data. If your model makes predictions in production, users correct errors, and those corrections are added to training data, you must ensure that eval data never flows through the same loop. If an eval example is served in production, corrected by a user, and added to training, it is now contaminated.
+
+The fix is tagging eval examples with a do-not-train flag. When eval examples are sampled from production, you mark them in your production database. Your data flywheel pipeline checks for that flag and excludes flagged examples from training data ingestion. You enforce this at multiple layers—database schema, ETL pipeline, and training script—to prevent bypass.
+
+Another risk is human-in-the-loop labeling where labelers see model predictions. If labelers label eval examples and also train examples, and they see the model's predictions on eval examples, they might unconsciously align their labels with the model. The eval set then measures model-label agreement, not ground truth accuracy. You prevent this by using different labeling teams for eval and training, or by ensuring labelers never see model predictions on eval data.
+
+## Contamination in Multi-Task and Multi-Model Settings
+
+If you train multiple models on overlapping data, contamination can propagate across models. If Model A is trained on Dataset 1 and evaluated on Dataset 2, and Model B is trained on Dataset 2 and evaluated on Dataset 3, Dataset 2 is contaminated for Model A's descendants. You must track data lineage across models and ensure that no model is ever trained on data that was used to evaluate an ancestor or sibling model.
+
+This is complex in multi-task settings where different tasks share training data. If Task A and Task B both train on Dataset X, and Dataset X contains eval examples for Task A, then Task B's training contaminates Task A's eval. You prevent this by partitioning shared datasets at the task level—each task gets its own disjoint subset of the shared dataset, and no task's eval set overlaps with any task's training set.
+
+## Cost-Benefit Tradeoff and Pragmatic Shortcuts
+
+Contamination prevention is expensive. Hashing, fuzzy matching, access control, and auditing all require engineering effort, storage overhead, and process discipline. Small teams with limited resources might skip some of these measures. The question is which ones are non-negotiable and which are optional.
+
+Non-negotiable: partition training and eval at the start, enforce partition IDs in your data warehouse, hash eval examples and check before every training run. These are low-cost, high-impact measures that prevent the most common contamination vectors. Optional: fuzzy matching for near-duplicates, model fingerprinting, separate repositories for eval data. These add rigor but require more resources.
+
+A pragmatic middle ground is implementing basic prevention upfront—partitioning and hashing—and adding advanced detection as you scale. If you have 10,000 training examples and 500 eval examples, manual inspection of borderline cases is feasible. If you have 10 million training examples, you need automated fuzzy matching. You match the rigor of your contamination prevention to the stakes and scale of your system.
+
+Your next step is defining how your evaluation dataset will be versioned, governed, and refreshed over time, so you maintain continuity and trust as your system evolves.

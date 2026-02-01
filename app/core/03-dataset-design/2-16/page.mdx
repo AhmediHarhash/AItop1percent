@@ -1,0 +1,177 @@
+# 2.16 — Data Provenance: Tracking Where Every Record Came From
+
+In June 2025, a financial services company faced an emergency audit from their primary regulator. The audit focused on a credit risk model that had denied 12,000 loan applications over eight months. The regulator asked a simple question: for any given prediction, can you trace back to the exact training data that influenced it, including the original source documents and the transformations applied? The company could not answer. Their training dataset was an aggregated export from a data warehouse. They knew the warehouse contained credit bureau data, internal transaction history, and third-party financial indicators, but they had no record of which specific sources contributed to which records, when the data was collected, or what transformations were applied before aggregation. The audit report cited them for inadequate data governance and model risk management. The fine was $8.7 million, and the model was ordered offline until full provenance could be established. Rebuilding provenance metadata for 14 million training records took nine months and cost $3.2 million in engineering and compliance effort.
+
+The company had treated data collection as a one-way pipeline: ingest, transform, store. They never built the reverse path: given a record, trace it back to its origin. Provenance is that reverse path. It is the metadata that tells you where each record came from, when it was collected, how it was transformed, who approved its use, and what policies governed it. Without provenance, you cannot debug model failures, you cannot comply with data protection regulations, you cannot audit for bias, and you cannot trust your data.
+
+Provenance is not a nice-to-have. It is a foundational requirement for any production AI system. Every record in your dataset must be traceable to its source. Every transformation must be logged. Every merge or join must preserve lineage. This subchapter covers how to build provenance into your data collection pipelines from the start, not bolt it on later when regulators or incidents demand it.
+
+## Provenance Metadata Schema: What to Track for Every Record
+
+Provenance metadata is the set of fields you attach to every record that describe its origin, history, and governance. At minimum, every record must carry seven core provenance fields: source identifier, collection timestamp, source version, record identifier, transformation lineage, consent status, and retention policy.
+
+Source identifier names the upstream system or data source that produced the record. If the record came from a customer support ticket system, the source identifier is the ticket system's canonical name. If it came from a third-party API, the source identifier includes the API provider and endpoint. Source identifiers are stable over time. If you rename a system, you update the mapping table but preserve the original identifier in historical records. This ensures you can trace records back to their source even after internal systems are renamed or replaced.
+
+Collection timestamp is the moment your pipeline ingested the record, not the moment the record was created at the source. Source creation time is also tracked, but collection timestamp is critical for understanding data freshness, debugging pipeline delays, and meeting retention requirements. Collection timestamp is recorded in UTC with millisecond precision. This allows you to reconstruct the exact ingestion order of records even when they arrive in the same second.
+
+Source version captures the version of the upstream system that produced the record. If a customer support system deploys a new version that changes ticket schema or adds new fields, you track that version number. Source version enables you to correlate data quality issues with upstream deployments. If records collected after version 3.2.0 have higher null rates, you know the issue was introduced in that release.
+
+Record identifier is a unique stable ID for the record within its source system. For a support ticket, it is the ticket ID. For a database row, it is the primary key. For an API response, it is the entity ID. Record identifier allows you to deduplicate, update, or delete records based on their source identity. If the source system updates a record, you can trace the updated version back to the original record using the identifier.
+
+Transformation lineage is a list of all transformations applied to the record between collection and final storage. If a record was collected, parsed, normalized, anonymized, and enriched, the lineage lists all five steps in order. Each step includes the transformation name, version, timestamp, and configuration parameters. Lineage is append-only. When you apply a new transformation, you add a lineage entry. You never modify or delete prior entries. This creates an immutable audit trail of how the record evolved.
+
+Consent status tracks whether the user or entity associated with the record consented to its use for AI training, evaluation, or inference. Consent status is critical for GDPR, CCPA, and other privacy regulations. Values are explicit-consent, implicit-consent, no-consent-required, or consent-withdrawn. If a user withdraws consent, you mark the record as consent-withdrawn and exclude it from future training runs. Consent status is also timestamped so you can prove when consent was obtained or withdrawn.
+
+Retention policy specifies how long the record can be stored and when it must be deleted. Retention is driven by regulation, contract, or internal policy. GDPR might require deletion after six months. A data provider contract might allow retention for two years. Internal policy might mandate deletion after model training is complete. Retention policy is enforced by automated deletion jobs that scan for expired records and remove them from storage. Provenance metadata includes the retention expiration date so deletion jobs know when to act.
+
+Beyond these core fields, you add domain-specific provenance metadata based on your use case. For healthcare data, you track patient consent forms, IRB approval numbers, and data use agreements. For financial data, you track regulatory classifications, data sensitivity levels, and audit trail references. For user-generated content, you track content moderation status, policy version, and review timestamps. Provenance schema is extensible, but the core seven fields are non-negotiable.
+
+## Implementing Provenance at Collection Time
+
+Provenance must be captured at the moment data enters your pipeline, not retroactively. You instrument your ingestion code to write provenance metadata atomically with the data itself. Every data collection script, API client, or ETL job writes both the record and its provenance to storage in a single transaction. This prevents gaps where data exists but provenance does not.
+
+You use structured provenance formats. Provenance is not freeform text notes. It is structured metadata in JSON, Parquet, or database tables with defined schemas. Structured provenance enables programmatic querying, automated compliance checks, and cross-system lineage tracking. You define provenance schemas early and enforce them through validation at ingestion.
+
+A data ingestion pipeline at a healthcare company collects patient survey responses from multiple hospital systems. Each hospital system has a different API format and data model. The ingestion pipeline normalizes responses into a common schema but also writes provenance metadata for every record. Provenance includes the hospital system ID, API version, collection timestamp, patient consent status from hospital records, and retention policy based on hospital data-sharing agreements. When regulators audit the dataset six months later, the company provides complete provenance documentation within two hours by querying the provenance database.
+
+## Lineage Tracking Through Transformations
+
+Transformation lineage is the most complex part of provenance because data rarely flows through a single pipeline. A record might be collected, split into multiple derived records, joined with other sources, aggregated, filtered, and sampled across multiple stages and systems. Lineage must track all of these operations and preserve the links between source records and derived records.
+
+The basic lineage model is a directed acyclic graph. Each record is a node. Each transformation is an edge connecting input records to output records. If you parse a raw log line into a structured event, the lineage graph has one input node for the raw line and one output node for the structured event, connected by a parse edge. If you join two records to create an enriched record, the graph has two input nodes and one output node, connected by a join edge.
+
+Lineage graphs are stored as relational metadata, not embedded in every record. Embedding full lineage in every record would explode storage costs. Instead, every record carries a lineage identifier, and the lineage graph is stored in a separate lineage database. The lineage identifier is a hash or UUID that uniquely identifies the record's position in the lineage graph. When you need to trace a record, you query the lineage database using the identifier and retrieve the full upstream graph.
+
+Lineage metadata includes transformation type, transformation version, input record identifiers, output record identifiers, transformation parameters, and execution timestamp. Transformation type describes the operation: parse, filter, join, aggregate, sample, anonymize, or enrich. Transformation version is the code version that executed the transformation. This allows you to correlate data quality issues with specific code deployments.
+
+Input record identifiers list all records that contributed to the output. For a one-to-one transformation like parsing, there is one input. For a join, there are two or more inputs. For an aggregation, there might be hundreds of inputs. You store input identifiers as a list, preserving the order and role of each input. For a join, you record which input was the primary record and which were secondary enrichment sources.
+
+Output record identifiers list all records produced by the transformation. Most transformations produce one output per input, but some produce many. If you split a multi-turn conversation into individual turns, one input record produces five output records. The lineage graph captures this one-to-many relationship. If you filter records, some inputs produce zero outputs. The lineage graph records which inputs were dropped and why.
+
+Transformation parameters capture the configuration used during execution. If you filtered records based on a quality score threshold, the lineage records that threshold. If you sampled records at a 10% rate, the lineage records the sampling rate and random seed. Parameters enable reproducibility. Given the same inputs and parameters, the transformation should produce the same outputs. Parameters also enable debugging. If a transformation produced unexpected outputs, you inspect the parameters to see if they were misconfigured.
+
+## Automating Lineage Capture
+
+Lineage tracking is automated through pipeline instrumentation. Every transformation step is wrapped in a lineage-aware decorator or middleware that automatically logs inputs, outputs, parameters, and timestamps to the lineage database. Developers do not manually write lineage code. They use standard transformation primitives provided by the pipeline framework, and lineage tracking happens transparently. This reduces the risk of missing lineage and ensures consistency across all transformations.
+
+A data engineering team at a fintech company built a custom Python library that wraps common data transformation functions. Every function in the library automatically emits lineage events to a central lineage service. When a developer calls the join function, the library logs the input record IDs, join key, join type, and output record IDs to the lineage database. When they call the filter function, the library logs the filter predicate, input count, and output count. Developers write normal data transformation code, and lineage capture happens automatically.
+
+Lineage is verified at each stage. After a transformation runs, the pipeline checks that the lineage graph is complete and consistent. Every output record must have at least one input. Every input must be traceable to a source. If lineage verification fails, the transformation is rolled back and flagged for investigation. This prevents gaps in the lineage graph from going undetected.
+
+You also implement lineage regression tests. When you modify transformation code, tests verify that lineage output format remains compatible with existing lineage consumers. A change that breaks lineage tracking is treated as a critical bug and blocked from deployment. Lineage is part of your data contract, not an afterthought.
+
+## Provenance in Merged and Joined Datasets
+
+Joining datasets from multiple sources is where provenance gets hard. When you merge customer demographic data with transaction history and third-party credit scores, the resulting record has three upstream sources. Provenance must track all three, including the join keys, join type, and match confidence.
+
+The simplest join is a primary-foreign key join where one source is the primary record and others are enrichment. If you join customer demographics as the primary source with transaction history as enrichment, the provenance metadata lists demographics as the primary source and transactions as the secondary source. The join key is the customer ID. The join type is left-join, meaning all demographic records are preserved even if they have no matching transactions.
+
+For many-to-many joins, provenance becomes more complex. If you join support tickets with user feedback surveys where one ticket might reference multiple surveys and one survey might reference multiple tickets, the lineage graph has multiple input records from each source. Provenance must track which specific ticket and survey records contributed to each joined record. This requires storing input record identifiers as a list with source annotations.
+
+Match confidence is critical for fuzzy joins. If you join records based on approximate string matching or entity resolution, the join is probabilistic. Provenance must track the match score or confidence level so you can filter low-confidence joins or audit decisions made based on uncertain matches. If a fraud detection model made a decision based on a joined record with 65% match confidence, you need to know that confidence level to assess decision risk.
+
+Provenance also tracks join failures. If 10,000 primary records attempted to join with secondary records but 1,200 had no match, those 1,200 records have incomplete provenance. They exist in your dataset, but they are missing enrichment data. Provenance metadata flags these records as incomplete and logs the reason: no matching record found, join key was null, or match confidence below threshold. Downstream systems can filter incomplete records or handle them differently based on use case requirements.
+
+## Handling Merged Data from Multiple Sources
+
+Merged datasets combine records from multiple sources without joining them. If you collect support tickets from three different regional systems and merge them into one dataset, provenance must track which region each record came from. This is simpler than joins because each record has one source, but it still requires careful metadata management to ensure you can segment by source later. If model performance is poor on records from one region, you need to identify those records via provenance.
+
+Provenance in merged datasets also tracks merge conflicts. If two sources both provide a record with the same identifier but different field values, you must resolve the conflict by choosing one version, merging fields, or flagging the conflict. Provenance records which conflict resolution strategy was used, which source was chosen as authoritative, and what the conflicting values were. This enables auditing of merge decisions and troubleshooting when merged records produce unexpected model behavior.
+
+Union datasets combine records from sources with different schemas. If you union customer feedback from email surveys, in-app prompts, and support tickets, each source has a different schema. Provenance must track the source schema version and the mapping applied to normalize records into a common schema. If a field is missing in one source but present in others, provenance records that the field was absent in the source, not nulled during transformation. This distinction matters for understanding data quality and missingness patterns.
+
+A customer analytics company merges product review data from five different e-commerce platforms. Each platform has different review schemas: some include star ratings from 1 to 5, others use thumbs up or down, others use sentiment labels. The merge pipeline normalizes all reviews into a common schema with a normalized sentiment score. Provenance tracks the source platform, original rating value, normalization function applied, and normalization confidence. When analysts notice unusual sentiment distributions, they query provenance to discover that one platform's normalization function was misconfigured, converting positive reviews to neutral sentiment.
+
+## Tooling for Provenance in 2026
+
+Building provenance infrastructure from scratch is expensive and error-prone. In 2026, most teams use specialized provenance and lineage tools that integrate with their data pipelines. The leading platforms are Apache Atlas, AWS Glue Data Catalog, Google Cloud Dataplex, Microsoft Purview, and open-source solutions like Marquez, OpenLineage, and Amundsen.
+
+Apache Atlas is an open-source metadata and governance platform originally developed by Hortonworks. It tracks data lineage across Hadoop ecosystems, Spark jobs, and cloud storage. Atlas automatically discovers datasets, infers schemas, and builds lineage graphs by parsing execution logs from Spark and Hive. It provides a web UI for browsing lineage, searching metadata, and auditing data flows. Atlas integrates with Ranger for access control and classification tagging.
+
+AWS Glue Data Catalog is a managed metadata service that stores table definitions, schema versions, and lineage metadata for data in S3, RDS, and Redshift. Glue crawlers automatically discover datasets and infer schemas. Glue ETL jobs emit lineage metadata showing how source tables are transformed into target tables. The catalog integrates with Lake Formation for access control and Athena for querying metadata.
+
+Google Cloud Dataplex is a data fabric platform that unifies data lakes and warehouses under a single governance layer. Dataplex auto-discovers datasets in Cloud Storage and BigQuery, tracks lineage for Dataflow and Dataproc jobs, and enforces data quality and retention policies. It provides APIs for querying lineage and metadata programmatically, enabling integration with custom ML pipelines.
+
+Microsoft Purview is an enterprise data governance platform that spans Azure, on-premises, and multi-cloud environments. Purview scans data sources, catalogs assets, and tracks lineage for Azure Data Factory, Synapse, and Databricks pipelines. It provides a compliance dashboard showing data sensitivity classifications, retention policies, and regulatory mappings. Purview integrates with Azure Policy for enforcement and Azure Monitor for auditing.
+
+Open-source lineage tools like Marquez and OpenLineage provide lightweight, API-driven lineage tracking without vendor lock-in. OpenLineage is a standard for emitting lineage events from data pipelines. It defines a JSON schema for lineage metadata and provides client libraries for Python, Java, and SQL. Marquez is a reference implementation of the OpenLineage spec that collects, stores, and visualizes lineage graphs. Teams embed OpenLineage clients in their pipeline code, emit lineage events, and query Marquez for lineage analysis.
+
+Amundsen is a data discovery and metadata platform developed by Lyft. It catalogs datasets, tracks ownership, usage, and lineage, and provides a search UI for finding data assets. Amundsen integrates with Airflow, Spark, and Presto to automatically infer lineage from DAGs and execution logs. It emphasizes social metadata like user bookmarks, data quality ratings, and ownership annotations.
+
+Choosing a provenance tool depends on your infrastructure. If you run on AWS, Glue Data Catalog is the natural choice. If you use Databricks, Unity Catalog provides built-in lineage tracking. If you have multi-cloud or hybrid infrastructure, Purview or open-source tools like Marquez offer broader coverage. If you build custom pipelines, OpenLineage gives you flexibility to emit lineage without adopting a full platform.
+
+Regardless of tool, the integration pattern is the same. Your pipeline code emits lineage events via API or SDK. The lineage platform ingests events, builds lineage graphs, and stores metadata. Downstream systems query the platform to retrieve lineage for debugging, compliance, or auditing. Lineage becomes a shared service, not a per-pipeline implementation.
+
+## Evaluating and Comparing Provenance Tools
+
+When selecting a provenance tool, you evaluate several dimensions: coverage of your data infrastructure, automation versus manual instrumentation, query performance, compliance feature support, and total cost of ownership. Coverage means the tool can track lineage across all your data sources, transformation engines, and storage systems. If you use five different ETL tools, your provenance system must integrate with all five, or you have lineage gaps.
+
+Automation determines how much manual work is required to capture lineage. Managed platforms like Glue and Dataplex automatically infer lineage from execution logs with minimal configuration. Open-source tools like OpenLineage require explicit instrumentation in your pipeline code. Automation reduces implementation effort but may provide less granular lineage. Manual instrumentation is more work but gives you full control over lineage detail.
+
+Query performance matters when you have millions of records and complex lineage graphs. Tracing a record back through ten transformation stages and five joins should complete in seconds, not minutes. You benchmark query performance with realistic data volumes and lineage graph complexity before committing to a tool.
+
+Compliance feature support includes retention enforcement, consent tracking, data classification, and audit trail generation. Regulated industries need provenance tools that can automatically enforce retention policies, flag records with withdrawn consent, and generate compliance reports for regulators. Not all tools provide these features out of the box.
+
+Total cost of ownership includes licensing fees, infrastructure costs, implementation effort, and ongoing maintenance. Managed platforms have monthly fees based on data volume and queries. Open-source tools are free to use but require infrastructure to host and expertise to maintain. You calculate five-year TCO including all costs, not just licensing.
+
+## Regulatory Requirements for Data Traceability
+
+Data provenance is not just good practice. It is a legal requirement under multiple regulations. GDPR Article 30 requires organizations to maintain records of processing activities, including data sources, purposes, retention periods, and recipients. CCPA requires businesses to disclose data sources and uses upon consumer request. The EU AI Act requires high-risk AI systems to maintain detailed logs of training data, including origins and transformations.
+
+GDPR provenance requirements focus on demonstrating lawful basis for processing. You must be able to show where personal data came from, what consent or legitimate interest justified its collection, and how long it was retained. Provenance metadata must include consent records, data processing agreements, and retention policies. When a data subject requests deletion under Article 17, provenance enables you to identify and delete all records associated with that individual, including derived records.
+
+CCPA provenance requirements focus on transparency. Consumers have the right to know what personal information you collected, the sources, the business purposes, and the third parties with whom it was shared. Provenance metadata must link records to source categories like directly from the consumer, from service providers, from data brokers, or from public records. When a consumer submits a CCPA request, provenance enables you to generate a comprehensive disclosure of their data.
+
+The EU AI Act provenance requirements focus on accountability for high-risk systems. Article 10 requires training data to be relevant, representative, and free of errors and biases to the extent possible. Article 17 requires keeping logs of data governance and data management for the lifetime of the system. Provenance metadata must document data sources, quality assessments, bias evaluations, and corrective actions taken. When regulators audit a high-risk system, provenance provides the evidence trail.
+
+HIPAA and HITECH in healthcare require tracking access to protected health information. Provenance metadata must log who collected the data, who accessed it, and for what purpose. Audit trails must be immutable and retained for six years. Provenance systems integrate with access control systems to log every query, export, and transformation involving PHI.
+
+SOX and financial regulations require tracing financial data to authoritative sources. If a risk model uses credit bureau data, provenance must show which bureau, which data product, and which version. If a trading algorithm uses market data, provenance must show the exchange, the feed, and the timestamp. Provenance enables auditors to verify that financial data is accurate, complete, and sourced from approved providers.
+
+Industry-specific regulations like GDPR for pharma clinical trials require tracking data lineage through analysis pipelines to ensure reproducibility and integrity. Provenance metadata must document the source clinical sites, patient consent forms, protocol versions, and statistical analysis steps. Regulatory submissions include lineage documentation as evidence of data integrity.
+
+## Building Compliance into Provenance Systems
+
+Building compliant provenance is not a one-time project. Regulations evolve. New requirements emerge. Your provenance system must be extensible so you can add new metadata fields as regulations expand. It must be auditable so regulators can verify completeness and accuracy. It must be tamper-proof so provenance records cannot be altered after creation. This requires immutable storage, cryptographic hashing, and access logging.
+
+Immutable storage ensures provenance records cannot be modified or deleted after creation. You use append-only databases or write-once storage systems. When a provenance record is written, it is cryptographically hashed and the hash stored separately. Any attempt to modify the record will change its hash, making tampering detectable. Regulators can verify provenance integrity by recomputing hashes and comparing to stored values.
+
+Access logging tracks who queries provenance metadata and for what purpose. Every provenance query is logged with user identity, timestamp, query parameters, and justification. This creates an audit trail showing who accessed sensitive lineage information. If a data breach occurs, access logs help determine who accessed the compromised data and when.
+
+Retention enforcement uses provenance metadata to automatically delete expired records. Automated jobs scan for records where the retention expiration date has passed and delete them from storage. Deletion is logged in provenance metadata, creating a permanent record that the data was deleted as required by policy or regulation. This is critical for GDPR's right to be forgotten and other data minimization requirements.
+
+## Provenance as the Foundation of Data Trust
+
+Beyond compliance, provenance is the foundation of data trust. When your data scientist questions whether training data is biased, provenance lets them trace records back to source demographics and inspect collection methods. When your model underperforms on a new data segment, provenance lets you identify which records came from that segment and how they differ from the rest. When a stakeholder asks why a specific prediction was made, provenance lets you trace the prediction back to the training examples that influenced it.
+
+Provenance enables reproducibility. If you need to retrain a model exactly as it was trained six months ago, provenance tells you the exact source versions, collection timestamps, transformation parameters, and dataset composition. Without provenance, reproducibility is guesswork. With provenance, it is a metadata query.
+
+Provenance enables impact analysis. If a data source is found to be corrupted or biased, provenance tells you exactly which records in your dataset came from that source, which models were trained on those records, and which predictions were influenced by them. You can quantify impact, retrain affected models, and notify stakeholders with precision.
+
+Provenance enables continuous improvement. You track data quality metrics per source, per collection window, and per transformation stage. Over time, you identify which sources contribute the highest-quality data, which transformations introduce the most errors, and which collection methods scale best. Provenance makes data operations measurable, not just observable.
+
+Provenance is not free. It adds storage overhead, processing latency, and system complexity. But the cost of missing provenance is higher. Regulatory fines, failed audits, undebuggable model failures, and eroded stakeholder trust all result from treating data collection as a one-way process. Provenance is the reverse index that makes your data system legible, auditable, and trustworthy.
+
+## Operationalizing Provenance in Large-Scale Systems
+
+At scale, provenance systems must handle billions of records, millions of transformations per day, and complex multi-stage lineage graphs. Performance optimization becomes critical. You implement provenance caching, lineage graph pruning, and incremental lineage updates to keep query latency low.
+
+Provenance caching stores frequently accessed lineage paths in fast key-value stores. If analysts repeatedly trace the same record types back to sources, you cache those lineage paths and serve them from cache instead of recomputing. Cache invalidation happens when transformations change or new data is ingested.
+
+Lineage graph pruning limits how far back lineage traces go. For operational purposes, you may only need to trace back through the last three transformation stages, not all the way to original sources. You define pruning policies based on use case requirements. Compliance queries may require full lineage. Debugging queries may only need recent lineage.
+
+Incremental lineage updates allow you to add new lineage edges without recomputing the entire graph. When a new transformation runs, it adds new nodes and edges to the existing lineage graph. Old lineage remains unchanged. This allows lineage to scale to continuously running pipelines that process data 24/7.
+
+You also partition lineage databases by time window or data domain. Lineage for records collected in January 2025 is stored separately from lineage for records collected in February 2025. Lineage for customer data is stored separately from lineage for transaction data. Partitioning improves query performance by reducing the search space.
+
+## Monitoring and Alerting for Provenance Gaps
+
+Provenance systems require active monitoring to detect gaps or failures. You track provenance coverage: the percentage of records that have complete lineage back to sources. Coverage should be 100%. Any gap indicates a failure in lineage capture that must be investigated and fixed.
+
+You also track lineage freshness: how long between data ingestion and lineage availability. Lineage should be available within seconds of data ingestion. Delays indicate bottlenecks in lineage processing that degrade operational usefulness.
+
+Automated alerts fire when provenance coverage drops below 100% or lineage freshness exceeds thresholds. A provenance system that silently fails to capture lineage is worse than no provenance system because it creates false confidence. Active monitoring ensures failures are detected and fixed immediately.
+
+You run periodic provenance audits that sample records and verify end-to-end lineage. Audits check that lineage graphs are complete, consistent, and match actual transformation history. Discrepancies indicate bugs in lineage capture code that must be fixed.
+
+The next chapter covers synthetic data generation: when, how, and why to create artificial training data, and how to ensure synthetic data improves model performance without introducing new failure modes.

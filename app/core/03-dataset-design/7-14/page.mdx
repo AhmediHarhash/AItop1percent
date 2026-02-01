@@ -1,0 +1,101 @@
+# 7.14 — The Handoff to Fine-Tuning: Format Requirements by Provider
+
+Why do thirty percent of fine-tuning jobs fail before the first epoch completes? Format errors. The dataset looks perfect in your development environment—clean examples, balanced labels, validated alignment—but the moment you upload it to OpenAI, Anthropic, Google, or your internal fine-tuning pipeline, the job crashes with a cryptic error message. Line 1,247 has an invalid format. Conversation roles are inconsistent. Token count exceeds maximum context length. The dataset file is missing a required field. You spend two hours debugging format compliance, reformat the file, re-upload, and try again. This time it runs. The actual fine-tuning is uneventful, but you lost half a day to format wrangling.
+
+Format requirements are not universal. Every provider has slightly different expectations for how training data should be structured, what fields are mandatory, how conversations should be formatted, and what token limits apply. You learn these requirements before you build the dataset, not after, because reformatting 50,000 examples is tedious and error-prone.
+
+## Provider-Specific Format Requirements: OpenAI, Anthropic, Google, Open-Source
+
+OpenAI fine-tuning as of 2026 expects data in JSONL format, where each line is a valid JSON object representing one training example. For chat models like GPT-4, each example contains a messages array with role and content fields. Roles are system, user, or assistant. The system message is optional and sets context or instructions. User messages represent user input, assistant messages represent model responses. A typical training example might include a system message defining the assistant's behavior, a user message asking a question, and an assistant message providing the answer. OpenAI does not require alternating user and assistant messages, but most training datasets follow that pattern for clarity.
+
+OpenAI also supports function calling and tool use in fine-tuning data. If you want the model to learn when and how to call functions, you include function definitions and function call examples in the training data. Each function call is represented as a message with role assistant and a function call field containing the function name and arguments. The function's output is represented as a message with role function. This structure mirrors the API's runtime behavior.
+
+Anthropic fine-tuning uses a similar JSONL format but with role names user and assistant only. System instructions are embedded as the first user message or as a prefix to every example. Anthropic places more emphasis on few-shot examples in the prompt and less on large-scale fine-tuning, so their fine-tuning datasets tend to be smaller and more curated. Token limits per example are strictly enforced, and examples that exceed the limit are rejected during upload. Anthropic also requires balanced conversation turns: every user message should be followed by an assistant message. Trailing user messages without responses cause validation errors.
+
+Google's fine-tuning for Gemini models uses a similar structure but allows additional metadata fields: example IDs, source tags, and quality scores. Google's format also supports interleaved text and image inputs for multimodal fine-tuning, where each message can include both text content and image references. Images are uploaded separately and referenced by URI in the training data. This adds complexity: you must ensure all image URIs are accessible, correctly formatted, and point to valid image files. Missing or broken image links cause the job to fail.
+
+Open-source fine-tuning tools like Hugging Face Transformers, Axolotl, and LitGPT have more flexible format requirements but also more configuration burden. You can fine-tune on raw text, instruction-response pairs, multi-turn conversations, or custom formats. You define the format in a configuration file or data preprocessing script, which gives you control but also introduces more opportunities for errors. You might define a chat template that specifies how to serialize conversations into token sequences, then discover during training that the template produced malformed input. Open-source tools often fail silently or produce degraded results rather than crashing with clear error messages, so you monitor training metrics closely.
+
+Across all providers, the general pattern is the same: one example per line, structured as a JSON object, with conversation turns represented as arrays of messages. But the specific field names, role naming conventions, token limits, and metadata requirements differ enough that you cannot reuse a dataset formatted for one provider on another provider without transformation.
+
+## JSONL Structure and Conversation Format Standards
+
+JSONL—JSON Lines—is the dominant format for fine-tuning datasets. Each line in the file is a complete, valid JSON object. Lines are separated by newlines. The file is not wrapped in an outer array; it is a sequence of independent objects. This format is efficient for large datasets because you can stream examples one at a time without loading the entire file into memory.
+
+A typical JSONL training file for chat fine-tuning looks like this in abstract structure: each line contains an object with a messages key, whose value is an array of message objects. Each message object has a role key and a content key. The role is a string indicating who is speaking: system, user, or assistant. The content is a string containing the message text. Some providers allow additional keys: name for speaker identification, function call for tool use, metadata for tracking.
+
+Conversation format standards dictate the order and composition of messages. Most training examples follow a pattern: optional system message, user message, assistant message, user message, assistant message, and so on. The system message, if present, is usually the first message in the array. The conversation alternates between user and assistant, ending with an assistant message so the model learns to generate the final response. If the conversation ends with a user message, the model has no completion to learn from, and most providers reject the example.
+
+Some providers allow multiple assistant messages in a row, which is useful for teaching the model to generate multi-step reasoning or chained outputs. Some providers allow multiple user messages in a row, which is useful for representing batch questions or context updates. You check the provider's documentation to see what is allowed.
+
+Token limits apply per example, not per message. If an example's total token count—summing all messages in the conversation—exceeds the model's context window, the example is rejected or truncated. Truncation is dangerous because it might cut off the assistant's response, teaching the model to produce incomplete outputs. You validate token counts before uploading.
+
+JSONL files must be valid line by line. A single malformed line—missing a comma, unescaped quote, trailing bracket—causes the entire upload to fail. You validate JSONL syntax with a parser before uploading. Many teams write a pre-upload validation script that reads the JSONL file, parses each line, checks for required fields, validates token counts, and reports errors. This script catches format issues locally, before they waste upload time and API quota.
+
+## Token Counting and Context Length Constraints Per Provider
+
+Token counting is not trivial. Different providers use different tokenizers, and the same text string might tokenize into different token sequences depending on the model family. OpenAI's GPT models use tiktoken, a BPE tokenizer. Anthropic uses a similar BPE tokenizer with a different vocabulary. Google uses SentencePiece for some models. Open-source models like Llama use their own tokenizers. You cannot count tokens by splitting on whitespace or assuming one token per word. You use the provider's tokenizer library.
+
+For OpenAI, you import the tiktoken library, load the tokenizer corresponding to the model you are fine-tuning, and encode each message's content to count tokens. You sum token counts across all messages in the example, adding a few extra tokens for message delimiters and formatting overhead. OpenAI documents the exact overhead per message, which varies by model version. If the total exceeds the model's context length—8,192 tokens for GPT-3.5, 128,000 tokens for GPT-4 Turbo, varying by model tier—the example is invalid.
+
+For Anthropic, token counting works similarly but with stricter enforcement. Anthropic rejects examples that exceed limits rather than silently truncating. You count tokens before adding examples to the dataset, filtering out or splitting long conversations. Splitting long conversations is tricky: you must decide where to cut without losing coherence. A common approach is to split at natural conversation boundaries—topic shifts, user intent changes—and treat each segment as a separate training example.
+
+For Google and open-source models, token counting depends on the specific model and tokenizer. You load the tokenizer from the model's checkpoint or Hugging Face repository, encode the text, and count tokens. You also account for special tokens: beginning-of-sequence, end-of-sequence, padding, and separator tokens. These add to the total count and must fit within the context window.
+
+Token limits are hard constraints. You cannot argue with them or work around them by clever formatting. If an example is too long, you either shorten it or exclude it. Shortening might mean summarizing the conversation, removing low-value turns, or splitting into multiple examples. Excluding might mean accepting that some high-value examples cannot be used in fine-tuning and must be handled via prompt engineering or retrieval instead.
+
+You track token count distributions across your dataset. If the median example is 200 tokens and the 95th percentile is 1,500 tokens, you are in good shape. If the median is 4,000 tokens and ten percent of examples exceed the limit, you have a problem. You either re-collect shorter examples or redesign the task to require less context.
+
+## Validation Before Upload: Catching Format Errors Early
+
+Pre-upload validation is non-negotiable. You write a script that loads the JSONL file, parses each line, and checks every requirement: valid JSON syntax, required fields present, role values from allowed set, token counts within limits, no trailing user messages, no empty content strings, no null values in required fields. You run this script locally before uploading anything.
+
+The script outputs a validation report: total examples, valid examples, invalid examples, and a list of errors with line numbers. If errors are found, you fix them in the source data, regenerate the JSONL file, and validate again. You do not upload a file with known errors hoping the provider will ignore them. Providers do not ignore them.
+
+Some providers offer validation APIs that check format before starting a fine-tuning job. OpenAI's fine-tuning API validates the file during upload and returns errors immediately. You upload a small test file first, verify it passes validation, then upload the full dataset. This catches provider-specific quirks that your local validation script might miss.
+
+Common validation errors include: mismatched role names, where you used user and assistant but the provider expects User and Assistant with capital letters. Trailing commas in JSON arrays, which are invalid JSON syntax. Unescaped special characters in content strings, like newlines or quotes that break JSON parsing. Missing message arrays, where an example is a flat object instead of a nested structure. Token count overruns, where examples exceed limits by a few tokens due to incorrect delimiter accounting.
+
+You also validate dataset-level properties. If you claim to have 10,000 training examples but the file only contains 9,200 valid examples after filtering invalid ones, you document that discrepancy. If the dataset is supposed to be balanced across classes but validation reveals a 3-to-1 imbalance, you know before training starts.
+
+Some teams build automated validation into their data pipeline, so every dataset generated for fine-tuning is validated automatically. The pipeline outputs a validation certificate: a JSON file summarizing validation results, including pass/fail status, error counts, token statistics, and dataset characteristics. You attach this certificate to the fine-tuning job for traceability.
+
+## Cost Estimation: Predicting Fine-Tuning Spend from Dataset Characteristics
+
+Fine-tuning is not free. Providers charge per token processed during training, with costs scaling by dataset size, number of epochs, and model size. You estimate costs before starting a job, especially for large datasets or expensive models.
+
+OpenAI charges per 1,000 tokens per epoch. If your dataset contains 50,000 examples averaging 300 tokens each, that is 15 million tokens. If you train for three epochs, you process 45 million tokens. At the current rate—varying by model, but assume $0.008 per 1,000 tokens for GPT-4 fine-tuning as an illustrative figure—that is $360. Not catastrophic, but not trivial. If you accidentally included 500,000 examples instead of 50,000, the cost jumps to $3,600. You check dataset size and token counts before committing.
+
+Anthropic charges similarly, with per-token pricing that varies by model tier. Google charges by training time and accelerator usage, which is harder to estimate but correlates with dataset size and example length. Open-source fine-tuning on your own infrastructure costs GPU hours: a single A100 GPU costs $2 to $4 per hour on cloud providers. Fine-tuning a 7B parameter model on 100,000 examples might take 10 to 20 hours, costing $40 to $80.
+
+Cost estimation tools are simple: total tokens equals number of examples times average tokens per example. Total cost equals total tokens times epochs times per-token rate. You build a spreadsheet or script that takes dataset characteristics as input and outputs estimated cost. You run this before uploading data.
+
+You also estimate time. Larger datasets take longer to upload, validate, and train. A 10 GB JSONL file might take thirty minutes to upload on a slow connection. A fine-tuning job on 500,000 examples might run for 12 hours. You schedule jobs during off-peak times or when you can monitor progress.
+
+Cost and time estimates help you make trade-offs. If fine-tuning the full dataset costs $1,200 and takes 18 hours, but fine-tuning a random 20 percent subset costs $240 and takes 4 hours with only a small performance drop, you might choose the subset for initial experiments. You iterate on the small dataset, verify that training works, then scale up for the final model.
+
+## The Pre-Flight Checklist: Everything to Verify Before Starting a Fine-Tuning Run
+
+You do not click the start button until you have verified everything on the pre-flight checklist. This checklist includes data validation, cost estimation, configuration review, and stakeholder alignment.
+
+Data validation: JSONL file is well-formed and syntactically valid. Every example has required fields. Token counts are within limits. No examples are duplicates unless intentional. Roles are correctly assigned. Conversations end with assistant messages. No placeholder text, debugging strings, or corrupted data. Dataset size matches expectations.
+
+Configuration review: Model ID is correct. Hyperparameters—learning rate, batch size, epochs—are set appropriately for the dataset size and task. Validation split is defined if you want evaluation metrics during training. Output directory or model name is set so you can identify the fine-tuned model later. Cost estimate is reviewed and approved.
+
+Stakeholder alignment: The product team knows what model you are fine-tuning, what task it will perform, and when it will be ready. The dataset meets the success criteria defined during problem framing. Legal and compliance have reviewed the training data if it contains sensitive information. You have a rollback plan if the fine-tuned model performs worse than the baseline.
+
+Instrumentation: Logging is configured to capture training metrics, validation loss, and any errors. You can monitor progress in real time. You will receive notifications when training completes or fails. You have a plan for evaluating the fine-tuned model on a hold-out test set.
+
+You run through this checklist with a colleague or write it down and check each item methodically. Teams that skip this step waste time restarting failed jobs, debugging configuration errors, and explaining to stakeholders why the model is not ready when promised.
+
+The pre-flight checklist also includes a final manual review of a random sample of examples. You open the JSONL file, jump to a random line, read the example, and verify it makes sense. You do this five or ten times. If you spot an error—a nonsensical assistant response, a misaligned conversation, a formatting glitch—you stop and investigate whether it is an isolated issue or a systemic problem. Catching one error in manual review often reveals dozens more in automated validation.
+
+## The Handoff and What Comes Next
+
+When the dataset passes validation, the format is correct, the cost is approved, and the checklist is complete, you upload the file and start the fine-tuning job. The dataset engineering phase is finished. The model training phase begins.
+
+But dataset engineering does not end when training starts. You monitor training metrics for signs of data quality issues: unexpectedly high loss, divergence, overfitting in early epochs, or bizarre failure modes in validation examples. If training fails or produces a bad model, you trace the failure back to the data. Maybe the dataset had distributional drift. Maybe examples were too easy and the model memorized rather than generalized. Maybe fine-tuning was the wrong approach entirely, and few-shot prompting would have worked better.
+
+Fine-tuning is the culmination of dataset construction, but it is not the end of the story. The real test is deployment. The fine-tuned model must perform reliably on production data, which may differ from the training distribution. You evaluate it rigorously, using the methods from Section 8, before you trust it with real users.
+
+You have now completed the construction of a training dataset: from defining task requirements, to sourcing and filtering examples, to annotating and validating data, to handling multimodal alignment, to formatting for provider-specific fine-tuning APIs. The next chapter examines the subtler challenge that runs through every stage of dataset work: bias, fairness, and representativeness. Because a technically perfect dataset that systematically excludes or misrepresents populations is not just flawed—it is dangerous.

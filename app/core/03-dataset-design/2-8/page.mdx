@@ -1,0 +1,199 @@
+# 2.8 — API-Based Data Collection: Rate Limits, Costs, and Reliability
+
+In November 2024, a customer intelligence startup built a dataset pipeline that pulled product reviews from three e-commerce platforms via their public APIs. The pipeline was designed to collect 500,000 reviews per day across 12,000 products to feed a sentiment analysis model. During the first week of operation, the system worked flawlessly, ingesting data at the target rate and populating their training dataset on schedule. In week two, one platform updated its API to enforce a new rate limit of 100 requests per minute, down from the previous 500. The startup's pipeline, which had no rate-limiting logic or retry handling, immediately began failing. By the time engineers noticed, they had been locked out of the API for 72 hours due to repeated violations. The second platform introduced a tiered pricing model that charged $0.005 per request above 50,000 daily requests, retroactive to the start of the month. The startup's bill jumped from zero to $14,000 in two weeks. The third platform deprecated a field in their response schema without warning, breaking the startup's parser and corrupting 180,000 records before anyone noticed. Three months into the project, they had collected only 60% of their target dataset, burned $38,000 in unexpected API costs, and missed their product launch deadline by eleven weeks.
+
+The failure was not that they used APIs for data collection. API-based collection is often the only way to access real-time, third-party, or dynamically generated data. The failure was that they treated APIs like static data sources, assuming availability, cost, and format would remain constant. APIs are dependencies with SLAs, usage policies, and versioning cycles that you do not control. In 2026, API-based data collection is standard practice for teams building datasets from external services, internal microservices, and model provider platforms. But APIs impose rate limits that throttle throughput, introduce costs that scale unpredictably, change formats that break parsers, and fail intermittently in ways that corrupt datasets. Resilient API collection pipelines require cost modeling, adaptive rate limiting, robust retry logic, schema versioning, and monitoring that detects failures before they cascade. This subchapter covers how to build data collection systems on top of APIs without inheriting their fragility.
+
+## API Collection Architecture Patterns
+
+API-based data collection pipelines have three architectural layers: the request layer that calls endpoints, the orchestration layer that manages concurrency and retries, and the storage layer that persists responses. The mistakes happen when teams collapse these layers into scripts that work until the API changes.
+
+The request layer abstracts the API itself. This layer handles authentication, constructs requests, parses responses, and translates API-specific errors into standardized exceptions. The customer intelligence startup hardcoded API URLs, authentication tokens, and response parsing directly into their collection script. When one platform changed its authentication from API keys to OAuth2, they had to rewrite 300 lines of code across multiple files.
+
+A better design isolates each API behind a client class or module that exposes a consistent interface. A media monitoring company collected articles from eight news APIs. They built a client for each API that implemented a common interface: fetch, parse, and handle errors. When one API changed authentication, they updated only that client. The rest of the pipeline was unaffected. Abstraction layers prevent API changes from rippling through your entire system.
+
+The orchestration layer controls request rates, manages concurrency, and handles retries. This layer is where rate limiting, backoff strategies, and failure recovery live. The startup's pipeline had no orchestration. It sent requests as fast as possible until the API blocked it.
+
+A financial data company built an orchestration layer using a task queue with configurable rate limits per API. Each API had a separate queue with limits set 20% below the documented maximums to provide headroom for bursts. When an API returned a rate limit error, the orchestration layer paused that queue for 60 seconds and retried. This kept the pipeline running even when individual APIs throttled. Orchestration is not optional. It is the difference between a fragile script and a production pipeline.
+
+The storage layer persists raw responses before parsing or transformation. Many teams parse API responses immediately and store only the extracted fields. This is efficient but fragile. If your parser has a bug or the API changes its schema, you lose the original data and cannot recover.
+
+A recruiting platform collected job postings from aggregator APIs and extracted title, description, and salary into a database. Six months later, they needed to add location and remote-work fields. Because they had not stored raw responses, they had to re-collect six months of data. A travel booking company made the opposite choice. They stored every raw API response in cloud object storage, then ran parsing as a separate batch process.
+
+When they discovered a parser bug that mishandled international phone numbers, they reprocessed two months of raw data in four hours. Storing raw responses adds storage cost but provides recovery and reprocessing flexibility. For most use cases, the tradeoff is worth it.
+
+Separate these three layers with clear boundaries. Changes to request clients should not require changes to orchestration logic. Changes to storage formats should not require changes to how you call APIs. Separation enables independent evolution and isolates failures.
+
+## Rate Limits and Adaptive Throttling
+
+APIs enforce rate limits to protect their infrastructure from abuse and overload. Limits are expressed as requests per second, requests per minute, requests per day, or combinations of all three. Violating limits results in throttling, temporary bans, or permanent API key revocation. Your collection pipeline must respect these limits while maximizing throughput.
+
+Start by documenting every API's rate limits explicitly. Do not assume limits are stable or well-documented. The customer intelligence startup relied on outdated documentation that listed 500 requests per minute. The actual limit had been reduced to 100 six months earlier, but the API docs were never updated.
+
+Check documentation, test empirically, and monitor for changes. A social media analytics company tested each API by gradually increasing request rates until they hit throttling errors, then set their pipeline limits to 80% of observed maximums. This gave them a buffer for other API users and usage spikes. Empirical testing reveals the ground truth when documentation is stale or missing.
+
+Implement adaptive throttling that adjusts to API feedback. Fixed rate limits work until the API changes or you share quota with other processes. Adaptive throttling listens to rate limit headers and error codes, then adjusts request rates dynamically. Many APIs return headers like X-RateLimit-Remaining or Retry-After.
+
+A logistics data pipeline parsed these headers after every request. When X-RateLimit-Remaining dropped below 20% of the limit, the pipeline automatically slowed its rate by 30%. When it hit zero, the pipeline paused for the duration specified in Retry-After. This prevented violations and maximized throughput within available quota.
+
+If your API does not return rate limit headers, implement exponential backoff on 429 Too Many Requests errors. Start with a one-second delay, double it on each retry, and cap at 60 seconds. A video metadata collection system used exponential backoff and reduced rate limit violations by 94% compared to fixed retries. Exponential backoff is the minimum standard for handling rate limits when headers are unavailable.
+
+Handle burst limits separately from sustained limits. Some APIs allow short bursts above the average rate but enforce lower sustained rates over longer windows. A search API allowed 50 requests per second but only 100,000 per day. A naive implementation could burn the daily quota in 33 minutes.
+
+A music streaming company implemented dual rate limiting: a per-second limit of 40 requests and a daily budget tracker that spread requests evenly across 24 hours. When daily usage exceeded 70% of quota before 5 PM, the pipeline slowed to preserve budget for evening hours when fresh data was more valuable. Multi-level throttling prevents quota exhaustion.
+
+Distribute requests across time when possible. If you need to collect 100,000 records and you have 24 hours to do it, spread requests evenly rather than front-loading. This reduces peak load, avoids triggering burst limits, and provides resilience to failures.
+
+A weather data pipeline collected forecasts from a meteorological API. Instead of fetching all locations at midnight, they randomized request timing across the day. This kept their rate below limits and avoided competing with other users who likely scheduled jobs at round hours. Temporal distribution is load balancing for API quotas.
+
+## Cost Modeling and Budget Management
+
+API costs fall into three categories: per-request fees, tiered pricing, and overage charges. In 2026, many APIs that were previously free or flat-rate have shifted to usage-based pricing. Collecting large datasets from these APIs can generate costs that exceed infrastructure and labor budgets if you do not model and monitor spending.
+
+Model your costs before building the pipeline. Multiply your target dataset size by the cost per request, then add overhead for retries, errors, and exploratory queries. The customer intelligence startup needed 500,000 reviews. At $0.005 per request, that is $2,500 base cost. Add 15% for retries and failed requests, and the realistic cost is $2,875.
+
+They did not do this math and were blindsided by a $14,000 bill that included overage charges and retroactive tiering. A speech transcription company modeled costs for collecting 10,000 hours of audio via a transcription API priced at $0.02 per minute. Ten thousand hours is 600,000 minutes, or $12,000. They compared this to the cost of hiring human transcribers at $1.50 per minute and chose the API. Cost modeling is a build-versus-buy decision at the data collection layer.
+
+Track spending in real time. API bills arrive at the end of the month, often too late to prevent overruns. Build cost tracking into your pipeline by logging request counts and multiplying by known per-request prices. A mapping platform collected geolocation data from a geocoding API. They instrumented their pipeline to increment a cost counter on every request and pushed metrics to a dashboard.
+
+When daily spending exceeded $200, alerts fired, and the pipeline paused until engineers reviewed. This prevented a runaway job from burning their monthly budget in two days. Real-time cost visibility is operational hygiene. Without it, you fly blind until the bill arrives.
+
+Optimize for cost efficiency without sacrificing data quality. Batch requests when APIs support it. A single batched request that returns 100 records is cheaper than 100 individual requests. A product catalog company used a supplier API that allowed batch queries of up to 50 SKUs per request. By batching, they reduced costs by 98% compared to individual queries.
+
+Cache responses when data does not change frequently. If you are collecting company metadata that updates monthly, cache responses for 30 days and refresh only when necessary. A financial intelligence platform cached company profile data for 60 days, reducing API calls by 85% and cutting costs from $9,000 to $1,350 per month. Caching is cost arbitrage.
+
+Negotiate pricing for large-scale usage. API pricing is often tiered, with discounts at higher volumes or custom agreements for enterprise users. The speech transcription company initially paid $0.02 per minute. After demonstrating consistent usage of 200,000 minutes per month, they negotiated a rate of $0.011 per minute, saving $1,800 monthly.
+
+Vendors prefer predictable revenue and will discount for committed usage. Do not accept list pricing for production-scale collection. If you are a significant customer, you have leverage to negotiate better terms.
+
+Set budget caps and kill switches. If your pipeline runs away due to a bug or misconfiguration, it should stop before it bankrupts your project. A real estate data company set a daily budget cap of $500. When spending hit $450, the pipeline slowed to 10% throughput. At $500, it stopped entirely and required manual re-enable.
+
+This design prevented a retry loop bug from costing them $18,000 in one weekend. Budget caps are circuit breakers for cost. They protect you from runaway processes that would otherwise drain your entire budget before you notice.
+
+## Retry Strategies and Failure Handling
+
+APIs fail. Endpoints return 500 errors, networks time out, authentication tokens expire, and upstream dependencies crash. Your pipeline must handle these failures without losing data or corrupting your dataset.
+
+Classify errors into retriable and non-retriable categories. Retriable errors are transient: 500 Internal Server Error, 503 Service Unavailable, 429 Too Many Requests, network timeouts. Non-retriable errors are permanent: 400 Bad Request, 401 Unauthorized, 404 Not Found. Retry transient errors with exponential backoff. Do not retry permanent errors, which indicate bugs in your requests.
+
+The customer intelligence startup retried every error, including 404s, wasting quota on requests that would never succeed. A content aggregation company classified errors explicitly. Transient errors triggered retries with backoff. Permanent errors logged details and moved on. This reduced wasted retries by 60% and simplified debugging.
+
+Implement a maximum retry limit to prevent infinite loops. Three to five retries with exponential backoff is standard. If a request fails five times, log it to a dead-letter queue for manual review and move on. A healthcare data pipeline retried failed API calls up to four times with delays of 1, 2, 4, and 8 seconds.
+
+If all retries failed, the request was written to a failed-requests table with the error message and timestamp. Engineers reviewed this table daily and re-queued requests after fixing issues. Bounded retries prevent one bad endpoint from blocking your entire pipeline.
+
+Use idempotency to make retries safe. If a request might succeed but the response is lost due to a network error, retrying could create duplicate records. APIs that support idempotency keys allow you to retry safely by sending the same key with each attempt. The API deduplicates on the key and returns the original response.
+
+A payments data pipeline assigned a unique idempotency key to every transaction query. When a request timed out, they retried with the same key, ensuring they never double-counted transactions. If your API does not support idempotency keys, implement deduplication in your storage layer by checking for duplicate IDs before inserting records.
+
+Handle partial failures in batch requests. If you send a batch of 50 items and 3 fail, retry only the failed items, not the entire batch. A product data pipeline batched SKU queries in groups of 100. When 5 SKUs returned errors, the pipeline extracted those 5, retried them individually, and merged results. This minimized wasted API calls and improved efficiency.
+
+Monitor failure rates and alert on anomalies. A sudden spike in 500 errors indicates an API outage. A spike in 429 errors means you are exceeding rate limits. A spike in 404 errors suggests your request logic has a bug.
+
+A logistics API pipeline tracked error rates by status code and sent alerts when any code exceeded 5% of requests in a 10-minute window. This caught an API outage within minutes and allowed engineers to pause collection until the service recovered. Failure rate monitoring is early warning.
+
+## Handling API Changes and Schema Versioning
+
+APIs evolve. Providers add fields, deprecate endpoints, change authentication, and modify response schemas. Your pipeline must handle these changes without breaking or corrupting data.
+
+Version your API clients and parsers explicitly. When an API changes, deploy a new version of your client without removing the old one. Run both versions in parallel during a transition period, then retire the old version once you have validated the new one.
+
+A financial market data company used versioned clients: v1, v2, v3. When the API provider released a v3 schema with renamed fields, they deployed a v3 client, ran it alongside v2 for two weeks to compare outputs, then switched traffic to v3 and deprecated v2. This prevented schema changes from causing data loss.
+
+Monitor for schema drift. Even when APIs claim to be stable, fields appear, disappear, or change types. The customer intelligence startup's parser broke because a field changed from a string to an array without warning. A media company built schema validation into their pipeline. After every API response, they validated the structure against an expected schema.
+
+When validation failed, the pipeline logged the response, alerted engineers, and skipped parsing to avoid corruption. This caught schema changes within hours instead of weeks. Schema validation is a safety net that prevents silent data corruption.
+
+Store raw responses and version your parsing logic separately. When the API changes, you can reprocess raw data with updated parsers instead of re-collecting. A travel API changed date formats from ISO 8601 to Unix timestamps. A booking platform had stored raw responses and was able to reparse six months of data with updated logic in three hours.
+
+Teams that parsed inline and discarded raw responses had to re-collect everything. Decouple collection from parsing. This separation gives you recovery options when schemas change unexpectedly.
+
+Subscribe to API change notifications and monitor deprecation warnings. Most providers announce breaking changes weeks or months in advance via email lists, changelogs, or response headers. A payments API sent deprecation warnings in response headers six months before removing an endpoint.
+
+A fintech company monitored these headers and proactively migrated to the new endpoint before the deadline. Teams that ignored warnings faced outages when the old endpoint disappeared. Treat API changelogs like security bulletins. Review them regularly and plan migrations proactively.
+
+Test your pipeline against API sandbox or staging endpoints when available. Providers sometimes offer test environments where you can validate changes before they hit production. A shipping logistics company tested all pipeline updates against the API provider's sandbox. This caught a bug in their authentication logic that would have caused a production outage. Sandbox testing is regression prevention.
+
+## Building Resilient Collection Pipelines
+
+Resilience means your pipeline continues to make forward progress even when individual components fail, APIs throttle, or data is corrupt. Resilient pipelines degrade gracefully rather than failing catastrophically.
+
+Design for partial success. If you are collecting from ten APIs and three are down, the pipeline should collect from the seven that work and retry the three that failed. A news aggregation pipeline collected articles from 15 sources. It ran each source in parallel, isolated failures, and succeeded as long as at least 10 sources returned data.
+
+This kept the dataset growing even during partial outages. Monolithic pipelines that require all dependencies to succeed are brittle. Partition work and accept partial success. This approach maximizes data collection even when some sources are unavailable.
+
+Implement checkpointing and resumption. If your pipeline crashes halfway through collecting 500,000 records, it should resume from record 250,000, not restart from zero. A social media pipeline checkpointed progress every 1,000 requests by writing the last successful ID to a state file. On restart, it read the state file and resumed from the checkpoint.
+
+This reduced wasted work and API costs. Stateless pipelines that restart from scratch waste quota and time. Checkpointing is essential for long-running collection jobs.
+
+Use dead-letter queues for failed requests. When a request fails after all retries, write it to a queue for later review and reprocessing. This separates failure handling from the main pipeline and prevents one bad request from blocking others. A public records pipeline wrote failed requests to a DLQ with error details and retry count.
+
+Engineers reviewed the DLQ daily, fixed bugs, and requeued items. The main pipeline never blocked on transient failures. Dead-letter queues are failure isolation. They allow you to continue making progress while deferring problematic requests for human review.
+
+Run pipelines idempotently so they can be re-executed without creating duplicates. If you run the pipeline twice, the result should be the same as running it once. Use unique IDs from the API as primary keys in your storage layer to enforce deduplication.
+
+A product review pipeline used review IDs from the API as primary keys in the database. When the pipeline re-ran due to a deployment, duplicate inserts were ignored. Idempotency makes pipelines safe to retry. You can re-run failed jobs without worrying about data duplication.
+
+Monitor end-to-end latency and throughput. Track how long it takes to collect a batch, how many records per minute you are processing, and how far behind real-time you are. A cryptocurrency trading platform collected market data via API and monitored lag between API event timestamps and ingestion timestamps.
+
+When lag exceeded 30 seconds, alerts fired. This caught a bottleneck in their parsing logic that was slowing ingestion. End-to-end monitoring detects performance degradation before it becomes a crisis.
+
+## API Collection at Scale
+
+Scaling API collection introduces challenges around parallelism, quota allocation, and infrastructure costs. What works for collecting 10,000 records fails at 10 million.
+
+Parallelize requests across multiple workers or threads, respecting total rate limits. If an API allows 100 requests per second and you have 10 workers, each worker should limit itself to 10 requests per second. A distributed collection system used 50 worker instances to collect product data from an e-commerce API.
+
+They implemented a shared rate limiter using Redis that tracked global request counts and allocated quota fairly across workers. This scaled throughput while preventing any worker from exceeding limits. Centralized rate limiting is essential for distributed collection. Without it, workers compete for quota and trigger rate limit violations.
+
+Partition work to avoid contention and duplication. Assign each worker a distinct subset of IDs or queries. A hiring platform collected job postings from multiple cities. They partitioned by city and assigned each worker a list of cities to query. This eliminated overlap and ensured complete coverage.
+
+Random work distribution causes gaps and duplicates. Explicit partitioning guarantees correctness. Each worker owns a well-defined slice of the total work, preventing both duplication and missed records.
+
+Use managed job orchestration platforms instead of building custom schedulers. Tools like Airflow, Prefect, and AWS Step Functions handle retries, checkpointing, and monitoring. A media company moved from custom scripts to Airflow and reduced pipeline engineering time by 60%.
+
+Managed platforms provide observability, scheduling, and failure recovery out of the box. Build pipelines on top of orchestration frameworks, not cron jobs. The investment in learning a platform pays off quickly in reduced maintenance burden.
+
+Optimize infrastructure costs by using spot instances or serverless functions for API collection. Collection workloads are often bursty and fault-tolerant, making them ideal for cheap, interruptible compute. A mapping company ran API collection on AWS Lambda. Each invocation fetched a batch of records, stored results, and terminated.
+
+This cost 70% less than running persistent EC2 instances. Serverless is cost-effective for intermittent collection. You pay only for actual execution time, not for idle capacity.
+
+Cache aggressively to reduce redundant API calls. If multiple pipelines need the same data, fetch it once and share. A retail analytics company had three teams independently collecting product catalog data from the same API. They built a shared caching layer that served all three teams from a single collection run, cutting API costs by two-thirds.
+
+Centralized caching is cost pooling. It prevents duplicate requests for the same data across different consumers.
+
+## When API Collection is the Right Choice
+
+API-based collection makes sense when the data is owned by a third party, when it changes frequently, or when building your own collection infrastructure is prohibitively expensive. It does not make sense when you need full control over data provenance, when API costs exceed alternatives, or when reliability requirements are higher than the API's SLA.
+
+Use APIs when the data is external and unavailable elsewhere. Social media posts, financial market prices, weather forecasts, and public records are often accessible only via APIs. A sentiment analysis company needed real-time social media data. The only option was platform APIs. They built a resilient collection pipeline with retries, rate limiting, and cost tracking. API collection was the only path to the data.
+
+Use APIs when data freshness matters more than cost. If you need data within minutes of generation, APIs are often the only option. A news monitoring platform collected breaking news via APIs because web scraping introduced 10-20 minute delays. The API costs were higher, but freshness was a product requirement. For real-time use cases, APIs are worth the premium.
+
+Do not use APIs when you can collect the same data more cheaply and reliably. If data is available via bulk downloads or database exports, prefer those methods. A research team needed historical financial data. The API charged $0.01 per record. The same data was available as a $500 quarterly bulk export.
+
+They chose the export, saving $12,000 per year. Bulk data beats APIs for historical or static datasets. APIs are optimized for real-time access, not for large historical downloads.
+
+Do not use APIs when reliability requirements exceed the API's uptime. If the API has 95% uptime and your pipeline needs 99.9%, you will spend more on retry logic and failure handling than the data is worth. A logistics company needed shipment tracking data with 99.95% reliability. The tracking API had 97% uptime.
+
+They switched to a direct database integration with the shipping provider, eliminating API dependency. Match your reliability needs to the API's SLA, or find an alternative. Building extreme reliability on top of an unreliable API is expensive and fragile.
+
+Do not use APIs when vendor lock-in is unacceptable. APIs create dependency on the provider's pricing, availability, and terms. If the provider raises prices, deprecates endpoints, or shuts down, your pipeline breaks. A healthcare company relied on a single diagnostic data API. When the provider was acquired and the API was discontinued, their pipeline collapsed. They had no fallback.
+
+Diversify data sources or build alternatives to avoid single-API dependency. Treat critical APIs like critical infrastructure, with redundancy and fallback plans.
+
+## The Operational Discipline of API Pipelines
+
+API collection is not a set-and-forget process. It is an operational discipline that requires monitoring, cost management, and continuous adaptation to API changes. Teams that treat it casually end up with broken pipelines, runaway costs, and incomplete datasets.
+
+Assign ownership of each API integration to a specific engineer or team. APIs need monitoring, updates, and troubleshooting. Orphaned integrations rot. A media company assigned each of their 12 API integrations to a team member. When an API changed, the owner was responsible for updating the client, validating data, and communicating impact. Ownership creates accountability.
+
+Run regular drills to test failure handling. Simulate API outages, rate limit errors, and schema changes to verify your retries and alerts work. A fintech company ran quarterly chaos tests where they intentionally broke API integrations to verify recovery. They discovered that two of their pipelines had broken retry logic that no one had noticed because APIs had been stable. Drills surface hidden fragility.
+
+Maintain runbooks for common API issues. Document how to handle rate limit errors, authentication failures, and schema changes. A logistics platform built a wiki page for each API with troubleshooting steps, contact info for the provider, and escalation procedures.
+
+When an API failed at 2 AM, the on-call engineer followed the runbook and restored service in 15 minutes. Runbooks reduce mean time to recovery. They codify tribal knowledge and make incident response faster and more consistent.
+
+Review API costs monthly and optimize high-spend integrations. The highest-cost APIs are candidates for renegotiation, caching, or replacement. A content platform reviewed API spending every month. They identified one API that cost $4,000 monthly and replaced it with a bulk data export for $300. Cost reviews drive efficiency.
+
+API-based data collection is the intersection of software engineering, operational resilience, and cost management. It is not a scripting task. It is a production system that powers your dataset pipelines and directly impacts model quality, budget, and timelines. Treat it with the rigor of any mission-critical infrastructure. The next step is managing the datasets you have collected through versioning, access control, and lifecycle policies.

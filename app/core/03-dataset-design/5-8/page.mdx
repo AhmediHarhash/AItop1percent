@@ -1,0 +1,99 @@
+# 5.8 — Compaction, Small-File Problem, and Partition Strategy
+
+In late 2025, a recommendation system at a SaaS analytics platform experienced a 12x slowdown in training data loading, causing model retraining jobs to miss their daily deployment window for three consecutive weeks. The dataset had grown from 200 million records to 1.8 billion over six months, which the team expected. What they did not expect was that the file count had grown from 4,000 files to 310,000 files. Each incremental update to the dataset wrote dozens of small files, and no compaction process existed to merge them. The training job spent 87% of its runtime opening files and reading metadata, not processing data. The Spark driver ran out of memory trying to plan the query because the partition metadata structure exceeded available heap space. The fix required a one-time compaction job that merged 310,000 files into 8,000 files, reducing the next training run from 14 hours to 72 minutes. The three weeks were spent debugging memory errors and profiling IO patterns that should never have occurred.
+
+The root cause was not dataset growth. Growth is inevitable and manageable. The cause was unmanaged file proliferation driven by a partition strategy designed for writes, not reads. The team partitioned by hourly timestamp to support fast incremental ingestion, but AI training jobs read across months of data, scanning thousands of partitions with hundreds of tiny files each. No one thought about compaction because no one understood the cost of small files at scale. Modern data infrastructure requires deliberate file management. The small-file problem is not an edge case. It is the default outcome when writes and reads have different access patterns and no one reconciles them. Understanding compaction strategies, partition design for AI workloads, and file size optimization is the difference between a data pipeline that scales and one that collapses under its own metadata overhead.
+
+## The Small-File Problem: Why File Count Matters More Than Data Size
+
+Object storage systems are optimized for large objects. Reading a 1 GB file from S3 is cheap. Reading one thousand 1 MB files is expensive, not because the total data volume is the same, but because the overhead of each request dominates. Every file read incurs latency for the HTTP request, authentication, metadata lookup, and connection setup. When file sizes drop below 10 MB, overhead exceeds data transfer time. When file sizes drop below 1 MB, the ratio becomes absurd. A training job that reads 100,000 files spends more time establishing connections than reading data.
+
+The problem compounds at the query planning layer. Distributed query engines like Spark and Trino build an execution plan by listing all files in the relevant partitions, reading metadata from each file, and scheduling tasks to process them. For columnar formats like Parquet, metadata includes schema, row counts, and column statistics. Reading metadata for 100,000 files can take longer than reading the data itself. The driver node that coordinates planning becomes a bottleneck, and for sufficiently large file counts, it runs out of memory before the query even starts.
+
+File proliferation happens naturally in streaming and incremental batch workloads. A streaming job that writes micro-batches every five minutes generates 288 files per partition per day. Over a month, a single partition accumulates 8,640 files. If you partition by date and run for a year, you have over 100,000 files in a single table. The data volume might be modest, but the metadata overhead is catastrophic.
+
+The small-file problem is insidious because it does not manifest immediately. Early in a project, when the dataset contains a few thousand files, queries run fine. As file count grows, performance degrades gradually. Teams attribute slowdowns to data growth, add more compute, and continue. By the time the real cause is identified, the dataset contains hundreds of thousands of files, and compaction is a multi-day remediation project.
+
+## Compaction: Merging Small Files Into Optimal Sizes
+
+Compaction is the process of reading multiple small files and rewriting them as fewer large files, without changing the logical data. It is a physical optimization that improves read performance at the cost of write-time overhead. The optimal file size depends on the query engine and the access pattern, but for analytical workloads, the target is typically 128 MB to 1 GB per file. Files smaller than 64 MB should be compacted. Files larger than 2 GB should be split.
+
+Compaction can be synchronous or asynchronous. Synchronous compaction happens during the write operation. Each write merges newly written files with existing small files in the same partition. This keeps file counts low but increases write latency. Asynchronous compaction runs as a separate background process, typically on a schedule. It scans partitions, identifies those with excessive file counts or suboptimal file sizes, and rewrites them. This decouples compaction cost from the write path but introduces eventual consistency: queries see uncompacted files until the compaction job completes.
+
+For AI training workloads, asynchronous compaction is almost always preferable. Training jobs read large historical windows and benefit from optimized file layout, but they do not require immediate consistency. Incremental writes happen frequently and must remain fast. Running compaction nightly or weekly balances read performance with write throughput.
+
+The compaction job itself is straightforward. You read all files in a partition, concatenate them into a single DataFrame, and write the result back to the same partition with a target file size. Delta Lake provides a built-in optimize command. Iceberg provides similar functionality through rewrite actions. If you are working with raw Parquet, you implement compaction as a Spark job that groups files by partition, reads each group, and writes consolidated outputs.
+
+The operational challenge is not how to compact, but when and what. Compacting every partition on every run is wasteful. Most partitions do not need it. You compact partitions that exceed a file count threshold, typically 50 to 100 files, or that have average file sizes below 32 MB. Monitoring file counts and sizes per partition is the prerequisite for intelligent compaction scheduling.
+
+## Partition Strategy for AI Workloads: Reads Versus Writes
+
+Partitioning is the practice of organizing data into subdirectories based on one or more columns, typically temporal or categorical dimensions. A dataset partitioned by date stores each day's data in a separate directory. Partitioning enables partition pruning, where the query engine skips entire partitions that do not match the query filter, reducing the data scanned and improving performance.
+
+The challenge is that partitioning strategies optimized for writes are often suboptimal for reads. Write-optimized partitioning uses fine-grained partitions to isolate incremental updates. A streaming pipeline partitions by hour or minute so that each micro-batch writes to a distinct partition, avoiding contention. Read-optimized partitioning uses coarser partitions aligned with query patterns. If training jobs read a month of data at a time, partitioning by month reduces the number of partitions scanned and simplifies file management.
+
+AI workloads are read-heavy. Training jobs read historical data spanning weeks or months. Inference feature pipelines read recent data spanning hours or days. The access pattern is wide temporal scans with filters on categorical dimensions. The optimal partition strategy reflects this. Partition by date at the day or week granularity, not hour or minute. If categorical filters are common, add a secondary partition on that dimension, but avoid high-cardinality categories that create thousands of partitions.
+
+For example, a dataset of user interactions might be partitioned by date and event type. Training jobs filter by date range and event type, so both dimensions support partition pruning. Partitioning by user ID would create millions of partitions, one per user, which degrades metadata performance and provides no benefit because training jobs rarely filter to individual users.
+
+The failure mode is over-partitioning. Teams partition by every dimension that seems relevant, producing partition schemes with four or five levels. The result is an exponential explosion of partitions, most of which contain tiny amounts of data. A dataset with 1 billion rows partitioned by year, month, day, country, and event type might produce 50,000 partitions, many with fewer than 1,000 rows. The metadata overhead outweighs any pruning benefit.
+
+A good heuristic is to limit partitioning to two dimensions, with the primary dimension being temporal and the secondary dimension having low to moderate cardinality. If your query patterns require additional filtering, rely on column statistics and predicate pushdown rather than partitioning. Parquet files store min and max values for each column, which allows the query engine to skip files even when those columns are not partition keys.
+
+## File Size Optimization: Balancing Throughput and Parallelism
+
+File size is a trade-off between sequential throughput and parallelism. Larger files maximize sequential read throughput because you amortize connection overhead and metadata reads across more data. Smaller files maximize parallelism because each file can be processed by a separate task, enabling better load distribution across a cluster.
+
+For single-node reads, larger files are unambiguously better, up to the point where file size exceeds memory or processing time becomes too long for fault tolerance. For distributed reads, the optimal size depends on cluster size and task scheduling. If you have 100 workers and 10 files, only 10 workers are active at a time. If you have 100 files, all workers can process data in parallel.
+
+The typical target for AI training datasets is 256 MB to 1 GB per file. This size is large enough to minimize metadata overhead but small enough to enable parallelism on modestly sized clusters. For very large clusters with hundreds or thousands of workers, smaller files in the 128 MB to 256 MB range provide better load balancing. For small clusters or single-node processing, files can be larger, up to 2 GB.
+
+The practical constraint is that file size affects write behavior. When you write a DataFrame with a target file size of 1 GB, the writer buffers data until it accumulates 1 GB per partition per writer task, then flushes to storage. If partitions are small, you may never reach the target size, resulting in small files anyway. If partitions are large and you have few writer tasks, you may produce files much larger than the target. Tuning file size requires tuning both the target size parameter and the number of writer tasks.
+
+Delta Lake and Iceberg both allow you to specify target file size during writes. Spark uses the maxRecordsPerFile and maxFileSize configuration options. The compaction process also respects target file size, rewriting files to match the configured target. Monitoring actual file sizes in production is essential because configuration does not guarantee outcomes. If you configure a target of 512 MB but observe a bimodal distribution with files at 50 MB and 2 GB, your write parallelism or partition strategy needs adjustment.
+
+## Partition Granularity and Training Data Loading Performance
+
+Training jobs load data differently than analytical queries. Analytical queries often scan recent partitions and apply filters, aggregations, or joins. Training jobs scan large historical windows with minimal filtering, convert data to tensors, and shuffle for minibatch construction. The bottleneck is raw data loading throughput, not query planning or filtering logic.
+
+Partition granularity directly affects loading throughput because it determines how many partitions and how many files the training job must open. A dataset partitioned by hour over a one-year training window contains 8,760 partitions. If each partition contains 50 files, the training job opens 438,000 files. A dataset partitioned by day contains 365 partitions. If each partition contains 20 files after compaction, the training job opens 7,300 files. The file count difference is 60x, and the loading time difference is similar.
+
+Training frameworks like PyTorch and TensorFlow do not optimize for metadata-heavy loads. They assume data is pre-loaded into memory or accessed through high-throughput sequential reads. When forced to open hundreds of thousands of small files, they thrash. The Python GIL becomes a bottleneck. Memory usage spikes as file handles accumulate. Loading time dominates training time, which defeats the purpose of distributed training.
+
+The mitigation is to align partition granularity with the training window and to compact partitions before training. If your training window is 30 days, partition by day and compact to 10-20 files per partition. This produces 300 to 600 files for the full training load, which is manageable. If your training window is six months, partition by week, not day. The goal is to keep total file count below 10,000 for the full training dataset.
+
+Some teams pre-materialize training datasets by reading from the partitioned source, shuffling, and writing a single consolidated dataset with no partitions and a small number of large files. This adds a preprocessing step but eliminates file count issues entirely during training. The trade-off is storage duplication and staleness. The consolidated dataset is a snapshot that diverges from the source as new data arrives.
+
+## Monitoring File Counts and Sizes: The Metrics That Matter
+
+You cannot manage what you do not measure. File count and file size distributions are first-class metrics for data infrastructure, on par with query latency and throughput. Yet most teams do not track them until performance degrades. By the time degradation is visible, the problem is severe.
+
+The essential metrics are total file count, file count per partition, average file size, and file size distribution. Total file count indicates overall metadata load. File count per partition indicates whether compaction is keeping up with writes. Average file size indicates whether files are in the optimal range. File size distribution reveals whether you have a small-file problem, a large-file problem, or both.
+
+These metrics are extractable from table metadata. Delta Lake exposes file statistics through the detail command. Iceberg exposes them through metadata tables. Spark can query the underlying file system directly. The monitoring job is simple: query metadata, compute statistics, and emit them to your observability platform. Run it daily or after each compaction job.
+
+Alerting thresholds depend on your scale, but reasonable defaults are: alert if any partition exceeds 100 files, alert if average file size drops below 64 MB, alert if total file count exceeds 10,000 per billion rows. These thresholds catch file proliferation early, when remediation is cheap.
+
+When alerts fire, the response is compaction. If compaction is already scheduled and running, the alert indicates that compaction is not keeping pace with writes. You increase compaction frequency, allocate more resources to the compaction job, or adjust the partition strategy to reduce write volume per partition.
+
+## Partition Evolution: Changing Partition Strategy Without Full Rewrites
+
+Partition strategy is not set in stone. As your workload evolves, your optimal partitioning changes. Early in a project, when data volume is small, partitioning by hour works fine. As volume grows, hourly partitions become unmanageable, and you need to repartition by day. The question is how to repartition without rewriting the entire dataset.
+
+Apache Iceberg supports partition evolution natively. You change the partition spec in the table metadata, and new writes use the new partitioning while old data remains in the old partitioning. Queries work transparently across both partition schemes because Iceberg tracks partition metadata separately from data layout. This allows you to migrate partition strategies incrementally. Write new data with daily partitions, leave historical data in hourly partitions, and eventually backfill historical partitions if needed.
+
+Delta Lake does not support partition evolution directly. Changing partition keys requires rewriting the table. The recommended approach is to create a new table with the desired partition scheme, copy data from the old table, and swap the table references. This is disruptive and expensive for large tables, which is why partition strategy should be carefully considered up front.
+
+The broader lesson is that partition strategy is an infrastructure decision with long-term consequences. Changing it later is possible but costly. The safe default for AI datasets is to partition by date at the day granularity, optionally adding a low-cardinality secondary dimension if query patterns demand it. Avoid fine-grained temporal partitions, avoid high-cardinality categorical partitions, and plan for compaction from day one.
+
+## When to Skip Partitioning Entirely
+
+Partitioning is not always beneficial. Small datasets with fewer than 100 million rows and fewer than 1,000 files do not benefit from partitioning. The overhead of managing partitions exceeds the performance gain from pruning. Query engines are fast enough to scan the full dataset and filter in memory.
+
+Datasets with no dominant filter dimension also do not benefit. If queries filter on many different columns with no consistent pattern, partitioning by any single dimension provides little pruning benefit. In this case, rely on column statistics and predicate pushdown, which work across all columns without requiring partitioning.
+
+Datasets that are always read in full, such as static benchmark datasets or small feature stores, do not need partitioning. The entire dataset fits in memory or is scanned sequentially anyway. Partitioning adds complexity with no upside.
+
+The heuristic is: partition when queries filter consistently on a temporal or categorical dimension, when dataset size exceeds 100 million rows, and when partition counts remain under 1,000. Outside these conditions, partition pruning does not justify the operational overhead.
+
+The next step is ensuring that teams can find and reuse datasets across the organization, which requires a centralized registry that catalogs what datasets exist, who owns them, and what they contain, covered in 5.9.

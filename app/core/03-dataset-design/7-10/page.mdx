@@ -1,0 +1,101 @@
+# 7.10 — Training Data for Agent Systems: Trajectory and Tool-Use Datasets
+
+Agent training data is not input-output pairs. It is decision sequences.
+
+The distinction matters more than most teams realize. In November 2025, a customer support automation platform spent four months fine-tuning a model on 50,000 support exchanges—clean question-answer pairs extracted from chat logs, beautifully formatted, carefully deduplicated. The model learned to generate helpful responses. It did not learn to decide when to query the knowledge base, when to escalate to a human, when to request clarification, or when to invoke the refund tool. When deployed as an agent with those tools available, it produced coherent text but never called a single tool. The team had trained a conversationalist, not an agent.
+
+## The Trajectory Structure
+
+Agent behavior unfolds over time through repeated cycles of observation, reasoning, action, and result. Each cycle produces a state transition. The sequence of these transitions is the trajectory. This is what you train on when you want a model to act, not just respond.
+
+A trajectory for a customer support agent handling a refund request might span seven steps: receive the user message, query the order database, observe that the order exists and is within the return window, reason that a refund is appropriate, invoke the refund tool with the order ID, observe the tool's success confirmation, and generate a message to the user confirming the refund. Each step has an observation—what the agent sees—a reasoning trace if you're training on chain-of-thought, an action the agent takes, and a result that updates the world state. This entire sequence is one training example, not seven separate examples.
+
+The format you choose for encoding trajectories determines how easily your model learns to produce them. The most common structure is a flat interleaved sequence: observation, action, observation, action, and so on. This mirrors the actual execution loop. Some teams insert explicit reasoning steps between observation and action, training the model to produce chain-of-thought before acting. Others use a structured format where each step is explicitly labeled with its type. The critical requirement is consistency. If your training data uses one format and your inference-time prompt uses another, the model will struggle to generalize.
+
+Trajectory length varies by task complexity. Simple retrieval tasks might complete in two or three steps. Multi-step research tasks can span dozens. Your dataset should reflect the actual distribution of trajectory lengths your agent will encounter in production. If 80% of real tasks resolve in under five steps but your training data oversamples complex twenty-step trajectories because they're more interesting, your model will learn to overcomplicate simple requests.
+
+## Tool-Use Examples: Teaching When and How
+
+Tool-use datasets teach two skills: recognizing when a tool is needed and invoking it correctly. Both are harder than they appear.
+
+Recognition is the harder problem. A user message like "What's the weather in Seattle?" clearly requires a weather API call. A message like "I'm planning a picnic this weekend" might or might not, depending on whether your agent is expected to proactively offer weather information or wait for an explicit request. Your training data encodes these judgment calls. If you include trajectories where agents proactively call tools in ambiguous cases, you're training proactivity. If you only include trajectories with explicit requests, you're training conservatism.
+
+Invocation correctness is about formatting. Tools have schemas: required parameters, optional parameters, type constraints, valid value ranges. Your training examples must demonstrate correct usage. A calendar tool might accept date strings in ISO 8601 format. If your training data sometimes shows the model passing dates as natural language like "next Tuesday," you're teaching the model that this works. It doesn't. The tool will error, and the model won't know how to recover.
+
+Tool error handling belongs in your trajectory data. When a tool call fails—because of invalid parameters, network issues, permission errors, or missing data—the agent must observe the error, reason about the cause, and decide on a recovery action. This might mean retrying with corrected parameters, falling back to a different tool, or informing the user that the action isn't possible. If your training data only includes successful tool calls, your model has no examples of graceful failure recovery.
+
+Multi-tool trajectories are where complexity compounds. An agent might query a database to get an order ID, then pass that ID to a refund tool, then log the refund in an audit system, then send a confirmation email. Each step depends on the previous step's output. Your training data must show this chaining clearly: the output of step N becomes the input to step N+1. If you train on isolated single-tool examples and expect the model to chain them at inference time, you're hoping for generalization that rarely materializes.
+
+## Success and Failure Trajectories
+
+Most teams build datasets of successful trajectories only. This teaches the model what good looks like but not what bad looks like or how to avoid it.
+
+A failure trajectory is a sequence where the agent makes a suboptimal decision and either recovers or produces a poor outcome. These examples are instructive in ways that success trajectories are not. A support agent that immediately escalates a simple password reset request to a human without attempting to help has failed, even if the user eventually gets help. A research agent that queries the same API five times with identical parameters because it didn't parse the result correctly has failed. A code-writing agent that overwrites a file without checking if it exists has failed.
+
+Including failure trajectories in your dataset requires labeling them as such. You don't want the model to imitate the failure—you want it to learn not to. Some teams use a reward signal at the end of each trajectory: positive for success, negative for failure. Others use preference pairs: here's a good trajectory and a bad trajectory for the same task, learn to prefer the good one. The preference approach works better for most tasks because it gives the model a direct comparison.
+
+Failure recovery trajectories are the most valuable type. These show the agent making a mistake, recognizing it, and correcting course. A calendar agent might call the wrong API endpoint, receive an error, parse the error message, realize the mistake, and retry with the correct endpoint. This sequence teaches error detection, diagnosis, and correction—skills that pure success trajectories never demonstrate.
+
+The ratio of success to failure examples affects model behavior. Too many failures and the model learns that failure is normal or acceptable. Too few and it never sees error patterns. A working ratio for most agent tasks is 70% success, 20% success-with-recovery, and 10% unrecovered failure labeled as negative examples. This balance teaches competence, resilience, and the boundaries of acceptable performance.
+
+## Synthetic Trajectory Generation
+
+Real trajectories are expensive to collect. Users must interact with your system, the agent must act, and the outcomes must be observed and labeled. For many agent tasks, you can generate synthetic trajectories faster and cheaper by simulating the environment.
+
+A simulated environment is a simplified model of the world your agent operates in. For a customer support agent, this might be a mock database of orders, products, and users, plus mock implementations of your refund, shipping, and notification tools. You define a task—process a refund for order 12345—and run your agent against the simulation. The resulting trajectory is synthetic but realistic.
+
+Quality depends on simulation fidelity. If your mock tools return success for every call regardless of parameters, your synthetic trajectories won't teach parameter validation. If your mock database never returns edge cases like missing records or expired sessions, your trajectories won't prepare the model for those scenarios. The simulation must be complex enough to produce the variety of outcomes your agent will face in production.
+
+Task diversity is the second quality dimension. If you generate 10,000 trajectories all following the same pattern—user requests refund, agent checks order, agent issues refund—you've trained the model on one pattern repeated 10,000 times. You need variation: refunds for ineligible orders, refunds for orders that don't exist, refunds where the payment method has expired, refunds where the user changes their mind halfway through. Each variation teaches a different decision path.
+
+Synthetic trajectories work best as a supplement to real data, not a replacement. Use them to cover edge cases, rare tool combinations, and failure modes that haven't occurred often enough in production logs. Use real trajectories to ground the model in actual user behavior, language patterns, and task distributions.
+
+## Observation and State Representation
+
+What the agent observes at each step determines what it can reason about and act on. Observation design is a data modeling problem.
+
+For agents that operate through text interfaces—chatbots, coding assistants, research tools—observations are messages, tool outputs, and error strings. The agent sees what a human user would see. This simplifies data collection because you can log actual interface interactions. The challenge is that text observations can be verbose, redundant, or ambiguous. A 2,000-character tool output might contain one critical field and 1,999 characters of irrelevant detail. Your training data should show the model which parts matter.
+
+For agents that operate in structured environments—database query agents, API orchestration agents, robotics control systems—observations are state vectors, sensor readings, or structured data objects. These observations are compact and precise but require explicit formatting. You must decide how to represent a database query result, an API response schema, or a sensor array as text that a language model can process.
+
+State representation fidelity affects generalization. If you train on trajectories where database results are shown as natural language summaries—"the user has three pending orders"—the model learns to work with summaries. If you later feed it raw structured data at inference time, it may not adapt. Conversely, if you train on raw JSON-like representations—described in prose as an object with order ID, status, and timestamp fields—the model learns to parse structure. Use the same representation in training that you'll use in production.
+
+Partial observability is common in real agent tasks. The agent doesn't see the full world state, only the parts exposed through tools and APIs. Your training data should reflect this. If the agent can't see a user's email address until it calls the getUserProfile tool, don't include the email address in earlier observations. This teaches the model to recognize information gaps and take actions to fill them.
+
+## Tool Selection and Efficiency Signals
+
+An agent that solves a task in fifteen steps when three would suffice has a trajectory that works but isn't optimal. Your dataset should include signals that distinguish efficient from inefficient behavior.
+
+The simplest signal is trajectory length. Shorter is usually better, all else equal. A two-step trajectory that correctly completes a task is preferable to a five-step trajectory that completes the same task with redundant tool calls. Some teams train with a length penalty: trajectories receive lower reward scores if they're unnecessarily long. This biases the model toward directness.
+
+Tool selection matters more than length in multi-tool environments. An agent with access to a fast local cache and a slow remote API should prefer the cache when possible. An agent with access to a free tool and a paid tool should prefer the free one when both work. Your training data encodes these preferences by including trajectories that demonstrate the better choice. If you want the model to prefer the cache, include examples where the agent checks the cache first, finds the data, and skips the API call.
+
+Redundant actions are a common inefficiency. An agent that queries the same database twice in a row with identical parameters is wasting time and resources. An agent that calls three different search tools when one would suffice is overcomplicating. Your dataset can include negative examples of these patterns—trajectories labeled as suboptimal due to redundancy—or you can simply exclude them and ensure all included trajectories are efficient.
+
+Efficiency preferences interact with robustness. The most efficient trajectory might involve calling the least reliable tool. A more robust trajectory might call a slower, more dependable tool or include a retry mechanism. Your dataset's balance between efficiency examples and robustness examples defines the model's risk tolerance. If you want an agent that prioritizes speed, include more efficient trajectories. If you want one that prioritizes reliability, include more trajectories with defensive redundancy.
+
+## Reasoning Traces in Trajectories
+
+Some teams train agents to produce explicit reasoning before acting. The trajectory includes not just observation and action but also the thought process that led to the action.
+
+A reasoning trace might look like this: the agent observes a user request for a refund, reasons that it needs to verify eligibility by checking the order date and return policy, decides to call the order lookup tool, executes the call, observes the result, reasons that the order is within the return window, decides to invoke the refund tool, and so on. Each reasoning step is text that explains the agent's internal logic.
+
+This approach has three advantages. First, it makes the model's decisions interpretable. You can read the reasoning trace and understand why the agent chose a particular action. Second, it improves reliability. Models that reason explicitly before acting tend to make fewer impulsive errors. Third, it provides a mechanism for debugging. When an agent makes a wrong decision, the reasoning trace often reveals the faulty assumption or misinterpreted observation.
+
+The cost is verbosity. Trajectories with reasoning traces are longer, which means slower inference and higher compute cost. For tasks where interpretability matters—medical agents, financial agents, high-stakes decision support—the cost is justified. For tasks where speed and efficiency dominate—real-time chat, low-latency retrieval—reasoning traces may be unnecessary overhead.
+
+If you include reasoning traces in your training data, they must be consistent and accurate. A reasoning trace that says "I will check the order status" followed by an action that calls a completely different tool teaches the model that reasoning and action don't need to align. This is worse than no reasoning at all. Every reasoning step must directly justify the subsequent action.
+
+## Dataset Size and Diversity for Agent Training
+
+Agent datasets require more diversity than supervised fine-tuning datasets for single-turn tasks. A summarization model might achieve strong performance with 10,000 diverse examples. An agent that handles multi-step tasks with ten available tools might need 100,000 trajectories to cover the combinatorial space of tool sequences, edge cases, and error conditions.
+
+The diversity bottleneck is tool combinations. If your agent has access to five tools, there are 120 possible sequences of three tools, ignoring parameters and context. Add parameters, and the space explodes. Your dataset must include enough coverage of common sequences—the patterns that occur frequently in real use—and enough examples of rare but critical sequences, like error recovery paths.
+
+Task diversity is orthogonal to trajectory diversity. You might have 50,000 trajectories covering only three task types. This teaches the model to handle those three tasks in many different ways but doesn't help it generalize to new task types. For agents expected to handle a wide range of user requests, your dataset must span a wide range of task categories, even if each category has fewer examples than you'd prefer.
+
+Data imbalance across tools is common and problematic. If 80% of your trajectories use the search tool and only 2% use the delete tool, the model will be far more competent at search than delete. This might reflect real usage patterns—search is more common—but it leaves the model underprepared for delete operations. Deliberate oversampling of rare tools ensures the model sees enough examples to learn competent usage.
+
+## Bridge to Transfer Learning
+
+The trajectory datasets you build for one agent task often contain lessons transferable to other tasks. An agent trained on customer support trajectories learns not just the specifics of refund tools and order databases but also general skills: how to interpret tool errors, how to chain dependent actions, how to recognize when it lacks necessary information. These skills transfer. The next subchapter examines how to design datasets that maximize this transfer and how to avoid the failure modes that waste the opportunity.

@@ -1,0 +1,107 @@
+# 5.6 — Storage Architecture: Object Stores, Data Lakes, and Feature Stores
+
+In September 2025, a logistics company with operations in 40 countries built a machine learning platform to optimize delivery routes and predict demand. The platform processed 15 million events per day and trained over 200 models on datasets ranging from 100 GB to 5 TB. The initial architecture stored all datasets in a relational database. Training pipelines queried the database directly, running complex joins and aggregations to generate feature tables. Within three months, the database became a bottleneck. Training jobs queued for hours waiting for database locks. Query performance degraded as the tables grew. The database bill reached 80,000 dollars per month, and the team had not even reached half of their planned model coverage. The root cause was not that they chose the wrong database. It was that they used a transactional database for analytical workloads. They were storing datasets in a system designed for low-latency reads and writes of small records, when they needed high-throughput scans of large datasets. After migrating to an object store and data lake architecture, their storage costs dropped by 75%, training pipeline performance improved by 10x, and they eliminated the database bottleneck entirely.
+
+Where and how you store datasets affects cost, access speed, pipeline complexity, and the types of queries and transformations you can run efficiently. You do not store all data in the same system. You use different storage systems for different access patterns: object stores for bulk storage and archival, data lakes for analytical queries, feature stores for low-latency serving, and relational databases for transactional data. Your storage architecture is the foundation of your data infrastructure, and choosing the wrong architecture creates bottlenecks that are expensive to fix later.
+
+## Object Stores: S3, GCS, and Azure Blob
+
+Object stores are the default choice for bulk dataset storage in 2026. Amazon S3, Google Cloud Storage, and Azure Blob Storage are designed for storing large amounts of unstructured or semi-structured data at low cost with high durability and scalability. You store datasets as files in an object store, and you read them with high-throughput sequential access. Object stores are not databases. They do not support SQL queries, indexes, or transactions. But for use cases where you need to store large datasets and read them in full or in large chunks, object stores are the most cost-effective and scalable option.
+
+The pricing model for object stores is simple: you pay for storage per GB per month, and you pay for data transfer and API requests. Storage costs are low, typically one to three cents per GB per month for standard storage classes. Data transfer costs apply when you move data out of the cloud provider's network, but transfers within the same region are usually free or very cheap. API request costs are negligible for most workloads. The total cost of storing 10 TB of datasets in S3 is around 230 dollars per month, compared to thousands of dollars per month for a relational database with the same capacity.
+
+Object stores provide multiple storage classes optimized for different access patterns. Standard storage is for frequently accessed data and offers low-latency retrieval. Infrequent access storage is cheaper but has slightly higher retrieval costs and latency. Archive storage is the cheapest but requires hours to retrieve data. You choose the storage class based on how often you access the dataset. Training datasets that are used daily go in standard storage. Historical datasets used for occasional retraining or auditing go in infrequent access storage. Datasets that are kept only for compliance and are rarely accessed go in archive storage. Many object stores support lifecycle policies that automatically transition objects to cheaper storage classes after a certain period, so you do not need to manually manage storage tiers.
+
+Object stores are durable. S3 standard storage offers 99.999999999% durability, which means the probability of losing an object in a given year is vanishingly small. You do not need to run your own backups or replication. The object store handles it for you. You do need to version your objects and protect against accidental deletion. Most object stores support versioning, which keeps multiple versions of an object and allows you to restore a previous version if the current version is deleted or corrupted. You enable versioning on your dataset buckets and configure lifecycle policies to expire old versions after a retention period.
+
+You organize datasets in object stores using prefixes and naming conventions. A common pattern is to use a hierarchical structure that mirrors your dataset taxonomy: bucket name, dataset type, dataset name, version, and file name. For example: s3://ml-datasets/training/customer-churn/v0042/train.parquet. This makes it easy to list datasets, filter by type or version, and manage access controls at the prefix level.
+
+## Data Lakes: Structured Storage on Object Stores
+
+A data lake is not a separate storage system. It is a pattern for organizing and querying structured or semi-structured data stored in an object store. You store data in columnar formats like Parquet or ORC, partition the data by key columns like date or region, and use a metadata layer to provide SQL query interfaces. Tools like Apache Hive, Presto, Trino, AWS Athena, Google BigQuery, and Databricks SQL allow you to query data lakes using SQL without loading the data into a database.
+
+The advantage of a data lake is that you get SQL query capabilities without the cost and complexity of a database. You store data in S3 or GCS at object store prices, and you query it on demand using serverless or cluster-based query engines. You do not pay for storage when you are not querying. You only pay for compute when you run queries. This is much cheaper than running a database cluster 24/7.
+
+Columnar formats like Parquet are essential for data lake performance. Parquet stores data by column rather than by row, which means you can read only the columns you need instead of scanning entire rows. If your dataset has 50 columns and your query only needs 3 of them, a columnar format reads 94% less data than a row-based format. Parquet also compresses data efficiently, reducing storage costs and improving query performance. A 100 GB CSV file typically compresses to 10-20 GB in Parquet format.
+
+Partitioning is the other key optimization. You partition datasets by frequently filtered columns like date, user ID, or region. When you query the dataset with a filter on the partition column, the query engine only reads the relevant partitions and skips the rest. For example, if you partition a dataset by date and query for data from the last 7 days, the query engine reads 7 partitions instead of scanning the entire dataset. This reduces query time and cost by orders of magnitude.
+
+A data lake metadata layer tracks partitions, schema, and statistics. Apache Hive Metastore is the most common metadata layer. It stores table definitions, partition locations, and column statistics in a relational database. Query engines like Presto and Athena use the metadata to plan queries and prune partitions. More recent metadata layers like Delta Lake, Apache Iceberg, and Apache Hudi provide additional features like ACID transactions, time travel, and schema evolution. These are especially useful for datasets that are updated frequently or require strict consistency guarantees.
+
+You build a data lake incrementally. You start by storing datasets in Parquet format in S3 and querying them with Athena or Presto. As your data volume grows, you add partitioning and a metadata layer. As your consistency requirements grow, you adopt Delta Lake or Iceberg. You do not need to build the full data lake architecture on day one. You evolve it as your needs evolve.
+
+## Feature Stores: Low-Latency Serving and Reuse
+
+Feature stores are specialized storage systems for machine learning features. They solve two problems: feature reuse and low-latency serving. Feature reuse means that features computed for one model can be reused by other models without recomputing the feature engineering pipeline. Low-latency serving means that features can be retrieved in milliseconds for online inference.
+
+A feature store has two components: an offline store for training and an online store for serving. The offline store is typically a data lake or data warehouse. You compute features in batch pipelines and write them to the offline store in columnar format. When you train a model, you read features from the offline store and join them with labels. The online store is a key-value database optimized for low-latency point lookups. Common choices are Redis, DynamoDB, Cassandra, and specialized feature store databases. You sync features from the offline store to the online store, and you query the online store at inference time to retrieve features for a given entity like a user or transaction.
+
+Feature stores also provide feature versioning, feature lineage, and feature discovery. You version features the same way you version datasets. Each feature has a schema, a computation logic, and a version identifier. When you train a model, you specify which feature versions to use, and the feature store retrieves the correct features. Feature lineage tracks which raw data sources and transformations produced each feature. Feature discovery allows data scientists to search for existing features before building new ones, reducing duplication and inconsistency.
+
+In 2026, feature stores are commonly used by teams that train many models on overlapping feature sets or that need low-latency inference. If you are training ten models that all use the same customer demographic features, you compute the features once and store them in a feature store, and all ten models read from the same store. If you are serving a model in an API with a latency requirement of under 50 milliseconds, you store features in the online feature store and retrieve them in a single key-value lookup.
+
+Feature stores are not required for all projects. If you are training a single model with custom features that are not reused, a feature store adds complexity without much benefit. But if you are building a platform that serves many models, a feature store becomes essential infrastructure.
+
+Open source feature stores include Feast, Tecton, and Hopsworks. Cloud providers offer managed feature stores like AWS SageMaker Feature Store and Google Vertex AI Feature Store. Commercial platforms like Tecton provide additional features like real-time feature computation and automated feature monitoring.
+
+## Relational Databases: When to Use Them and When to Avoid Them
+
+Relational databases like PostgreSQL, MySQL, and cloud-managed databases like AWS RDS and Google Cloud SQL are designed for transactional workloads: low-latency reads and writes of small records, ACID transactions, and complex joins on normalized tables. They are not designed for analytical workloads: scanning large datasets, running aggregations on billions of rows, or storing terabytes of historical data.
+
+You use relational databases for transactional data that is actively updated: user accounts, orders, inventory, application state. You do not use relational databases for machine learning datasets. If you store training datasets in a relational database, you will face performance bottlenecks, high costs, and scaling challenges.
+
+A common mistake is to use a relational database as both a transactional store and an analytical store. You store application data in the database, and you run training pipelines that query the database directly. This works fine when your datasets are small, but as soon as your datasets grow to millions of rows, the queries slow down, locks contend with transactional writes, and the database becomes a bottleneck. The fix is to separate transactional and analytical storage. You keep the relational database for transactions, and you export data to a data lake or data warehouse for analysis and model training.
+
+A typical pattern is to use change data capture to stream updates from the relational database to a data lake. Tools like Debezium, AWS DMS, and Fivetran capture insert, update, and delete events from the database and write them to S3 or GCS in Parquet format. Your training pipelines read from the data lake, not from the database. This decouples analytical workloads from transactional workloads and allows each system to scale independently.
+
+Relational databases are still useful for small reference datasets that are frequently joined with other data. For example, you might store a lookup table of product categories or geographic regions in a database and join it with event data during feature engineering. But for bulk storage of training datasets, object stores and data lakes are the right choice.
+
+## Data Warehouses: Analytical Databases for Aggregation and Reporting
+
+Data warehouses are analytical databases optimized for large-scale aggregation, complex joins, and business intelligence queries. Examples include Google BigQuery, Snowflake, Amazon Redshift, and Databricks SQL. Data warehouses are built on top of object stores and use columnar storage, partitioning, and distributed query engines to provide fast SQL queries on petabyte-scale datasets.
+
+You use data warehouses when you need to run complex analytical queries on structured data and you do not want to manage query clusters yourself. Data warehouses provide a SQL interface, automatic scaling, and query optimization. You load data into the warehouse, and you query it using standard SQL. The warehouse handles partitioning, indexing, and query execution.
+
+Data warehouses are more expensive than querying a data lake directly with a tool like Athena or Presto, because you are paying for managed compute and storage. But they are faster and easier to use for complex queries. If your training pipelines involve heavy aggregations, multi-way joins, or window functions, a data warehouse can reduce query time from hours to minutes.
+
+A common architecture is to use a data lake for raw and intermediate datasets and a data warehouse for aggregated feature tables. You run batch pipelines that read from the data lake, compute aggregations, and write the results to the data warehouse. Your training pipelines read feature tables from the data warehouse. This separates bulk storage from query-optimized storage and balances cost and performance.
+
+Data warehouses also integrate well with BI tools and dashboards. If your stakeholders need to explore datasets or generate reports, a data warehouse provides a familiar SQL interface and fast query performance.
+
+## Choosing the Right Storage System
+
+You choose storage systems based on access patterns, cost, and latency requirements. Use object stores for bulk storage of datasets that are read sequentially or in large chunks. Use data lakes when you need SQL query capabilities on object store data. Use data warehouses when you need fast complex queries and are willing to pay for managed compute. Use feature stores when you need feature reuse and low-latency serving. Use relational databases only for transactional data, not for analytical datasets.
+
+A typical machine learning storage architecture uses all of these systems. Raw data is ingested into an object store. Batch pipelines transform the data and write intermediate datasets back to the object store in Parquet format. A metadata layer like Hive Metastore or Iceberg tracks partitions and schema. Training pipelines query the data lake using Athena or Presto. Aggregated features are loaded into a data warehouse or feature store. The online feature store serves features for real-time inference. Transactional data stays in a relational database and is exported to the data lake using change data capture.
+
+You do not need to deploy this entire architecture on day one. You start with object stores and data lakes, and you add feature stores and data warehouses as your needs grow. The important principle is to separate storage by access pattern and not to use transactional databases for analytical workloads.
+
+## Cost Optimization for Dataset Storage
+
+Storage costs grow with data volume, and in 2026, it is common for machine learning teams to store hundreds of terabytes of datasets. You optimize costs by choosing the right storage class, compressing data efficiently, deleting obsolete datasets, and partitioning data to minimize query costs.
+
+Storage classes are the easiest optimization. Use standard storage for datasets accessed frequently, infrequent access storage for datasets accessed monthly, and archive storage for datasets kept only for compliance. Configure lifecycle policies to transition datasets automatically. For example, training datasets stay in standard storage for 30 days, move to infrequent access storage after 30 days, and move to archive storage after one year.
+
+Compression reduces both storage and query costs. Parquet and ORC formats compress data automatically using algorithms like Snappy or Zstandard. You do not need to compress manually. Just use a columnar format and the compression is built in. Compression ratios of 5x to 10x are common, which means a 1 TB CSV file compresses to 100-200 GB in Parquet.
+
+Deleting obsolete datasets is the most effective cost reduction. If you are storing 50 versions of every dataset and only the last 10 versions are ever used, you are paying for 40 versions of storage that provide no value. Implement retention policies that delete dataset versions older than a certain age. The retention period depends on your compliance and auditing requirements. For most teams, retaining the last 12 months of datasets is sufficient.
+
+Partitioning reduces query costs by allowing query engines to skip irrelevant data. If your dataset is partitioned by date and your query filters on the last 7 days, the query engine reads 7 days of data instead of the entire dataset. For a dataset with 2 years of history, this reduces the data scanned by 99%. Since query engines like Athena and BigQuery charge based on data scanned, partitioning directly reduces query costs.
+
+You also optimize costs by avoiding unnecessary data duplication. If the same dataset is stored in three different formats or in multiple regions, you are paying for three copies of storage. Store datasets in one format and one region, and replicate only when necessary for disaster recovery or compliance.
+
+## Storage Architecture and Data Governance
+
+Storage architecture affects data governance. Access controls, encryption, and audit logging are enforced at the storage layer. If your datasets are stored in S3, you configure bucket policies, IAM roles, and encryption settings. If your datasets are in a data warehouse, you configure table-level permissions and column-level security.
+
+A common governance pattern is to separate datasets into different buckets or projects based on sensitivity. Public datasets go in one bucket with open access. Internal datasets go in another bucket with restricted access. Datasets containing personal data or regulated data go in a third bucket with strict access controls and encryption. This makes it easier to enforce policies and audit access.
+
+Encryption is mandatory for datasets containing sensitive data. Object stores support encryption at rest and encryption in transit. You enable server-side encryption on your buckets, and the object store encrypts data automatically using managed keys or customer-managed keys. You enable encryption in transit by requiring HTTPS for all API requests. Data warehouses and feature stores also support encryption and should be configured with encryption enabled by default.
+
+Audit logging tracks who accessed which datasets and when. Object stores provide access logs that record every API request. Data warehouses provide query logs that record every SQL query. You enable logging, export logs to a centralized logging system, and monitor for unusual access patterns. Audit logs are required for compliance and are useful for debugging access control issues.
+
+## Storage Architecture as a Foundation
+
+Your storage architecture is not just about where you put files. It is the foundation for data pipeline performance, cost management, and governance. A well-designed storage architecture uses the right storage system for each access pattern, optimizes costs through storage classes and compression, enables efficient queries through partitioning and columnar formats, and enforces governance policies through access controls and encryption. A poorly designed storage architecture leads to bottlenecks, high costs, and compliance failures. You design your storage architecture early, and you evolve it as your data volume and complexity grow.
+
+The next subchapter covers schema evolution: how to handle schema changes in datasets without breaking downstream pipelines and models.
