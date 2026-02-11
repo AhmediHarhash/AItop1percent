@@ -1,0 +1,98 @@
+# 9.4 — Degraded Mode Operation: Fallback Models and Cached Responses
+
+The primary model is down. Your provider is experiencing an outage. Model serving infrastructure failed. Latency spiked to 15 seconds per request. The system that was answering 10,000 queries per hour is now answering zero. Traditional reliability engineering has a playbook for this: serve an error page, return cached responses, route to a backup region. AI systems need a different playbook because serving an error page means abandoning the user completely, and cached responses only work if you have seen the exact query before.
+
+**Degraded mode** is when you serve a worse experience to maintain some experience. You cannot provide the full-quality model, so you provide a faster, cheaper, less capable model. You cannot provide real-time generation, so you provide cached responses from similar past queries. You cannot provide personalized responses, so you provide generic responses. The user gets something instead of nothing. The question is how much worse "something" is allowed to be before it is worse than nothing.
+
+This subchapter covers how to design degraded mode architectures, when to trigger fallback, how to measure whether degraded mode is helping or hurting, and how to exit degraded mode without creating a second outage.
+
+## The Fallback Model Hierarchy
+
+The most common degraded mode strategy is a fallback model hierarchy. Your primary model is Claude Opus 4.5. It provides the best quality but costs 15 cents per query and runs at 800 milliseconds P95 latency. Your secondary fallback is Claude Sonnet 4.5. It provides 90 percent of the quality at three cents per query and 400 milliseconds latency. Your tertiary fallback is a fine-tuned Llama 4 Scout model you host yourself. It provides 70 percent of the quality at 0.5 cents per query and 200 milliseconds latency.
+
+When the primary model fails or latency exceeds 2000 milliseconds for three consecutive requests, the system automatically switches to the secondary fallback. If the secondary fallback fails or latency exceeds 1000 milliseconds, the system switches to the tertiary fallback. If the tertiary fallback fails, the system returns a cached response if one exists, or returns an error if no cache exists.
+
+The fallback is automatic and per-request. You do not switch the entire system to degraded mode. You switch individual requests that would otherwise fail. If 5 percent of requests to the primary model are timing out while 95 percent succeed, you serve the failing 5 percent from fallback while continuing to serve the succeeding 95 percent from primary. This minimizes the blast radius of degradation.
+
+The fallback models must be pre-warmed and tested. You cannot discover during an outage that your fallback model was never deployed to production or that it fails on 30 percent of your query types. You must route one percent of production traffic to each fallback model continuously, even when the primary model is healthy. This validates that fallback models work and keeps them warm enough to handle sudden traffic spikes.
+
+The quality gap between primary and fallback must be acceptable. If your primary model scores 0.85 on your quality rubric and your fallback scores 0.45, users will notice the degradation as a catastrophic failure rather than a slight quality drop. The fallback must be good enough that users perceive it as slower or less detailed responses, not as a broken system. A reasonable target is that fallback quality should be at least 80 percent of primary quality.
+
+## Cached Response Strategy
+
+The second degraded mode strategy is serving cached responses. When a query has been seen before and the context has not changed, serve the previous response. This works well for FAQ-style queries, common support questions, and any domain where queries are repetitive. It does not work for queries that depend on recent context, real-time data, or personalized user state.
+
+The cache key is not the raw query string. Two users asking "what is your return policy" might use different phrasing: "how do I return an item," "what is the refund process," "can I get my money back." You need semantic caching where similar queries map to the same cached response. The most common approach is to embed each query, cluster embeddings, and cache one response per cluster. When a new query arrives, embed it, find the nearest cluster, and serve the cached response if similarity exceeds 0.9.
+
+The cache must have a time-to-live. A response about company policy from three months ago might be outdated. A response about a product feature from last week might reference a feature that was removed. The TTL depends on your domain. For stable reference material, TTL might be 90 days. For time-sensitive content, TTL might be six hours. For real-time data, TTL might be five minutes. The cached response includes metadata showing when it was generated so users can assess freshness.
+
+Cache invalidation is harder than caching. When you update your knowledge base, you must invalidate all cached responses that might reference outdated information. The most common approach is to tag cached responses with the document IDs they reference. When a document is updated, purge all cached responses that reference it. This prevents serving stale information but requires careful tracking of which responses depend on which documents.
+
+Serving cached responses in degraded mode requires transparency. The user must know they received a cached response rather than a real-time generated response. The UI includes a note: "This response was generated previously. For the most current information, try again in a few minutes." This manages expectations and prevents users from trusting potentially stale information.
+
+## Triggering Degraded Mode Automatically
+
+The decision to enter degraded mode must be automatic. You cannot wait for a human to notice an outage and manually switch to fallback. By the time a human notices, you have already lost hundreds or thousands of requests. The system must detect failure and switch to degraded mode within seconds.
+
+The most common trigger is consecutive request failure. If three consecutive requests to the primary model timeout or return 5xx errors, switch to fallback immediately. Do not wait to see if the fourth request succeeds. Three failures is enough signal that something is wrong. The system logs the degradation event, increments a counter, and pages on-call if degraded mode lasts more than five minutes.
+
+A second trigger is elevated latency. If P95 latency exceeds 3000 milliseconds for two consecutive measurement windows—typically one minute each—switch to fallback. This catches scenarios where the primary model is responding but too slowly to be useful. Serving a fallback response in 500 milliseconds is better than serving a primary response in 8000 milliseconds.
+
+A third trigger is quality degradation. If quality SLI drops below 80 percent for 10 consecutive minutes, switch to fallback. This catches scenarios where the primary model is responding quickly but producing garbage. If the fallback model quality is higher than current primary model quality, fallback is better than primary. This situation should not happen, but when it does, fallback protects users.
+
+A fourth trigger is cost spike. If average cost per query exceeds four times normal for five consecutive minutes, switch to fallback. This catches scenarios where the primary model is working but using 10x expected token counts, indicating a prompt injection attack or a bug in prompt formatting. Serving a cheaper fallback model prevents cost overruns while you investigate.
+
+The triggers must be carefully tuned to avoid flapping. If the system switches to fallback, then immediately switches back to primary, then immediately switches to fallback again, users experience inconsistent quality. The switch-back criteria must include a stabilization period. After switching to fallback, the system must observe five consecutive successful primary model requests before switching back. This prevents rapid oscillation.
+
+## Measuring Whether Degraded Mode Is Helping
+
+Degraded mode is only valuable if fallback quality is better than failure. If your fallback model produces responses that users find useless, you might be better off returning an error and letting users retry later. You need metrics to assess whether degraded mode is helping or hurting.
+
+The primary metric is user behavior in degraded mode. Do users retry queries immediately? Do they abandon the session? Do they submit negative feedback? If 60 percent of users who receive a fallback response immediately retry the same query, the fallback quality is too low. Users are treating the fallback response as a failure and retrying to get a real response.
+
+A second metric is comparing fallback quality to baseline. Run your eval suite on responses generated by the fallback model. If fallback scores 0.65 and your quality SLO threshold is 0.7, fallback is below acceptable quality. If fallback scores 0.75, fallback is above threshold and acceptable. You can serve fallback responses without violating quality SLO.
+
+A third metric is error rate in degraded mode. If your fallback model fails 20 percent of requests, degraded mode is not solving the reliability problem—it is just moving it. Fallback model error rate must be significantly lower than primary model error rate during the triggering incident. If primary is failing 30 percent of requests and fallback is failing 5 percent, degraded mode is helping. If fallback is failing 25 percent, degraded mode is barely helping.
+
+A fourth metric is latency in degraded mode. If your fallback model has 1200 millisecond P95 latency and your primary model normally has 800 millisecond latency, degraded mode is providing worse experience on both quality and latency. Users are better off waiting for the primary model to recover. If fallback latency is 400 milliseconds, degraded mode provides faster responses even if quality is slightly lower.
+
+The aggregate metric is user satisfaction in degraded mode compared to user satisfaction during outages without degraded mode. This requires A/B testing during incidents, which is controversial. The alternative is to measure user behavior proxies: session abandonment rate, retry rate, negative feedback rate. If these metrics are better in degraded mode than during past outages, degraded mode is helping.
+
+## Partial Degradation: Selective Fallback by Query Type
+
+Not all queries need the same model quality. A user asking "what are your hours" can be served perfectly by a small, fast model. A user asking "explain the contraindications for prescribing this medication to a patient with renal impairment" needs the highest quality model. You can route different query types to different model tiers even when not in degraded mode, and expand that routing during degraded mode.
+
+The most common approach is query classification. Each incoming query is classified by complexity and risk within 20 milliseconds. Low-complexity, low-risk queries are routed to fast, cheap models. High-complexity or high-risk queries are routed to the primary model. During degraded mode, the threshold shifts. Medium-complexity queries that normally use the primary model are downgraded to the secondary model. Only high-complexity queries continue using the primary model.
+
+The classification model must be fast, accurate, and low-cost. You cannot spend 100 milliseconds classifying a query before routing it. The most common approach is a small DistilBERT-style classifier trained on thousands of labeled queries. It runs in under 15 milliseconds and achieves 92 percent accuracy. Misclassification is acceptable as long as it is conservative—routing a simple query to an expensive model wastes money but does not harm quality. Routing a complex query to a cheap model harms quality.
+
+A second approach is rule-based classification. Queries under 20 tokens are classified as simple. Queries containing medical, legal, or financial terms are classified as high-risk. Queries asking for lists or definitions are classified as low-complexity. Queries asking for explanations or analysis are classified as high-complexity. The rules are fast—under 5 milliseconds—and cover 80 percent of queries correctly. The remaining 20 percent are routed to the primary model by default.
+
+During degraded mode, you expand the percentage of queries routed to fallback. Normally, 20 percent of queries use fallback models. During degraded mode, 60 percent of queries use fallback models. This reduces load on the struggling primary model and allows it to recover. The increased fallback usage is temporary—once the primary model stabilizes, you return to normal routing.
+
+## Exiting Degraded Mode Without Creating a Second Incident
+
+The transition out of degraded mode is as important as the transition in. If you instantly shift 100 percent of traffic back to the primary model the moment it recovers, you risk overloading it and triggering a second failure. The exit must be gradual and monitored.
+
+The most common approach is gradual ramp-up. When the primary model shows five consecutive minutes of healthy responses, begin routing 10 percent of traffic back to primary. After five more minutes of healthy responses, increase to 30 percent. Then 50 percent, 75 percent, and finally 100 percent. Each step requires a stabilization period where you confirm the primary model handles increased load without degrading.
+
+The ramp-up monitors latency, error rate, and quality. If any metric degrades during ramp-up, pause and hold at current traffic percentage until the metric stabilizes. If metrics continue degrading, roll back to the previous traffic percentage. This prevents a scenario where you exit degraded mode, overload the primary model, and immediately re-enter degraded mode.
+
+A second approach is canary-based exit. Route one percent of traffic to primary as a canary. Monitor the canary for 10 minutes. If canary success rate is above 99 percent and latency is normal, increase to 5 percent. Continue doubling every 10 minutes until you reach 100 percent. If canary success rate drops below 99 percent, abort the exit and remain in degraded mode.
+
+A third approach is time-delayed exit. Remain in degraded mode for at least 30 minutes after the primary model appears healthy. This prevents exiting too quickly based on a brief recovery. Many incidents show temporary improvement followed by relapse. The 30-minute stabilization period ensures the recovery is real.
+
+During exit, communicate status to users. Do not silently switch from fallback to primary. The UI indicates "We are restoring full service. You may notice improving response quality over the next 10 minutes." This manages expectations and prevents users from thinking the quality variation is a bug.
+
+## Fallback for Retrieval Failures
+
+RAG systems have an additional degraded mode: generating responses when retrieval fails. If your vector database is down or retrieval returns zero results, you have two options: refuse to answer or generate from cached knowledge. The choice depends on your risk tolerance and domain.
+
+For high-risk domains like medical or legal advice, retrieval failure must refuse to answer. Generating from cached model knowledge creates hallucination risk. The response is "I cannot access the necessary information to answer that question right now. Please try again shortly." This is frustrating but safe.
+
+For low-risk domains like general product support or FAQ, generating from cached knowledge is acceptable. The model was trained on your documentation. If retrieval fails, the model can still answer many questions correctly. The response includes a disclaimer: "This answer is based on general knowledge since our database is temporarily unavailable. For the most current information, try again in a few minutes."
+
+The hybrid approach is confidence-based fallback. When retrieval fails, generate a response and score it with a confidence model. If confidence exceeds 0.85, serve the response with a disclaimer. If confidence is below 0.85, refuse to answer. This balances availability and safety.
+
+Your degraded mode architecture ensures users get something when the primary system fails, while monitoring ensures that "something" is better than nothing. The next subchapter covers multi-region and multi-provider failover—how to maintain availability when an entire region or provider goes down.
+

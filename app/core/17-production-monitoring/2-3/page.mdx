@@ -1,0 +1,114 @@
+# 2.3 — The Request Context: Capturing Metadata That Enables Debugging
+
+The metadata you capture determines whether debugging takes five minutes or five hours. When a user reports that the AI gave a wrong answer, the first question Engineering asks is "can you reproduce it?" If your instrumentation captures user ID, session ID, request ID, model version, prompt version, and feature flags, you can pull up the exact request in seconds, see what the model received, and start debugging. If your instrumentation captures only a timestamp and an error code, you are guessing. You have no idea which model ran, which prompt was used, or what context was included. You cannot reproduce the issue, so you cannot fix it.
+
+This is not a theoretical concern. It is the single most common reason that AI incidents take days instead of hours to resolve. The systems that respond to incidents quickly all share one characteristic: they capture rich, structured metadata for every request, and that metadata is indexed, searchable, and correlated across logs, traces, and metrics. The systems that struggle all share the opposite characteristic: sparse metadata, inconsistent field names, missing correlation IDs, and no way to reconstruct what happened for a specific request.
+
+The difference is not luck or team skill. The difference is deliberate instrumentation design. You decide, upfront, which fields matter for debugging. You standardize those fields across all services. You ensure every log line, every trace span, and every metric tag includes them. You build tooling that lets engineers query by those fields and jump from a user complaint to the underlying trace in one click. This is not glamorous work, but it is what separates teams that ship confidently from teams that fear every deploy.
+
+## The Core Context Fields
+
+Every AI request should capture a minimum set of metadata fields that form the foundation of debugging. **Request ID** is the first and most critical. A request ID is a unique identifier generated when your system receives a user query, and it follows that query through every stage of processing. It appears in every log line, every trace span, and ideally in the response you return to the user. When a user reports a bug, they can provide the request ID directly — either by copying it from the UI or by sending you the timestamp and their user ID so you can look it up. With the request ID, you can reconstruct exactly what happened. Without it, you are searching through millions of requests hoping to find the right one.
+
+**User ID** identifies which user made the request. This is essential for distinguishing between systemic issues and user-specific bugs. If twenty users report errors in the same minute, you have a system-wide incident. If one user reports errors across multiple requests, you have a user-specific bug — possibly corrupt session state, a misconfigured account, or a rare edge case in their data. User ID also enables user-level analysis: how many requests has this user made today? What is their error rate? Are they part of an A/B test? Do they have feature flags enabled?
+
+**Session ID** identifies the conversation or interaction session. For multi-turn chat systems, session ID is how you distinguish between "this error happened once in a long conversation" and "this error happens every time the user starts a new conversation." Session IDs also let you analyze session-level metrics: how long do sessions last? How many turns do users typically take? At what point do users abandon sessions? When you debug a multi-turn bug, you need to see the entire session history — every request, every response, every state change. Session ID is how you pull that history.
+
+**Timestamp** marks when the request occurred, with millisecond precision, in UTC. This sounds trivial, but timestamp precision matters. If a deploy went live at 14:32:17 UTC and errors started at 14:32:19 UTC, you know the deploy caused the errors. If your timestamps only have second precision, you cannot distinguish between errors that started before the deploy and errors that started after. Millisecond precision is cheap and eliminates ambiguity.
+
+**Endpoint or route** identifies which feature or API endpoint handled the request. Your AI system likely has multiple endpoints — chat, search, summarization, code generation, document analysis. Each endpoint has different performance characteristics, different failure modes, and different cost profiles. When you see a latency spike in your overall metrics, the first question is "which endpoint?" Endpoint metadata answers that instantly.
+
+**Client version or platform** identifies which application version or platform the user is running. If you have mobile apps, web apps, and API clients, each has a version number. When a new app version ships and error rates spike, you need to know which version introduced the regression. Client version metadata makes that obvious. Without it, you are correlating error spikes with deploy times manually, hoping you guessed the right version.
+
+These six fields — request ID, user ID, session ID, timestamp, endpoint, and client version — form the minimum context for debugging. If you capture nothing else, capture these. They cost almost nothing to store and index, and they unlock 80 percent of debugging workflows. Every additional field you add beyond these should solve a specific debugging problem you have encountered or anticipate.
+
+## Model and Prompt Versioning Context
+
+AI systems are not static. Models change, prompts evolve, and experiments run continuously. If your metadata does not capture which model and which prompt handled each request, you cannot correlate behavior changes with system changes. You end up guessing whether a regression was caused by a model upgrade, a prompt change, or something else entirely.
+
+**Model provider, name, and version** should be captured for every request. If you use GPT-5 for some requests and GPT-5-mini for others, you need to know which model handled each request. If OpenAI releases a new version of GPT-5 and your behavior changes overnight, model version metadata tells you exactly when the change occurred and which requests were affected. If you route requests to different models based on complexity — GPT-5-mini for simple queries, Claude Opus 4.5 for long-context tasks, Llama 4 for privacy-sensitive requests — model routing metadata tells you which routing logic ran and whether the right model was selected.
+
+**Prompt version or prompt hash** tracks which prompt template was used. If you use multiple prompt templates — one for general chat, one for technical queries, one for summarization — you need to know which template was selected. If you run A/B tests on prompt wording, you need to know which variant each request received. If you iterate on prompts frequently, you need a way to correlate quality regressions with specific prompt changes. Prompt version can be a semantic version string like "v2.4.1" or a content hash like "a3f5b8c2". The key is that it uniquely identifies the prompt template so you can group requests by prompt and analyze their outcomes.
+
+**Feature flags** control which features, experiments, or configurations are active for each request. If you gate new features behind flags, you need to log which flags were enabled for each request. If you run A/B tests, you need to log which variant each user saw. If a feature flag causes a regression, you need to identify affected requests so you can disable the flag, analyze the damage, and roll back safely. Feature flag metadata is the difference between "we think the new guardrail is causing false positives" and "we know that 4.7 percent of requests with the new-guardrail flag enabled were blocked, and here are the exact request IDs."
+
+**Model configuration** includes sampling temperature, top-p, max tokens, stop sequences, and any other generation parameters. If you use different configurations for different query types — higher temperature for creative tasks, lower temperature for factual queries — you need to log which configuration was used. If you suspect that a temperature change is causing quality regressions, configuration metadata lets you compare outcomes across temperature values. This metadata is optional for most teams, but it becomes essential when you start tuning generation parameters for quality or cost.
+
+## Retrieval and Context Metadata
+
+For RAG systems, retrieval context is often the primary source of incorrect responses. The model generates an answer based on the documents you retrieved. If retrieval failed — returned irrelevant documents, returned stale documents, returned zero documents — the model's response will be wrong. Without retrieval metadata, you cannot tell whether the bug is in retrieval or generation. With it, you can isolate the problem in seconds.
+
+**Number of documents retrieved** tells you whether retrieval ran successfully. If the user asks a question and retrieval returns zero documents, the model will either refuse to answer or hallucinate. Either way, the root cause is retrieval failure. If retrieval returns hundreds of documents and your system truncates them to fit in the prompt, you might be losing relevant context. Document count is a simple integer that flags retrieval problems immediately.
+
+**Relevance scores** show how confident your retrieval system is that the returned documents are relevant. If the highest relevance score is 0.42 on a scale of 0 to 1, your retrieval system is uncertain. The model might still generate a plausible-sounding answer, but it is working with weak evidence. Low relevance scores correlate with hallucination risk. Logging minimum, maximum, and average relevance scores gives you a quick signal for retrieval quality.
+
+**Retrieval strategy** identifies which retrieval approach was used. If you support vector search, keyword search, hybrid search, and graph search, you need to know which strategy ran for each query. If vector search is failing but keyword search is reliable, strategy metadata helps you detect that pattern. If you route queries to different retrieval strategies based on query type, strategy metadata confirms that routing worked correctly.
+
+**Retrieved document IDs or hashes** let you audit exactly which documents were injected into the prompt. If users report that the AI is citing outdated information, you can look up the retrieved document IDs, check when those documents were last updated, and confirm whether your indexing pipeline is stale. If users report that the AI is ignoring relevant documents, you can check whether those documents were retrieved at all, or whether they were retrieved but ranked too low to make it into the final prompt.
+
+**Tokens added by retrieval** tracks how much of your prompt budget is consumed by retrieved context. If your prompt has 8,000 tokens and retrieval added 6,000 of them, your prompt is dominated by retrieval. If retrieval adds 50 tokens, retrieval is barely contributing. Tracking retrieval token counts helps you balance retrieval depth with prompt efficiency. It also helps you detect prompt bloat — cases where your retrieval system is injecting far more context than necessary.
+
+## Agentic and Tool Call Metadata
+
+For systems that use function calling, tool use, or agentic reasoning, tool call metadata is essential. Most bugs in agentic systems trace back to tool misuse: the model called the wrong tool, passed invalid arguments, misinterpreted the tool's response, or failed to call a tool when it should have. Without tool metadata, these bugs are invisible. You see only the final response, which is wrong, but you have no idea why.
+
+**Tool calls made** lists which tools the model invoked during the request. This can be an array of tool names or a count. If the model makes zero tool calls when it should have made one, you know the model failed to recognize that a tool was needed. If the model makes ten tool calls when one would suffice, you know the model is inefficient or stuck in a loop. Tool call counts are your first signal for agentic behavior issues.
+
+**Tool arguments** capture what parameters the model passed to each tool. If the model calls a database query tool with a malformed SQL string, the tool will fail, and the model will receive an error. If you log the arguments, you can see exactly what the model sent and why the tool rejected it. Tool arguments can be large, so consider logging them in sampled instrumentation rather than always-on instrumentation, but make sure sampled logs include full arguments so you can debug tool misuse when it occurs.
+
+**Tool responses** capture what each tool returned. If a tool call succeeds but returns an empty result set, the model has no data to work with. If a tool call succeeds but returns an error message embedded in the response, the model might misinterpret the error as valid data. Logging tool responses lets you distinguish between "the tool failed" and "the tool succeeded but returned data the model cannot use."
+
+**Tool latency** tracks how long each tool call took. If users complain about slow responses, tool latency metadata tells you whether the bottleneck is in model inference or tool execution. If a database query tool takes five seconds to run, that is where you optimize. If all tools are fast and the model is slow, the bottleneck is in generation.
+
+**Tool failure status** indicates whether each tool call succeeded or failed. If a tool call fails, the model receives an error message and must decide how to proceed — retry, call a different tool, or return an error to the user. Logging tool failure status helps you detect flaky tools, permission issues, or malformed arguments. It also helps you measure tool reliability: what percentage of tool calls succeed on the first try?
+
+## Guardrail and Safety Metadata
+
+Guardrails evaluate responses for safety, policy compliance, factual correctness, or business rules. If a guardrail blocks a response, the user sees an error or a refusal. If a guardrail modifies a response, the user sees something different from what the model generated. Without guardrail metadata, these interventions are invisible. You cannot tell whether users are unhappy because the model is wrong or because your guardrails are too aggressive.
+
+**Guardrails evaluated** lists which guardrails ran for each request. If you have ten guardrails but only three ran because the others short-circuited, you need to know which three. If a guardrail never runs because it is misconfigured or skipped by routing logic, guardrail metadata exposes that gap.
+
+**Guardrail scores** capture the numerical output of each guardrail. A toxicity guardrail might return a score from 0 to 1, where higher scores indicate higher toxicity. A hallucination detector might return a score indicating confidence that the response is grounded in retrieved context. Logging these scores lets you analyze guardrail behavior over time: are scores drifting? Are you seeing more near-threshold cases? Should you adjust thresholds?
+
+**Guardrail decisions** indicate whether each guardrail passed, warned, or blocked the response. A guardrail that warns logs a flag but allows the response to proceed. A guardrail that blocks prevents the response from reaching the user. Decision metadata is how you measure false positive rates, false negative rates, and overall guardrail effectiveness. If users report that reasonable requests are being blocked, you filter for blocked requests, look at the guardrail scores, and determine whether your thresholds are too strict.
+
+**Modifications made** capture whether any guardrail modified the response before returning it to the user. Some guardrails redact PII, others rewrite toxic language, others inject disclaimers. If a guardrail modifies the response, you need to log what changed. Otherwise, users will report that the AI behaves strangely, and you will have no idea why. Modification metadata also helps you measure the cost of guardrails: how often do they intervene? How much do interventions degrade response quality?
+
+## Cost Attribution Metadata
+
+AI systems have variable costs. Different models cost different amounts per token. Different retrieval strategies have different compute costs. Different tools have different API costs. If you do not track cost attribution metadata, you cannot answer basic financial questions: which users are expensive? Which features are unprofitable? Which experiments increased costs?
+
+**Total tokens** breaks down into input tokens, output tokens, and cached tokens if you use prompt caching. Token counts are the primary driver of model costs. Logging them for every request lets you calculate cost per request, cost per user, cost per endpoint, and cost per model. You can also detect cost anomalies: if a single request consumes 100,000 tokens, something is wrong.
+
+**Estimated cost** is the dollar cost of the request, calculated from token counts and model pricing. Some teams calculate this in real time and log it as a field. Others calculate it in post-processing from token counts and pricing tables. Either way, cost metadata enables budget dashboards, cost alerts, and per-user or per-customer billing.
+
+**Retrieval cost** includes embedding generation costs, vector database query costs, and reranking costs. These are separate from model costs and often overlooked. If you use a commercial embedding API or a commercial reranking service, those costs add up. Logging retrieval costs separately lets you optimize retrieval strategies for cost-efficiency.
+
+**Tool costs** track the cost of external API calls made during tool execution. If your AI agent calls a weather API, a stock price API, or a database query that costs money, tool cost metadata ensures you account for it. Some tools are free, others charge per request, others have usage tiers. Logging tool costs per request lets you identify expensive tool usage patterns and optimize or rate-limit them.
+
+## Structured Logging and Consistent Field Names
+
+Metadata is only useful if it is structured and consistent. **Structured logging** means logging data as key-value pairs — JSON, logfmt, or similar formats — rather than free-form text. Structured logs are queryable, filterable, and aggregatable. Free-form logs are not. If you log "User 12345 made request abc-def-789 at 2026-02-14 10:23:45" as a plain string, you cannot efficiently query for all requests by user 12345. If you log it as structured fields — user_id=12345, request_id=abc-def-789, timestamp=2026-02-14T10:23:45Z — you can filter, group, and analyze effortlessly.
+
+**Consistent field names** means using the same field name for the same concept across all services. If your orchestration service logs "req_id" but your retrieval service logs "request_id" and your model service logs "requestId," you cannot correlate events across services. Pick one naming convention — snake_case, camelCase, whatever — and enforce it everywhere. Build linters or validation tools that reject logs with incorrect field names. This discipline pays off every time you debug a multi-service issue.
+
+**Standardized schemas** define which fields are mandatory, which are optional, and what data types they use. If request_id is always a UUID string, timestamp is always ISO 8601 UTC, and user_id is always an integer, your tooling can rely on those guarantees. If field types are inconsistent — sometimes user_id is a string, sometimes an integer — your queries break. Schema validation at instrumentation time prevents these issues.
+
+## Context Propagation Across Async Boundaries
+
+AI systems are increasingly asynchronous. A user sends a request, your system enqueues a background job to generate a response, and you return the response minutes or hours later via webhook or polling. When the background job runs, it needs the same context as the original request — user ID, session ID, request ID, feature flags, model version. Without that context, your logs for the background job are disconnected from the logs for the original request, and you lose the ability to trace the full lifecycle.
+
+**Context propagation** means embedding metadata in the message payload when you enqueue a job. When the worker picks up the job, it extracts the metadata and uses it to populate log fields, trace spans, and metric tags. This ensures continuity. A user's request at 10:00 AM and the background job that completes at 10:05 AM have the same request ID, user ID, and session ID, so you can see both in a single query.
+
+For long-running workflows — multi-agent systems, iterative refinement, human-in-the-loop approval — context propagation is even more critical. Each stage of the workflow might run minutes or hours apart, but they all belong to the same user session. Propagating session ID, user ID, and workflow ID across all stages ensures you can reconstruct the entire workflow from logs and traces.
+
+## What Happens When Context Is Missing
+
+Missing context turns debugging into archaeology. An engineer gets a bug report: "The AI gave a wrong answer yesterday afternoon." Without request ID, the engineer searches logs for all requests from that user around that time. There are 147 requests. The engineer does not know which one had the issue, so they read through responses manually, hoping to spot the wrong answer. They find a candidate request, but they do not know which model ran, which prompt was used, or which documents were retrieved. They guess that it was the new prompt template, but they cannot confirm. They deploy a speculative fix and hope the issue does not recur. This is not engineering. This is guessing.
+
+With rich context, the same incident plays out differently. The user provides a request ID from the UI, or the engineer looks up the user's requests from that timeframe and spots the one with an error flag. The engineer pulls up the request in the observability platform. They see the model version, prompt version, feature flags, retrieval strategy, retrieved document IDs, tool calls, guardrail scores, and the full trace. They identify the root cause in three minutes: a specific retrieved document contained outdated information, and the model cited it verbatim. The engineer updates the document, reindexes it, and confirms the issue is resolved. Total time: ten minutes. No guessing, no speculation, no wasted effort.
+
+The difference is not the engineer's skill. The difference is the metadata.
+
+The next step is to track the financial dimension of every request — how many tokens were consumed, how they were consumed, and where money was wasted — so you can optimize cost without degrading quality.
+

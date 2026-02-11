@@ -1,0 +1,104 @@
+# 9.9 — Dependency Mapping: When Upstream Failures Cascade
+
+At 3:42 PM on a Thursday, your AI system stops responding. Requests timeout. Error rate climbs to 100 percent. Your model serving infrastructure reports healthy. Your database is responsive. Your application servers are running. The incident lasts 14 minutes before resolving spontaneously. Post-incident investigation reveals the cause: your third-party embedding service experienced an outage. Your system sends every query to the embedding service for semantic search. When the embedding service failed, your entire system blocked waiting for responses that never came. A single upstream dependency took down your entire service.
+
+**Dependency failures cascade.** An AI system is not a monolithic application. It is a composition of models, APIs, databases, vector stores, content moderation services, logging systems, and third-party providers. Each dependency is a potential failure point. When a dependency fails, the question is not if it will impact your system, but how much and how fast. Understanding your dependency graph, measuring dependency health, and designing for graceful degradation when dependencies fail are essential reliability practices.
+
+This subchapter covers how to map your dependencies, how to monitor dependency health, how to design systems that degrade gracefully when dependencies fail, and how to prevent cascading failures from taking down your entire service.
+
+## Mapping the Full Dependency Graph
+
+The first step is knowing what you depend on. This sounds obvious, but most systems have hidden dependencies that only become apparent during an incident. Your engineers know you depend on OpenAI and Pinecone. They do not know that your monitoring system depends on Datadog, which depends on AWS CloudWatch, which depends on the same AWS region you use for model serving. When that region has issues, both your primary service and your monitoring fail simultaneously, and you have no visibility into what broke.
+
+Start by listing direct dependencies. These are services you call explicitly in code. Your system calls OpenAI for model inference, Pinecone for vector search, Postgres for user data, Redis for caching, Auth0 for authentication, and SendGrid for email. Each direct dependency is a potential failure point.
+
+Next, map indirect dependencies. Your Pinecone index depends on AWS S3 for backups. Your Postgres database depends on AWS RDS infrastructure. Your application runs on Kubernetes, which depends on container registries, DNS, and load balancers. Each indirect dependency is also a failure point. When S3 has an outage, Pinecone may continue operating but cannot restore from backups. You might not notice until you need disaster recovery.
+
+Then, map internal dependencies. Your model serving depends on your prompt library service. Your prompt library depends on your configuration database. Your configuration database depends on your internal authentication service. If the authentication service goes down, the configuration database cannot authorize reads, the prompt library cannot load prompts, and model serving breaks. The dependency chain has four hops, and failure at any hop breaks the chain.
+
+The dependency map must include criticality ratings. Not all dependencies are equally important. Your model serving dependency is critical—if it fails, your core product fails. Your email notification dependency is non-critical—if it fails, users do not receive emails, but the core product works. Classify each dependency as critical, important, or optional. Focus your reliability engineering on critical dependencies first.
+
+A second dimension is synchronous versus asynchronous dependencies. Synchronous dependencies are in the request path. If they fail, the request fails. Your model provider and vector database are synchronous. Asynchronous dependencies are out of the request path. If they fail, the request still succeeds. Your logging service and metrics collector are asynchronous. Synchronous dependencies require more aggressive failure handling than asynchronous dependencies.
+
+## Measuring Dependency Health Independently
+
+You cannot rely on a dependency's status page to know if it is healthy. Status pages lag reality by five to 20 minutes. By the time a status page shows an incident, you have already experienced impact. You need to measure dependency health yourself, from your perspective, in real-time.
+
+The most effective approach is synthetic health checks. Every 30 seconds, you send a test request to each critical dependency and measure whether it succeeds and how long it takes. For your model provider, the health check is a simple query with a known expected response. For your vector database, the health check is a lookup of a known document. For your authentication service, the health check is token validation. Each health check completes in under one second under normal conditions.
+
+The health check results feed a dependency health dashboard. For each dependency, you display current success rate, P95 latency, and comparison to baseline. If your model provider normally responds in 400 milliseconds and is now responding in 2,200 milliseconds, that is a warning sign even if success rate is 100 percent. If your vector database success rate drops from 99.9 percent to 94 percent, that is an incident even if it has not yet affected production traffic.
+
+A second measurement is production traffic metrics. Measure the actual error rate and latency of real requests to each dependency, not just synthetic checks. Synthetic checks might succeed while production traffic fails due to rate limiting, quota exhaustion, or specific query patterns that health checks do not exercise. Aggregate production metrics per dependency every minute. If error rate to a dependency exceeds five percent, alert immediately.
+
+A third measurement is dependency staleness. Some dependencies provide data that changes over time. Your content moderation service might provide a classifier that is retrained weekly. You need to know not just whether the dependency is reachable, but whether the data is current. Include a timestamp or version check in health checks. If the content moderation classifier version has not updated in 10 days when it should update weekly, flag it as stale even if it is still serving requests.
+
+The dependency monitoring must be independent of the dependencies themselves. Do not log dependency health to a logging service that is itself a dependency. Do not send metrics about OpenAI health through OpenAI. Use a separate monitoring system with its own infrastructure. This ensures you have visibility during incidents even when primary systems are down.
+
+## Designing for Graceful Dependency Failure
+
+When a critical dependency fails, you have four options: fail the request, retry, use a fallback, or serve degraded results. The choice depends on the dependency and the risk profile of your application.
+
+For model provider failures, the most common strategy is multi-provider fallback. Your primary provider is Anthropic. If Anthropic returns errors for three consecutive requests or timeouts, switch to OpenAI as secondary. You maintain pre-configured accounts with both providers and identical prompts adapted for each. The failover is automatic and per-request, not per-deployment. This allows you to serve users within seconds rather than waiting for Anthropic to recover.
+
+For vector database failures, the fallback is more complex. You cannot instantly switch to a different vector database—your embeddings are stored in Pinecone, not elsewhere. The fallback options are cached results or degraded retrieval. If Pinecone is down, you attempt to answer queries from cached responses of previous similar queries. If no cached response exists, you generate responses without retrieval, using only the model's parametric knowledge, with a disclaimer that results may be less accurate.
+
+For authentication service failures, the fallback depends on risk tolerance. A high-security application fails closed—if authentication is down, all requests are rejected. A lower-security application might fail open for read requests—allow unauthenticated reads from cache while rejecting writes. A third option is short-term token caching. You cache authentication results for 60 seconds. If the authentication service is down, accept recently cached tokens. This allows authenticated users to continue working while preventing completely unauthenticated access.
+
+For embeddings service failures, the fallback is to use cached embeddings. Every query you have seen before has a cached embedding. If the embedding service is down, you can only answer queries you have seen before. New queries are rejected with a message: "Embedding service temporarily unavailable. Try again in a few minutes or rephrase using simpler terms." This is degraded service, not full service, but it maintains partial availability.
+
+The fallback logic must include timeout policies. If your primary dependency normally responds in 500 milliseconds, do not wait 30 seconds before failing over to a fallback. Set timeout at 2,000 milliseconds—roughly 4x normal latency. If the dependency has not responded in 2,000 milliseconds, assume it is down and fail over. This limits the blast radius of a slow dependency. Waiting too long amplifies latency problems into availability problems.
+
+## Circuit Breakers to Prevent Cascading Failures
+
+When a dependency fails, naive retry logic makes the problem worse. Your code attempts to call the dependency, times out after 10 seconds, retries, times out again, retries again. Each request blocks a thread or async task for 10 seconds. Your system quickly exhausts resources waiting for a dependency that is not responding. The system effectively becomes single-threaded as every worker is stuck retrying failed dependencies.
+
+The solution is a **circuit breaker** pattern. The circuit breaker sits between your code and the dependency. It tracks recent success and failure rates. When failures exceed a threshold—say 50 percent of the last 20 requests—the circuit breaker "opens." While open, the circuit breaker immediately returns errors without attempting to call the dependency. This prevents wasted retries and frees resources to serve other work.
+
+After a cooldown period—typically 30 to 60 seconds—the circuit breaker enters "half-open" state. It allows one request through to test whether the dependency has recovered. If the test request succeeds, the circuit closes and normal operation resumes. If the test request fails, the circuit remains open and cooldown restarts. This prevents premature recovery attempts while quickly detecting when the dependency is healthy again.
+
+The circuit breaker must be per-dependency, not global. If your vector database is down, you still need to call your model provider. A global circuit breaker would prevent calling any dependency if one fails. Per-dependency circuit breakers isolate failures.
+
+The circuit breaker thresholds must be tuned to your system. A threshold that is too aggressive opens the circuit after transient errors, causing unnecessary fallback. A threshold that is too permissive leaves the circuit closed during real outages, allowing continued resource exhaustion. The standard starting point is: open circuit if failure rate exceeds 50 percent over the last 20 requests or if three consecutive requests fail.
+
+The circuit breaker state must be shared across instances. If you have 20 application servers each calling the same dependency, they should share circuit breaker state. You do not want 20 instances independently retrying a failed dependency. The state is shared via Redis or a similar fast shared store. When one instance opens the circuit, all instances see the open circuit within one second.
+
+## Bulkheads: Isolating Dependency Failures
+
+Even with circuit breakers, a slow dependency can exhaust resources. If your model provider is responding in 20 seconds instead of 500 milliseconds, circuit breakers will not open because requests eventually succeed. But every request ties up a worker thread or async task for 20 seconds. Your worker pool quickly saturates. New requests queue. Latency spikes. The system degrades even though nothing is failing.
+
+The solution is **bulkheads**—resource isolation per dependency. You allocate a fixed pool of resources for each dependency. Requests to that dependency can only use resources from that pool. If the pool is exhausted, additional requests are queued or rejected without affecting other dependencies.
+
+A common implementation is separate thread pools. Your system has 100 worker threads. You allocate 40 threads for model provider requests, 20 threads for vector database requests, 10 threads for authentication requests, and 30 threads for application logic. If the model provider becomes slow and saturates its 40-thread pool, those 40 threads are blocked. But the remaining 60 threads continue serving other work. The model provider slowness does not bring down authentication or other services.
+
+An alternative implementation in async systems is task limits. You allow a maximum of 50 concurrent tasks calling the model provider. If 50 tasks are already in-flight, additional model provider requests wait in a queue. If the queue exceeds 100 requests, new requests are rejected. This prevents unbounded growth of in-flight requests that exhaust memory.
+
+The bulkhead sizing requires understanding your traffic patterns. If 80 percent of your requests call the model provider and 10 percent call the vector database, allocating equal thread pools to each is wrong. The model provider pool will saturate under normal load while the vector database pool sits mostly idle. Size pools proportional to expected usage with headroom for spikes.
+
+The bulkhead pattern also applies to rate limits. If you have a rate limit of 10,000 requests per minute to your model provider, do not allow any single user to consume the entire limit. Allocate rate limits per user tier. Enterprise users collectively get 6,000 requests per minute. Paid users get 3,000. Free users get 1,000. If free users spike and exhaust their allocation, enterprise and paid users are unaffected.
+
+## Testing Dependency Failures in Production
+
+You cannot wait for a real dependency failure to discover how your system reacts. You need to test failure scenarios regularly in production using controlled fault injection. The practice is called chaos engineering for dependencies.
+
+The most common approach is shadow traffic with injected failures. You sample one percent of production traffic and send it through a shadow pipeline that injects dependency failures. The shadow pipeline simulates your vector database returning errors, your model provider timing out, or your authentication service being unreachable. You measure how the shadow traffic behaves and whether fallbacks work correctly.
+
+A second approach is scheduled brownouts. Every Tuesday at 2 AM, you deliberately degrade one dependency in production for 10 minutes. Week one, you inject 20 percent error rate into vector database requests. Week two, you inject 3x latency into model provider requests. Week three, you make the authentication service unreachable. You observe real production traffic behavior under each failure scenario and validate that failovers, circuit breakers, and fallbacks work as designed.
+
+A third approach is dependency health drills. Once per quarter, you conduct a drill where you announce in advance: "On Thursday at 3 PM, we will simulate a complete outage of our primary model provider for 30 minutes." The team monitors the drill in real-time. The drill validates failover automation, but also tests human response—do the right people get paged, do they follow runbooks, do they escalate appropriately?
+
+The chaos engineering must be safe. Do not inject failures that will take down production. Use shadow traffic or scheduled brownouts during low-traffic periods. Have a kill switch to abort chaos tests if real issues arise. The goal is to find weaknesses before they cause real incidents, not to create incidents.
+
+## Post-Incident Dependency Analysis
+
+After any incident involving dependency failures, conduct a dependency review. The review answers: which dependency failed, why did it cascade to us, what could have mitigated the cascade, and do we have similar risks with other dependencies?
+
+The review starts with the timeline. When did the dependency failure begin? When did we first detect it via health checks versus production errors? How long until circuit breakers activated? How long until fallbacks activated? How long until the dependency recovered? The timeline reveals gaps in detection and response.
+
+Next, analyze the blast radius. How much production traffic was affected? Which user tiers experienced impact? Which features broke versus degraded? The blast radius assessment informs prioritization. If a dependency failure took down 100 percent of traffic, it is higher priority than a failure that degraded 5 percent of traffic.
+
+Then, identify mitigations that could have helped. Could a fallback provider have maintained service? Could cached data have reduced impact? Could better circuit breaker tuning have limited resource exhaustion? Could rate limiting have prevented cascade? For each potential mitigation, estimate implementation effort and expected risk reduction.
+
+Finally, generalize the lessons. If your vector database failure took down the service, you likely have the same risk with other data stores. If your model provider timeout caused cascading thread exhaustion, you likely have the same risk with other slow dependencies. Use one incident to identify and fix an entire class of vulnerabilities.
+
+Your dependency mapping and failure isolation strategies transform a fragile system where any upstream failure takes down your service into a resilient system where dependency failures result in graceful degradation rather than cascading collapse. The next subchapter covers the explicit tradeoff between reliability and quality—when to sacrifice which dimension and why.
+

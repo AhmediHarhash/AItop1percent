@@ -1,0 +1,103 @@
+# 2.9 — Schema Design for AI Telemetry: Fields That Enable Analysis
+
+Your telemetry schema determines what questions you can answer six months from now. A well-designed schema makes it trivial to identify the root cause of a production incident at 3am. A poorly designed schema leaves you grep-ing through unstructured logs while customers wait. The difference is not in how much data you collect — it is in how you structure what you collect.
+
+Most teams start with whatever their observability vendor suggests, then discover three months later that they cannot answer basic questions. Which model version caused the spike in refusals? Which prompt template has the highest latency? Which user segments trigger the most tool errors? If your schema does not capture the fields that matter for AI workloads, you are collecting data without building insight.
+
+This is not about theoretical perfection. This is about designing a schema that survives contact with production — that handles schema evolution without breaking dashboards, that supports fast queries without full table scans, that gives you the information you need when a system is failing and every second of diagnosis costs money.
+
+## The Core Request Fields
+
+Every telemetry event for an AI request needs a set of foundational fields that enable you to reconstruct what happened. These are not optional. They are the minimum viable structure for production observability.
+
+**Request identifier** — A unique ID for the entire request, from the moment the user action starts to the moment the response returns. This is your primary key for correlating events across multiple systems. If a request triggers three model calls, two database queries, and a cache lookup, all of those events share the same request ID. Without it, you cannot reconstruct the full path of a request through your system. Use UUIDs or collision-resistant IDs. Never reuse request IDs across different users or sessions.
+
+**Timestamps** — Not one timestamp, four. Request start time, when the user initiated the action. Model start time, when your system sent the prompt to the model provider. Model end time, when the model returned its response. Request end time, when your system returned the final response to the user. The gaps between these timestamps tell you where latency lives. If model start happens 800 milliseconds after request start, your preprocessing is slow. If request end happens 400 milliseconds after model end, your post-processing or network serialization is the bottleneck. One timestamp tells you when something happened. Four timestamps tell you why it was slow.
+
+**User identifier** — Who made this request. Not personally identifiable information if you can avoid it — use a hashed user ID, a session token, or an internal identifier that links back to your user database without storing email addresses or names in your telemetry. You need this to answer questions like "is this user hitting errors at a higher rate than average?" or "which users are triggering the most expensive requests?" If your telemetry has no user dimension, you cannot segment quality or cost by customer, and you cannot identify when a single user is causing outsized load.
+
+**Session identifier** — If your application has multi-turn conversations, you need a session ID that groups requests together. This lets you analyze behavior across a conversation — how many turns before the model fails, how session length correlates with quality, whether users who hit errors early abandon the session. Session IDs also let you reconstruct conversation history for debugging. If a user reports that "the chatbot broke," and you only have individual request IDs, you have no way to see the full context that led to the failure.
+
+These fields are the skeleton. Everything else attaches to this structure. If you ship telemetry without these four dimensions — request, time, user, session — you have logs, not observability.
+
+## Model Metadata Fields
+
+AI systems change constantly. Models get updated, providers release new versions, you A/B test different architectures. If your telemetry does not capture which model served which request, you cannot diagnose regressions, compare performance across providers, or understand cost trends.
+
+**Provider** — Which model provider handled this request. OpenAI, Anthropic, Google, a self-hosted model on your own infrastructure. This matters when you run multi-provider routing. If Anthropic starts throttling your requests or OpenAI releases a new version that degrades on your workload, you need to see the provider-level split in your metrics. Do not rely on inferring the provider from the model name — record it explicitly.
+
+**Model ID** — The exact model that responded. Not "GPT" but "gpt-5-turbo-2026-01-15". Not "Claude" but "claude-opus-4-5-20260110". Model providers version their models with date-stamped identifiers for a reason — behavior changes between versions. If you log "gpt-5" and OpenAI updates the model three times in a month, you have no way to know which version caused a quality regression. Record the full, versioned model identifier on every request.
+
+**Model version or deployment ID** — If you fine-tune or run your own models, you need your own versioning on top of the provider's model ID. This is the SHA, the training run ID, the deployment tag, whatever identifier lets you trace a request back to a specific model artifact. When you deploy a new fine-tuned model and quality drops, you need to correlate that deployment timestamp with a specific model version in your telemetry. Without this field, you know something broke, but not which deployment broke it.
+
+**Model configuration** — Temperature, top-p, max tokens, stop sequences — the sampling parameters that control model behavior. These usually do not change request-to-request, but when they do, you need to see it. If a developer accidentally ships a prompt with temperature set to 1.5 instead of 0.7, your telemetry should show that. Log the parameters that vary. If temperature is always 0.7, you can record it once at the session level instead of per request, but you must record it somewhere. Configuration bugs are common and hard to diagnose without visibility into the parameters that were actually used.
+
+With these fields, you can ask questions like "what is the p95 latency for Claude Opus 4.5 requests versus GPT-5 requests?" or "did the January 15th model update improve refusal rates?" Without them, you are aggregating metrics across different models, different versions, different configurations, and treating them as if they are the same system. They are not.
+
+## Token Counts and Cost Fields
+
+AI systems are expensive, and cost is not constant across requests. A request that generates 50 tokens costs one-tenth what a request that generates 500 tokens costs. If your telemetry does not track tokens and cost per request, you cannot identify cost outliers, predict your monthly spend, or optimize your budget.
+
+**Input tokens** — How many tokens were in the prompt sent to the model. This includes the system prompt, the user message, any context from RAG, conversation history, and tool definitions. Most cost explosions come from input tokens, not output tokens, because teams underestimate how large their prompts have grown. If you stuff 8,000 tokens of RAG context into every request and you are hitting 10,000 requests per hour, you are burning through 80 million input tokens per hour. That is $24,000 per month on Claude Opus 4.5 at January 2026 pricing, before you generate a single output token. Record input tokens on every request.
+
+**Output tokens** — How many tokens the model generated in its response. Output tokens are usually more expensive per token than input tokens, so a long output can cost more than a short input. If your users ask the model to "write a detailed report" and the model generates 3,000 tokens when 300 would suffice, your cost per request is 10x higher than it needs to be. Log output tokens so you can identify requests with unexpectedly long outputs and prompt the model to be more concise.
+
+**Total cost** — The dollar cost of this request, calculated from input tokens, output tokens, and the model's pricing. Do not rely on multiplying tokens by a static rate — model pricing changes, and providers often have tiered pricing or volume discounts. If you have access to real-time cost data from your provider, log it. If not, calculate cost based on current pricing and log that. This field lets you sort requests by cost, identify the most expensive queries, and set alerts when a single request exceeds a cost threshold. A request that costs $4.50 because it generated 15,000 tokens is an outlier worth investigating.
+
+**Cached tokens** — If the model provider supports prompt caching, log how many tokens were served from cache versus recomputed. Anthropic's prompt caching can reduce input token costs by 90 percent for repeated prefixes. If your telemetry does not show cached versus uncached tokens, you cannot measure whether your caching strategy is working. This field is provider-specific — only log it if your provider exposes it.
+
+With these fields, you can answer questions like "what is the average cost per request?" and "which users are generating the most expensive queries?" and "did our prompt optimization reduce token usage?" Without them, you know your bill went up, but not why.
+
+## Quality Signal Fields
+
+Observability is not just about performance and cost. It is about quality. You need fields that let you measure whether the model is doing what you want it to do.
+
+**Response classification** — If your system classifies model outputs into categories — successful, refusal, hallucination, off-topic, policy violation — log that classification. This can come from a hard-coded rule, a second model evaluating the first, or a lightweight classifier running on every response. The classification lets you track quality metrics over time. If your refusal rate goes from 2 percent to 8 percent after a model update, you need to see that in your telemetry. If 15 percent of requests are classified as off-topic, you have a prompt engineering problem.
+
+**Quality score** — If you have a numeric quality signal, log it. This could be a confidence score from the model, a hallucination probability from a detection model, a relevance score from your RAG system, or a human thumbs-up thumbs-down rating. The score does not need to be perfect — it needs to be consistent and directional. A score that correlates loosely with real quality is enough to detect trends. If the average score drops from 0.82 to 0.74, something changed. Log the score, log the timestamp, log the model version. You need all three to diagnose the regression.
+
+**User feedback signals** — If users can rate responses, report issues, or regenerate answers, log those actions as telemetry events. User feedback is noisy, but it is also the most direct signal of production quality. If 5 percent of users click "regenerate" within 10 seconds of receiving a response, that is a quality problem. If users in Europe report issues at twice the rate of users in North America, you have a regional or language problem. Feedback does not need to be detailed — a binary "this was not helpful" flag is enough to aggregate into a metric.
+
+**Error codes** — When something goes wrong, log a structured error code, not a freeform error message. Freeform messages are not aggregatable. "Rate limit exceeded" and "RateLimitError: Exceeded quota" and "429 Too Many Requests" are three strings for the same error. If you want to count how often rate limits occur, you need a structured code like "rate_limit_exceeded". Log the code, log the provider, log the model. If OpenAI rate-limits you but Anthropic does not, that is actionable. If every provider rate-limits you, you have a traffic spike or a quota problem.
+
+These fields turn telemetry into a quality measurement system. Without them, you can only measure speed and cost. With them, you can measure whether your AI system is actually working.
+
+## Schema Evolution and Backward Compatibility
+
+Your telemetry schema will change. You will add new fields when you launch new features. You will deprecate old fields when systems evolve. You will rename fields when naming conventions shift. If your schema evolution breaks existing dashboards, queries, or alerts, your telemetry system becomes a liability instead of an asset.
+
+**Additive changes are safe.** Adding a new field to your telemetry events does not break anything. Old queries ignore the new field. New queries use it. This is the easiest form of schema evolution. When you launch a feature that needs a new dimension — say, you start routing requests based on user geography and you need a "region" field — just add it. Backfill is optional. The field will be null or missing for historical data, and that is fine. Your queries can filter for non-null values if they need the dimension.
+
+**Renaming fields is dangerous.** If you rename "user_id" to "customer_id", every query, dashboard, and alert that references "user_id" breaks. Do not rename fields in place. Instead, add the new field, populate both fields for a transition period, migrate queries and dashboards to the new field, then deprecate the old field after the migration is complete. This process can take weeks or months depending on how many systems depend on your telemetry. Rushing it creates outages.
+
+**Removing fields is dangerous.** If you delete a field, every query that depends on it fails. Before removing a field, audit every dashboard, every alert, every scheduled query, every notebook that might reference it. If you run a centralized telemetry system, you can grep your query logs to find references. If teams run their own queries against your data warehouse, you need to announce the deprecation and give teams time to migrate. The safe approach: mark the field as deprecated, stop populating it with new data, wait 90 days, then remove it from the schema. The 90-day window gives teams time to notice and migrate.
+
+**Changing field types is dangerous.** If you change "cost" from a float to an integer, or "timestamp" from epoch seconds to ISO 8601 strings, you break queries that expect the old type. Type changes require the same migration process as renames — add a new field with the new type, populate both, migrate consumers, deprecate the old field. Never change a type in place unless you control 100 percent of the consumers and can deploy the schema change and the consumer changes simultaneously.
+
+The principle: schema changes are code changes. They have dependencies, they have migration paths, they have rollback plans. Treat them with the same rigor you treat API changes.
+
+## The Danger of Untyped JSON Blobs
+
+Some teams log telemetry as unstructured JSON blobs — a "metadata" field that contains arbitrary key-value pairs that vary from request to request. This is flexible, but it destroys queryability.
+
+If every request logs a "metadata" field with different keys, you cannot write a SQL query that filters on a specific dimension. You have to parse the JSON at query time, which is slow and often unsupported by your data warehouse. If you want to know "how many requests had temperature greater than 0.9?" and temperature is sometimes in the JSON blob and sometimes not, you cannot answer the question without scanning every row and checking whether the key exists.
+
+Unstructured blobs also break dashboard tools. Most BI tools expect flat tables with named columns. If your key dimensions live inside a JSON field, you cannot build a chart that groups by those dimensions without custom query logic. This limits who can query your telemetry — only people who can write complex SQL or Python can use it, and everyone else is locked out.
+
+The fix: pull important fields out of the blob and into top-level columns. If you need flexibility for truly variable metadata — debugging fields that change based on what went wrong — keep a JSON field for that, but ensure that every queryable dimension has its own column. The rule: if you want to filter or group by a field, it should be a column, not a key inside a JSON blob.
+
+This does not mean zero JSON. It means you distinguish between structured, queryable fields and unstructured, debug-only fields. Request ID, timestamp, model ID, tokens, cost, quality score — these are columns. Stack traces, raw prompt text, debugging flags — these can live in a JSON field because you only look at them when drilling into a specific incident, not when aggregating metrics across thousands of requests.
+
+## Practical Schema Example
+
+A production-grade AI telemetry schema has around 20 to 30 core fields. Here is what a minimal schema looks like in prose:
+
+Request ID as a string, unique per request. User ID as a string, hashed or anonymized. Session ID as a string, grouping related requests. Request start timestamp, model start timestamp, model end timestamp, request end timestamp — all in UTC with millisecond precision. Provider as a string, like "openai" or "anthropic". Model ID as a string, the full versioned identifier. Model version as a string, your internal deployment tag. Temperature as a float, top-p as a float, max tokens as an integer. Input tokens as an integer, output tokens as an integer, cached tokens as an integer if available. Total cost as a float in dollars. Response classification as a string, like "success" or "refusal" or "error". Quality score as a float between 0 and 1. Error code as a string, structured and aggregatable. Region as a string, where the request originated. Feature flag state as a string or JSON blob, for A/B tests.
+
+That is 25 fields. It fits in a single database table. It supports fast queries. It answers the questions you need to answer in production. It evolves cleanly when you need to add dimensions.
+
+If your schema has fewer than 15 fields, you are probably missing something critical. If it has more than 40 fields, you are probably logging things that should live in a separate debug table. The goal is not exhaustive logging — the goal is sufficient structure to enable diagnosis and optimization without requiring full table scans or JSON parsing on every query.
+
+Schema design is not glamorous, but it is the difference between telemetry you trust and telemetry you ignore. Design it well once, and you can query it confidently for years. Design it poorly, and every incident becomes a data archaeology project where the data you need does not exist or cannot be queried at scale. The schema is your contract with future incidents — make it a contract you can live with.
+
+Next, we extend standard observability frameworks to handle AI-specific workloads — OpenTelemetry, semantic conventions, and the instrumentation patterns that make AI telemetry interoperable with the rest of your infrastructure.

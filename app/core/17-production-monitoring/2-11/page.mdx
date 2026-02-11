@@ -1,0 +1,121 @@
+# 2.11 — Retention Policies: How Long to Keep What
+
+In October 2025, a B2B SaaS company discovered that their telemetry storage costs exceeded their model costs. They were paying $18,000 per month to OpenAI for GPT-5 API calls and $23,000 per month to ClickHouse Cloud for telemetry storage. The telemetry budget was higher than the infrastructure it was monitoring. The root cause: they had set a 90-day retention policy for all telemetry when they launched, and they never revisited it. Every request — successful, failed, trivial, expensive — was stored in hot queryable storage for three months. They had 400 million rows in their telemetry table, and most of them would never be queried. When the finance team asked why telemetry cost more than the product, the engineering team had no good answer.
+
+Retention policies are not glamorous, but they determine whether your observability system is sustainable or whether it becomes a cost liability that management eventually forces you to shut down. The principle is simple: different data has different value at different times. A request that failed 10 seconds ago is critical. The same request, 90 days later, is historical context. You do not need the same queryability for both.
+
+The solution is tiered storage — hot storage for recent data that you query constantly, warm storage for data you query occasionally, cold storage for data you almost never query but need to keep for compliance or legal reasons. Each tier has different costs, different queryability, and different retention windows. If you design your retention policy correctly, you can keep years of telemetry while spending a fraction of what you would spend storing everything in a fast queryable database.
+
+## Hot Storage: The Last 7 to 14 Days
+
+Hot storage is where you put data you need to query in real time. This is the data that powers your dashboards, your alerts, your incident response. When a system degrades, you query hot storage to find the pattern. When a user reports an issue, you pull their requests from hot storage to diagnose the problem. Hot storage needs to be fast — subsecond query latency for most queries — and it needs to support arbitrary filtering and aggregation.
+
+For most AI systems, 7 to 14 days of hot retention is sufficient. Production incidents rarely require data older than a week. If you are investigating why quality degraded, you compare the last few days to the previous few days. If you are debugging an error spike, you look at the last 24 hours. If you need data from two months ago, you are doing forensic analysis, not active incident response, and you can tolerate slower queries.
+
+Hot storage is expensive. Databases like ClickHouse, Snowflake, and BigQuery charge based on storage volume and query volume. Keeping 90 days of data in hot storage costs three to six times more than keeping 14 days. The value of that extra retention is marginal — you will query it rarely — but you pay for it every month. The first cut to your telemetry costs should be reducing hot retention from 90 days to 14 days. The impact on operational capability is minimal. The cost savings are immediate.
+
+What goes in hot storage: every request, every token, every quality signal, every error. Hot storage is your primary diagnostic tool, so it needs complete data. You do not downsample. You do not filter out successful requests. You keep everything for 7 to 14 days, then you move it to the next tier.
+
+## Warm Storage: The Last 30 to 90 Days
+
+Warm storage is for data you query occasionally. You are analyzing trends, comparing month-over-month metrics, or investigating a regression that started weeks ago. You do not need subsecond latency, but you do need queryability. Warm storage should support the same SQL queries as hot storage, just slower.
+
+Warm storage is cheaper than hot storage but more expensive than cold storage. You can implement warm storage in a few ways. One option is to move older data to a cheaper storage tier within the same database. ClickHouse supports tiered storage where recent data lives on SSDs and older data lives on object storage like S3. Queries against S3-backed data are slower but still functional. Another option is to export data from your hot database to a data warehouse optimized for analytical queries, like Snowflake or BigQuery, where you pay less per gigabyte but queries take seconds instead of milliseconds.
+
+For warm storage, 30 to 90 days is typical. If you are analyzing how a prompt change affected quality over a month, you query warm storage. If you are calculating cost trends across quarters, you query warm storage. If you are auditing which users generated the most expensive requests in the last two months, you query warm storage.
+
+What can you downsample in warm storage: you can keep full data, or you can start removing low-value fields. For example, you might drop the full prompt and completion text but keep the metadata — tokens, cost, quality score, classification. This cuts storage costs significantly because prompt and completion text are the largest fields in most telemetry events. If you drop text, you lose the ability to debug specific responses, but you retain the ability to compute aggregate metrics. The trade-off is debuggability versus cost.
+
+Some teams keep full data in warm storage and only downsample when moving to cold storage. Other teams downsample aggressively and accept that they cannot reconstruct individual requests after 14 days. The decision depends on how often you need to pull specific requests for forensic analysis versus how much you are willing to pay for that capability.
+
+## Cold Storage: One to Seven Years
+
+Cold storage is for data you almost never query but need to keep for legal, compliance, or regulatory reasons. GDPR requires that you be able to retrieve and delete user data on request. HIPAA requires that you retain certain records for six years. SOX compliance may require that you keep audit logs for seven years. Cold storage is how you meet these requirements without bankrupting yourself.
+
+Cold storage is cheap. Object storage like AWS S3, Google Cloud Storage, or Azure Blob Storage costs less than $0.02 per gigabyte per month for standard tiers and even less for infrequent-access or archival tiers. You can store terabytes of telemetry for hundreds of dollars per month. The trade-off is queryability. Cold storage is not a database. You cannot run a SQL query against a directory of compressed JSON files in S3. If you need to query cold storage, you have to load the data back into a queryable system first, which is slow and manual.
+
+Cold storage is write-once, read-rarely. You export data from warm storage to S3 as compressed files — Parquet, JSONL.gz, or CSV.gz depending on your tooling. You organize files by date so you can load a specific time range if needed. You set lifecycle policies so that files automatically transition to cheaper storage classes after a certain period — for example, move to S3 Glacier after one year, then to Glacier Deep Archive after three years. You never query these files unless you receive a legal request, a compliance audit, or a rare incident that requires historical data.
+
+What you store in cold storage: the minimum required to meet compliance. If GDPR requires that you be able to retrieve all data for a user, you store request IDs, user IDs, timestamps, and enough metadata to reconstruct what happened. You do not need full prompt and completion text unless your compliance regime requires it. You do not need token-level details unless you are in a regulated industry where model behavior must be auditable.
+
+Cold storage retention is long — one to seven years depending on your industry. Financial services companies keep data for seven years due to SOX. Healthcare companies keep data for six years due to HIPAA. Companies with no specific regulatory requirements often keep one to two years of cold storage as a safety buffer. The cost is low enough that erring on the side of longer retention is reasonable.
+
+## Downsampling Strategies
+
+Downsampling reduces the volume of data you store by keeping only a subset of requests. Instead of storing every request, you store 10 percent or 1 percent, chosen randomly. Downsampling cuts storage costs proportionally — if you sample 10 percent of requests, your storage costs drop by 90 percent.
+
+The trade-off is that you lose the ability to query specific requests. If a user reports an issue and you only stored 10 percent of requests, there is a 90 percent chance you do not have their request in your telemetry. Downsampling works for aggregate metrics — if you are calculating average latency or total token usage, a 10 percent sample gives you an accurate estimate. It does not work for debugging individual requests.
+
+The best downsampling strategy is **head-based sampling with exceptions**. You sample most requests at a low rate — say, 5 percent — but you keep 100 percent of certain requests. Requests that failed. Requests that exceeded a latency threshold. Requests with low quality scores. Requests from VIP users. Requests during A/B tests. These exceptions ensure that you have full telemetry for the requests you are most likely to investigate, while reducing storage costs for the routine successful requests that you rarely query.
+
+Downsampling is easier to implement at ingestion time than after the fact. If your telemetry pipeline decides whether to store a request at the moment it is emitted, you do not pay to ingest, process, and store data you are going to discard later. If you store everything in hot storage and then downsample when moving to warm storage, you pay full cost for 14 days before getting the savings. Head-based sampling saves you money from day one.
+
+Some teams use **tail-based sampling**, where they make the sampling decision after the request completes, based on the outcome. This is more flexible — you can choose to keep requests based on latency, quality score, or error type — but it is also more complex to implement. Tail-based sampling requires buffering all requests in memory until they complete, then deciding whether to persist them. This increases memory usage and adds latency to your telemetry pipeline. Head-based sampling is simpler and cheaper, even if it is less precise.
+
+## Legal and Compliance Requirements
+
+Retention policies are not purely technical decisions. They are also legal and compliance decisions. Different regulations impose different requirements, and you need to structure your retention policy to meet them.
+
+**GDPR** requires that you be able to retrieve and delete all data associated with a user if they submit a data subject request. This means you need to index your telemetry by user ID and you need to retain data long enough to handle requests. GDPR also requires that you not keep data longer than necessary, so if you have no business or legal reason to keep seven years of telemetry, keeping it may violate GDPR's data minimization principle. The practical balance: keep data as long as you have a legitimate business need or a legal obligation, then delete it.
+
+**HIPAA** applies to healthcare data in the United States. If your AI system processes protected health information, HIPAA requires that you retain audit logs for six years. These logs must include who accessed what data and when. If your telemetry captures user interactions with health data, it falls under this requirement. HIPAA also imposes access controls and encryption requirements on stored data, so your cold storage must be encrypted and access-controlled, not a public S3 bucket.
+
+**SOX** applies to financial services companies in the United States. It requires that you retain financial records and audit logs for seven years. If your AI system processes financial data or makes decisions that affect financial reporting, your telemetry may fall under SOX. The key is that you must be able to demonstrate what your system did, when it did it, and whether it operated correctly. Cold storage with full request metadata is the standard way to meet this.
+
+**California Consumer Privacy Act (CCPA)** has similar requirements to GDPR — users can request that you retrieve or delete their data. If you operate in California or serve California users, you need to handle these requests. The mechanics are the same as GDPR — index by user ID, support retrieval and deletion.
+
+If you are in a regulated industry, talk to your legal team before setting retention policies. The safe default is to keep more rather than less, but there is a ceiling — if you keep data for 20 years when the regulation requires 7, you are creating unnecessary storage costs and unnecessary data breach risk. The optimal retention period is the legal minimum plus a small buffer for operational needs.
+
+## The Cost-Queryability Tradeoff
+
+The fundamental tension in retention policy design is cost versus queryability. The more data you keep in fast queryable storage, the more you can diagnose and optimize, but the more you pay. The less you keep, the cheaper your system, but the more incidents you cannot debug because the data you need does not exist or is inaccessible.
+
+The mistake most teams make is treating all data as equally valuable. It is not. The value of telemetry decays rapidly over time. A request from 10 minutes ago is worth 100 times more than a request from 10 months ago, because you are 100 times more likely to query it. But naive retention policies charge the same cost per request regardless of age, so you spend 90 percent of your budget storing data you will never query.
+
+The correct model is to match storage cost to query frequency. Recent data goes in expensive, fast storage because you query it constantly. Older data goes in cheaper, slower storage because you query it rarely. Very old data goes in archival storage because you almost never query it. This tiered approach reduces your total storage cost by 5x to 10x compared to keeping everything in hot storage, with minimal impact on operational capability.
+
+Here is a concrete example. A company processes 50 million AI requests per month. Each telemetry event is 1 kilobyte after compression. Storing 50 million events per month is 50 gigabytes per month, or 600 gigabytes per year. In ClickHouse Cloud, hot storage costs approximately $1 per gigabyte per month. Storing one year of hot data costs $600 per month. In S3, cold storage costs $0.02 per gigabyte per month. Storing one year of cold data costs $12 per month. The difference is $588 per month, or $7,000 per year, for the same data volume. Scale that to 500 million requests per month, and you are saving $70,000 per year by tiering your storage correctly.
+
+## Implementing Retention Policies in Practice
+
+Most databases support automatic data expiration through TTL (time-to-live) settings. ClickHouse, Snowflake, and BigQuery all let you set a retention period on a table, and rows older than that period are automatically deleted. This is the simplest way to implement hot storage retention — set a 14-day TTL on your telemetry table, and old data disappears automatically.
+
+For tiered storage, you need a pipeline that moves data from hot to warm to cold. One common pattern:
+- Every night, a job exports the previous day's telemetry from your hot database to S3 as compressed Parquet files.
+- The hot database deletes rows older than 14 days.
+- Warm storage is implemented as Parquet files in S3 partitioned by date. Queries against warm storage use a tool like AWS Athena or Google BigQuery, which can query Parquet files directly without loading them into a database.
+- After 90 days, files are moved from warm storage to cold storage by transitioning them to a cheaper S3 storage class or compressing them further.
+
+This pipeline is not real-time — there is a delay between when data leaves hot storage and when it becomes queryable in warm storage — but for data older than 14 days, a delay of a few hours is acceptable.
+
+Some teams skip warm storage and go straight from hot to cold. This works if you rarely query data older than 14 days, but it means that when you do need older data, you have to load it back into a database manually, which is slow. Warm storage is the middle ground that gives you queryability for recent history without paying hot-storage prices.
+
+## Retention Policy Template
+
+Here is a practical retention policy that works for most AI systems:
+
+**Hot storage**: 14 days, full data, no sampling, fast queryable database like ClickHouse or Snowflake. Cost: high. Use case: real-time monitoring, incident response, debugging.
+
+**Warm storage**: 90 days, full metadata with optional downsampling of prompt/completion text, queryable via data warehouse or Parquet files in S3 with Athena/BigQuery. Cost: medium. Use case: trend analysis, month-over-month comparisons, forensic investigations.
+
+**Cold storage**: 1 to 7 years depending on compliance requirements, minimal metadata, compressed files in S3 with lifecycle policies. Cost: low. Use case: compliance audits, legal requests, rare historical analysis.
+
+**Downsampling**: 5 percent head-based sampling for successful requests older than 14 days, 100 percent retention for errors, high latency, low quality, or VIP users.
+
+**Deletion**: After cold storage expires, data is permanently deleted. Implement deletion carefully — ensure that you have met all legal and compliance retention requirements before deleting anything.
+
+This policy keeps your most recent data fully queryable, retains enough history for trend analysis, meets typical compliance requirements, and costs a fraction of what you would pay to keep everything in hot storage forever.
+
+## What Happens When You Get Retention Wrong
+
+If you keep too little data, you cannot diagnose issues. A user reports that the model gave a bad response three weeks ago. You check your telemetry. You do not have data from three weeks ago — you only keep 7 days. You cannot help the user. You cannot investigate the issue. You lose trust.
+
+If you keep too much data in hot storage, your costs spiral. Your finance team sees that telemetry costs more than infrastructure. They ask why. You explain that observability is critical. They ask why you need 90 days of hot data. You do not have a good answer. They force you to cut the retention to 7 days, and you lose the ability to do trend analysis.
+
+If you keep data but do not make it queryable, you have the worst of both worlds. You pay to store it, but you cannot use it. Cold storage is only valuable if you can retrieve it when needed. If you store data in a format you cannot query, you are just creating a data graveyard that costs money and provides no value.
+
+The correct retention policy balances cost, queryability, and compliance. You keep enough hot data to operate effectively. You keep enough warm data to analyze trends. You keep enough cold data to meet legal requirements. You delete everything else. The policy should be documented, automated, and reviewed annually to ensure it still matches your operational and legal needs.
+
+Retention policies are boring, but they are the difference between sustainable observability and a system that either costs too much or provides too little visibility. Design your retention policy before you have a year of unmanaged data. By then, it is too late to fix it cheaply.
+
+Next, we move from telemetry architecture to using that telemetry — the quality metrics, thresholds, and dashboards that turn raw data into operational insight.

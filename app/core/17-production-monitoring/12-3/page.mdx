@@ -1,0 +1,100 @@
+# 12.3 — PII Detection and Redaction Logging
+
+What happens when your audit logs need to prove compliance with privacy regulations while simultaneously meeting logging completeness requirements? You cannot log sensitive customer data in plaintext — GDPR prohibits it, HIPAA prohibits it, state privacy laws prohibit it. But you also cannot omit the data entirely — auditors need to reconstruct decisions, and decisions depend on inputs. A loan decision without the applicant's income makes no sense. A medical recommendation without the patient's diagnosis is meaningless. The logs must contain enough information to be useful without containing so much that they become a privacy violation.
+
+The solution is structured redaction with redaction logging. You detect PII in the input data. You replace sensitive values with tokens or hashed identifiers. You log what was redacted, when, and why. You store the mapping between tokens and original values in a separate, access-controlled system. The audit log contains tokens. The mapping system contains PII. Auditors with proper authorization can join the two. Unauthorized users see only tokens. This separates the privacy risk from the audit requirement.
+
+Structured redaction is not simple find-and-replace. It requires understanding data types, context, and relationships. A social security number is always PII. A zip code might be PII depending on population density. A date of birth is PII, but an age range might not be. A combination of non-PII fields can become PII through correlation. Redaction logic must handle all of this.
+
+## Detecting PII in Unstructured Inputs
+
+If your AI system processes structured data — database records, API requests with known schemas — PII detection is straightforward. You know which fields contain PII. You redact those fields deterministically. The log shows "SSN: redacted" or "SSN: token_8472abc". Auditors understand immediately.
+
+If your system processes unstructured data — customer support messages, uploaded documents, freeform text — PII detection becomes a classification problem. You need a PII detection model that scans text and identifies sensitive entities: names, addresses, phone numbers, email addresses, financial account numbers, medical record numbers, biometric identifiers. The model tags each detected entity with its type and position.
+
+In 2026, multiple commercial PII detection services exist. AWS Comprehend Medical detects healthcare PII. Google Cloud DLP detects general PII with configurable sensitivity. Microsoft Presidio is open-source and customizable. All use transformer-based models trained on entity recognition tasks. Accuracy is high — precision above 95 percent, recall above 92 percent for common PII types. But no system is perfect. False negatives mean PII in logs. False positives mean over-redaction.
+
+False negatives are the privacy risk. If the detector misses a social security number and logs it in plaintext, you have violated data minimization principles. If an auditor or attacker accesses the logs, they see unredacted PII. The mitigation is defense in depth. Run multiple detectors in parallel. If any detector flags a span of text as PII, redact it. This reduces false negatives at the cost of more false positives.
+
+False positives are the usability risk. If the detector flags non-sensitive data as PII and redacts it, the log becomes less useful. A customer message saying "I live at 123 Main Street" might have "Main Street" redacted as an address even though it is a common term. A medical note saying "patient history includes prior surgery" might redact "history" as a potential identifier. Overly aggressive redaction creates logs that auditors cannot interpret.
+
+Tuning the detector requires labeled data from your domain. Take a sample of real inputs. Have annotators mark every PII entity. Train or fine-tune the detector on this data. Measure precision and recall. Adjust thresholds until you achieve the right balance. For audit logs, favor recall over precision. A false positive costs usability. A false negative costs compliance. Bias toward detecting more.
+
+## Redaction Strategies That Preserve Utility
+
+Once PII is detected, you must decide how to redact it. The simplest approach is complete removal. Replace "John Smith" with "REDACTED". Replace "555-1234" with "REDACTED". The log is maximally private. It is also minimally useful. Auditors see "REDACTED applied for a loan and was denied because REDACTED exceeded threshold". They cannot verify the decision.
+
+Token replacement preserves structure. Replace "John Smith" with "NAME_8472" and "555-1234" with "PHONE_1938". The log shows "NAME_8472 applied for a loan and was denied because PHONE_1938 exceeded threshold". This is still not useful, but it is better. Auditors can see that a name and phone number were involved. They can request the token mapping if they need the actual values.
+
+Partial redaction preserves some information. Replace "John Smith" with "J*** S****" or "John S***h". Replace "555-1234" with "555-****". Replace "123-45-6789" with "***-**-6789". Auditors see partial patterns. They can verify that the data is plausible without seeing the full value. This works for format validation but not for decision reconstruction. You cannot verify a credit decision from a partial social security number.
+
+Hashing provides deterministic obfuscation. Replace "John Smith" with the SHA-256 hash of "John Smith". The same name always produces the same hash. Different names produce different hashes. Auditors cannot reverse the hash to recover the name. But they can verify consistency. If the log shows two interactions with the same hashed name, they know it is the same person. They can analyze patterns without knowing identities.
+
+Hashing has limits. If the input space is small, hashes can be reversed by brute force. Hashing a social security number provides no protection — there are only one billion possible SSNs, and an attacker can hash all of them and build a lookup table in hours. The solution is salted hashing. Add a secret salt to the input before hashing: hash of "John Smith" plus secret salt. Without the salt, the hash is not reversible. Store the salt separately from the logs. Rotate it periodically.
+
+The best strategy depends on the use case. For audit logs that will be queried by humans, token replacement with a secure mapping system works well. For logs that will be analyzed algorithmically to detect patterns, salted hashing works well. For logs that meet legal minimum requirements, partial redaction works. Deploy all three. Let the logging API specify which strategy to use per field.
+
+## Building a Secure Token Mapping System
+
+Token replacement requires a mapping database. Token "NAME_8472" maps to "John Smith". The mapping must be stored securely, access-controlled, and auditable. It is the most sensitive data in your system. If the mapping is compromised, all redacted logs are exposed.
+
+The mapping database must be separate from the audit log storage. Do not store mappings and logs in the same database or the same AWS account. Physical separation limits blast radius. If an attacker compromises the logging system, they get tokens. If they compromise the mapping system, they get PII but no context. They need both to deanonymize logs.
+
+Access to the mapping system must be tightly controlled. Only authorized compliance officers and auditors should have access. Access requires multi-factor authentication. Access is logged in its own audit trail. Every lookup is recorded: who accessed which token, when, from what IP, for what purpose. Quarterly access reviews verify that access is still justified.
+
+Mappings should be encrypted at rest and in transit. Use field-level encryption with a key stored in a hardware security module or a managed KMS. Even if an attacker dumps the database, they cannot decrypt the PII without the key. The key itself should require multiple authorized users to access — split key or multi-party computation. No single individual can decrypt the mappings alone.
+
+Token generation must be cryptographically random. Do not use sequential IDs like "NAME_0001", "NAME_0002". These tokens leak information — the number of unique names, the order they appeared, the approximate time they were logged. Use UUIDs or random strings. Tokens should be indistinguishable from random noise.
+
+Mapping retention must align with data retention policies. GDPR's right to erasure requires deleting personal data on request. If a customer requests deletion, you must delete their PII from the mapping system. But you must not delete the token from the logs — that would break immutability. The log should show that "NAME_8472 applied for a loan" even after the mapping is deleted. Auditors see the token. They cannot dereference it. This satisfies both immutability and erasure requirements.
+
+## Redaction Logging Itself
+
+Every redaction event must be logged. The audit log records that PII was detected and redacted. The redaction log records the details: what was redacted, what type of PII, what rule triggered the redaction, what redaction strategy was used, and what token was assigned. This metadata is not PII. It can be stored alongside audit logs.
+
+The redaction log entry for a credit application might look like this: "Request ID 847392, field applicant_ssn, detected PII type SSN, confidence 0.99, redaction strategy token, token assigned SSN_8472ABC, timestamp 2025-03-14T10:22:38.291Z". This entry proves that redaction occurred. It shows what was redacted without showing the value. It enables debugging. If a decision is later disputed, you can verify that the SSN was redacted correctly.
+
+Redaction failures must also be logged. If the PII detector fails to initialize, if it times out, if it crashes — the system must log a redaction failure. The original request should be rejected or routed to a fallback path. Logging it unredacted is not acceptable. Redaction is a gate. Failure to redact means failure to log.
+
+Monitoring redaction rates provides a compliance signal. If 95 percent of credit applications have SSNs redacted and the rate suddenly drops to 60 percent, something broke. Maybe the detector model was updated and regressed. Maybe a code change bypassed redaction. Maybe an attacker disabled the redaction step. Alerts should fire when redaction rates deviate from baseline.
+
+Auditors will ask for evidence of redaction. Provide the redaction log. Show them that PII detection is active, that it runs on every request, and that failures are handled correctly. Show them the detector's precision and recall metrics. Show them the access controls on the mapping system. This proves that your redaction is not performative.
+
+## Handling Composite PII and Contextual Sensitivity
+
+Some PII is composite. A single field might not be sensitive, but multiple fields together become sensitive. A zip code and birth year are not PII individually in most jurisdictions. But zip code plus birth year plus gender can uniquely identify many individuals. Redaction logic must handle combinations.
+
+One approach is blanket redaction. If any combination of fields in the request could constitute PII, redact all of them. This is overly conservative. Logs become sparse. A better approach is contextual detection. Analyze the combination. If uniqueness is high — the combination could identify fewer than a threshold number of people — redact all contributing fields. If uniqueness is low, log them unredacted.
+
+Computing uniqueness requires a reference dataset. For US zip codes, you can use census data. For other fields, you might need to sample your own customer base. The computation does not need to be precise. You are estimating risk. If the combination likely identifies fewer than 100 people, redact. If it likely identifies more than 10,000, log it. The threshold depends on your risk appetite and regulatory environment.
+
+Contextual sensitivity also depends on use case. A customer's email address is PII in most contexts. But in a fraud investigation, the email domain might be the critical signal. Redacting "john.smith at example.com" to "EMAIL_8472" loses the domain. A better approach is structured redaction: log "username redacted, domain example.com". This preserves the fraud signal while protecting the individual's identity.
+
+Define redaction policies per field and per use case. The policy for logging customer support interactions differs from the policy for logging fraud investigations. Customer support logs need to verify that the agent followed procedure. Fraud logs need to detect patterns across accounts. Configure redaction differently. This requires a flexible redaction engine with rule-based policies, not a one-size-fits-all approach.
+
+## Balancing GDPR and Audit Requirements
+
+GDPR's data minimization principle states that you should collect and process only the personal data necessary for the purpose. Logging customer data for debugging is necessary. Logging it for audit is necessary. Logging it for analytics is usually not necessary. Your redaction policy must align with the purpose.
+
+GDPR's storage limitation principle requires deleting personal data when it is no longer needed. If the retention period for audit logs is seven years, the retention period for PII should match. But GDPR also grants rights to erasure. If a customer requests deletion, you must delete their PII before the retention period expires. This creates a conflict: audit logs must be immutable, but personal data must be erasable.
+
+The solution is the separation of logs and mappings, as described above. The immutable audit log contains tokens. The mapping system contains PII. On erasure request, delete the PII from the mapping system. The tokens remain in the log. The log is still immutable. The log still proves the decision occurred. But the log no longer contains personal data. This satisfies GDPR.
+
+GDPR also requires transparency. Customers have the right to know what data you collected and how you used it. If a customer requests a copy of their data, you must provide logs related to their account. This means searching logs by customer identifier, which requires the mapping system. Retrieve the customer's token from the mapping. Search the audit logs for that token. Export matching entries. Dereference tokens back to readable values for the export. This is complex but achievable with proper infrastructure.
+
+Some regulators want raw data. They do not want tokens. They want to see exactly what the model processed. In these cases, provide the dereference capability during the audit. The auditor connects to your mapping system through a controlled interface. They submit tokens. The system returns values. The auditor reconstructs the decision. The PII never leaves your infrastructure. The auditor sees it temporarily in their secure session. No export of raw PII occurs.
+
+## PII in Model Outputs
+
+Redaction is usually focused on inputs. But model outputs can also contain PII. If your model generates text that includes names, addresses, or other sensitive data, those outputs must be redacted before logging. This is harder because you cannot predict what the model will generate.
+
+A medical AI summarizing patient notes might output: "Patient John Smith has a history of hypertension and was prescribed lisinopril." Logging this summary in plaintext is a HIPAA violation. The output must be scanned for PII just like the input. Apply the same detection and redaction pipeline. Replace "John Smith" with a token. Replace "hypertension" and "lisinopril" if they are considered sensitive in your regulatory context.
+
+The challenge is latency. Input redaction happens before the model runs. Output redaction happens after. If the output is shown to a user, you must redact it before display. This adds latency to the response path. The solution is asynchronous logging. Show the output to the user immediately. Redact and log it in the background. The user experience is not delayed. The log entry appears a few hundred milliseconds later.
+
+Outputs that are used as inputs to downstream systems must be redacted before passing them on. If your model generates a summary and another system stores it in a database, the summary must be redacted at the boundary. Otherwise, PII leaks across system boundaries. Define redaction as an infrastructure concern, not an application concern. Every system boundary applies redaction automatically.
+
+Model outputs can also inadvertently reveal PII through inference. A model that predicts "high risk of diabetes" for a specific user has revealed health information. Even if the output does not name the user, it is still sensitive. Log the prediction with the user's token, not their identifier. Apply the same access controls as other health data. Treat predictions as sensitive data with the same rigor as inputs.
+
+The next subchapter explores explainability capture — recording not just what the model decided, but why, in a form that regulators and auditors can interpret and verify.
+

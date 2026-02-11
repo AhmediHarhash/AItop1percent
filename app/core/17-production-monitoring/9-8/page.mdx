@@ -1,0 +1,98 @@
+# 9.8 — Load Shedding Strategies for Token Overruns
+
+Your capacity planning was correct for 95 percent of scenarios. You provisioned for P95 load with appropriate headroom. You have auto-scaling policies. You have graceful degradation. And then something unexpected happens. A viral social media post drives traffic up 8x in 30 minutes. A major industry incident sends support queries up 12x. A bug in client code causes users to submit 50,000-token queries instead of the expected 500-token queries. Your infrastructure is overwhelmed. Auto-scaling cannot provision fast enough. Degradation is not sufficient. You need to shed load—reject some requests so the system can serve the rest.
+
+Load shedding is the controlled decision to fail. You cannot serve everyone, so you choose who to serve and who to reject. The alternative is uncontrolled failure where the system thrashes, latency spikes to 30 seconds, and everyone gets a terrible experience. **Load shedding is preferable to collapse**, but only if you shed the right load. Rejecting enterprise customers to serve free-tier users is a business failure. Rejecting simple queries while processing expensive complex queries wastes capacity. You need shedding policies that protect high-value users, maximize throughput, and communicate clearly when capacity is exhausted.
+
+## Detecting When to Shed Load
+
+The decision to shed load must be automatic and based on clear thresholds. You cannot wait for humans to decide during an incident. By the time someone decides to shed load, the system has already collapsed. The detection triggers are similar to graceful degradation triggers, but the thresholds are higher because load shedding is a more extreme measure.
+
+The primary trigger is queue depth. When request queue depth exceeds 1,000 requests and continues growing for three consecutive minutes, begin shedding load. A queue depth of 1,000 means you have 10 to 20 seconds of backlog. If the queue continues growing, you will soon run out of memory or exceed timeout limits. Shedding load now prevents worse outcomes later.
+
+A second trigger is memory pressure. When instance memory utilization exceeds 85 percent, begin shedding load immediately. High memory pressure indicates you are queuing too many requests, buffering too much data, or experiencing a memory leak. Continuing to accept requests at this point risks out-of-memory crashes that take down the entire service. Shedding load reduces memory pressure and prevents total failure.
+
+A third trigger is latency runaway. When P95 latency exceeds 10 seconds—roughly 10x normal latency—begin shedding load. At 10-second latency, most clients have already timed out. You are consuming compute resources to generate responses that no one will receive. Shedding load allows you to serve the remaining requests within reasonable latency.
+
+A fourth trigger is error rate. When error rate exceeds 20 percent, begin shedding load. At 20 percent error rate, the system is already failing a fifth of requests. Shedding an additional 10 to 20 percent of load to stabilize the remaining 70 to 80 percent is a net improvement. You fail more requests intentionally, but the requests you serve succeed at higher rate.
+
+The shedding triggers are OR conditions, not AND. If any single trigger fires, begin shedding. You do not wait for multiple indicators. Each trigger represents a different failure mode, and any one of them justifies shedding. The triggers are also progressive—the worse the situation, the more aggressive the shedding.
+
+## Priority-Based Shedding: Who Gets Rejected First
+
+When you must reject requests, you reject the lowest-value requests first. This requires a priority scheme that ranks requests by business value. The ranking is automatic, based on metadata available at request ingestion.
+
+The most common priority hierarchy is user-tier-based. Enterprise customers have priority 1. Paid individual users have priority 2. Free-tier users have priority 3. Anonymous users have priority 4. When shedding load, you reject priority 4 first, then priority 3, then priority 2. Priority 1 requests are rejected only in catastrophic scenarios where the alternative is total system failure.
+
+The rejection is implemented through admission control. Each priority level has a quota. Under normal load, all quotas are effectively unlimited. When queue depth exceeds the shedding threshold, you impose quota limits. Priority 4 users are limited to 10 percent of capacity. Priority 3 users are limited to 30 percent. Priority 2 users are limited to 50 percent. Priority 1 users get the remaining capacity plus any unused capacity from lower priorities.
+
+As load increases, you tighten quotas. If queue depth exceeds 2,000, priority 4 quota drops to 5 percent. Priority 3 quota drops to 20 percent. If queue depth exceeds 3,000, priority 4 quota drops to zero—all anonymous traffic is rejected. Priority 3 quota drops to 10 percent. You incrementally shed load from the bottom until the system stabilizes.
+
+A second priority dimension is query complexity. Serving a 500-token query uses less capacity than serving a 10,000-token query. During load shedding, you reject the most expensive queries first within each user tier. Free-tier users submitting 8,000-token queries are rejected before free-tier users submitting 300-token queries. This maximizes the number of users served for the available capacity.
+
+The complexity assessment happens at request ingestion based on estimated token count. You do not wait to generate the full response to determine cost. You estimate cost from input tokens, retrieval results, and expected output length. Queries estimated above 3,000 tokens are classified as high-cost. Queries below 500 tokens are low-cost. During load shedding, high-cost queries from lower-priority tiers are rejected first.
+
+A third priority dimension is retry attempts. A user submitting their first request has higher priority than a user retrying their fifth request. This prevents retry storms from consuming capacity. If a user already received an error three times, rejecting their fourth attempt is more acceptable than rejecting someone's first attempt. The system tracks retry count via a short-lived cookie or token and uses it in priority calculation.
+
+## Communicating Rejections Without Creating Retry Storms
+
+The worst outcome of load shedding is a retry storm. You reject 30 percent of requests. Users immediately retry. Now you are shedding 30 percent of traffic that is all retries, and the original 70 percent becomes 100 percent again because users keep retrying. Effective load shedding requires communicating rejections in a way that prevents immediate retries.
+
+The most important element is the HTTP status code. Do not return 500 Internal Server Error. That signals to clients "this was a bug, retry immediately." Return 503 Service Unavailable with a Retry-After header set to 120 seconds. This signals "we are overloaded, try again in two minutes." Well-behaved clients respect the Retry-After header and wait before retrying.
+
+A second element is exponential backoff guidance. The error response includes explicit backoff instructions. "The service is at capacity. Please wait 120 seconds before retrying. If you receive this error again, wait 240 seconds." The backoff advice is human-readable in the response body and machine-readable in response headers. Client SDKs parse the headers and automatically implement exponential backoff.
+
+A third element is alternative action suggestions. The error response does not just say "go away." It offers alternatives. "Service at capacity. Try these alternatives: 1) Check our status page for updates. 2) Try again in two minutes. 3) Use our cached FAQ for common questions." The alternatives reduce user frustration and provide partial value even when generation is unavailable.
+
+A fourth element is transparency about wait time. If possible, the rejection includes an estimate of when capacity will be available. "Service at capacity. Estimated recovery time: 15 minutes." The estimate is based on historical incident duration, current queue drain rate, and auto-scaling progress. It might not be perfectly accurate, but it gives users a sense of whether to wait or abandon the session.
+
+For API clients, you can implement client-side queuing with webhooks. Instead of rejecting the request, you accept it into a queue and return a token. "Your request is queued. You will receive a webhook at your callback URL when processing completes, estimated in eight minutes." The client is not blocked, the system processes requests as capacity becomes available, and users get eventual results rather than immediate failures.
+
+## Token-Based Shedding: Rejecting Expensive Queries
+
+Load shedding based on user priority protects high-value customers. Load shedding based on token cost protects system capacity. When a user submits a query with 30,000 tokens of context asking for a 5,000-token response, that single query might consume as much capacity as 50 normal queries. Rejecting it protects capacity for many other users.
+
+The token limit is dynamic, not static. Under normal load, you accept queries up to 50,000 tokens. Under moderate load, the limit drops to 20,000 tokens. Under heavy load, the limit drops to 8,000 tokens. Under extreme load, the limit drops to 2,000 tokens. The limit is a function of current queue depth and throughput rate.
+
+The rejection is graceful. You do not silently drop the request. You return an error with a specific explanation and guidance. "Your query exceeds the current token limit of 8,000 tokens. The system is experiencing high load. Please reduce context or try again in 10 minutes when limits will be relaxed." This tells the user exactly what is wrong and how to fix it.
+
+For users who cannot reduce token count, you offer degraded alternatives. "Your query exceeds token limits. We can process it with reduced context—using only the most relevant sections—or you can wait for full processing when capacity is available." The user chooses between partial results now and full results later.
+
+A specific challenge is queries that appear normal at ingestion but expand during generation. A user asks a question, retrieval returns 5,000 tokens of context, and the model generates a 4,000-token response. Total cost is 9,000 tokens, but you did not know that until generation completed. You cannot reject mid-generation. You must either complete the generation or abort and waste the partial compute.
+
+The mitigation is early token estimation. Before retrieval, estimate the cost based on query characteristics. Complex analytical queries are likely to generate long responses. Queries requesting lists or summaries generate long responses. Queries asking for short factual answers generate short responses. The estimator is a small regression model trained on historical query-response pairs. It predicts token cost with 80 percent accuracy within 20 percent error margin.
+
+When estimated cost exceeds current limits during load shedding, reject the query before retrieval. This prevents investing retrieval and generation compute into a query you might need to abort. The error message includes the estimate: "Based on your query, we estimate processing will require 8,500 tokens. The current limit is 8,000 tokens due to high load. Please simplify your request or try again later."
+
+## Incremental Shedding and Recovery
+
+Load shedding is not binary. You do not go from accepting all traffic to rejecting 40 percent instantly. You shed load incrementally, observing the effect at each step, and escalate or de-escalate based on results. This prevents over-shedding—rejecting more traffic than necessary—and allows rapid recovery when load subsides.
+
+The incremental policy is threshold-based. When queue depth exceeds 1,000, shed 10 percent of lowest-priority traffic. If queue depth continues rising and exceeds 1,500, shed 20 percent. If queue depth exceeds 2,000, shed 30 percent. Each escalation step requires three minutes of observation. You do not escalate faster than the system can respond.
+
+The shedding percentage is calculated per priority tier. Shedding 30 percent total might mean rejecting 80 percent of priority 4 traffic, 40 percent of priority 3 traffic, 10 percent of priority 2 traffic, and zero percent of priority 1 traffic. The distribution protects high-value users while achieving the overall shedding target.
+
+Recovery is even more incremental than escalation. When queue depth drops below 800 and stays there for five minutes, reduce shedding by 5 percent. After another five minutes below 800, reduce shedding by another 5 percent. You gradually restore service rather than opening the floodgates. This prevents a secondary spike when you stop shedding and all the users who were rejected retry simultaneously.
+
+The recovery observes latency and error rate alongside queue depth. If queue depth is low but latency remains elevated, do not reduce shedding. If error rate is above two percent, do not reduce shedding. You need all indicators to show stability before restoring capacity.
+
+A critical practice is logging every shedding event. Each rejected request is logged with timestamp, user priority, estimated token cost, rejection reason, and queue depth at rejection time. This log allows post-incident analysis. You can calculate how many users were affected, which priority tiers bore the most impact, and whether shedding achieved its goal of stabilizing the system.
+
+## Rate Limiting as Preventive Load Shedding
+
+Load shedding is reactive—you shed load after the system is overloaded. Rate limiting is proactive—you prevent overload by limiting how much traffic each user can generate. Rate limiting is a gentler form of load shedding that activates before the system reaches crisis.
+
+The most common rate limit is queries per minute per user. Free-tier users get 10 queries per minute. Paid users get 100 queries per minute. Enterprise users get 1,000 queries per minute. If a user exceeds their limit, additional requests are rejected with a 429 Too Many Requests status code. The rejection is immediate, at ingestion, before any compute is consumed.
+
+The rate limit can be dynamic based on system load. Under normal conditions, free-tier users get 10 queries per minute. Under moderate load, the limit drops to five queries per minute. Under heavy load, the limit drops to two queries per minute. This progressively reduces low-priority traffic as load increases, preventing the need for aggressive load shedding later.
+
+A second form of rate limiting is token-per-day budgets. Each user tier has a daily token budget. Free-tier users get 50,000 tokens per day. Paid users get 2 million tokens per day. Once a user exhausts their budget, requests are rejected until the next day. This prevents individual users from consuming disproportionate capacity and protects the system from runaway usage.
+
+A third form is concurrency limiting. Each user can have at most three requests in-flight simultaneously. If a user submits a fourth request while three are still processing, the fourth is queued or rejected. This prevents a single user from monopolizing capacity with parallel requests.
+
+Rate limiting must be implemented at the edge, not at the model serving layer. By the time a request reaches the model, you have already consumed network and orchestration resources. The rate limiter sits in the API gateway or load balancer and rejects requests before they enter the system. This minimizes waste when limits are exceeded.
+
+The rate limit enforcement is per-user, not per-session. A user who opens three browser tabs and submits requests from all three simultaneously counts those requests against their single rate limit. This prevents circumventing rate limits through multiple sessions. The user is identified by API key, authentication token, or IP address depending on your system.
+
+Your load shedding and rate limiting policies ensure that when capacity is exhausted, the system fails gracefully by rejecting low-priority traffic while protecting high-priority users. The next subchapter covers dependency mapping—understanding how upstream failures cascade through your system and how to mitigate them.
+

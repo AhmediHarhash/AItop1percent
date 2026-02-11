@@ -1,0 +1,101 @@
+# 2.5 — Latency Decomposition: Where Time Goes in AI Requests
+
+Why is this request slow?
+
+That question arrived on Slack at 2:47am for an engineering team running a customer support agent. Users were complaining about response times. The dashboards showed p50 latency at 4.2 seconds, p95 at 8.7 seconds, p99 at 14 seconds. Those numbers meant angry customers and a CEO asking questions. But the team had no idea where the time was going. The model? The retrieval? The database? They were flying blind, and every guess cost them another hour of sleep.
+
+The next morning they added latency decomposition. They instrumented every stage of their request pipeline. Within twenty minutes they found the problem: their reranking step was taking 3.8 seconds at p95, dominated by a cross-encoder model running on CPU. They moved it to GPU, rewrote the batching logic, and dropped p95 latency to 2.1 seconds. The answer was always in the data. They just had to collect the right data.
+
+Latency decomposition is the practice of breaking down total request time into measurable stages so you can see exactly where time is spent. Without it, you are guessing. With it, you are debugging.
+
+## The Anatomy of an AI Request
+
+An AI request in 2026 is not a single operation. It is a pipeline of stages, each with its own latency profile. A typical customer support agent request flows through these stages:
+
+**Request ingestion and routing** — The request arrives, your API gateway authenticates the user, routes to the correct service, and extracts parameters. This should be fast, usually under 20 milliseconds at p50, but slow authentication systems or complex routing logic can push it higher.
+
+**Prompt construction** — Your system assembles the final prompt. This might involve template rendering, pulling user context from a database, fetching conversation history, inserting retrieved documents. Depending on the number of database queries and the complexity of your context assembly, this can range from 30 milliseconds to 500 milliseconds. If you are making five serial database calls to assemble context, you are spending hundreds of milliseconds before you even call the model.
+
+**Retrieval** — For RAG systems, this is where you query your vector database, retrieve candidate documents, and optionally rerank them. Vector search itself is usually 50 to 200 milliseconds at p50, but reranking with a cross-encoder can add another 200 to 2000 milliseconds depending on the model and the number of candidates. This stage is often the silent killer in RAG latency.
+
+**Guardrail checks on input** — If you run guardrails before the model call, this adds latency. A lightweight keyword filter might add 10 milliseconds. A distilled classifier model adds 100 to 300 milliseconds. A full LLM-based check adds 800 milliseconds or more. Every guardrail layer compounds.
+
+**Model inference** — The actual call to the model. This breaks down further into time to first token and time to completion. For streaming responses, time to first token is what the user perceives as initial latency. For batch or non-streaming requests, total time to completion is what matters. GPT-5-mini might give you first token in 300 milliseconds at p50, total completion in 1.5 seconds for a 400-token response. Claude Opus 4.5 might be 500 milliseconds to first token, 3 seconds to completion for the same length response.
+
+**Guardrail checks on output** — After the model responds, you might run content moderation, PII detection, or factual grounding checks. These add the same latency costs as input guardrails. A full PII scan with a classifier can add 200 milliseconds. An LLM-based factual grounding check can add 1.5 seconds.
+
+**Post-processing and response formatting** — You parse the model output, format it for the user, log the interaction, and return the response. This is usually under 50 milliseconds, but if you are doing complex parsing or making additional database writes, it can grow.
+
+Without decomposition, all you see is 4.2 seconds. With decomposition, you see that 3.8 seconds of that is reranking, and suddenly you know exactly what to fix.
+
+## Measuring Time to First Token vs Time to Completion
+
+For streaming responses, the two metrics that matter are time to first token and time to completion. Time to first token is the perceived responsiveness. Time to completion is the total cost and throughput.
+
+**Time to first token** is measured from the moment your service receives the user request to the moment the first token arrives from the model provider. This includes all pre-model stages: authentication, prompt construction, retrieval, input guardrails, and the model provider's queuing and inference startup time. For a conversational agent, this is the metric users feel. If first token takes 2 seconds, the user perceives a laggy experience no matter how fast the rest of the tokens arrive.
+
+**Time to completion** is measured from request receipt to final token delivery. This includes time to first token plus the streaming duration. For a 400-token response at 50 tokens per second, streaming takes 8 seconds after first token. If first token was 500 milliseconds, total time to completion is 8.5 seconds. This metric determines throughput and cost. A model that streams slower or generates longer responses consumes more compute and limits concurrency.
+
+The gap between these two metrics tells you about streaming speed. If first token is 500 milliseconds but completion is 9 seconds for a 300-token response, your effective streaming speed is around 35 tokens per second. If first token is 500 milliseconds but completion is 4 seconds for the same response, you are getting 100 tokens per second. Knowing this gap helps you choose models and identify degradation. When streaming speed drops, completion time grows, and you hit rate limits faster.
+
+## Tracking Latency by Stage with Spans
+
+The standard way to measure latency decomposition is with distributed tracing and spans. Every stage of your pipeline becomes a span. Spans nest inside each other, creating a waterfall view of where time is spent.
+
+Your instrumentation wraps each stage in a span that records start time, end time, and metadata. When the request completes, the tracing system shows you the full breakdown. A typical trace for a RAG agent request looks like this:
+
+Total request: 3.2 seconds. Within that, prompt construction: 120 milliseconds. Retrieval: 1.8 seconds, broken down into vector search at 90 milliseconds and reranking at 1.71 seconds. Input guardrails: 150 milliseconds. Model inference: 980 milliseconds, with first token at 420 milliseconds. Output guardrails: 200 milliseconds. Post-processing: 40 milliseconds.
+
+From this trace, you immediately know that reranking is the bottleneck. You do not need to guess. You do not need to deploy changes and hope. You see the data and you optimize the right thing.
+
+The tracing system most teams use in 2026 is OpenTelemetry. It provides a standard instrumentation API and exports traces to whatever backend you use: Datadog, Honeycomb, Grafana Tempo, Langfuse. You instrument your code once and can switch backends without rewriting instrumentation.
+
+## Percentile Decomposition: p50, p95, p99 by Stage
+
+Looking at average latency by stage is not enough. You need percentiles. The p50 tells you the typical case. The p95 tells you what most users experience under load. The p99 tells you what the worst-affected users see and what breaks your SLA.
+
+A stage that looks fast at p50 can be catastrophically slow at p99. A team running a financial research agent saw retrieval latency at 80 milliseconds p50, 4.2 seconds p99. The p50 looked fine. The p99 was killing user experience for the customers who ran the most complex queries. The cause was a query pattern that forced a full scan on a subset of their vector index. At p50, queries hit the hot cache. At p99, queries hit the cold path and scanned millions of vectors.
+
+You need to track each stage at p50, p95, and p99. When you see a stage where p99 is more than five times p50, you have a tail latency problem. That stage has a bimodal distribution: fast most of the time, catastrophically slow sometimes. These are the stages that hurt users the most because they are unpredictable.
+
+Your monitoring system should alert on p95 and p99 by stage, not just overall latency. An alert that fires when overall p95 exceeds 5 seconds is useful. An alert that fires when reranking p95 exceeds 2 seconds is actionable. The second alert tells you exactly what broke.
+
+## Identifying Bottlenecks with Waterfall Views
+
+A waterfall view displays all stages of a request as horizontal bars proportional to their duration. Each bar starts when the stage starts and ends when it completes. Nested stages appear as bars within bars. This visualization makes bottlenecks obvious.
+
+When you look at a waterfall, the longest bar is your bottleneck. If reranking is a 3-second bar in a 5-second request, reranking is your problem. If model inference is a 4-second bar in a 6-second request, model inference is your problem. The waterfall does not lie.
+
+Waterfalls also reveal sequential versus parallel execution. If two stages that could run in parallel are shown as sequential bars, you have an architectural opportunity. A team building a legal contract agent ran input guardrails, then retrieval, then model inference. Each stage waited for the previous one. They parallelized guardrails and retrieval, running them simultaneously while prompt construction happened. This cut 800 milliseconds from their p50 latency because retrieval no longer waited for guardrails.
+
+When you optimize, you optimize the longest bar first. Optimizing a 50-millisecond stage when you have a 3-second stage is a waste of time. The 3-second stage dominates. Cut it in half and you save 1.5 seconds. Cut the 50-millisecond stage in half and you save 25 milliseconds. The difference in impact is two orders of magnitude.
+
+## Cache Hit Latency vs Cache Miss Latency
+
+Many AI systems use caching: semantic caching for repeated queries, prompt caching for repeated context, or result caching for deterministic responses. Cache hits are fast. Cache misses are slow. If you do not decompose these, you see average latency that masks the real user experience.
+
+A cache hit for a semantic cache might return a response in 80 milliseconds. A cache miss requires vector search, reranking, model inference, and guardrails, taking 4.5 seconds. If your cache hit rate is 60 percent, your average latency is 1.84 seconds. But 40 percent of users are seeing 4.5 seconds. The average hides the pain.
+
+You need separate latency tracking for cache hits and cache misses. This tells you two things: how effective your cache is at improving latency, and what the baseline uncached latency looks like. If cache miss latency is growing over time, your underlying system is degrading even if average latency looks stable because cache hit rate is masking it.
+
+A team running an e-commerce recommendation agent had this exact problem. Their average latency was stable at 1.2 seconds for three months. They celebrated the stability. Then cache hit rate dropped from 70 percent to 40 percent due to product catalog changes. Average latency spiked to 2.8 seconds overnight. If they had been tracking cache miss latency separately, they would have seen it grow from 3.2 seconds to 5.1 seconds over those three months. The cache was hiding a slow degradation.
+
+## Measuring External Dependencies Separately
+
+Your AI system depends on external services: model providers, vector databases, SQL databases, Redis, third-party APIs. Each dependency contributes latency. Each dependency has its own reliability profile. If you lump them together, you cannot tell which one is slow.
+
+Instrument each external dependency as its own span. Tag each span with the dependency name and the operation. When you query your vector database, the span is named vector-search and tagged with the database name and the collection. When you call the model provider, the span is named model-inference and tagged with the provider and model name.
+
+This granularity lets you answer questions like: Is our vector database slower today than yesterday? Is GPT-5 slower this hour than last hour? Is Pinecone faster than our self-hosted Qdrant cluster? Without per-dependency instrumentation, you cannot answer these questions. You just see "something is slow" and start guessing.
+
+A healthcare agent team discovered that their patient data API was adding 600 milliseconds at p95 due to a database index that degraded over time. They only found this because they instrumented the API separately. If they had lumped it into "prompt construction," they would have optimized the wrong thing. Instrumentation specificity translates directly into debugging speed.
+
+## The Cost of Not Knowing
+
+The team that did not decompose latency spent six weeks optimizing the wrong things. They upgraded their model from GPT-5-mini to GPT-5 thinking inference was slow. Latency did not improve. They rewrote their prompt construction logic thinking templating was the bottleneck. Latency did not improve. They switched vector databases thinking retrieval was slow. Latency did not improve. Finally they added tracing and found the real problem in five minutes: their reranking model was misconfigured and running on CPU instead of GPU. One configuration change, one deployment, problem solved.
+
+Six weeks of wasted effort. Six weeks of user complaints. Six weeks of engineering time that could have been spent building features. All because they did not instrument latency by stage.
+
+The cost of not decomposing latency is not just slow debugging. It is misallocated optimization effort, incorrect architecture decisions, and lost trust from users who experience slowness you cannot explain. Latency decomposition is not optional. It is the foundation of every other performance optimization you will ever do.
+
+Next, we examine how to track cost with the same granularity, attributing AI spend by user, feature, and model so you know where your budget is actually going.

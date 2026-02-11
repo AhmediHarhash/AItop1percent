@@ -1,0 +1,106 @@
+# 9.6 — Graceful Quality Degradation Under Load
+
+Black Friday at 11:47 AM. Your e-commerce support system normally handles 800 queries per minute. Right now it is receiving 4,200 queries per minute. Your model serving infrastructure is scaling, but not fast enough. Latency has climbed from 600 milliseconds to 2,800 milliseconds. Users are experiencing delays. Your infrastructure has three options: serve everyone slowly, serve some people quickly and reject the rest, or serve everyone with reduced quality but acceptable speed.
+
+Traditional web services handle overload by queuing requests or returning 503 Service Unavailable errors. AI systems have a third option: **graceful quality degradation**. You can serve every request within acceptable latency by using faster, cheaper, less capable models. You sacrifice quality to maintain availability and speed. The question is how much quality you can sacrifice before users perceive the degraded service as broken.
+
+This subchapter covers how to detect when you are approaching capacity limits, how to implement quality degradation strategies that users tolerate, how to measure whether degradation is preferable to rejection, and how to return to full quality when load subsides.
+
+## Detecting Capacity Saturation Before It Becomes an Outage
+
+The worst time to discover you are at capacity is when you are already dropping requests. You need early warning indicators that show when you are approaching saturation, giving you time to activate degradation strategies before users experience failures.
+
+The most important indicator is latency trend. Your baseline P95 latency is 650 milliseconds. When P95 latency crosses 1,200 milliseconds—roughly double baseline—you are entering saturation. The doubling indicates that queuing is beginning. When latency crosses 2,000 milliseconds, you are deep into saturation and must act immediately. The latency thresholds are specific to your system, calibrated from load testing.
+
+A second indicator is queue depth. Your model serving infrastructure has a request queue. Under normal load, queue depth is under 50 requests. When queue depth exceeds 200 requests, you are accumulating backlog faster than you can process it. When queue depth exceeds 500 requests, you will start rejecting requests soon. The queue depth threshold depends on your processing rate. If you can handle 100 requests per second and your queue depth is 500, you have five seconds of buffer.
+
+A third indicator is auto-scaler lag. Your infrastructure automatically scales based on load. Under normal conditions, scaling completes within two minutes. When load spikes faster than scaling can accommodate, you see divergence between desired capacity and actual capacity. If desired capacity is 40 instances and actual capacity is 25 instances, you are 15 instances short. The divergence indicates that scaling cannot keep up with growth.
+
+A fourth indicator is error rate. Your normal error rate is 0.2 percent. When error rate exceeds 1 percent, infrastructure is beginning to shed load. When error rate exceeds 5 percent, you are rejecting a significant fraction of requests. The error rate threshold is your first line of defense—if you wait until error rate is 10 percent, you have already failed many users.
+
+The detection system monitors all four indicators with different urgency levels. Latency above 1,200 milliseconds is yellow alert—prepare to degrade quality. Queue depth above 300 is yellow alert. Error rate above two percent is red alert—degrade quality immediately. Any two yellow alerts together escalate to red alert.
+
+## The Degradation Ladder: Trading Quality for Capacity
+
+When you detect capacity saturation, you do not immediately switch to the smallest, fastest model. You degrade quality incrementally, using just enough degradation to stay within capacity while maintaining the highest quality possible. This requires a ladder of model tiers, each faster and cheaper than the previous.
+
+Tier 1 is your normal service: Claude Opus 4.5 with full retrieval, full context window, and optimized prompts. This serves 800 queries per minute at 650 milliseconds P95 latency and eight cents per query.
+
+Tier 2 is the first degradation: Claude Sonnet 4.5 with full retrieval and full context. This serves 1,400 queries per minute at 400 milliseconds P95 latency and three cents per query. Quality drops from 0.88 to 0.82 on your rubric—a noticeable but acceptable degradation. You activate Tier 2 when latency exceeds 1,200 milliseconds or queue depth exceeds 250.
+
+Tier 3 is the second degradation: Claude Sonnet 4.5 with reduced context—only the top three retrieved documents instead of top five. This serves 1,800 queries per minute at 350 milliseconds P95 latency and 2.5 cents per query. Quality drops to 0.78. You activate Tier 3 when Tier 2 latency exceeds 800 milliseconds or queue depth exceeds 300.
+
+Tier 4 is the third degradation: a fine-tuned Llama 4 Scout model with minimal context. This serves 3,000 queries per minute at 200 milliseconds P95 latency and 0.8 cents per query. Quality drops to 0.68. You activate Tier 4 only under extreme load when the alternative is rejecting requests.
+
+Tier 5 is the emergency fallback: cached responses only. No generation. If we have seen a similar query before, serve the cached response. If not, return "Service temporarily at capacity, please try again in 30 seconds." This handles effectively unlimited load because no model inference is required.
+
+The ladder allows you to degrade only as much as necessary. If Tier 2 is sufficient to clear the queue, you never activate Tier 3. If load continues rising, you automatically step down the ladder. If load subsides, you automatically step back up. The transitions are automatic, based on observed latency and queue depth.
+
+## Selective Degradation by User Segment and Query Type
+
+Not all queries should degrade equally. A free-tier user asking a simple question can tolerate Tier 3 quality. An enterprise customer asking a complex, high-stakes question should receive Tier 1 quality even under extreme load. You need to prioritize degradation to protect high-value users and high-risk queries.
+
+The most common approach is segment-based degradation tiers. Enterprise customers always receive Tier 1 or Tier 2, never below. Paid individual users receive Tier 1, Tier 2, or Tier 3 depending on load. Free-tier users receive Tier 2, Tier 3, or Tier 4. Anonymous users receive Tier 4 or cached responses. This ensures that paying customers experience minimal degradation while free users absorb most of the quality reduction.
+
+The implementation is a priority queue. Incoming requests are tagged with user segment. The queue processes enterprise requests first, then paid requests, then free requests. Under normal load, all segments receive Tier 1 service. Under moderate load, free-tier requests shift to Tier 2 while paid and enterprise stay at Tier 1. Under heavy load, free-tier shifts to Tier 3, paid shifts to Tier 2, enterprise stays at Tier 1. Under extreme load, free-tier shifts to Tier 4 or rejection, paid shifts to Tier 3, enterprise shifts to Tier 2.
+
+A second approach is query-type-based degradation. Simple queries degrade before complex queries. A query asking for hours of operation can tolerate a smaller model. A query asking for medical advice cannot. You classify each query as simple, moderate, or complex within 15 milliseconds. Simple queries degrade first. Complex queries degrade last.
+
+The classification combines multiple signals. Query length under 50 tokens is likely simple. Query containing domain-specific jargon—medical terms, legal terms, technical terms—is likely complex. Query asking for factual recall is simple. Query asking for analysis or judgment is complex. The classifier is a small DistilBERT model with 90 percent accuracy.
+
+A third approach is willingness-to-wait signaling. Users can tag their query as "high priority" or "standard priority." High priority queries receive Tier 1 service even under load, but count against the user's rate limit more heavily. Standard priority queries degrade normally. This lets users choose their own quality-latency tradeoff. Power users who need highest quality can signal that and accept lower rate limits. Casual users who tolerate degradation can signal that and get faster responses.
+
+## Communicating Degradation to Users
+
+Users must know when they receive degraded service. Silently serving lower quality responses breaks trust. Users cannot tell whether the model is wrong or whether you degraded quality to handle load. Transparency prevents confusion and manages expectations.
+
+The most common approach is in-UI notification. When a user receives a response from Tier 2 or below, the interface displays a banner: "We are experiencing high traffic. This response was generated with a faster model to ensure quick reply. For highest quality, try again in 15 minutes." The notification is dismissible but visible. It explains what happened and when to expect normal service.
+
+A second approach is response metadata. The API response includes a field indicating service tier. "service_tier": "degraded_tier_2". Client applications can display this however they choose. Mobile apps might show a small icon. Web apps might add a background color. Enterprise integrations might log it for audit purposes. The metadata is machine-readable, enabling automated monitoring of degradation frequency.
+
+A third approach is latency-quality tradeoff disclosure. When a query is routed to a degraded tier, the system estimates how long the user would wait for full-quality service and presents a choice. "Estimated wait for full quality: 45 seconds. Receive a faster response now? Yes / No." If the user selects yes, serve Tier 2. If the user selects no, queue for Tier 1. This respects user preference rather than imposing degradation.
+
+The disclosure must be honest. Do not claim "high traffic" if degradation is due to infrastructure failure. Do not promise "15 minutes" if you have no idea when load will subside. Users trust transparency. They do not trust vague reassurances.
+
+## Measuring User Tolerance for Degradation
+
+The goal of degradation is to maintain availability without destroying user experience. If degraded quality is so low that users retry every query three times, you have not maintained availability—you have shifted load from model inference to user frustration. You need metrics to assess whether users tolerate degradation or perceive it as failure.
+
+The primary metric is retry rate. After receiving a Tier 2 or Tier 3 response, what percentage of users immediately retry the same query? If retry rate is under 10 percent, users tolerate degradation. If retry rate is over 30 percent, users perceive degradation as failure. The threshold is calibrated from user research. You run experiments where you intentionally serve degraded responses to a sample of users and measure behavior.
+
+A second metric is session abandonment rate. What percentage of users leave the session after receiving a degraded response? During normal operation, session abandonment after a response is 12 percent. During Tier 2 degradation, abandonment is 15 percent. During Tier 3 degradation, abandonment is 22 percent. A 10-percentage-point increase in abandonment indicates that users find the experience unacceptable.
+
+A third metric is explicit feedback. Users can rate responses as helpful or not helpful. During normal operation, 8 percent of responses are rated not helpful. During Tier 2 degradation, 14 percent are rated not helpful. During Tier 3 degradation, 28 percent are rated not helpful. A doubling or tripling of negative feedback indicates quality has fallen below acceptable.
+
+A fourth metric is downstream conversion. For e-commerce support, conversion might be completing a purchase. For internal support, conversion might be resolving a ticket without escalation. If Tier 2 degradation reduces conversion by less than five percent, degradation is acceptable. If Tier 3 degradation reduces conversion by 20 percent, degradation is too aggressive.
+
+The metrics are tracked separately by user segment. Enterprise users might tolerate zero degradation—even Tier 2 causes significant abandonment. Free-tier users might tolerate Tier 3 with minimal behavior change. You set different degradation policies based on tolerance by segment.
+
+## Returning to Full Quality Without Overloading Again
+
+When load subsides, you must exit degraded mode carefully. If you instantly shift all traffic back to Tier 1, you might trigger a second capacity crisis. The return to full quality must be gradual and monitored.
+
+The most common approach is stepwise recovery. When queue depth drops below 150 and latency drops below 900 milliseconds for 10 consecutive minutes, upgrade one tier. If you are at Tier 3, move to Tier 2. Wait another 10 minutes. If queue depth remains below 150 and latency remains below 700 milliseconds, move to Tier 1. Each step requires a stabilization period to ensure the system can handle increased load.
+
+During stepwise recovery, you monitor the same indicators that triggered degradation. If queue depth starts rising again or latency crosses thresholds, pause the recovery and remain at current tier. Do not continue upgrading if the system shows signs of saturation. This prevents oscillation between degraded and normal modes.
+
+A second approach is user-segment-sequenced recovery. Return enterprise users to Tier 1 first, then paid users, then free users. This ensures that high-value users experience the shortest degradation window. The sequencing is automatic—enterprise traffic is upgraded as soon as capacity allows, even if free-tier traffic remains degraded.
+
+A third approach is time-throttled recovery. Regardless of current load, remain in degraded mode for at least 30 minutes after load drops below thresholds. This prevents premature recovery during a brief lull before a second spike. Many traffic spikes show a sawtooth pattern—surge, brief drop, surge again. The 30-minute stabilization period filters this pattern.
+
+During recovery, communicate status to users. "Traffic returning to normal. You may notice improving response quality over the next 10 minutes." This manages expectations and prevents users from thinking quality variation is random or indicates a bug.
+
+## Capacity Planning to Reduce Degradation Frequency
+
+The best degradation strategy is not needing to degrade. Every time you activate degraded mode, you lose quality and risk user dissatisfaction. You need capacity planning that keeps you below degradation thresholds under normal and expected peak load.
+
+The capacity target is headroom-based. Your infrastructure should handle 150 percent of average load without degradation. If average load is 1,000 queries per minute, provision for 1,500 queries per minute at Tier 1 quality. This gives you buffer for daily variance and weekly spikes without entering degraded mode.
+
+The planning uses historical load patterns. Analyze the last three months of traffic. Identify daily peak load, weekly peak load, and any event-driven spikes—product launches, holidays, marketing campaigns. Your capacity target is 150 percent of the 95th percentile daily peak. This keeps you below degradation 95 percent of the time.
+
+For planned events—Black Friday, major product launches—you pre-provision additional capacity. If you expect load to triple, provision triple capacity before the event. Do not rely on auto-scaling to handle 3x load growth in real-time. Auto-scaling handles unexpected spikes. Pre-provisioning handles expected spikes.
+
+The cost-quality tradeoff is explicit. Provisioning for 150 percent of average load costs 50 percent more than provisioning for 100 percent of average load. But degrading to Tier 2 reduces user satisfaction by 8 percentage points and reduces conversion by 4 percent. For an e-commerce site with 10 million dollars per month in revenue, a 4 percent conversion drop costs 400,000 dollars. The 50 percent infrastructure cost increase might be 15,000 dollars per month. The ROI is clear.
+
+Your graceful degradation system allows you to handle unexpected load spikes without rejecting users, while capacity planning minimizes how often you need to degrade. The next subchapter covers capacity planning in depth—how to forecast demand and provision infrastructure to meet it.
+

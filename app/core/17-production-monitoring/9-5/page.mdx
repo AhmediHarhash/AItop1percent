@@ -1,0 +1,90 @@
+# 9.5 — Multi-Region and Multi-Provider Failover
+
+Your entire production system runs in US-East. At 2:17 PM on a Tuesday, AWS US-East begins experiencing elevated error rates. Your model serving infrastructure is degraded. Latency spikes from 800 milliseconds to 4500 milliseconds. Error rate climbs from 0.1 percent to 12 percent. You have no fallback. Your users in North America, Europe, and Asia are all experiencing failures because you depend on a single region for a global service.
+
+Multi-region failover means running your system in at least two geographically separated regions and automatically routing traffic to healthy regions when one fails. Multi-provider failover means having accounts with multiple model providers—OpenAI, Anthropic, Google, Cohere—and automatically routing to working providers when one experiences an outage. The combination gives you resilience against region-level failures, provider-level outages, and infrastructure issues.
+
+The challenge is not technical architecture—the patterns are well-known. The challenge is cost, consistency, and state synchronization. Running duplicate infrastructure in three regions triples your baseline compute cost. Switching providers mid-session means the new provider does not have the conversation history unless you replicate it. Failing over to a different model means responses change tone and capability. You need strategies that provide resilience without creating new categories of failure.
+
+## Multi-Region Deployment Patterns
+
+The simplest pattern is active-passive. Your primary region handles all traffic. Your secondary region is deployed and ready but idle. When the primary fails, you route traffic to secondary. This minimizes cost because you only run one region at a time. The downside is cold-start latency. If the secondary region has not served traffic in days, the first requests after failover will be slow while infrastructure warms up.
+
+A better pattern is active-active with primary routing. Both regions are actively serving traffic. Ninety-five percent of traffic goes to the primary region. Five percent goes to the secondary region as a health check and warmup. When primary fails, you shift the 95 percent to secondary. Secondary is already warm and can handle the increased load. This adds five percent infrastructure cost in the secondary region but eliminates cold-start issues.
+
+The third pattern is geographic routing. Users in North America route to US-East. Users in Europe route to EU-West. Users in Asia route to Asia-Southeast. Each region serves its geography. When a region fails, users from that geography route to the nearest healthy region. This minimizes latency during normal operation and distributes load globally. The downside is that you need three or more regions, each with full infrastructure.
+
+The routing decision happens at the edge, not at the application layer. You cannot wait until a request reaches your application server to decide whether to route it to a different region. By then you have already committed network resources. The routing happens in your CDN, load balancer, or DNS. When the CDN detects elevated error rates or latency from a region, it updates routing tables within 10 seconds and directs new requests to healthy regions.
+
+The health check is critical. You cannot rely on infrastructure health checks alone. Your model serving infrastructure might report healthy while your model is producing garbage. You need application-level health checks that actually call the model with a test query and validate the response. The health check runs every 30 seconds from each region to every other region. If a region fails three consecutive health checks, it is marked unhealthy and removed from rotation.
+
+## State Synchronization Across Regions
+
+The hardest problem in multi-region deployment is state. Your user is mid-conversation when the primary region fails. You fail over to the secondary region. The secondary region has no memory of the conversation history. The next response starts from scratch. The user experiences the failover as a jarring reset that breaks context.
+
+The most common solution is asynchronous state replication. Every turn in every conversation is written to both the primary and secondary region. The write to primary is synchronous—you wait for acknowledgment before returning the response to the user. The write to secondary is asynchronous—you fire and forget. If the secondary write fails, you log the error but do not block the user. This ensures that 99 percent of conversation state exists in both regions with under 100 millisecond replication lag.
+
+When you fail over to the secondary region, most conversations have complete state. The one percent where asynchronous replication had not completed before the primary failed are the exception. For these conversations, you either start fresh or pull state from a backup. The backup is a write-ahead log stored in cross-region replicated object storage like S3. Every state mutation is appended to the log before being applied. The secondary region can replay the log to reconstruct state.
+
+A second approach is sticky failover. When a conversation starts, you assign it to a region. All subsequent turns in that conversation go to the same region unless that region is completely down. If you need to fail over, you fail over entire conversations, not individual requests. This minimizes the number of conversations that experience mid-session failover and reduces the state synchronization problem.
+
+A third approach is stateless failover. You do not replicate conversation state across regions. Instead, every request includes enough context to be stateless. The client sends the last five conversation turns with every request. The server does not need to remember anything. This works for short conversations but becomes impractical for long conversations where context exceeds token limits. It also increases bandwidth and latency because every request carries full history.
+
+The choice depends on your session characteristics. If conversations are typically under 10 turns, stateless failover is simplest. If conversations average 50 turns, you need state replication. If conversations include uploaded documents or complex user state, you need full state synchronization with eventual consistency tolerance.
+
+## Multi-Provider Failover and Model Equivalence
+
+Multi-region failover solves infrastructure failures. Multi-provider failover solves provider outages. On March 15, 2026, Anthropic experienced a two-hour outage affecting all Claude models. Systems that depended exclusively on Claude were down for two hours. Systems that could fail over to OpenAI or Google continued operating with degraded quality but maintained availability.
+
+The challenge is model equivalence. Claude Opus 4.5 and GPT-5 are not interchangeable. They have different strengths, different failure modes, different response styles, and different costs. A prompt optimized for Claude might produce mediocre results on GPT-5. A system-level instruction that Claude respects might be ignored by GPT-5. You cannot simply swap providers and expect identical behavior.
+
+The most common approach is pre-tested fallback prompts. You maintain two versions of every prompt: one optimized for your primary provider and one optimized for your fallback provider. During normal operation, you route one percent of traffic through the fallback provider using the fallback prompt. You measure quality on the fallback provider and ensure it exceeds your minimum acceptable threshold. When you need to fail over, you switch to the fallback prompt and provider simultaneously.
+
+The fallback prompt is not a copy-paste of the primary prompt. It is adapted for the fallback model's characteristics. If your primary provider is Claude and your fallback is GPT-5, your fallback prompt might be more explicit about response format, include additional examples, or adjust temperature settings. The adaptation is based on eval results from running both prompts through both models and choosing the combination that produces the best fallback quality.
+
+A second approach is runtime prompt adaptation. When you fail over to a different provider, you run the prompt through an adapter that modifies it for the new model. The adapter might add format instructions, adjust example phrasing, or inject model-specific directives. This is more complex but allows you to maintain a single primary prompt and generate provider-specific versions on demand.
+
+A third approach is quality-aware failover. You do not just fail over to any working provider. You fail over to the provider whose quality is closest to your primary provider for your specific use case. You maintain a quality matrix: for each task type, you have measured quality scores for every model you might use. When failing over, you choose the highest-quality available model. This might mean failing over to a different provider's more expensive model rather than their cheapest model.
+
+## Cost Implications of Multi-Region and Multi-Provider Architecture
+
+Running infrastructure in multiple regions costs money. Replicating state costs money. Routing health-check traffic to secondary regions costs money. Maintaining accounts and integrations with multiple providers costs money. You need to balance resilience with cost.
+
+The most significant cost is idle infrastructure. In an active-passive setup, your passive region is deployed but not serving production traffic. You are paying for compute, storage, and network capacity that sits unused until a failure occurs. For a system serving 100,000 requests per day at an average cost of eight cents per request, your active region costs 8,000 dollars per day in model inference costs alone. Your passive region, if fully provisioned, costs another 8,000 dollars per day in infrastructure costs even though it serves zero production traffic.
+
+The solution is right-sizing the passive region. You do not need to provision passive capacity for normal load. You need to provision for emergency load with degraded performance. If your SLO allows P95 latency of 800 milliseconds during normal operation and 2000 milliseconds during incident response, your passive region can run at 40 percent of active region capacity. This reduces idle cost to 3,200 dollars per day while still providing meaningful failover capability.
+
+A second cost is cross-region data transfer. Every state mutation written to both regions incurs data egress fees. AWS charges approximately 0.02 dollars per gigabyte for cross-region transfer. If each conversation state is 10 kilobytes and you have 100,000 conversations per day, you transfer one gigabyte per day, costing 0.02 dollars. This is negligible. But if you are synchronizing vector embeddings or large documents, the cost scales quickly. A 5-megabyte document uploaded by 10,000 users per day transfers 50 gigabytes per day, costing one dollar per day. Over a year, that is 365 dollars just for replication.
+
+A third cost is multi-provider contract minimums. Anthropic and OpenAI require minimum monthly spend commitments for enterprise accounts. If your primary provider is Anthropic and you commit to 50,000 dollars per month, you might also need a secondary commitment to OpenAI of 10,000 dollars per month to ensure priority access during failover. Your baseline cost increases by 10,000 dollars per month even if you never fail over. The insurance is expensive.
+
+The cost-benefit analysis depends on your availability requirements. If you have a 99.9 percent uptime SLO, you can tolerate 43 minutes of downtime per month. Most provider outages last under 30 minutes. Multi-provider failover might be overkill. If you have a 99.99 percent uptime SLO, you can tolerate four minutes of downtime per month. Multi-provider failover becomes essential.
+
+## Automated Failover Triggers and Manual Override
+
+Failover must be automatic for fast-moving outages. If your primary region error rate spikes to 20 percent, you cannot wait for a human to approve failover. The system must detect the failure and switch regions within 60 seconds. But automatic failover can be wrong. A transient spike in errors might trigger failover unnecessarily, and the act of failing over creates its own risks. You need automatic triggers with manual override.
+
+The most common trigger is sustained elevated error rate. If error rate exceeds 10 percent for three consecutive one-minute windows, trigger automatic failover. A single one-minute spike does not trigger failover. This filters transient issues while catching sustained outages quickly.
+
+A second trigger is health check failure. If the application-level health check fails five times in a row—typically over 2.5 minutes—trigger automatic failover. The health check calls the model with a known query and validates the response. If the model is not responding or responses are malformed, health checks fail.
+
+A third trigger is manual failover initiation. The on-call engineer can manually trigger failover from a command-line tool or dashboard. This is used when humans detect issues faster than automated systems—for example, when users report a specific quality problem that does not show up in aggregated metrics.
+
+The failover decision includes a safety check. Before switching regions, the system validates that the target region is healthy. If both regions are unhealthy, failover makes the situation worse. The system checks that the target region has passed its last three health checks, error rate is under two percent, and latency is under 1500 milliseconds. If these conditions are met, proceed with failover. If not, remain in the primary region and escalate to human responders.
+
+After automatic failover, the system pages on-call immediately. Automatic failover is not a resolution—it is a stopgap. Someone needs to investigate why the primary region failed and decide when to fail back. The page includes the trigger reason, error rates in both regions, and a link to the real-time dashboard.
+
+## Testing Failover Without Breaking Production
+
+You cannot validate your failover architecture during an actual outage. By then it is too late. You need to test failover regularly, ideally weekly, in a way that does not impact production users. The most common approach is controlled traffic shifting.
+
+Every Tuesday at 3 AM, you shift 10 percent of production traffic to the secondary region for 15 minutes. You monitor error rates, latency, and quality. If all metrics are acceptable, you shift traffic back to primary. If metrics degrade, you investigate and fix the issue before the next test. This validates that your secondary region can handle real production traffic and that your routing logic works.
+
+A second approach is chaos engineering with synthetic traffic. You generate 1,000 synthetic queries representative of production traffic. You route them through the primary region and record responses. You then trigger a simulated failover and route the same queries through the secondary region. You compare responses. If quality degrades by more than five percent, you have a failover quality issue to fix.
+
+A third approach is incident simulation. You deliberately break your primary region in a staging environment and validate that failover happens automatically within 60 seconds. You measure state synchronization—what percentage of active conversations successfully fail over with full context. You measure recovery time—how long it takes to fully restore service in the secondary region. You identify gaps and fix them before a real incident.
+
+The test schedule is public. The team knows that every Tuesday at 3 AM, you test failover. This prevents panicked responses when monitoring shows traffic shifting between regions. The tests are logged and reviewed. If a test fails, you treat it as a P2 incident and fix the issue within one business day.
+
+Your multi-region and multi-provider architecture provides resilience against infrastructure and vendor failures, with clear policies for when to fail over, how to maintain state, and how to manage the cost-resilience tradeoff. The next subchapter covers graceful quality degradation under load—how to maintain service when demand exceeds capacity.
+

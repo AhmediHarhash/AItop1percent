@@ -1,0 +1,98 @@
+# 9.3 — AI SLIs: What Counts as an Error in LLM Systems
+
+An HTTP 500 response is an error. A response that arrives in 12 seconds when your timeout is 10 seconds is an error. A database query that returns corrupted data is an error. These definitions are unambiguous. An LLM system that returns an HTTP 200, delivers a response in 800 milliseconds, and provides a grammatically correct answer to the wrong question is not an error by traditional definitions—but it is absolutely a failure from the user's perspective.
+
+Service level indicators for AI systems must capture this gap. You need SLIs that measure not just whether the system responded, but whether the response was useful, safe, accurate, and on-topic. The SLI must be automatically calculable for every request without human judgment, fast enough to compute without adding significant latency, and reliable enough to use for alerting and error budget tracking.
+
+The hardest part is defining the threshold. An eval score of 0.72 is a success or a failure? A response that refuses a valid question is an error or appropriate model behavior? A response that takes 950 milliseconds when your SLO is 800 milliseconds P95 counts against your budget how much? This subchapter defines how to construct AI SLIs that translate messy quality judgments into binary success-or-failure indicators you can count.
+
+## The Binary Transformation Problem
+
+Traditional SLIs are naturally binary. The API returned a response or it did not. The response arrived within the latency threshold or it did not. AI outputs are continuous. An eval score is a float between zero and one. A safety classifier outputs a probability distribution. A response length is an integer. You need rules to transform continuous measurements into binary pass-or-fail indicators.
+
+The most common approach is threshold-based. You define a quality threshold—say 0.7 on your automated eval rubric. Any response scoring 0.7 or higher is a success. Any response below 0.7 is a failure. Your SLI is the percentage of requests that succeed, measured over a rolling time window. If 98.5 percent of requests score 0.7 or higher over the last hour, your SLI is 98.5 percent.
+
+The threshold must be justified by user research or business impact analysis. If responses scoring 0.65 are rated "helpful" by users 50 percent of the time while responses scoring 0.75 are rated helpful 90 percent of the time, your threshold should sit between 0.65 and 0.75. You want the threshold where user satisfaction changes meaningfully. A threshold that is too high labels acceptable responses as failures. A threshold that is too low labels unacceptable responses as successes.
+
+A second approach is multi-threshold SLIs. You define a "good" threshold and a "catastrophic" threshold. Any response above 0.75 is good. Any response below 0.4 is catastrophic. Responses between 0.4 and 0.75 are marginal. Your SLI tracks two percentages: percentage of good responses and percentage of catastrophic responses. Your SLO specifies that 95 percent of responses are good and zero percent are catastrophic. This captures the distinction between minor quality issues and major failures.
+
+A third approach is composite SLIs. A request succeeds if it meets latency threshold AND quality threshold AND safety checks. You combine multiple continuous measurements into a single binary indicator. A response that scores 0.9 on quality but takes three seconds when your latency threshold is one second is a failure. A response that arrives in 500 milliseconds but scores 0.6 on quality is a failure. Only responses that meet all criteria count as successes.
+
+The composite approach simplifies reporting but complicates debugging. When your SLI drops from 98 percent to 95 percent, you need to decompose which component failed. You must track per-dimension SLIs alongside the composite SLI so you can identify whether the issue is latency, quality, or safety. The composite SLI is what you report to executives. The per-dimension SLIs are what you use for incident response.
+
+## Defining Success for Retrieval-Augmented Systems
+
+RAG systems have an additional dimension: retrieval correctness. The model can generate a high-quality response based on incorrect retrieved documents. The response is fluent, on-topic, and scores well on generic quality rubrics—but it is factually wrong because retrieval failed. Your SLI must detect this.
+
+The most common approach is dual measurement. You measure retrieval quality and generation quality separately, then combine them. Retrieval quality is measured by whether the top-k retrieved documents contain the information needed to answer the query. Generation quality is measured by whether the response is accurate given the retrieved documents. A request succeeds only if both retrieval and generation succeed.
+
+Measuring retrieval quality requires ground truth. For a static eval set, you label which documents contain the answer for each query. In production, you approximate retrieval quality using metrics like retrieval confidence scores, document relevance scores, or consistency between multiple retrieval attempts. If you retrieve twice using slightly different query reformulations and get completely different documents, retrieval quality is low.
+
+Measuring generation quality given retrieval is easier. You check whether the response is grounded in the retrieved documents. A response that cites document sections and matches content is grounded. A response that contradicts retrieved documents or hallucinates information not present in context is not grounded. Grounding checkers run fast—under 100 milliseconds—using heuristics like citation matching and entailment models.
+
+Your RAG SLI is the percentage of requests where retrieval succeeded AND generation succeeded. If retrieval fails but generation succeeds by using cached knowledge, that might still be acceptable depending on your domain. For a medical system, ungrounded responses are failures even if they sound correct. For a casual chatbot, ungrounded responses might be acceptable if they are helpful. The SLI definition must match your risk tolerance.
+
+## Refusal as Success or Failure
+
+Your model refuses to answer 5 percent of production queries. Some refusals are appropriate—the user asked how to build a bomb. Some refusals are inappropriate—the user asked a valid question that triggered an overly sensitive safety classifier. Your SLI must distinguish between these cases.
+
+The most common approach is split classification. You maintain a list of prohibited query types—illegal activities, self-harm instructions, requests for personal information. When the model refuses a query from this list, the refusal is correct and counts as a success. When the model refuses a query not on this list, the refusal is incorrect and counts as a failure.
+
+The challenge is that you cannot manually label every production query. You need an automated classifier that predicts whether a query should be refused. The classifier was trained on thousands of labeled examples and runs in under 50 milliseconds. If the classifier predicts "should refuse" with confidence above 0.8 and the model refuses, that is a success. If the classifier predicts "should answer" with confidence above 0.8 and the model refuses, that is a failure.
+
+The gray zone is queries where the classifier confidence is between 0.2 and 0.8. You cannot confidently label these as correct or incorrect refusals. One approach is to treat them as neutral—they do not count toward SLI calculation. Another approach is to sample them for human review and adjust your SLI calculation based on the human-reviewed subset. A third approach is to have a separate SLI for refusal precision: what percentage of refusals are appropriate according to your classifier.
+
+Over-refusal is more dangerous than under-refusal for most applications. If your medical chatbot refuses to answer "what are symptoms of diabetes" because it falsely flags it as medical advice, you lose user trust. If your chatbot occasionally answers a borderline question that should have been refused, you have a minor safety incident. Your SLI should penalize inappropriate refusals more heavily than it penalizes rare inappropriate answers.
+
+## Measuring Safety Violations as SLI Components
+
+Safety violations are binary. A response either violates safety policy or it does not. The challenge is that safety measurement is probabilistic. Your safety classifier outputs a confidence score between zero and one. You need a threshold to convert that score into a binary violation indicator.
+
+The most common approach is high-confidence flagging. If the safety classifier outputs confidence above 0.9, the response is a violation. If confidence is below 0.9, the response is not a violation. Your safety SLI is the percentage of responses that are not violations. If 99.98 percent of responses score below 0.9 on the safety classifier, your safety SLI is 99.98 percent.
+
+The threshold matters. Set it too high and you miss real violations. Set it too low and you flag false positives that consume human review capacity. The right threshold comes from validation. Run the classifier on 10,000 human-labeled examples. For each confidence threshold, calculate precision and recall. Choose the threshold where precision is at least 60 percent while recall is at least 90 percent. This ensures that most flagged responses are real violations while catching most real violations.
+
+A second approach is multi-tier safety SLIs. You define three severity levels: high, medium, and low. High severity violations—self-harm instructions, illegal activity—have a threshold of 0.7. Medium severity violations—PII leakage, biased content—have a threshold of 0.85. Low severity violations—borderline rudeness, slight off-topic drift—have a threshold of 0.95. Your SLI tracks violation rate for each tier separately. Your SLO specifies zero high-severity violations, under 0.1 percent medium-severity, and under 1 percent low-severity.
+
+A third approach is feedback-adjusted SLIs. When a flagged response is reviewed by humans and confirmed as a violation, that confirmation strengthens the SLI calculation retroactively. When a flagged response is reviewed and found to be a false positive, that weakens the SLI. This creates a feedback loop where your SLI gets more accurate over time as human reviewers correct classifier errors.
+
+## Latency SLIs That Account for Query Complexity
+
+A simple query should return in 300 milliseconds. A complex query with 10,000 tokens of context might legitimately take 2000 milliseconds. Your latency SLI must account for this variance without treating all slow responses as failures.
+
+The most common approach is segmented latency SLIs. You classify queries by complexity—measured by input token count, retrieval result count, or some combination—and apply different latency thresholds to each segment. Queries under 100 tokens have a 400 millisecond threshold. Queries between 100 and 1000 tokens have an 800 millisecond threshold. Queries over 1000 tokens have a 1500 millisecond threshold. Your SLI is calculated separately for each segment.
+
+The classification must be fast and automatic. You cannot spend 50 milliseconds classifying query complexity before applying a latency threshold. The classification happens at log time based on metadata you already have—token count, user segment, endpoint. The threshold lookup is a simple table: if token count between 100 and 1000, threshold equals 800.
+
+A second approach is percentile-based SLIs. Instead of a fixed threshold, your SLI is whether the response latency is below the P95 latency for queries of similar complexity. This automatically adjusts for query variation without requiring manual threshold tuning. If P95 latency for 500-token queries is 750 milliseconds, any 500-token query that completes in under 750 milliseconds counts as a success.
+
+A third approach is user-segment-specific SLIs. Enterprise customers get stricter latency thresholds than free-tier users. A 1000-millisecond response is a failure for enterprise, but a success for free-tier. Your SLI is calculated separately per user segment and weighted by business value. Enterprise SLI has 10x weight compared to free-tier SLI in aggregate reporting.
+
+## Cost as a Pass-Fail Indicator
+
+Cost is typically tracked as an average, not a binary indicator. But you can construct cost SLIs by defining a per-query cost threshold. Any query that costs more than 15 cents is a "cost failure." Your cost SLI is the percentage of queries under 15 cents.
+
+This approach is useful when cost variability is high. If most queries cost five cents but 1 percent of queries cost three dollars because users provide 50,000-token context, your average cost is manageable but your cost SLI flags the outliers. You can investigate why some queries are 40x more expensive than median and decide whether to throttle them.
+
+The threshold comes from business analysis. If your revenue per query is 20 cents and your target margin is 50 percent, your cost threshold is 10 cents. Any query over 10 cents loses money. Your cost SLI tracks what percentage of queries are profitable. If cost SLI drops below 95 percent, you are losing money on five percent of traffic and need to either raise prices or reduce costs.
+
+A second approach is budget-relative SLIs. Each user has a monthly cost budget based on their subscription tier. Your SLI tracks whether each user stays within budget. Users who exceed budget count as failures. Your aggregate cost SLI is the percentage of users who stay within budget each month.
+
+A third approach is cost efficiency SLIs. You measure cost per unit of value delivered—cost per resolved customer query, cost per correct answer, cost per user session. Your SLI tracks whether cost efficiency stays above a threshold. If cost per resolved query exceeds 25 cents, that query is a cost failure. This captures the idea that spending is only acceptable if you delivered value.
+
+## Combining SLIs Into a Single Health Score
+
+Each dimension has its own SLI: latency, quality, safety, cost, retrieval correctness, refusal accuracy. Reporting six separate SLIs is accurate but overwhelming. Executives want a single number. You need a way to combine SLIs into a composite health score without hiding critical information.
+
+The most common approach is weighted aggregation. Quality SLI has 40 percent weight, latency SLI has 25 percent weight, safety SLI has 25 percent weight, cost SLI has 10 percent weight. Your composite health score is the weighted average. If quality is 98 percent, latency is 97 percent, safety is 99.9 percent, and cost is 95 percent, your health score is 98 times 0.4 plus 97 times 0.25 plus 99.9 times 0.25 plus 95 times 0.1 equals 97.975 percent.
+
+The weights reflect business priorities. For a safety-critical medical application, safety might have 50 percent weight. For a high-volume consumer application, latency might have 40 percent weight. For a cost-sensitive enterprise tool, cost might have 30 percent weight. The weights are not technical judgments, they are business judgments about what matters most.
+
+A second approach is minimum scoring. Your health score is the minimum of all SLIs. If quality is 98 percent, latency is 97 percent, and safety is 92 percent, your health score is 92 percent. This captures the idea that you are only as strong as your weakest dimension. A single failing dimension pulls down the composite score.
+
+A third approach is conditional composition. Your health score is calculated from quality and latency only if safety SLI is above 99 percent. If safety SLI drops below 99 percent, your health score is zero regardless of other dimensions. This enforces that safety is non-negotiable while allowing normal quality-latency tradeoffs.
+
+The composite score is for executive dashboards and SLO reporting. Incident response and debugging use per-dimension SLIs. When health score drops from 98 percent to 94 percent, the first step is always decomposing which dimension failed. The composite score tells you there is a problem. The per-dimension SLIs tell you what the problem is.
+
+Your SLI definitions transform subjective AI quality into objective measurements you can count, alert on, and manage with error budgets. The next subchapter covers degraded mode operation—how to keep serving users when the primary model fails.
+

@@ -1,0 +1,98 @@
+# 6.4 — Loop Detection: Catching Agents That Spin Forever
+
+An agent that queries the same API eleven times in a row with the same parameters is not gathering information. It is stuck. But unless you detect the loop and kill the agent, it will continue until it hits a step limit or burns through your token budget. Loop detection is not a nice-to-have debugging feature. It is mandatory cost control.
+
+Agents get stuck in loops for several reasons. The agent's planning logic decides a tool should provide useful information, calls it, receives a result, fails to interpret the result, re-evaluates the situation, decides the same tool should provide useful information, calls it again, and repeats. Or the agent alternates between two strategies, never committing to either, oscillating until a timeout stops it. Or the agent misinterprets success as failure and retries a tool call that already succeeded. All of these patterns burn tokens, waste time, and produce no value.
+
+## The Eleven-Query Disaster
+
+A recruiting agent in late 2025 helped hiring managers source candidates by searching resume databases, LinkedIn, and GitHub. One Friday afternoon, costs spiked to nineteen times normal. Investigation showed that a single agent instance had issued the same GitHub search query forty-three times in five minutes before the system's hard step limit killed it.
+
+The agent was searching for candidates with a rare skill combination. The GitHub API returned zero results. The agent interpreted zero results as an API failure, retried, got zero again, retried again, and continued. The agent's error-handling logic was designed to retry transient failures, but it could not distinguish between "the API failed" and "the API returned an empty result set." The retry logic triggered on every attempt. The agent ran until the step limit stopped it at forty-three queries.
+
+The loop consumed 340,000 tokens — roughly ninety times the expected cost for that request type. The agent produced no output. The user waited three minutes and gave up. The pattern repeated across seventeen different requests that day before the team detected it and deployed a fix.
+
+## Detecting Repeat Tool Calls
+
+The simplest loop pattern is identical tool calls. An agent calls the same tool with the same parameters multiple times in close succession. You detect this by logging tool calls with their parameters and checking for duplicates within a sliding window.
+
+You define a duplicate as a tool call with identical tool name and parameters made within the last N steps, where N is typically three to five. An agent that calls a search tool three times with the same query in the last five steps is almost certainly stuck. A sophisticated version hashes the parameters to detect semantic duplicates — queries that are phrased differently but mean the same thing.
+
+A customer support agent in early 2026 used a knowledge base search tool. Loop detection flagged any case where the same search query appeared twice within a three-step window. In the first week, the system flagged 0.8 percent of requests. Manual review showed that seventy percent of flagged cases were true loops — the agent had misunderstood a result and retried. Thirty percent were legitimate retries after an intermediate action changed the context. The team adjusted the detection window to four steps, which reduced false positives to twelve percent while still catching most true loops.
+
+## Detecting Oscillation Patterns
+
+More sophisticated loops involve oscillation. The agent alternates between two or three strategies without making progress. Tool A returns data, the agent decides the data is insufficient and calls tool B, tool B returns data, the agent decides it needs tool A again, tool A returns the same data as before, the agent calls tool B again, and the cycle repeats.
+
+You detect oscillation by tracking tool call sequences. If the agent's last six tool calls follow the pattern A-B-A-B-A-B, the agent is oscillating. More generally, if a sequence of K tool calls repeats within a window of 2K steps, the agent is likely looping.
+
+A legal research agent in mid-2025 had access to a case law database and a statute database. For certain complex queries, the agent would search case law, find a reference to a statute, search the statute database, find a reference back to case law, search case law again, find the same reference to the same statute, and repeat. The agent was following valid references but not recognizing that it had already visited those references.
+
+The team implemented oscillation detection: if the agent called the same pair of tools in alternating sequence more than twice, the system flagged it as a potential loop. The agent's planning logic was updated to maintain a history of visited references and skip references it had already explored. Oscillation loops dropped from 3.2 percent of research queries to 0.4 percent.
+
+## Tracking Unique vs. Redundant Steps
+
+Loop detection does not require catching identical tool calls. You can detect loops by comparing unique actions to total actions. An agent that takes twenty steps but only performs eight unique actions has taken twelve redundant steps. High redundancy indicates looping behavior even if no two steps are exactly identical.
+
+You calculate a uniqueness ratio: unique actions divided by total actions. An agent that takes ten steps with nine unique actions has a uniqueness ratio of 0.9 — very efficient. An agent that takes ten steps with four unique actions has a uniqueness ratio of 0.4 — highly redundant. You set a threshold: if uniqueness drops below 0.6, flag the request for review or terminate it.
+
+An inventory management agent in early 2026 checked stock levels, reserved inventory, verified reservations, and confirmed orders. Expected uniqueness ratio: above 0.8. One week, the team noticed median uniqueness dropping to 0.65. Investigation showed the agent was rechecking stock levels multiple times during the reservation process, even though stock levels had not changed between checks. The agent's logic included a "verify before commit" step that triggered twice due to a conditional branch error. Fixing the branch restored uniqueness to 0.82 and reduced median step depth from 9.4 to 7.1.
+
+## Real-Time Loop Termination
+
+When you detect a loop, you terminate the agent immediately. Letting a looping agent continue wastes cost and frustrates users who are waiting for a response. Termination logic works as follows: if loop detection triggers, the system cancels the agent's execution, logs the loop pattern, and returns an error or escalates to a human.
+
+Some systems implement graduated termination. First loop detection triggers a warning logged to the agent's context, giving the agent one chance to self-correct. If the agent continues the loop, the system terminates it. This reduces false positives where the agent was about to break out of the pattern naturally.
+
+A financial planning agent in mid-2025 implemented two-stage loop detection. First detection: log a warning and inject a message into the agent's context — "You have queried the portfolio API twice with the same parameters. Consider a different approach." If the agent queried the same API a third time, the system terminated it. In practice, twelve percent of first-stage warnings were followed by successful self-correction. The agent read the warning, adjusted its strategy, and completed the task. Eighty-eight percent of warnings were ignored, and those agents were terminated at the second detection.
+
+## Loop Attribution to Specific Tool Sequences
+
+When a loop occurs, you need to know which tools were involved. Loop attribution logs the sequence of tool calls that formed the loop. This helps you identify whether the loop is caused by a specific tool returning ambiguous results, or by the agent's planning logic failing to interpret results correctly, or by a combination of both.
+
+A travel booking agent in early 2026 experienced loops involving three tools: flight search, seat availability check, and pricing verification. Loop attribution showed that ninety percent of loops followed the pattern: flight search, seat availability, pricing verification, flight search again with slightly different parameters, seat availability again, pricing verification again. The agent was adjusting search parameters after discovering pricing issues, then rechecking everything, which sometimes led to finding the same flight and repricing it identically.
+
+The team identified the root cause: the pricing verification tool returned a "price changed" warning even when the price was identical to the cached price, because it compared floating-point numbers without rounding. The agent interpreted "price changed" as a signal to restart the search. Fixing the floating-point comparison eliminated ninety percent of loops.
+
+## The Infinite Context Problem
+
+Some agents maintain full conversation history as context. In a loop, the agent repeatedly adds similar actions to the context, eventually consuming all available context window space. When the context window fills, the agent either crashes or truncates early context, which can break the loop by accident — the agent forgets why it was looping — but also breaks the agent's ability to reason coherently about the task.
+
+You monitor context window utilization as a secondary loop signal. An agent that has consumed ninety percent of its context window before completing five steps is either working on an extraordinarily complex task or stuck in a loop that is polluting the context. High context utilization early in a trajectory is a loop indicator.
+
+A documentation agent in mid-2025 generated technical documentation by querying code repositories, extracting function signatures, and synthesizing explanations. The agent maintained full history of every query and every result. In one case, the agent entered a loop querying the same repository repeatedly. After twenty queries, the context window hit capacity. The agent truncated the earliest queries to make room for new ones, which removed the evidence that it had already queried those files, so the agent queried them again. The loop became self-sustaining.
+
+The team implemented context-aware loop detection: if the agent consumed more than seventy percent of its context window before completing the task, the system flagged it. Separately, the agent's context management was updated to deduplicate identical queries, which prevented the context window from filling with repetitive data. Combined, these changes reduced infinite context loops to near zero.
+
+## User-Facing Loop Indicators
+
+When an agent is taking too long, users want to know if progress is being made or if the system is stuck. Some teams expose step depth and uniqueness metrics to the front end, displaying a message like "Processing step eight of an estimated twelve steps" or "This request is taking longer than usual."
+
+More advanced implementations detect loops in real time and proactively inform the user. If loop detection triggers, instead of silently terminating the agent, the system tells the user: "We encountered difficulty retrieving the information you requested. A human specialist will follow up within two hours." This converts a silent failure into a managed escalation.
+
+A healthcare prior authorization agent in early 2026 implemented this pattern. When a loop was detected, the system immediately escalated to a human reviewer and sent the user a notification explaining that their request required additional review. Escalation transparency improved user satisfaction scores by nine points compared to the previous pattern of returning a generic error after a three-minute timeout.
+
+## Post-Loop Analysis
+
+After terminating a looping agent, you log the full trajectory for post-incident analysis. The log includes every tool call, every parameter, every result, every planning step, and the loop detection trigger that caused termination. Engineers review loop incidents weekly to identify recurring patterns and improve both the agent's logic and the tools it depends on.
+
+Loop analysis often reveals tool quality issues. A tool that returns ambiguous or inconsistent results causes loops. A tool that fails silently — returning a success status code but empty data — causes loops because the agent retries expecting real data. Fixing these tool issues reduces loop frequency across the entire agent system.
+
+A logistics agent in late 2025 logged forty-seven loop incidents in one week. Post-loop analysis showed that thirty-one of those incidents involved the shipment tracking tool returning a status of "in transit" for packages that had already been delivered. The agent would query tracking, see "in transit," try to retrieve delivery details, fail, query tracking again, see "in transit" again, and loop. The root cause was a caching issue in the tracking provider's API. Fixing the cache invalidation logic eliminated that loop pattern entirely.
+
+## Configuring Loop Detection Sensitivity
+
+Loop detection has two failure modes: too sensitive and you terminate agents working on complex tasks, too lenient and you let loops burn cost. You tune sensitivity based on your system's tolerance for false positives versus false negatives.
+
+High-sensitivity configuration detects loops aggressively: duplicate tool calls within two steps, uniqueness ratio below 0.7, oscillation patterns of length four. This catches almost all loops but also terminates some legitimate complex reasoning. You use high sensitivity for cost-critical systems where runaway agents are expensive.
+
+Low-sensitivity configuration detects only obvious loops: duplicate tool calls within five steps, uniqueness ratio below 0.5, oscillation patterns of length eight. This misses subtle loops but rarely terminates valid agents. You use low sensitivity for quality-critical systems where false terminations hurt user experience more than extra cost.
+
+Most systems start with moderate sensitivity and tune based on incident review. You track termination rate, false positive rate, and cost burned by undetected loops. If false positives are high, reduce sensitivity. If undetected loops are burning budget, increase sensitivity.
+
+An agent system handling legal document review used low sensitivity initially — terminating an agent working on a complex contract would be worse than letting it run longer than necessary. After three months, data showed that undetected loops were rare, but median cost per request was twenty percent above budget. The team increased sensitivity slightly, which raised termination rate from 0.3 percent to 0.7 percent but reduced cost overruns by fourteen percent. The cost savings justified the additional escalations.
+
+Loop detection is not theoretical. Agents loop. They loop often enough that without detection, they become an operational cost and user experience problem. Building loop detection into your agent monitoring is not optional. It is part of making agents production-ready.
+
+The next subchapter covers planning failure detection — identifying when an agent's high-level strategy is incorrect even though each individual step succeeds.
+

@@ -1,0 +1,131 @@
+# 2.10 — OpenTelemetry and AI: Extending Standards for LLM Workloads
+
+The platform team had spent six months building a standard observability stack for the company — OpenTelemetry for instrumentation, Jaeger for distributed tracing, Prometheus for metrics, Grafana for dashboards. Every backend service emitted traces and metrics in the standard format. Every deployment was observable. Then the AI team launched their first product, and none of the standard tooling worked. Model calls did not show up as spans. Token costs were invisible. Prompt-response pairs were nowhere in the traces. The AI team asked the platform team: "Can we just use our own observability tool?" The platform team said no — they had just unified observability across 40 services, and they were not going to maintain a parallel system for one team. The AI team said fine, and proceeded to log everything to a separate database that the platform team could not access. Six months later, during a production incident that spanned both traditional services and AI services, no one could correlate the traces. The AI logs and the standard traces lived in different systems with different timestamps and no shared request IDs.
+
+This is the core tension. Standard observability frameworks like OpenTelemetry were built for REST APIs, databases, and message queues — not for systems where a single operation costs four dollars, where the request payload is a 5,000-token prompt, and where the response is generated one token at a time over 20 seconds. You can force AI workloads into standard spans and metrics, but you lose the dimensions that matter — tokens, costs, quality scores, prompt versions. Or you build AI-specific tooling, but then your AI telemetry does not integrate with your existing infrastructure, and you end up with observability silos.
+
+The solution is not to abandon OpenTelemetry. The solution is to extend it — to use OpenTelemetry's existing primitives while adding semantic conventions and custom attributes that capture what makes AI workloads different. This gives you the integration with standard tooling and the AI-specific visibility you need. The question is how to do it without turning every model call into an unstructured blob that standard tools cannot parse.
+
+## OpenTelemetry Basics for AI Engineers
+
+OpenTelemetry is a vendor-neutral standard for collecting telemetry — traces, metrics, and logs. It provides instrumentation libraries for most programming languages, exporters that send data to observability backends, and a set of semantic conventions that define how to describe common operations like HTTP requests, database queries, and RPC calls.
+
+A **trace** represents a single request as it flows through your system. The trace is made up of **spans**, where each span represents a unit of work — a function call, a database query, an HTTP request. Spans have a start time, an end time, a name, and a set of attributes that describe what happened. Spans can be nested — a parent span for "handle user request" contains child spans for "call database" and "call model provider". The entire trace forms a tree that shows the full path of a request through your system.
+
+**Attributes** are key-value pairs attached to spans. They describe the operation. For an HTTP request span, attributes might include the HTTP method, the status code, and the URL. For a database query span, attributes include the query text and the row count. Attributes make spans queryable — you can filter traces by attribute values, group spans by attributes, and aggregate metrics from attributes.
+
+**Metrics** are numeric measurements over time. A counter that increments every time a model is called. A histogram of response latencies. A gauge that tracks the current number of in-flight requests. Metrics are cheaper to collect and store than traces, so you emit metrics for everything and traces for a sample of requests.
+
+For traditional services, OpenTelemetry works out of the box. You add the instrumentation library, it auto-instruments HTTP clients and database drivers, and telemetry flows to your backend. For AI services, you need to manually instrument model calls because no standard library knows how to wrap a call to OpenAI's API or your internal inference server. This is where semantic conventions for AI become critical.
+
+## Semantic Conventions for LLM Spans
+
+Semantic conventions are standardized attribute names and span naming patterns. They ensure that different teams, different tools, and different vendors all describe the same operation in the same way. If everyone names a database query span "db.query" and uses the attribute "db.system" to specify the database type, then dashboards, alerts, and analytics tools can work across all services without custom configuration.
+
+OpenTelemetry did not originally have semantic conventions for LLMs, because LLMs were not a standard infrastructure component in 2021 when the conventions were written. But by 2025, the OpenTelemetry community and AI observability vendors started converging on a set of conventions. By 2026, the **gen_ai** namespace is the de facto standard for describing LLM operations.
+
+A span representing a call to an LLM should be named "gen_ai.request" or "gen_ai.chat.completions" depending on the API style. The span should have a set of standard attributes:
+
+**gen_ai.system** — The model provider. "openai", "anthropic", "google", "azure_openai". This is analogous to "db.system" for database queries. It lets you filter traces by provider and compare latencies or error rates across providers.
+
+**gen_ai.request.model** — The model ID. "gpt-5-turbo-2026-01-15", "claude-opus-4-5-20260110", "gemini-3-pro". This is the versioned model identifier, not a generic name. It lets you correlate telemetry with model versions and detect regressions when models update.
+
+**gen_ai.request.max_tokens** — The maximum number of tokens the model is allowed to generate. This is part of the request configuration and affects both latency and cost. If you set max_tokens to 4,000 but the model typically generates 200 tokens, you are giving the model a much larger budget than it needs, which can affect scheduling and pricing in some provider systems.
+
+**gen_ai.request.temperature** — The sampling temperature. A critical parameter that affects output variability. Logging it lets you detect configuration drift — if temperature accidentally gets set to 1.5 instead of 0.7, your telemetry will show it.
+
+**gen_ai.usage.input_tokens** — The number of tokens in the prompt. This is the primary driver of input cost and a key factor in latency.
+
+**gen_ai.usage.output_tokens** — The number of tokens the model generated. This is the primary driver of output cost and streaming latency.
+
+**gen_ai.response.finish_reason** — Why the model stopped generating. "stop" means it finished naturally. "length" means it hit the max token limit. "content_filter" means the model refused to complete the request due to policy. This field is essential for understanding refusals and truncations.
+
+These attributes turn a generic span into something queryable. You can ask "what is the p95 latency for all gpt-5-turbo requests?" or "how many requests finished due to content_filter in the last hour?" Without these conventions, every team invents their own attribute names, and cross-team analysis becomes impossible.
+
+## Custom Attributes for Prompt and Completion Content
+
+The standard semantic conventions cover metadata, but they do not cover the actual content of the prompt and the response. Some teams want to log the full prompt and completion text for debugging. Other teams cannot log content due to privacy or security policies. The decision is yours, but if you do log content, you need custom attributes.
+
+**gen_ai.prompt** — The full text of the prompt sent to the model. This can be large — 5,000 or 10,000 tokens in some cases. Logging it makes debugging much easier. If a user reports a bad response, you can pull the trace, read the prompt, and see exactly what the model received. The downside is cost and privacy. Storing full prompts increases your telemetry storage costs significantly, and if the prompt contains user data, you need to handle it according to your data retention policies. Some teams log prompts for only a sampled percentage of requests — 1 percent or 5 percent — to balance observability and cost.
+
+**gen_ai.completion** — The full text of the model's response. Same trade-offs as prompt logging. It is incredibly useful for debugging, but it is large and potentially sensitive. If your model occasionally generates inappropriate content, logging the completion lets you see exactly what was returned and improve your content filtering. If you do not log it, you only have metadata — token counts, finish reason, latency — which is often not enough to diagnose quality issues.
+
+**gen_ai.prompt.version** — If you version your prompts using a templating system or a prompt management tool, log the version identifier. This lets you correlate telemetry with prompt changes. If you deploy a new prompt version and refusal rates spike, you need to see that in your traces. Without prompt versioning in telemetry, you have to manually correlate deployment timestamps with telemetry timestamps, which is error-prone.
+
+These custom attributes extend the standard conventions without breaking compatibility. Standard OpenTelemetry tools can still process the traces — they just ignore the custom attributes they do not understand. AI-specific tools can read the custom attributes and surface them in AI-focused dashboards.
+
+## Instrumenting Model Provider Clients
+
+Manual instrumentation is straightforward. Every time you call a model, you create a span, set the attributes, and close the span when the call completes. Here is what that looks like conceptually:
+
+You start a span with the name "gen_ai.request". You set the attributes before making the call — provider, model ID, temperature, max tokens. You call the model provider's API. When the response arrives, you set the output attributes — input tokens, output tokens, finish reason. You calculate the duration from the span's start and end timestamps. You close the span, and it gets exported to your telemetry backend.
+
+For streaming responses, instrumentation is more complex. The model returns tokens incrementally, and the span does not end until the stream closes. You need to track when the first token arrives — that is the time-to-first-token metric — and when the last token arrives. You need to count tokens as they stream in. If the stream fails halfway through, you need to mark the span as an error and record the failure reason. Streaming spans are longer-lived and require stateful tracking.
+
+Some AI observability vendors provide pre-built OpenTelemetry instrumentation for popular model clients. Langfuse, Traceloop, and Arize all have libraries that auto-instrument OpenAI's Python SDK, Anthropic's SDK, and other common clients. These libraries wrap the model call in a span, set the semantic attributes automatically, and handle streaming correctly. If you are using a supported client, you can get full OpenTelemetry integration with a few lines of setup code.
+
+If you are calling a custom model endpoint or a provider without a pre-built integration, you have to write the instrumentation yourself. This is not hard — OpenTelemetry's SDKs make it straightforward to create spans and set attributes — but it is manual work that you need to maintain as your model calling code evolves.
+
+## The gen_ai Namespace in OpenTelemetry
+
+The **gen_ai** namespace is not an official part of the OpenTelemetry specification as of early 2026, but it is the emerging standard used by most AI observability tools. The namespace follows OpenTelemetry's naming conventions — dot-separated hierarchical names, lowercase, underscores for multi-word terms.
+
+The top-level namespace is **gen_ai**. This distinguishes generative AI operations from other AI workloads like inference on traditional ML models, which would use a different namespace. Under gen_ai, there are sub-namespaces for different dimensions:
+
+**gen_ai.system** — Attributes that describe the system or provider. The model provider, the API version, the deployment region.
+
+**gen_ai.request** — Attributes that describe the request. The model ID, the configuration parameters like temperature and max tokens, the operation type like "completion" or "embedding".
+
+**gen_ai.usage** — Attributes that describe resource usage. Input tokens, output tokens, cached tokens if the provider supports caching.
+
+**gen_ai.response** — Attributes that describe the response. The finish reason, the quality score if you compute one, the response classification if you categorize outputs.
+
+This structure mirrors how OpenTelemetry organizes other semantic conventions. Database operations use "db.system", "db.statement", "db.operation". HTTP operations use "http.method", "http.status_code", "http.url". The gen_ai namespace follows the same pattern, making it intuitive for teams already using OpenTelemetry.
+
+As of 2026, not every observability backend natively understands the gen_ai namespace. Jaeger and Zipkin display the attributes as custom fields but do not have AI-specific visualizations. Grafana can chart the attributes if you write custom queries, but it does not have built-in dashboards for token usage or cost. AI-specific tools like Langfuse and Arize do have native support — they parse the gen_ai attributes and surface them in AI-focused dashboards with token usage graphs, cost breakdowns, and prompt-response viewers.
+
+The long-term direction is for the gen_ai namespace to become part of the official OpenTelemetry semantic conventions, which would push more general-purpose observability tools to add native support. Until then, you can use the namespace with standard OpenTelemetry tooling, but you will need custom dashboards or AI-specific backends to get full value from the AI-specific attributes.
+
+## Integrating AI Traces with Application Traces
+
+The biggest value of using OpenTelemetry for AI telemetry is that your AI spans integrate seamlessly with your application spans. A user request that starts in your API gateway, calls your application logic, retrieves data from a database, and then calls an LLM generates a single trace with all of those operations as spans. You can see the full request path — how long the database query took, how long the LLM call took, how they compare.
+
+This integration breaks if your AI telemetry lives in a separate system. If your application emits OpenTelemetry traces to Jaeger but your AI calls go to a separate AI observability tool, you cannot see the full request. You can see that the application took 3 seconds, and separately you can see that the LLM call took 2.8 seconds, but you cannot see them in the same trace. If the user reports that their request was slow, you do not know whether the slowness was in the application logic or the model call.
+
+To keep traces unified, you need to ensure that your AI instrumentation uses the same trace context as the rest of your application. OpenTelemetry propagates trace context through headers or in-process context objects. When your application code calls your LLM client, the LLM client should create a child span under the current active span. That way, the LLM call shows up in the trace tree at the correct position.
+
+Some AI observability tools do not natively support OpenTelemetry trace context propagation. They use their own trace IDs and their own span hierarchies. If you use one of these tools, your AI traces are isolated from your application traces. You lose the ability to see the full request path. Before adopting an AI observability tool, verify that it supports OpenTelemetry trace context. If it does not, you will need to export AI traces to a separate system and manually correlate them with application traces using request IDs, which is fragile and slow.
+
+## Real Implementations in Langfuse, Traceloop, and Arize
+
+Several observability platforms have built native support for AI telemetry using OpenTelemetry conventions. These platforms provide SDKs that instrument model calls, emit OpenTelemetry spans with gen_ai attributes, and export traces to backends that understand AI workloads.
+
+**Langfuse** is an open-source observability tool specifically for LLM applications. It provides instrumentation libraries for Python and JavaScript that wrap model calls and emit OpenTelemetry-compatible traces. Langfuse understands the gen_ai namespace and surfaces token counts, costs, and prompt-response pairs in its UI. It also supports prompt versioning and eval metrics. The key feature is that Langfuse traces integrate with standard OpenTelemetry backends — you can send traces to both Langfuse for AI-specific analysis and Jaeger for general distributed tracing.
+
+**Traceloop** is another OpenTelemetry-based tool for AI observability. It focuses on auto-instrumentation — you add a single decorator or middleware, and Traceloop instruments all model calls in your application without requiring manual span creation. Traceloop supports the gen_ai namespace and exports traces to OpenTelemetry-compatible backends like Honeycomb, Datadog, and New Relic. The trade-off is that auto-instrumentation works for common model clients but may not capture custom inference code or self-hosted models.
+
+**Arize** is an enterprise AI observability platform that supports OpenTelemetry ingestion. Arize focuses on model monitoring and drift detection, not just request tracing. It ingests OpenTelemetry spans, extracts the gen_ai attributes, and builds monitoring dashboards that track quality metrics, cost trends, and model performance over time. Arize's strength is in handling high-volume telemetry and surfacing signals that indicate model degradation or data drift.
+
+All three platforms demonstrate that OpenTelemetry can be extended to handle AI workloads without forking the standard. They use the same trace propagation, the same span model, the same exporters — they just add AI-specific semantic conventions and build UIs that surface those conventions. This is the pattern to follow if you are building your own AI observability tooling.
+
+## When to Use OpenTelemetry vs. Custom Logging
+
+OpenTelemetry is not always the right choice. If you have no existing OpenTelemetry infrastructure, if your AI system is isolated from other services, or if you need AI-specific features that OpenTelemetry does not support, custom logging may be simpler.
+
+Use OpenTelemetry when:
+- Your organization already uses OpenTelemetry for other services, and you want unified observability.
+- Your AI system integrates tightly with traditional backend services, and you need to see the full request path across both.
+- You want to send telemetry to multiple backends or switch backends without changing instrumentation.
+- You need interoperability with standard observability tools like Grafana, Prometheus, and Jaeger.
+
+Use custom logging when:
+- You are building a standalone AI system with no integration into existing infrastructure.
+- You need AI-specific features like prompt diffs, eval score tracking, or conversation history visualization that standard OpenTelemetry tools do not support.
+- You want to minimize dependencies and avoid the complexity of configuring OpenTelemetry exporters.
+- Your observability backend is an AI-specific tool that does not ingest OpenTelemetry traces.
+
+The decision is not binary. Many teams use OpenTelemetry for performance and error telemetry and supplement it with custom logging for quality metrics and debugging data. The key is to ensure that both systems share common identifiers — request IDs, session IDs, user IDs — so you can correlate data across them when diagnosing incidents.
+
+OpenTelemetry gives you integration with the broader observability ecosystem. Custom logging gives you flexibility and AI-specific features. Choose based on whether integration or specialization matters more for your system. But if you have the choice, prefer OpenTelemetry with extensions over building an entirely separate telemetry stack. The value of unified traces is too high to give up without a strong reason.
+
+Next, we address how long to keep this telemetry — retention policies, storage tiers, and the cost-queryability trade-off that determines what data you can access when you need it.

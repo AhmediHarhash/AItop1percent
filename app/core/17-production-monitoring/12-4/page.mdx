@@ -1,0 +1,106 @@
+# 12.4 — Explainability Capture: Recording Why the Model Decided
+
+The EU AI Act does not just require logging what the model decided. Article 13 requires explanations. When a high-risk AI system produces a decision, the people affected by it have the right to obtain information about the logic involved. They must understand why the system reached that conclusion. For regulators, this is not a technical curiosity. It is a fundamental right. If you cannot explain your model's decision, you cannot deploy it in the EU for high-risk applications.
+
+But what does "explain" mean for a model with 70 billion parameters? You cannot print the weight matrices. You cannot show the attention patterns. Regulators are not asking for a technical artifact. They are asking for a human-understandable narrative: what input factors drove this decision, how much did each factor contribute, and would changing those factors have changed the outcome? This narrative must be captured at inference time, stored in the audit log, and made available on demand. If you generate it retroactively, the explanation might not match what the model actually did.
+
+Explainability capture is the process of generating, validating, and logging these explanations as part of the decision pipeline. It is not a post-hoc analysis. It is not optional. It is infrastructure that runs on every high-risk prediction, produces a structured explanation, and writes it to the audit trail alongside the decision itself.
+
+## What Counts as an Explanation Under Regulation
+
+GDPR Article 22 grants the right to an explanation for automated decisions. The EU AI Act Article 13 extends this. In 2026, the GPAI Code of Practice clarified what regulators expect. An explanation must include the decision, the primary contributing factors, the relative importance of those factors, and a statement of whether the decision would differ if key factors changed. It must be understandable to a layperson, not a data scientist.
+
+A credit denial explanation might read: "Application denied. Primary factors: debt-to-income ratio 48 percent, exceeds policy threshold of 40 percent. Secondary factor: credit history less than two years. If debt-to-income ratio were below 40 percent, decision would likely be approval." This explanation is actionable. The applicant knows why they were denied. They know what to fix. They can challenge the decision if the stated factors are incorrect.
+
+A non-compliant explanation reads: "Application denied. Model confidence: 0.87." This tells the applicant nothing. They do not know what drove the decision. They cannot correct errors. They cannot contest the decision meaningfully. Regulators consider this a transparency failure. If your system produces explanations like this, it does not meet Article 13.
+
+The explanation must be specific to the individual decision. Generic statements do not count. "Applications are evaluated based on creditworthiness" is not an explanation. "Your application was evaluated based on your debt-to-income ratio of 48 percent" is an explanation. The difference is specificity and grounding in the actual data.
+
+Explanations must also disclose when the model is uncertain. If confidence is low, the explanation should say so. "Model confidence is 52 percent, indicating uncertainty. Primary factors: limited credit history and borderline debt-to-income ratio." This transparency is valuable. It allows humans to review uncertain cases. It prevents over-reliance on low-confidence predictions.
+
+## Feature Attribution Methods for Black-Box Models
+
+Large language models and other deep neural networks are not inherently interpretable. You cannot read the decision process from the weights. You need post-hoc attribution methods that estimate which input features influenced the output. The two dominant approaches in 2026 are SHAP and attention-based attribution.
+
+SHAP, or Shapley Additive Explanations, computes the contribution of each input feature by measuring how the prediction changes when that feature is added or removed. It is model-agnostic — it works for any model, including black-box APIs. SHAP values sum to the difference between the model's prediction and the baseline prediction. This decomposition is mathematically rigorous. It is also computationally expensive. For a model with 100 input features, computing exact SHAP values requires evaluating the model on thousands of input variations.
+
+In practice, you use approximate SHAP. Kernel SHAP or Tree SHAP for structured data. Partition SHAP for text. These approximations reduce computation time from minutes to seconds. Accuracy is still high — within a few percent of exact SHAP. For audit purposes, approximate SHAP is acceptable. You are not publishing a research paper. You are providing a reasonable explanation.
+
+Attention-based attribution uses the model's attention weights to identify important tokens or features. Transformer models compute attention over input tokens. High attention weights suggest the token was important. You extract the attention weights from the model's forward pass, aggregate them across layers, and rank tokens by total attention. This is fast — no additional inference required. But attention is not causation. A token can have high attention without influencing the output. Attention-based explanations are less rigorous than SHAP but much faster.
+
+For production explainability capture, use both. Run attention-based attribution on every request — it is cheap. Run SHAP on high-risk or disputed requests — it is expensive but rigorous. Log both sets of explanations. Auditors can see the fast explanation immediately and request the detailed explanation if they need it. This balances cost and compliance.
+
+## Generating Explanations Without Killing Latency
+
+Computing explanations adds latency. SHAP requires multiple model evaluations. Even attention extraction requires parsing internal activations. If your SLA is 200 milliseconds, you cannot spend 5 seconds generating an explanation. The user experience breaks. The solution is asynchronous explainability.
+
+Return the decision immediately. Log the decision with a placeholder for the explanation: "explanation pending". Trigger an asynchronous job to compute the explanation. When the job completes, update the log entry with the explanation. The user receives the decision in 200 milliseconds. The explanation appears in the log within 10 seconds. Auditors querying logs see complete entries. Users who request immediate explanations see "explanation being generated, available shortly."
+
+This approach requires careful handling of immutability. If your logs are truly immutable, you cannot update them. The solution is event sourcing. Log the decision as one event. Log the explanation as a second event with the same request ID. When reconstructing the decision, join both events. The decision and explanation are separate but linked. This preserves immutability while allowing asynchronous enrichment.
+
+For synchronous explanations, optimize the attribution method. Precompute SHAP values for common feature ranges. Use lookup tables instead of recomputing every time. For text models, cache attention patterns for frequent inputs. These caching strategies reduce latency from seconds to tens of milliseconds. They are not applicable to every input — cached explanations only work for inputs similar to previously seen ones. But for many production workloads, 60 to 80 percent of inputs fall into common patterns. Cache those.
+
+Another optimization is explanation compression. Instead of logging the full SHAP value for every feature, log only the top five contributors. A model with 200 input features might have five features contributing 85 percent of the prediction. Logging those five captures most of the explanation with much less data. Auditors rarely need to see all 200 features. They need to see the dominant drivers.
+
+## Structured Explanation Schemas
+
+Explanations must be machine-readable for compliance automation. Free-text narratives are human-readable but not queryable. A structured schema enables automated checks: verify that every high-risk decision has an explanation, verify that the top contributing factor exceeds a minimum importance threshold, verify that explanations cite the correct policy thresholds.
+
+A structured explanation has five sections: decision summary, feature contributions, counterfactuals, model metadata, and confidence. Decision summary is a one-sentence statement of the outcome. Feature contributions list the top features with their values and importance scores. Counterfactuals describe how changing features would change the decision. Model metadata includes the model version and configuration. Confidence includes the model's confidence score and any uncertainty flags.
+
+For a loan denial, the JSON structure might look like this, described in prose since we cannot show braces: an object with a decision field containing "denied", a features array containing objects with name "debt_to_income_ratio", value "48 percent", importance "0.42", and similar objects for credit_history_months and employment_status. A counterfactual field states "If debt_to_income_ratio were 38 percent, predicted decision is approval with confidence 0.76." A model field contains model_id and version. A confidence field contains score "0.87" and uncertainty "low".
+
+This structure is queryable. You can filter logs for denials where debt-to-income ratio was the top feature. You can compute the distribution of importance scores. You can verify that counterfactuals were generated. You can detect explanations with missing fields. Compliance automation relies on this structure.
+
+Version the schema. As your explanation capabilities evolve, you will add fields or change types. Version 1 might not include counterfactuals. Version 2 adds them. Version 3 adds confidence intervals. Log the schema version with each explanation. Parsers can handle all versions. Auditors requesting old logs get explanations in the old schema. You provide a translator if they need current schema.
+
+## Validating Explanation Consistency
+
+An explanation is useless if it is wrong. If the explanation says debt-to-income ratio was the top factor, but the model actually keyed on zip code, the explanation misleads regulators. Validation ensures explanations match model behavior.
+
+The simplest validation is assertion checking. If the explanation says Feature X contributed negatively, predict the outcome with Feature X removed. The prediction should improve. If it does not, the explanation is suspect. Run these checks on a random sample of explanations. If more than 5 percent fail, your attribution method is unreliable. Investigate and fix.
+
+Another validation is human review. Show explanations to domain experts. Ask them if the explanations make sense. For a medical diagnosis model, show explanations to doctors. If the model claims a diagnosis is driven by age and symptom duration, does the doctor agree? If explanations consistently contradict expert intuition, the model might be relying on spurious correlations. This is not just an explanation problem. It is a model problem.
+
+Consistency validation checks that similar inputs produce similar explanations. If two loan applications differ only in zip code, but one explanation cites debt-to-income ratio and the other cites employment status, something is wrong. Either the model is extremely sensitive to zip code in a way the explanations are not surfacing, or the explanations are noisy. Test this by generating pairs of near-identical inputs and comparing explanations. High explanation variance for low input variance signals a problem.
+
+Log validation results. If an explanation fails consistency checks, flag it in the audit log. Auditors should see that you are validating explanations, not just generating them. If a disputed decision has a flagged explanation, that is evidence you detected the issue. If you did not flag it but the auditor discovers it, that is evidence your validation is insufficient.
+
+## Counterfactual Explanations and Actionability
+
+Regulators do not just want to know what happened. They want to know what would have happened under different circumstances. This is counterfactual reasoning. If the applicant's income were 10 percent higher, would they be approved? If the patient's symptom severity were lower, would the diagnosis change? Counterfactuals make explanations actionable.
+
+Generating counterfactuals requires perturbing the input and rerunning the model. Start with the actual input. Identify the top contributing feature — say, debt-to-income ratio. Adjust that feature toward the decision boundary. Rerun the model. If the decision flips, log the counterfactual: "If debt-to-income ratio were 38 percent instead of 48 percent, decision would be approval." If the decision does not flip, adjust a second feature. Continue until you find a counterfactual that flips the decision or exhaust reasonable perturbations.
+
+Not all counterfactuals are realistic. "If your age were 10 years younger" is not actionable — the applicant cannot change their age. "If your income were 10 percent higher" is actionable — they can seek a raise or additional employment. Define realism constraints. Only generate counterfactuals that adjust mutable features within plausible ranges. Do not suggest reducing age. Do not suggest changing race. Do not suggest impossible combinations of features.
+
+Counterfactuals must be logged with the constraints that generated them. If a counterfactual says "increase income by 10 percent", log the original income and the adjusted income. Auditors can verify the math. They can verify that the adjustment is within policy bounds. They can verify that the model actually responds to that adjustment as claimed.
+
+Some models are non-monotonic. Increasing a favorable feature does not always improve the outcome. If this happens, the counterfactual might be: "No single-feature adjustment changes the decision. A combination of 5 percent income increase and six additional months of credit history would result in approval." This is more complex but more honest. Log multi-feature counterfactuals when single-feature ones do not exist.
+
+## Logging Explanations in Multiple Languages
+
+If your system operates in multiple countries, explanations must be available in multiple languages. Logging them only in English violates the principle of transparency. A French applicant has the right to an explanation in French. A German regulator auditing the system expects explanations in German.
+
+The simplest approach is template-based translation. Define explanation templates in each supported language: "Application denied. Primary factor: debt-to-income ratio of X percent exceeds threshold of Y percent." At logging time, select the template for the user's language, fill in X and Y, and log the result. This works for structured explanations with a fixed set of features and templates.
+
+For more complex explanations, use machine translation. Generate the explanation in English, translate it, and log both. The English version is the canonical record. The translated version is for user-facing transparency. If the translation is later disputed, you can refer to the English original. Use a deterministic translation service — same input always produces the same output. This enables validation.
+
+Do not trust machine translation blindly. Have native speakers review translations for common templates. Build a glossary of domain terms with approved translations. "Debt-to-income ratio" must always translate to the same term in French. Inconsistent terminology confuses users and auditors. Lock down translations for regulatory terms.
+
+If a regulator audits the system, provide explanations in their language. If they are German, export logs with German explanations. If they do not speak the user's language, provide English as a fallback. The goal is clarity. The auditor should understand what the model did without needing a translator.
+
+## When Explanations Reveal Model Flaws
+
+Explanations are not just compliance artifacts. They are debugging tools. If explanations consistently highlight unexpected features, your model might be broken. A hiring model that explains decisions based on zip code is likely discriminatory. A loan model that explains decisions based on last name is using a protected attribute. Explanations surface these issues.
+
+Monitor explanation patterns. Compute the frequency of each feature appearing as the top contributor. If "zip code" is the top feature in 40 percent of denials, investigate. Either zip code legitimately correlates with risk in your domain, or the model learned a spurious pattern. Validate with domain experts. If they say zip code should not matter, the model is wrong.
+
+Explanations can also reveal data leakage. If the explanation cites a feature that should not be available at inference time, your pipeline leaked it. A fraud model that explains decisions based on "reported fraud status" is using the label as a feature. This is a data engineering bug. The explanation caught it.
+
+Set up explanation anomaly detection. Define rules for what features are acceptable to cite. If a feature outside the acceptable set appears in an explanation, alert the team. Review the model and the data pipeline. Either the rule is wrong and needs updating, or the model is using data it should not have.
+
+In some cases, explanations reveal that the model is correct but the policy is wrong. If the model consistently denies applicants due to a feature that business stakeholders did not realize was decisive, the explanation prompts a policy review. Maybe the threshold is too strict. Maybe the feature is proxying for something else. Explanations make these conversations possible. They turn a black-box decision into a starting point for organizational learning.
+
+The next subchapter examines data retention compliance — how to manage logs that must persist for years under GDPR, HIPAA, and financial regulations, while also respecting rights to erasure.
+

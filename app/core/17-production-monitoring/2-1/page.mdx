@@ -1,0 +1,94 @@
+# 2.1 — Instrumentation Fundamentals: What to Log, What to Sample, What to Skip
+
+In September 2025, a fintech company running an AI-powered fraud detection system made two instrumentation decisions that seemed reasonable at the time. First, they logged every token in every prompt and response to help debug model behavior. Second, they captured full request and response bodies for every API call in their RAG pipeline. Within three weeks, their logging bill hit $47,000 per month — more than their model inference costs. Their logs contained 2.3 terabytes of mostly redundant data, and when a real incident occurred, their engineers spent forty minutes just loading query results in their observability platform. They had drowned in data they would never analyze while missing the signals that actually mattered.
+
+Six months later, a different team made the opposite mistake. They instrumented their customer service AI with minimal logging to keep costs down — just request IDs, timestamps, and HTTP status codes. When users started reporting incorrect answers in March 2026, the team had almost nothing to work with. They could see that requests were completing successfully, but they had no idea which model version was running, what retrieval strategy was used, which guardrails fired, or what token counts looked like. They spent three weeks rebuilding their instrumentation before they could even begin debugging the actual problem. By then, the issue had cost them twelve enterprise customers.
+
+Both teams learned the same lesson from opposite directions: instrumentation is not a binary choice between logging everything and logging nothing. It is a deliberate engineering decision about what signals matter, what can be reconstructed, and what can be safely ignored. The teams that get this right capture just enough data to debug any production issue in minutes, while keeping costs manageable and query performance fast.
+
+## The Three-Tier Instrumentation Model
+
+Every piece of data you might instrument falls into one of three categories, and each category demands a different approach. **Always-on instrumentation** captures data for every single request. This is your lightweight metadata layer — the information you need to route, filter, and correlate during an incident. Request ID, timestamp, user ID, model version, endpoint, response code, latency, token counts, and cost. This data is small, cheap to store, and absolutely critical. You cannot debug anything without it.
+
+**Sampled instrumentation** captures detailed data for a subset of requests. This is where you log full prompts, full responses, retrieval results, tool call arguments, guardrail decisions, and internal reasoning traces. The sampling rate depends on your traffic volume and your budget. High-traffic systems might sample one percent or even 0.1 percent of requests. Low-traffic systems might sample 100 percent. The key is that sampled data is rich enough to reconstruct exactly what happened for a specific request, but sparse enough that storage costs stay reasonable.
+
+**On-demand instrumentation** captures expensive data only when explicitly requested. This is where you enable verbose debug logging, capture model attention weights, or trace every step of a multi-agent workflow. On-demand instrumentation is too expensive to run continuously, but it gives you the nuclear option when you hit a bug that sampled data cannot explain. You turn it on for a specific user, a specific session, or a specific feature flag, collect the data you need, then turn it off.
+
+The mistake both teams made was treating all instrumentation as if it belonged in the first category. The fintech company logged full prompts and responses for every request — sampled data at always-on scale. The customer service team logged only metadata — always-on data without the sampled richness. The right approach is to deliberately design what goes into each tier based on cost, cardinality, and debugging value.
+
+## What Belongs in Always-On Instrumentation
+
+Every AI request generates a set of structured metadata that costs almost nothing to capture and store, but which becomes invaluable during an incident. **Request ID** is the foundation — a unique identifier that lets you trace a single request across distributed systems, through multiple services, into your model provider's logs, and back to user-facing errors. Without request IDs, you have no way to correlate events. With them, debugging becomes a matter of filtering, not guessing.
+
+**Timestamp** tells you when the request happened. This sounds trivial until you are trying to correlate a user complaint with a specific deploy, a specific model rollout, or a specific infrastructure failure. You need timestamps with millisecond precision, and you need them in UTC. Never rely on local time zones in production logs.
+
+**User ID and session ID** let you answer critical questions during an incident: is this affecting one user or all users? Is it isolated to one session or reproducible across sessions? Is the problem with cached context from an earlier interaction or with the current request itself? Without user and session IDs, you cannot distinguish between a systemic issue and a user-specific edge case.
+
+**Model metadata** includes the model provider, model name, model version, and any routing decisions your system made. If you use multiple models — GPT-5 for complex queries, GPT-5-mini for simple ones, Claude Opus 4.5 for long-context tasks — you need to know which model actually handled each request. When a regression appears, the first question is always "what changed?" Model metadata answers that question instantly.
+
+**Token counts** break down into input tokens, output tokens, cached tokens if you use prompt caching, and total tokens. Token counts are how you track cost per request, detect prompt bloat, identify retrieval strategies that inject too much context, and spot truncation issues. They are small integers that cost almost nothing to log, and they unlock cost attribution, budget alerting, and performance optimization.
+
+**Latency** captures how long the request took end-to-end, from the moment your system received it to the moment you returned a response. Latency is your first signal when something is wrong. A sudden spike in p99 latency tells you to investigate before users start complaining. A gradual increase over days tells you that your system is degrading under load. Latency is cheap to measure, universally useful, and should be logged for every request.
+
+**Response metadata** includes status codes, error types if the request failed, whether the response was truncated, whether any guardrails fired, and whether any fallback logic triggered. This is the outcome layer — whether the request succeeded, failed, or succeeded with caveats. During an incident, you filter for errors first, then drill into specific failure modes. Response metadata makes that filtering instant.
+
+All of this fits into a structured log event of a few hundred bytes. At one million requests per day, you are storing a few gigabytes per month. The cost is negligible. The value during an incident is immeasurable.
+
+## What Belongs in Sampled Instrumentation
+
+Sampled instrumentation captures the data that is too large or too expensive to log for every request, but which you need to reconstruct specific incidents or analyze patterns over time. **Full prompts** are the most obvious example. A production prompt might include a system message, few-shot examples, retrieved context, conversation history, and the user's current query — easily five to ten thousand tokens. Logging that for every request creates terabytes of storage and makes log queries unbearably slow. But logging it for one percent of requests gives you a representative sample to analyze prompt quality, detect drift, and reconstruct bugs.
+
+**Full responses** are equally large. If your model generates multi-paragraph answers, logging every response is expensive. But if you only ever see the final status code, you cannot tell whether the model hallucinated, whether the tone shifted, or whether the answer was factually correct but poorly phrased. Sampling responses at the same rate as prompts gives you the ground truth to validate your system's behavior.
+
+**Retrieval results** show which documents or chunks your RAG system pulled, what their relevance scores were, and which ones made it into the final prompt. During an incident where users report incorrect answers, the first question is always "did retrieval fail, or did the model misinterpret good context?" Without retrieval logs, you are guessing. With them, you know within seconds whether the bug is in your retrieval pipeline or your generation pipeline.
+
+**Tool calls** capture which tools the model invoked, what arguments it provided, what the tool returned, and whether the tool call succeeded or failed. In a system with agentic capabilities, most bugs trace back to tool misuse — the model called the wrong tool, passed malformed arguments, or misinterpreted the tool's response. Logging tool calls for a sample of requests gives you the data to reproduce these failures and fix them.
+
+**Guardrail decisions** show which guardrails evaluated the request, what scores they produced, and whether any guardrails blocked or modified the response. If users complain that the system is refusing reasonable requests, you need guardrail logs to see whether the toxicity filter fired incorrectly, whether the PII detector blocked a false positive, or whether a custom business rule rejected something it should have allowed.
+
+The sampling rate depends on your scale. A startup with 10,000 requests per day can afford to log everything. A company with 10 million requests per day might sample 0.1 percent — 10,000 sampled requests, which is still enough to detect patterns and debug outliers. The key is to sample consistently across all instrumentation types. If you sample prompts at one percent, sample responses, retrieval results, tool calls, and guardrail decisions at the same rate, using the same sampling decision. That way, when you load a sampled request, you get the full picture, not partial data.
+
+## What Belongs in On-Demand Instrumentation
+
+On-demand instrumentation is for the data that is too expensive to capture even in samples, but which becomes essential when you hit a specific bug or performance issue. **Verbose debug logs** are the classic example. During normal operation, you do not need to see every internal function call, every retry attempt, every cache hit or miss. But when you are tracking down a race condition or a subtle state management bug, verbose logs become invaluable. You enable them for a specific user or session, reproduce the issue, capture the logs, then disable them.
+
+**Distributed trace details** go deeper than standard tracing. A standard trace captures span start, span end, and basic attributes. A detailed trace captures every intermediate step — how long the embedding took, how long the vector search took, how long each retrieved document was, how many times the model retried generation, how many tokens were processed per second. This level of detail creates massive data volumes, but it also exposes bottlenecks and inefficiencies that you cannot see in aggregate metrics.
+
+**Model internals** include attention weights, hidden states, or confidence scores if your model provider exposes them. These are rarely available in production APIs, but when they are, they unlock deep debugging. If the model is consistently ignoring part of the prompt, attention weights show you where the model is actually focusing. If the model is producing low-confidence answers, confidence scores tell you whether the model itself is uncertain or whether the prompt is ambiguous.
+
+**Request replay** is a form of on-demand instrumentation where you capture everything about a request — the full prompt, the full context, the model version, the sampling parameters, the random seed if available — and store it in a way that lets you replay the exact request later. If a user reports a bug, you capture their next request in full, replay it in a staging environment, modify variables one at a time, and isolate the root cause. Request replay is expensive in storage and engineering effort, but it is the gold standard for reproducing non-deterministic bugs.
+
+The infrastructure for on-demand instrumentation requires feature flags or request headers that let you selectively enable verbose logging for specific users, sessions, or endpoints. Without that infrastructure, on-demand instrumentation is useless — you cannot turn it on when you need it. With it, you have a debugging superpower that lets you go as deep as necessary without drowning your logs in noise.
+
+## The Cost of Over-Instrumentation
+
+Over-instrumentation kills systems in three ways: cost, performance, and cognitive load. The fintech company's $47,000-per-month logging bill was the cost failure — they were paying more to store logs than to run the models that generated them. At that scale, logging is not a debugging tool, it is a budget crisis. The financial damage is immediate and measurable, and it forces teams to either cut instrumentation or cut features.
+
+Performance degradation is subtler but just as damaging. Logging full prompts and responses means serializing large objects, writing them to disk or network, and waiting for acknowledgment before continuing. If your logging pipeline is synchronous, every log write adds latency to every request. If it is asynchronous, log writes compete with your actual workload for CPU, memory, and I/O. At high traffic volumes, excessive logging can add tens or hundreds of milliseconds to request latency, degrading user experience and reducing throughput.
+
+Cognitive load is the least obvious cost, but it compounds over time. When your logs contain everything, every query returns too much data. Engineers spend more time filtering, scrolling, and skimming than analyzing. The signal-to-noise ratio drops so low that people stop using logs altogether and rely on instinct or guesswork. When logs are no longer trustworthy or usable, instrumentation has failed its core purpose.
+
+The solution is not to log less arbitrarily. The solution is to be deliberate about what you log, why you log it, and how you will use it during an incident. If you cannot articulate why a specific piece of data matters for debugging, do not log it. If you can derive it from other logged data, do not store it redundantly. If you only need it occasionally, move it to sampled or on-demand instrumentation.
+
+## The Cost of Under-Instrumentation
+
+Under-instrumentation kills systems by making incidents undebuggable. The customer service team that logged only request IDs and status codes had no way to answer basic debugging questions: which model version was running? What prompt did the model receive? What did the model respond with? Which documents did retrieval pull? Without answers, they were blind. They could see that something was wrong, but they could not see what or why.
+
+The cost of under-instrumentation is measured in time. Incidents that should take minutes take hours. Bugs that should be obvious require multiple engineers, multiple theories, and multiple rounds of adding instrumentation, redeploying, waiting for the bug to recur, and checking the logs again. Every hour spent debugging is an hour not spent building features. Every day a bug remains unfixed is another day of user frustration, customer churn, and reputational damage.
+
+Under-instrumentation also creates a culture of learned helplessness. When logs never contain the information you need, engineers stop trusting observability. They start debugging by guessing, by changing variables and hoping for improvement, by deploying speculative fixes and monitoring whether error rates drop. This is not engineering — it is superstition. Teams that operate this way ship slower, break more often, and burn out faster.
+
+The solution is to instrument deliberately from the start, not retroactively after an incident. Define what signals matter for your system. Capture always-on metadata for every request. Sample detailed data at a rate your budget allows. Build on-demand instrumentation into your architecture so you can go deeper when needed. Treat instrumentation as a first-class engineering concern, not an afterthought.
+
+## Building a Sustainable Instrumentation Strategy
+
+A sustainable instrumentation strategy balances coverage, cost, and usability. Start by defining your always-on instrumentation schema — the structured metadata you will log for every single request. This schema should be stable, well-documented, and consistent across all services in your AI pipeline. If your prompt construction service logs request ID as "req_id" but your model inference service logs it as "request_id," you cannot correlate events. Consistency is not optional.
+
+Next, define your sampling strategy. Decide what percentage of requests you will sample, and implement reservoir sampling or hash-based sampling to ensure even coverage across users, time periods, and endpoints. Hash-based sampling is particularly useful for debugging — if you hash the request ID and sample based on the hash, you can always determine whether a specific request was sampled, and you can increase the sampling rate for specific users or sessions without redeploying.
+
+Then, build infrastructure for on-demand instrumentation. Add feature flags or request headers that enable verbose logging. Add endpoints or admin tools that let you turn on detailed tracing for specific users. Add replay infrastructure if your system architecture allows it. The goal is to ensure that when you hit a bug you cannot debug with sampled data, you have a path to deeper instrumentation.
+
+Finally, monitor your instrumentation costs and usability. Set alerts on your logging bill so you know immediately if costs spike. Run regular queries against your logs to ensure query performance stays fast. Ask engineers whether they can debug incidents efficiently with the data you are capturing. If the answer is no, adjust your instrumentation. If costs are climbing, adjust your sampling rate. Instrumentation is not set-it-and-forget-it — it is an iterative process that evolves with your system.
+
+The next question is how to structure that instrumentation across distributed AI pipelines — prompt construction, retrieval, model inference, tool calls, guardrails — so you can trace a single request through every stage and understand where failures occur.
+
