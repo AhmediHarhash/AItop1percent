@@ -1,0 +1,66 @@
+# 10.4 — Token Bombs and Context Stuffing
+
+Most teams think cost attacks require volume. They are wrong. A single carefully crafted prompt can consume more resources than ten thousand normal requests. The attacker who understands tokenization and context expansion doesn't need to flood your API — they just need to make every request catastrophically expensive.
+
+In late 2025, a customer service AI at a logistics company began hitting context limits on seemingly simple queries. The team saw requests that looked like basic tracking questions — "Where is my package?" — but each one triggered out-of-memory errors and cost spikes. The root cause: a single user had discovered that embedding specific Unicode sequences in their queries caused the tokenizer to expand the input by a factor of twelve. One request that appeared to be 200 tokens was actually consuming 2,400 tokens after encoding. Over three days, this user cost the company eighteen thousand dollars in inference charges while making only 340 requests. The attack wasn't detected until a billing alert fired. By then, the same user had shared the technique on a forum where seventeen other accounts immediately started using it.
+
+Token bombs are inputs designed to maximize the gap between apparent size and actual token consumption. The attacker's goal is to make you pay for far more computation than the visible text suggests. They exploit tokenization behavior, context expansion mechanisms, and memory allocation to turn small inputs into massive resource consumption.
+
+## The Tokenization Multiplier
+
+Tokenizers are optimized for natural language. They handle common words and phrases efficiently — "the quick brown fox" tokenizes to four tokens, one per word. But tokenizers must also handle any valid Unicode input, including characters and sequences rarely seen in training data. Certain Unicode ranges, especially those used for mathematical symbols, rare scripts, and control characters, tokenize extremely inefficiently. A single visible character can become four, six, or even twelve tokens.
+
+The attacker who understands this can craft inputs that look short but tokenize long. A prompt that displays as thirty characters might consume four hundred tokens. If your system charges per token, shows character counts to users, or validates input length by character count rather than token count, the attacker gets massive amplification. They pay for thirty characters of quota, you pay for four hundred tokens of inference.
+
+This isn't theoretical. Multiple public disclosures in 2025 documented tokenization exploits where specific Unicode sequences — particularly from mathematical symbol blocks and certain emoji modifier combinations — produced token expansion ratios exceeding ten-to-one. The attackers weren't sending gibberish. They constructed prompts that included these characters in ways that looked like legitimate queries to automated systems but expanded massively during tokenization.
+
+## Recursive Definition Bombs
+
+The second category of token bombs exploits the model's context window itself. Instead of attacking tokenization, these attacks embed definitions that force the model or system to expand content recursively. The simplest form is a prompt that asks the model to repeat or expand a definition that references itself, creating exponential growth in the effective context.
+
+A classic pattern: the attacker submits a document that contains nested definitions. "Term A is defined as Term B plus the full text of Term C. Term B is defined as Term D plus the full expansion of Term A." If your RAG system retrieves and expands these definitions before sending them to the model, a small input document can expand to fill the entire context window. The retrieval process itself becomes the amplification mechanism.
+
+More sophisticated versions use instruction-level recursion. The attacker crafts a system message or few-shot example that instructs the model to fully expand all references before processing. Then they submit a query containing circular references. The model attempts to expand, fills the context window, and either errors out or consumes maximum tokens before producing any useful output. You paid for 128,000 tokens of processing. The user got an error message and immediately retried with a slightly modified version.
+
+## Compression and Encoding Exploits
+
+A third vector targets systems that accept compressed or encoded inputs. If your API allows users to submit base64-encoded text, gzipped payloads, or any other compressed format, the attacker can send small payloads that decompress to enormous size. A two-kilobyte gzipped file can expand to two megabytes of text. If your system decompresses before validating token count, the attack succeeds before you realize the input is malicious.
+
+This pattern is especially dangerous in document processing pipelines. The attacker uploads a PDF that appears to be five pages. The PDF contains embedded compressed streams that expand to five thousand pages when extracted. Your system dutifully processes the entire document, sends it to the model in chunks, and racks up inference costs in the hundreds or thousands of dollars. The attacker paid for a five-page document. You paid for five thousand pages of processing.
+
+Encoding exploits follow similar logic. An attacker submits text in a character encoding that requires significantly more tokens than standard UTF-8. Certain legacy encodings and multi-byte character sets can double or triple token consumption for the same semantic content. If your input validation checks character count but not token count, and your billing or rate limiting operates on tokens, the gap becomes an attack surface.
+
+## Context Stuffing to Trigger Failures
+
+Token bombs don't always aim to maximize cost. Sometimes the goal is to trigger errors, exhaust memory, or force the system into degraded states. Context stuffing attacks deliberately craft inputs that push the system to its context limit, causing failures that reveal information or create denial of service.
+
+A common pattern: the attacker determines your exact context window size — 128,000 tokens, 200,000 tokens, whatever your deployment uses. They craft a prompt that consumes exactly that amount, leaving no room for the model's response. The system either errors immediately, returns a truncated response, or enters a retry loop. Each attempt costs you money. The attacker learns which context limits trigger which behaviors, mapping your infrastructure by observing failure modes.
+
+In multi-turn systems with conversation memory, context stuffing can be even more effective. The attacker fills the conversation history with massive inputs across multiple turns. Each turn adds to the context until the system can no longer function. Once the context is full, legitimate users can't interact with the system — every request fails because there's no room left for new input or output. The attacker has effectively locked the conversation state into a denial-of-service condition.
+
+## Memory Bombs in Stateful Systems
+
+Systems that maintain state between requests face a related attack: memory bombs. Instead of maximizing tokens in a single request, the attacker constructs inputs that force the system to allocate excessive memory for state tracking, caching, or intermediate results. This is particularly dangerous in RAG systems, agent frameworks, and any architecture that holds retrieved documents or tool outputs in memory.
+
+A RAG example: the attacker submits a query designed to retrieve hundreds of documents. Each document is individually small — under your per-document size limits — but collectively they require gigabytes of memory to hold in the context buffer. The system retrieves everything, attempts to assemble the context, and runs out of memory before the model even receives the prompt. The request fails, but you've already paid for the retrieval operations and memory allocation.
+
+Agent systems face a variant where the attacker triggers tool calls that return massive outputs. The agent calls a web scraper, a database query, or a code execution tool. The tool returns megabytes of data. The agent framework attempts to include all of it in the next model call. The system exhausts memory, triggers garbage collection storms, and becomes unresponsive to other requests. One malicious user's request brings down the entire agent pool.
+
+## Payload-to-Cost Amplification Ratios
+
+The attacker's efficiency metric is payload-to-cost amplification: how much cost can they generate per unit of input they control. A normal request might have a one-to-one ratio — they send 500 tokens, you process 500 tokens. A token bomb achieves ten-to-one, fifty-to-one, or even higher ratios. The attacker sends 100 visible characters, you process 5,000 tokens.
+
+This ratio determines whether an attack is economically viable for the attacker. If they need to send a hundred requests to cost you a dollar, the attack requires effort and resources that might not be worth it. If they can cost you ten dollars with a single request, the economics shift dramatically. They can exhaust your budget, trigger billing alerts, or make your service unprofitable with minimal effort.
+
+The defense against high amplification ratios is straightforward in principle but tedious in practice: validate token count before processing, not just character count or payload size. Tokenize the input, count the result, and enforce limits at the token level. This adds latency — tokenization isn't free — but it's the only reliable way to prevent the attacker from exploiting the gap between apparent size and actual cost. Every input validation checkpoint that checks bytes or characters without checking tokens is a potential amplification exploit waiting to happen.
+
+## Detection Through Cost Anomalies
+
+Token bombs create distinctive cost signatures. A user whose requests consistently show high token-to-character ratios is either legitimately working with unusual text or exploiting tokenization. A session that hits context limits on simple queries is either dealing with enormous conversational history or deliberately stuffing context. A document upload that expands by orders of magnitude during processing is either an edge case or a compression bomb.
+
+The challenge is that these patterns can overlap with legitimate use. A researcher working with mathematical notation will naturally have poor tokenization efficiency. A customer support conversation that's been going on for an hour will naturally approach context limits. A user uploading scanned document OCR results might legitimately have terrible compression ratios. You can't block based on these signals alone — but you can flag them for review, apply stricter rate limits, or require manual approval for continued access.
+
+The most reliable detection comes from comparing cost per request against expected norms. If the median request from a user costs twelve cents and one request costs forty dollars, something is wrong. Automated systems should flag outliers immediately, pause processing, and alert human reviewers. The financial damage from token bombs compounds with every minute of delay between the attack and detection. Fast alerting on cost anomalies is not just a billing concern — it's a security control.
+
+The next attack vector doesn't amplify cost through token expansion — it amplifies it through time. The attacker who can force your system to spend minutes processing a request that should take seconds achieves the same economic damage through a different mechanism.
+

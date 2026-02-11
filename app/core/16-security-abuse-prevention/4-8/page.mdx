@@ -1,0 +1,76 @@
+# 4.8 — Defense: Tool Call Validation and Sandboxing
+
+What happens when a model calls a tool with arguments that are technically valid but semantically malicious? In October 2025, a code assistant agent had access to a file_read tool. The tool accepted a file path parameter. The engineers had implemented path validation: no absolute paths, no parent directory traversal with dot-dot-slash patterns, no suspicious strings like /etc/passwd or .env. The validation caught the obvious attacks. Then a user convinced the agent to "help debug the configuration" by reading the file at config/../../../etc/hosts. The validation logic checked for literal dot-dot-slash patterns. It didn't normalize the path before checking. The tool read the file. The validation had failed not because it didn't exist, but because it wasn't thorough enough.
+
+Tool call validation is the second line of defense after least-privilege design. Even a narrowly scoped tool can be misused if its inputs aren't rigorously validated. Even a read-only tool can become a data exfiltration vector if it accepts path traversal tricks, regex injection, or unbounded result sets. Validation is not optional. It is the mechanism that ensures the tool does exactly what it was designed to do and nothing more.
+
+## Schema Validation for Tool Parameters
+
+Every tool has a schema. The schema defines the parameters the tool accepts, their types, their constraints, and their allowed values. Schema validation is the first check that runs before any tool logic executes. If the arguments don't match the schema, the tool refuses to run. No exceptions. No partial execution. No "we'll validate the important fields and skip the rest." The schema is the contract, and the contract is enforced.
+
+Type validation is the baseline. A parameter declared as an integer must be an integer. A string must be a string. A boolean must be a boolean. This catches accidental misuse and basic prompt injection attempts that try to smuggle code or unexpected data types into arguments. But type validation alone is insufficient. You also need constraint validation. A user_id parameter might be an integer, but it should also be positive, non-zero, and within the range of valid IDs in your system. A file_path parameter might be a string, but it should also match a specific pattern, not contain null bytes, and resolve to a location within an allowed directory after normalization. A date parameter should be parseable, chronologically valid, and within a reasonable range.
+
+In early 2026, a customer support agent had a tool that accepted a search_query parameter. The tool ran the query against an internal search index. The schema validated that the parameter was a string and that it was less than 500 characters. It didn't validate what the string contained. An adversarial prompt crafted a query string that was technically valid but contained regex patterns designed to cause catastrophic backtracking in the search engine. The query took forty seconds to execute and pegged CPU to 100 percent. The validation had checked length but not content. The tool became a denial-of-service vector.
+
+Schema validation must include content checks. Strings should be checked against allowlists or validated against patterns that define legitimate inputs. Queries should be sanitized and parameterized. Regex patterns should be tested for complexity. URLs should be parsed and checked against domain allowlists. Email addresses should match standard formats. Every input should be treated as hostile until proven safe.
+
+## Allowlists and Blocklists
+
+A data retrieval tool in mid-2025 accepted a table_name parameter. The tool was designed to let agents query specific tables for reporting purposes. The engineers implemented a blocklist: the tool refused to access tables named users_internal, api_keys, or billing_raw. The blocklist grew over time as new sensitive tables were added. Then a developer created a table called customer_pii_archive. It wasn't on the blocklist. The agent accessed it. The blocklist approach had failed because it required someone to remember to add every new sensitive table to the block list. The default was open.
+
+Allowlists are safer than blocklists. An allowlist defines the only values that are permitted. Everything else is rejected by default. A table_name parameter should have an allowlist of tables the agent is allowed to query. A file_path parameter should have an allowlist of directories the agent can access. A service_name parameter should have an allowlist of services the agent can interact with. If the value isn't on the list, the tool returns an error.
+
+Allowlists are harder to maintain than blocklists in some contexts, especially when valid inputs are user-generated or dynamic. But for tool arguments, the set of valid inputs is usually knowable at design time. If you can't define an allowlist for a parameter, that's a signal that the tool is too flexible and should be redesigned. Blocklists are appropriate for filtering out known bad patterns within a larger valid space, like stripping SQL comment syntax from query strings. But for parameters that define what resource the tool operates on, allowlists are the correct default.
+
+The combination is most effective: a strict allowlist for resource identifiers, and a blocklist for known malicious patterns in freeform content. A search tool might allowlist the indexes it can query and blocklist regex metacharacters from the search string. A file tool might allowlist directories and blocklist path traversal sequences. Both layers make misuse structurally harder.
+
+## Rate Limiting and Throttling
+
+Tool call validation isn't just about individual arguments. It's also about call frequency and volume. A translation tool that's secure per-call can still be abused if an attacker prompts the agent to call it ten thousand times in a minute. A file_read tool that validates paths correctly can still leak data if the agent is made to read fifty files in one session. Rate limiting is a defense against resource exhaustion, data exfiltration, and cost attacks.
+
+Rate limits should be applied at multiple levels. Per session: an agent session should have a maximum number of tool calls it can make before requiring re-authentication or admin review. Per tool: individual tools should have limits on how many times they can be called within a time window. Per user: the underlying user whose request triggered the agent should have aggregate limits across all their sessions. Per resource: if a tool accesses external APIs, those APIs should have their own rate limits enforced by the tool.
+
+In November 2025, a research assistant agent had access to a web_fetch tool that retrieved content from URLs. The tool had no rate limit. An adversarial prompt instructed the agent to "gather comprehensive information" by fetching content from two hundred URLs provided in the input. The agent did. The external API provider flagged the traffic as abusive and temporarily banned the company's IP address. The tool had no per-session throttling, and the cost was borne by every service running from that IP.
+
+Rate limits must be enforced at the tool level, not just in the prompt. The tool tracks its own call count. It maintains state across invocations. When the limit is reached, it returns an error and logs the event. The model can't bypass the limit by rephrasing the request or calling the tool from a new prompt branch. The enforcement is structural.
+
+Throttling is related but distinct. Throttling slows down tool execution to prevent rapid-fire abuse without hard-failing the request. A tool might allow ten calls per minute but enforce a one-second delay between consecutive calls. This prevents burst attacks while allowing legitimate workflows to continue. Throttling is particularly useful for tools that interact with external services or perform expensive operations. The delay adds a cost to abuse that makes attacks less viable.
+
+## Argument Normalization and Canonicalization
+
+Path traversal vulnerabilities happen because validation checks run on the input as provided, but the system interprets the input after normalization. An agent provides the string config/../secret.txt. The validation checks for dot-dot-slash and finds it. Blocked. Then the attacker tries config/%2e%2e/secret.txt. The validation checks for dot-dot-slash. It doesn't find it, because the dots are URL-encoded. The tool decodes the path before using it. The traversal succeeds.
+
+Normalization must happen before validation, not after. The tool receives the raw input, normalizes it to canonical form, then validates the canonical form. For file paths, this means resolving relative paths to absolute paths, expanding symlinks, decoding URL encoding, and stripping null bytes. For URLs, this means parsing the URL, extracting the host and path, decoding percent-encoding, and checking the result against allowlists. For SQL or command strings, this means stripping comments, normalizing whitespace, and checking for injection patterns after normalization.
+
+A database tool in December 2025 accepted a query parameter. The tool validated that the query didn't contain DROP, DELETE, or UPDATE keywords. An attacker submitted a query containing DR/*comment*/OP. The validation didn't find DROP because it was split by a SQL comment. The database engine ignored the comment and executed the DROP. The tool's validation logic didn't account for SQL comment syntax. Normalization would have stripped the comment before validation ran.
+
+Canonicalization is the same principle applied to identifiers. A user_id might be provided as a string, an integer, or a float depending on how the model serialized it. The tool should canonicalize all three forms to the same internal representation before processing. This prevents bypasses where an attacker provides the same identifier in a format the validation doesn't recognize.
+
+## Sandboxing Tool Execution
+
+Even with perfect validation, a tool can still cause damage if it has access to too much of the underlying system. Sandboxing is the practice of running tool execution in a restricted environment where even a fully compromised tool can't escape its boundaries. This is least-privilege applied at the execution layer.
+
+Containerization is the most common sandboxing approach. The tool runs in a container with a minimal filesystem, no network access unless explicitly required, and restricted system calls. If the tool is compromised and an attacker gains code execution, the damage is limited to the container. The host system remains untouched. Cloud functions and serverless environments provide a similar level of isolation. Each tool invocation runs in an ephemeral execution context that's destroyed after the call completes.
+
+Virtual machines provide stronger isolation for tools that need access to riskier capabilities. A tool that compiles and runs user-provided code should run in a VM that's snapshotted and reset after each invocation. A tool that performs system administration tasks should run in a VM that has network access only to the specific resources it needs to manage. The VM is the boundary. If the tool is exploited, the attacker is contained within the VM.
+
+Sandboxing also applies to resource limits. A tool should have CPU quotas, memory limits, and execution timeouts. If a tool call exceeds its resource budget, it's terminated. This prevents denial-of-service attacks where an adversarial prompt causes a tool to consume unbounded resources. A tool that processes user input should have a maximum execution time of a few seconds. A tool that queries a database should have query timeouts. A tool that makes external API calls should have hard timeouts on socket connections.
+
+## The Validation-Execution Boundary
+
+Validation and execution must be separate stages with a clear boundary between them. The tool receives arguments, validates them completely, and only then begins execution. If validation fails, execution never starts. There is no partial execution, no optimistic processing, no "validate the critical fields and proceed." The boundary is absolute.
+
+This separation makes security audits tractable. You can review the validation logic independently of the execution logic. You can test validation without needing a working backend. You can update validation rules without touching execution code. The two concerns are decoupled.
+
+In practice, this means structuring your tool code with a validation function that runs first and returns either a canonicalized, validated set of arguments or an error. The execution function only runs if validation succeeds, and it operates on the validated arguments without re-checking them. The execution function trusts that its inputs are safe because the validation function has already enforced that guarantee.
+
+When validation fails, the tool should return an error message that's safe to show to the model and safe to log. It should not leak information about why the validation failed in a way that helps an attacker refine their bypass attempt. "Invalid file path" is safe. "Path traversal detected: resolved to /etc/passwd" is not. The error message should be generic enough to prevent information disclosure but specific enough to be useful for debugging legitimate issues.
+
+## Validation as a Living System
+
+Validation logic is not write-once. It evolves as new bypass techniques are discovered, as the tool's scope changes, and as the threat model updates. Every tool should have validation tests that cover both legitimate inputs and known attack patterns. When a new bypass is discovered in production or during red-teaming, it becomes a new test case. The validation logic is updated to catch it. The test suite ensures the bypass stays fixed.
+
+Validation is also where telemetry lives. Every validation failure should be logged with the rejected input, the reason for rejection, and the session context. These logs are monitored for patterns. If a specific validation rule is firing frequently, it might indicate an attack campaign. If a validation rule never fires, it might be redundant or incorrectly implemented. Validation logs are a rich signal for detecting adversarial behavior before it succeeds.
+
+Tool call validation and sandboxing are technical controls. They work even when prompts fail, even when the model is compromised, even when the attacker has full control over the conversation. But they can't catch everything. Some actions are technically valid, correctly validated, and still too dangerous to allow without a human check. That's where approval workflows come in.
+

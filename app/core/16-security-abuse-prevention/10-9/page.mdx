@@ -1,0 +1,106 @@
+# 10.9 — Defense: Circuit Breakers and Timeouts
+
+The production LLM system at a logistics company began degrading at 11:43pm on a Saturday in December 2025. Requests started timing out. Not all requests — just the ones using the primary reasoning model. By 11:58pm, the timeout rate hit 30 percent. By 12:14am, it was 60 percent. The system kept trying. Every timeout consumed fifteen seconds of GPU time before failing. Every retry consumed another fifteen seconds. The circuit stayed closed. Requests kept flowing. Costs kept climbing. By the time an engineer was paged at 1:40am and manually disabled the reasoning model endpoint, the system had burned through eleven thousand dollars on failed requests that were never going to succeed. The model API was having an outage. The logistics company's system had no way to detect that and stop.
+
+A circuit breaker would have opened at 12:05am when the error rate crossed 20 percent. The system would have stopped sending requests to the degraded model. Fallback logic would have routed traffic to a cheaper, more reliable model. The incident would have cost eight hundred dollars instead of eleven thousand. The circuit breaker is not optional infrastructure. It is the difference between a contained failure and a financial disaster.
+
+## Circuit Breaker Patterns for AI Systems
+
+A **circuit breaker** is a mechanism that detects failure conditions and automatically stops requests to a failing component until conditions improve. The pattern comes from electrical engineering — when a circuit overloads, the breaker trips and cuts power to prevent damage. In software systems, when a service fails, the breaker opens and cuts traffic to prevent cascading failures. In AI systems, circuit breakers serve three purposes: protect infrastructure, protect budgets, and protect user experience.
+
+The classic circuit breaker has three states: closed, open, and half-open. In the **closed state**, requests flow normally. The breaker monitors error rates, latency, and other signals. When failures exceed a threshold, the breaker trips to the **open state**. In the open state, requests are immediately rejected without attempting to reach the failing component. This gives the downstream system time to recover without being hammered by continued traffic. After a cooldown period, the breaker moves to the **half-open state**. A small percentage of requests are allowed through to test whether the downstream system has recovered. If those requests succeed, the breaker closes. If they fail, the breaker reopens and the cooldown period resets.
+
+For AI systems, you need circuit breakers at multiple levels: per model, per provider, per tool or function, and per cost threshold. A failure in GPT-5.2 should not take down your entire system. A cost spike from one user should not exhaust your organizational budget. Circuit breakers compartmentalize failures and contain damage.
+
+## Error-Based Circuit Breakers
+
+The most common circuit breaker type triggers on error rate. If a model API returns errors for 20 percent of requests over a five-minute window, open the circuit. Define what counts as an error: HTTP 500 responses, timeouts, rate limit errors from the provider, malformed responses, or any response that does not return a valid completion.
+
+Set error thresholds based on your baseline. Measure your system's normal error rate over a month. If your 99th percentile error rate is 2 percent, set the breaker threshold at 10 percent. You want enough headroom that transient spikes do not trigger false positives, but tight enough that sustained failures trip the breaker within minutes, not hours.
+
+When the breaker opens, route traffic to a fallback model. If GPT-5.2 is failing, route to GPT-5. If GPT-5 is failing, route to GPT-5-mini. If all OpenAI models are failing, route to Claude or Gemini. Your fallback chain should have at least three tiers. The first tier is a comparable model from the same provider. The second tier is a comparable model from a different provider. The third tier is the cheapest model that can still fulfill basic requests. Document your fallback chain in your runbook. Test it regularly. A fallback chain you discover is broken during an incident is not a fallback chain.
+
+Track why circuits are opening. Log every trip with context: which model, what the error rate was, what time it occurred, how long the circuit stayed open. Review circuit breaker logs weekly. Patterns emerge. If a particular model trips the breaker every Saturday night, that is a signal. Either that model has reliability problems during off-peak hours, or your traffic pattern on weekends triggers failure modes that weekday traffic does not. Investigate and fix the root cause. Circuit breakers are not a substitute for reliability. They are a temporary defense while you make the system reliable.
+
+## Latency-Based Circuit Breakers
+
+Error-based breakers catch outages. Latency-based breakers catch degradation. A model API that is technically working but taking forty-five seconds to respond is not usable. If you wait for errors, your users suffer through slow requests for minutes before the breaker trips. Latency-based breakers trip faster.
+
+Set a latency threshold based on user experience requirements. If your application promises responses in under ten seconds, set the breaker threshold at twenty seconds. If 10 percent of requests exceed twenty seconds over a five-minute window, open the circuit. The model is degraded. Route to a faster fallback.
+
+Latency breakers are particularly important for reasoning models. GPT-5.2, Claude Opus 4.5, and other reasoning-heavy models have variable latency. A request that normally takes eight seconds might take ninety seconds if the model enters a deep reasoning loop. If many requests hit that slow path simultaneously, your users wait indefinitely. A latency breaker detects the slowdown and switches traffic to a faster model before users start abandoning sessions.
+
+Measure latency at the provider boundary, not at your application boundary. If a request takes sixty seconds total, and fifty-eight of those seconds were waiting for the model API, the problem is the model. If fifty-eight seconds were in your application processing, the problem is your code. Circuit breakers should only trip on provider latency. Track both. Alert on both. But only break the circuit when the provider is the bottleneck.
+
+## Cost-Based Circuit Breakers
+
+Traditional circuit breakers monitor errors and latency. AI systems need a third dimension: cost. An attacker or a misconfigured system can drive costs into the stratosphere without triggering error or latency breakers. Every request succeeds. Every request completes in reasonable time. Every request costs one hundred times more than expected. You need a breaker that trips on spending rate.
+
+A **cost-based circuit breaker** monitors spending per minute or per hour and opens the circuit when spending exceeds a threshold. Calculate your baseline spending rate. If your system normally costs three thousand dollars per day, that is 125 dollars per hour or roughly two dollars per minute. Set a breaker threshold at five times baseline: ten dollars per minute. If spending exceeds that rate for five consecutive minutes, open the circuit.
+
+When a cost breaker opens, do not shut down the entire system. Degrade intelligently. Stop all requests to expensive models. Route all traffic to the cheapest available model. Disable features that are expensive — image generation, tool use, large context windows. Keep the system running at minimal cost while you investigate the spike. A cost breaker that shuts everything down is too aggressive. Users lose access unnecessarily. A cost breaker that degrades to minimal functionality protects the budget while maintaining availability.
+
+Cost breakers catch runaway loops, compromised accounts that are being abused, and configuration errors. A deployment that accidentally routes all traffic to the most expensive model will trip a cost breaker within minutes. A compromised service account sending requests in a tight loop will trip it within seconds. Both scenarios would bypass error and latency breakers because the requests are succeeding. Only a cost breaker catches them.
+
+Track cost per request as a time series. Plot average cost per request over the last hour. If it spikes suddenly, investigate immediately. A cost spike with stable request volume means request characteristics changed — larger contexts, more expensive models, more output tokens. A cost spike with increasing request volume could be legitimate traffic growth or could be an attack. Differentiate by checking where the traffic is coming from. New users sending expensive requests are suspect. Existing users scaling up their usage is normal growth.
+
+## Timeout Hierarchies: Request, Session, Daily
+
+Circuit breakers protect systems. Timeouts protect individual transactions. Every request, session, and daily activity window needs a timeout. Without timeouts, a single stuck request can hold resources forever.
+
+**Request-level timeouts** are the first line of defense. Every API call to a model provider should have a maximum execution time. If the provider does not respond within that time, cancel the request and return an error. Set request timeouts based on model type. For fast models like GPT-5-mini or Claude Haiku 4.5, use a fifteen-second timeout. For reasoning models like GPT-5.2 or Claude Opus 4.5, use a two-minute timeout. For image generation models, use a five-minute timeout. Match the timeout to the expected latency plus a generous buffer. You are not trying to kill slow requests. You are trying to kill stuck requests.
+
+When a request times out, do not retry it immediately. Timeouts usually indicate downstream congestion or a systemic issue. Retrying instantly makes the problem worse. Use exponential backoff. Wait two seconds, then retry. If that times out, wait four seconds. If that times out, wait eight seconds. After three retries, give up and return an error to the user. Log every timeout with full context: which model, what the request size was, what the timeout threshold was. If a particular model times out frequently, raise the threshold or switch to a different model.
+
+**Session-level timeouts** limit the total duration of a multi-turn conversation. A session is defined as a continuous interaction with memory. Each session should have a maximum lifetime — typically two to four hours. After that time, the session expires. The user can start a new session, but the old one is closed. This prevents sessions from accumulating infinite context and consuming infinite memory. It also limits the damage from a session hijacking attack. If an attacker steals a session token, they inherit the session timeout. They have at most a few hours to exploit it before the session expires.
+
+Session timeouts should trigger warnings before they expire. At 90 percent of the session lifetime, notify the user: "Your session will expire in 12 minutes. Save any important information." Give them time to export data or copy content before the session closes. When the timeout is reached, close the session gracefully. Do not drop the user mid-request. Finish the current request, then close the session and prompt them to start a new one.
+
+**Daily activity timeouts** limit how long a single user can interact with the system in a 24-hour period. Even with session timeouts, a determined attacker can start new sessions repeatedly. A daily activity timeout tracks cumulative active time across all sessions. If a user is actively sending requests for more than eight hours in a 24-hour period, flag it. At ten hours, force a cooldown. The user must wait until their 24-hour window resets before they can continue.
+
+Daily activity timeouts catch bot behavior. A human user does not interact with an LLM for twelve consecutive hours. A script does. Even if the script is sophisticated enough to start new sessions every few hours, it will eventually trip the daily activity limit. Legitimate power users occasionally have long work sessions. When a user hits the daily limit, do not ban them. Require additional authentication. Send a push notification to their registered device: "Confirm you are still using the system." If they confirm, extend the limit. If they do not respond, assume the account is compromised and lock it.
+
+## Graceful Degradation vs Hard Cutoff
+
+When a circuit breaker opens or a timeout is reached, you have two choices: degrade gracefully or cut off hard. The right choice depends on the failure type and the user's context.
+
+**Graceful degradation** keeps the system running at reduced capacity. When the primary model fails, route to a cheaper model. When budgets are exhausted, switch to minimal functionality. When latency degrades, reduce output length or disable expensive features. The user stays productive, but at lower quality or reduced capability. This is the right choice for transient failures, cost overruns, and infrastructure congestion. The problem is temporary. The system will recover. Degradation buys you time without losing users.
+
+**Hard cutoff** stops the system entirely. No fallback. No degradation. The user gets an error and cannot proceed. This is the right choice for security incidents, data integrity problems, and catastrophic failures. If you detect that prompts are exfiltrating PII, you do not degrade to a cheaper model. You shut down immediately and investigate. If a model is returning factually incorrect responses at a high rate, you do not route to a fallback. You stop serving responses until you understand why. Hard cutoffs are rare. They should only happen when continuing to operate would cause more harm than stopping.
+
+The decision between degradation and cutoff should be policy-driven. Define in advance which failure conditions trigger degradation and which trigger cutoff. Document it in your runbook. Train your on-call engineers on the decision tree. When the breaker opens at 2am, the on-call engineer should not have to debate whether to degrade or shut down. The policy should tell them.
+
+For cost breakers, degrade. For error-rate breakers, degrade if the error is transient — timeouts, rate limits, 503 responses. Cut off if the error indicates a logic problem — malformed outputs, responses that violate safety policies, responses that leak data. For latency breakers, degrade. For security breakers, always cut off.
+
+## Recovery and Reset Strategies
+
+Circuit breakers that open but never close are permanent outages. Recovery is as important as detection. When a breaker opens, the system must periodically test whether the downstream component has recovered. If it has, close the breaker and resume normal operation. If it has not, keep the breaker open and keep testing.
+
+The standard recovery strategy is the half-open state. After the breaker has been open for a cooldown period — typically five to ten minutes — move to half-open. In this state, allow a small percentage of traffic through to test the downstream system. Start with 1 percent. If those requests succeed, increase to 5 percent. If those succeed, increase to 25 percent. If those succeed, close the breaker fully. At any point, if requests start failing again, reopen the breaker and reset the cooldown timer.
+
+The half-open test should use real user traffic, not synthetic health checks. Synthetic checks often succeed when real traffic fails because they use simplified requests. A model API might respond correctly to a ten-token health check prompt but fail on real user requests with thousands of tokens of context. Use representative traffic for testing. Sample actual user requests from the last hour, scrub any PII, and replay them during the half-open phase. If they succeed, the system is truly recovered.
+
+Recovery time matters. A breaker that stays open for thirty minutes causes significant user impact. A breaker that tries to close too aggressively causes flapping — repeatedly opening and closing as the downstream system is not fully recovered. Balance recovery speed with stability. A five-minute cooldown is reasonable for most failures. For critical systems where downtime is extremely expensive, reduce to two minutes but increase the half-open testing duration. For systems where stability is more important than recovery speed, extend to ten minutes.
+
+Log every breaker state transition. When a breaker opens, log why, what the failure signal was, and what threshold it exceeded. When it moves to half-open, log the test results. When it closes, log the recovery time. Build dashboards that show circuit breaker state in real time. Engineers should be able to see at a glance which models are healthy, which are degraded, and which are fully broken. Breaker state is a critical operational signal.
+
+## The Complete Economic Defense Stack
+
+Rate limiting, budgets, and circuit breakers form a layered defense against economic and availability attacks. Each layer catches different failure modes. Each layer operates independently. Together, they create a system that is resilient to abuse, robust against infrastructure failures, and controllable within financial constraints.
+
+**Rate limiting** constrains request volume and computational cost per user. Attackers cannot flood the system with requests. Misconfigured clients cannot exhaust token quotas. Power users have defined limits that prevent any single account from consuming the entire system's capacity.
+
+**Budget caps** constrain financial cost across all dimensions. Attackers cannot drain organizational budgets. Runaway processes cannot spend arbitrarily. Teams operate within defined envelopes. Finance and engineering have a shared language for discussing AI infrastructure costs.
+
+**Circuit breakers** contain failures and prevent cascading damage. Model outages do not take down applications. Cost spikes trigger automatic degradation. Latency problems do not create user-facing timeouts that go unresolved. The system degrades gracefully instead of failing catastrophically.
+
+These three mechanisms do not operate in isolation. Rate limiters inform circuit breakers — if request volume spikes, breakers can preemptively degrade traffic before errors appear. Budget systems inform rate limiters — if spending accelerates, token quotas can automatically tighten. Circuit breakers inform budgets — if a model is degraded and traffic is being routed to a cheaper fallback, budget consumption slows. The three systems form a feedback loop that stabilizes the deployment under stress.
+
+Building this defense stack requires coordination across teams. Rate limiting is typically owned by API gateway or platform engineering. Budget systems are owned by FinOps or infrastructure teams. Circuit breakers are owned by SRE or production engineering. All three teams need shared visibility into the same metrics: request volume, error rates, latency, token consumption, cost per request, cost per user, cost per hour. Build a unified dashboard that shows all dimensions. Every team should see the same picture of system health and cost health simultaneously.
+
+Test your defense stack under load. Run chaos experiments: disable a model, simulate a cost spike, inject latency into API responses. Verify that breakers trip as expected. Verify that budgets hold. Verify that rate limiters prevent runaway scenarios. Test during normal business hours when engineers are available to intervene if something goes wrong. Do not discover that your circuit breaker is misconfigured during a real incident at 3am.
+
+The economics of AI systems are under constant attack. Sometimes the attacker is malicious — a bad actor trying to drain your budget or take down your service. Sometimes the attacker is accidental — a user who misconfigured a script, a developer who tested in production, a PM who launched a feature without understanding the cost implications. Rate limiting, budget caps, and circuit breakers defend against both. They make your system resilient to malice and robust against mistakes. That resilience is not optional. It is the difference between a production AI system and an expensive science project.
+
+Denial of service and economic attacks are Category 5 on the abuse taxonomy. They target availability and cost. Rate limiting and budgets limit exposure. Circuit breakers limit damage. Together, they form the defensive perimeter that keeps your system operational and your costs controlled. But availability and cost are not the only attack surfaces. Your system depends on models, libraries, and tools built by third parties. Those dependencies are attack surfaces. The next frontier is supply chain security — defending against compromised models, poisoned datasets, and malicious dependencies that enter your stack before you ever deploy.
+

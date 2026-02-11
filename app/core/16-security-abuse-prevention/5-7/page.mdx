@@ -1,0 +1,98 @@
+# 5.7 — Defense: Output Filtering and PII Detection
+
+The model just synthesized a response that contains an email address from the training data. A Social Security number that appeared in a support ticket three months ago. A credit card number the model memorized during fine-tuning. The response is perfect — helpful, accurate, well-formatted — except it includes information that should never leave your infrastructure. This is the moment output filtering exists to catch. Not after the data reaches the user. Not in a post-incident review. Right now, before the response leaves your system.
+
+Output filtering is your last defense against data leakage. Everything upstream failed — the model was prompted badly, the retrieval system pulled sensitive context, the memory layer included confidential information, the training data wasn't scrubbed properly. The model generated text containing private information. Output filtering is the final gate. If it fails, the data is gone.
+
+## The Filtering Architecture
+
+Output filtering sits between the model's generation and the user's screen. The model produces a response. Before that response returns to the application, it passes through a scanning layer that looks for patterns matching sensitive data types. Email addresses. Phone numbers. Social Security numbers. Credit card numbers. Street addresses. Names paired with identifying information. API keys. Database credentials. Internal URLs. Any pattern that represents personally identifiable information or confidential data.
+
+The scanner runs synchronously. The user waits. If the scan detects sensitive content, the system takes action — redact the sensitive portions, replace them with placeholders, or refuse to return the output entirely. If the scan finds nothing, the output proceeds to the user. The entire process adds latency to every request. You pay this cost on every response because the cost of missing one piece of PII is orders of magnitude higher.
+
+Pattern-based detection is the simplest approach. Regular expressions for common formats: email addresses follow a structure, credit card numbers follow Luhn's algorithm, Social Security numbers fit a specific digit pattern. You write matchers for each data type, run them against the output text, flag anything that matches. This approach is fast — milliseconds per request — and has zero false negatives for well-formatted data. If someone's SSN appears in the output as nine digits with standard formatting, you catch it.
+
+The weakness is that pattern-based detection only catches well-formatted data. It misses obfuscated formats, partial identifiers, context-dependent PII. An email address with spaces inserted between characters passes through. A credit card number split across two lines evades detection. A name paired with a birthdate might not match any pattern individually but together constitutes PII. Pattern matchers are brittle. Attackers know this. They prompt the model to return sensitive data in non-standard formats.
+
+## Machine Learning-Based Detection
+
+ML-based PII detection uses a trained model to classify tokens or spans of text as potentially sensitive. Instead of matching rigid patterns, the model learns what PII looks like in context. It sees that "John Smith" followed by a nine-digit number is likely a name and SSN pair. It recognizes that certain sentence structures tend to precede credit card numbers. It understands that internal URLs often appear after phrases like "you can access the document at."
+
+The advantage is coverage. ML-based detectors catch malformed data, context-dependent identifiers, and novel patterns that weren't explicitly programmed. They handle the cases where pattern matchers fail. The disadvantage is latency and false positives. An ML model adds tens to hundreds of milliseconds per request depending on model size and input length. And ML-based detectors flag text that looks like PII but isn't — "John Smith" the public figure gets flagged alongside "John Smith" the internal employee. "Example Corp" gets flagged as a company name even when used as a teaching example.
+
+Production systems in 2026 typically run both. Pattern-based detection as the first pass — fast, catches the obvious cases. ML-based detection as the second pass — slower, catches the subtle cases. If either detector flags content, the system takes action. The combined approach balances speed and coverage. The pattern matcher handles 95% of detections with microsecond latency. The ML model handles the remaining 5% where context matters.
+
+## The False Positive Problem
+
+Every PII detection system produces false positives. Text that looks like sensitive data but isn't. An email address format in an example. A phone number in a tutorial. A string of digits that happens to match the credit card Luhn check. A name that's also a public figure. The question is not whether you'll block legitimate content — you will — but how often, in what contexts, and with what user experience.
+
+High-sensitivity detection blocks more. You tune thresholds aggressively, flag anything remotely suspicious, prioritize preventing leaks over user experience. This is appropriate for regulated industries, high-risk applications, and contexts where a single leak creates legal liability. A healthcare system with HIPAA obligations runs high-sensitivity detection. Better to block a thousand legitimate responses than to leak one patient record. A financial services platform under SOX compliance makes the same choice. The cost of a false positive — a user sees a "this response contains restricted content" message — is trivial compared to the cost of a true positive leak.
+
+Low-sensitivity detection accepts more risk. You tune thresholds permissively, flag only high-confidence matches, prioritize user experience over absolute security. This is appropriate for low-risk applications, public-facing chatbots, and contexts where false positives create significant friction. A customer support bot that blocks too many responses frustrates users and drives them away. A content generation tool that flags common phrases becomes unusable. You still run detection — you're not ignoring the risk — but you calibrate for usability.
+
+The calibration depends on the data's sensitivity tier. Tier 1 applications — those handling regulated data, confidential business information, or authenticated user content — run high-sensitivity detection. Tier 2 and 3 applications — those with lower risk profiles — tune for balance. You don't use the same filtering threshold for a public FAQ bot and an internal HR assistant. The HR assistant sees employee records. The FAQ bot sees generic questions. The filtering strategy must match the data exposure risk.
+
+## Context-Aware Filtering
+
+The hardest PII to detect is context-dependent. "John Smith" alone is not PII — it's a common name. "John Smith, born March 15, 1987, living at 742 Evergreen Terrace" is PII. The difference is context. A name paired with a birthdate, an address, an email, a phone number, or any other unique identifier becomes personally identifiable. No single field triggers the filter. The combination does.
+
+Context-aware filtering analyzes relationships between detected entities. The system flags a name. It flags a birthdate. It flags an address. Individually, these might not trigger a block — names and dates appear in legitimate responses constantly. But when they appear together in the same response, separated by fewer than 50 tokens, the system infers a high likelihood of PII and blocks the output.
+
+This requires entity extraction and relationship analysis. You can't just run regex matches. You need to parse the output into structured entities — person names, dates, locations, organizations, identifiers — then evaluate whether combinations of entities constitute PII. This is computationally expensive. Entity extraction models add significant latency. Relationship analysis requires graph traversal or rule evaluation across detected entities. But it's the only way to catch composite PII that evades pattern and ML-based detection.
+
+The alternative is allowing attackers to extract PII by prompting the model to return fields separately across multiple requests. "What is the customer's name?" in one request. "What is their birthdate?" in another. "What is their address?" in a third. Each response passes filtering individually. Across three requests, the attacker assembled a complete profile. Context-aware filtering within a single request blocks this. Cross-request correlation — tracking what information has been returned to a user across multiple interactions — blocks the multi-turn variant.
+
+## Redaction Strategies
+
+When filtering detects PII, you have three options: mask it, replace it, or refuse the entire response. Each strategy has different security and usability implications.
+
+Masking replaces sensitive substrings with placeholder characters. "John Smith's email is john.smith@example.com" becomes "John Smith's email is REDACTED." The rest of the response remains intact. The user sees that information was removed and can infer what was there. Masking preserves response structure and context while preventing data leakage. The downside is that heavy masking makes responses unintelligible. If 40% of the output is redacted, the user gets gibberish.
+
+Replacement substitutes sensitive data with synthetic equivalents. "John Smith's email is john.smith@example.com" becomes "John Smith's email is user42@example.org." The response remains grammatically intact and semantically similar. The user can't tell that filtering occurred unless they know the original content. Replacement works well when the specific value doesn't matter — the model was illustrating a point using real data, substituting synthetic data preserves the teaching while preventing leakage.
+
+The risk with replacement is that it can mislead. If the model was answering a specific factual question — "What is John Smith's email?" — replacing the real email with a synthetic one returns false information. The user acts on that false information and encounters problems. Replacement is appropriate when the data's role is illustrative, not factual. If you can't distinguish those cases automatically, replacement becomes dangerous.
+
+Refusal blocks the entire response. The user sees an error message: "This response contained restricted content and cannot be displayed." No partial output, no redacted text, no hints about what was removed. The user knows the request triggered a security filter but learns nothing about what data the model attempted to return. Refusal is the safest strategy. It leaks no information. The downside is user experience — legitimate requests get blocked when detection misfires, and users receive no useful output.
+
+Production systems typically use a hybrid approach. Low-confidence detections trigger masking or replacement. High-confidence detections trigger refusal. If the PII detector is 60% confident, mask the suspicious span. If it's 95% confident, refuse the entire response. The threshold depends on your risk tolerance and the sensitivity tier of the application.
+
+## Latency Considerations
+
+Every millisecond you add to response time degrades user experience. Pattern-based PII detection adds single-digit milliseconds. ML-based detection adds 20 to 200 milliseconds depending on model size and text length. Entity extraction and relationship analysis add another 50 to 300 milliseconds. If you run all three sequentially, you've added 100 to 500 milliseconds to every request. For a real-time voice assistant, that's unacceptable. For a document generation tool, it's tolerable. For a compliance-critical application, it's mandatory.
+
+The tradeoff is speed versus coverage. You can run only pattern-based detection and catch 85% of PII with minimal latency. You can add ML-based detection and catch 97% with moderate latency. You can add context-aware analysis and catch 99.5% with high latency. The right choice depends on your application's latency budget and risk profile.
+
+Caching helps but doesn't solve the problem. You can cache detection results for identical outputs, but LLM responses vary across requests even for the same prompt. Caching is effective only if you're serving many users with identical generated content — rare outside of FAQ bots and templated responses. For most applications, every output is unique and requires full scanning.
+
+Parallel processing reduces latency. Run pattern detection, ML detection, and entity extraction simultaneously instead of sequentially. Use GPU acceleration for the ML model. Optimize regex matchers. A well-optimized pipeline adds 30 to 80 milliseconds instead of 100 to 500. That's the difference between acceptable and unusable for latency-sensitive applications.
+
+## The Detection Surface
+
+Output filtering only protects what it scans. If your application returns structured data — JSON objects, database records, API responses — alongside natural language text, you must filter all of it. A model that generates SQL queries can leak data through the query itself, not just the explanation. A model that returns JSON can embed PII in field values. A model that generates code can include API keys in example configurations.
+
+The detection surface includes every output format the model produces. Text responses, JSON payloads, code snippets, URLs, file contents, metadata fields. Each format requires appropriate filtering. Regex matchers work for text but break on structured data. JSON requires parsing and recursive field scanning. Code requires syntax-aware analysis to distinguish between examples and real credentials.
+
+The attack surface is the inverse of your detection surface. Any output path you don't scan is a potential exfiltration vector. Attackers probe for unfiltered paths — prompting the model to return data in formats the filtering system ignores. If you filter text but not JSON, they prompt for JSON output. If you filter response bodies but not headers or metadata, they extract data through those channels. Comprehensive filtering means covering every output mechanism, not just the obvious ones.
+
+## Production Deployment Patterns
+
+Output filtering runs as a service in the request path. The application sends the model's generated output to the filtering service. The service scans, makes a decision — pass, redact, or block — and returns the result. If the scan passes, the application returns the output to the user. If the scan redacts, the application returns the modified output. If the scan blocks, the application returns an error.
+
+The filtering service must have latency guarantees. If filtering adds unpredictable latency, user experience suffers. You set SLOs — 95th percentile latency under 50ms for pattern detection, under 150ms for ML detection, under 300ms for full analysis. If the filtering service exceeds these thresholds, you either optimize the detection pipeline or adjust the filtering strategy to use faster methods.
+
+The filtering service must be stateless and horizontally scalable. Every request gets filtered, so the service must handle production traffic volume. Stateless design allows you to scale by adding instances. Filtering one million requests per hour requires provisioning enough filtering capacity to handle peak load with headroom for spikes.
+
+The filtering service must have fallback behavior. If the service is down or overloaded, what happens? You can fail open — skip filtering and return unfiltered outputs — or fail closed — refuse all outputs until filtering is restored. Fail open preserves availability but risks leakage. Fail closed preserves security but breaks the application. The right choice depends on your risk tolerance and application requirements. Most regulated systems fail closed. Most public-facing systems fail open with aggressive monitoring.
+
+## Monitoring and Iteration
+
+Every blocked or redacted response is a signal. High block rates indicate either aggressive filtering or a real data leakage problem. If 10% of outputs trigger filtering, either your detection is miscalibrated or your upstream systems are feeding sensitive data to the model at alarming rates. You monitor block rate by detection type — pattern, ML, entity-based — to understand which signals are firing.
+
+False positive rates require manual review. You sample blocked outputs, review them with human judgment, and classify whether the block was correct. If 50% of blocks are false positives, your thresholds are too aggressive. If 5% are false positives, your thresholds are appropriately calibrated. The acceptable false positive rate depends on your application. Tier 1 systems tolerate 30-50% false positives. Tier 3 systems target under 10%.
+
+True positive rates are harder to measure because you don't have ground truth for what data the model should never return. You rely on red team testing — intentionally prompting the model to leak data and measuring how often filtering catches it — and on incident analysis when leaks occur in production. If a data leak reaches a user and you later discover filtering should have caught it, that's a detection gap. You analyze the output, understand why detection failed, and adjust rules or retrain models.
+
+Output filtering is not static. Data formats evolve. Attackers adapt. Your detection rules and models require continuous updates. You review blocked outputs weekly, identify new PII patterns, add detection rules, retrain models on new examples. A filtering system that doesn't evolve becomes ineffective within months as attackers discover its blind spots.
+
+The next defense layer operates earlier in the stack — before the model generates output, before data flows into context. Tenant isolation architecture ensures that sensitive data from one customer never reaches the model or memory systems serving another customer.
+

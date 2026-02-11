@@ -1,0 +1,84 @@
+# 10.7 — Defense: Rate Limiting and Quotas
+
+Traditional rate limiting was built for stateless HTTP requests where each call costs roughly the same. One API call equals one database query equals one unit of infrastructure. You could limit users to 1000 requests per hour and feel confident you were protecting your system. That mental model dies the moment you deploy an LLM API.
+
+One user sends a five-word question about the weather. Cost: three cents, 200 milliseconds of GPU time, 150 tokens. Another user sends a 4000-word document and asks for a complete rewrite in twelve languages. Cost: eighteen dollars, forty seconds of GPU time, 95,000 tokens. Both count as one request. Your traditional rate limiter treats them identically. The attacker knows this. They will never hit your request limit. They will hit your budget limit in twenty minutes.
+
+## Why Request-Based Limits Fail for AI Systems
+
+The core problem is cost asymmetry. In traditional systems, cost scales linearly with request count. In LLM systems, cost scales with token count, model complexity, and processing time. A single malicious prompt can consume more resources than ten thousand normal requests combined.
+
+A financial services company deployed an internal research assistant in March 2025 with a limit of 500 requests per user per day. They assumed this was generous — most employees would use it ten to twenty times. Within a week, three users were hitting the limit daily. Investigation revealed they were not spamming the system. They were asking complex questions with massive context windows. One user routinely sent 50,000-token prompts analyzing quarterly reports. Each request cost forty times the median. The rate limit protected nothing. The per-user monthly bill for those three accounts exceeded twenty thousand dollars combined. They were within policy. The policy was measuring the wrong thing.
+
+Request-based limits create a false sense of security. They stop unsophisticated abuse — someone scripting thousands of empty calls — but they do nothing against the attack that matters: the attacker who crafts expensive prompts and stays under your request threshold while draining your budget. The limit becomes a challenge: how much damage can I do with exactly 500 requests? The answer is often hundreds of thousands of dollars.
+
+The second failure mode is that request-based limits ignore context accumulation. In a conversation with memory, each subsequent request includes more context. The first message costs you 150 tokens. The twentieth message costs you 8,000 tokens because you are including the full conversation history. Request nineteen and request twenty count the same against the limit. They do not cost the same. The attacker exploits this by building long conversations that grow exponentially in cost while staying under the request cap. Your system bleeds money and your rate limiter reports everything is fine.
+
+## Token-Based Quotas as the Primary Control
+
+The fundamental unit of cost in LLM systems is the token. Your rate limiting must count tokens, not requests. A **token-based quota** enforces a maximum number of input and output tokens per user per time period. The user can make one enormous request or a thousand tiny ones. Either way, when they hit the token limit, they stop.
+
+Implementing token quotas requires counting both prompt tokens and completion tokens. You cannot count only one side. An attacker who stays silent and forces the model to generate massive outputs can drain budgets just as effectively as someone sending massive inputs. Your quota must cover the full round-trip: tokens in, tokens out, weighted by the cost of each.
+
+For OpenAI GPT-5 in January 2026, input tokens cost one-fifth the price of output tokens. Your quota should reflect this. A user who sends 100,000 input tokens and receives 20,000 output tokens should count differently than a user who sends 20,000 input tokens and receives 100,000 output tokens, even though both total 120,000 tokens. The second user consumed five times more cost. Weight your quota accordingly. The simplest approach: count output tokens at five times the weight of input tokens when calculating quota usage. Adjust the multiplier to match your actual model pricing.
+
+Token quotas prevent the long-context attack. If a conversation accumulates 50,000 tokens of history and the user has a daily quota of 200,000 tokens, they can continue for a limited time. They cannot run indefinitely. The attacker who tries to build an infinite conversation runs into a hard wall. The conversation ends when the quota ends, not when your budget runs out.
+
+## Multi-Level Quota Architecture
+
+Effective quota systems operate at multiple levels simultaneously. You need per-user quotas, per-session quotas, per-hour quotas, and organization-wide quotas. Each level catches a different attack pattern.
+
+**Per-user daily quotas** are your primary control. Every user gets a fixed token budget per day. This stops the individual who is abusing the system, whether maliciously or through ignorance. Set the quota high enough that legitimate power users do not hit it, but low enough that a single compromised account cannot drain the entire organizational budget. For a typical enterprise deployment, 500,000 tokens per user per day is a reasonable starting point. Adjust based on actual usage patterns after the first month.
+
+**Per-session quotas** prevent runaway conversations. A session is defined as a continuous conversation with memory. Each session gets a separate quota, typically lower than the daily quota. If a user hits the session quota, the conversation ends. They can start a new session and continue, but they cannot push a single thread into infinite context. A session quota of 100,000 tokens prevents most runaway scenarios while allowing substantive conversations. This also limits the damage from session hijacking. If an attacker steals a session token, they inherit the session quota. They cannot drain the user's full daily budget from a single hijacked session.
+
+**Per-hour quotas** detect burst attacks. An attacker who compromises an account will often try to do maximum damage immediately, before the compromise is detected. They will not spread their attack evenly across a day. They will fire everything in the first ten minutes. A per-hour quota catches this. Even if the user has 500,000 tokens remaining for the day, they cannot consume more than 100,000 in a single hour. This gives your monitoring systems time to detect anomalies and alert before the budget is exhausted. Legitimate users rarely hit hourly quotas because their usage is naturally paced by reading and thinking time. Attackers script their attacks and hit hourly limits instantly.
+
+**Organization-wide quotas** provide the final safety net. If your company has 10,000 employees and a monthly budget of $200,000 for LLM usage, you need a hard cap at the organizational level. No matter how many users are active, no matter how many session or user quotas are still available, the system stops when the organization hits its total budget. This prevents the scenario where a sophisticated attacker compromises hundreds of accounts and distributes the attack across all of them, staying under individual quotas while collectively draining the entire budget. Organization-wide quotas should trigger soft warnings at 80% usage and hard cutoffs at 100%. At 80%, alert finance and engineering. At 100%, stop all requests until the next billing cycle or until a human approves a budget increase.
+
+## Dynamic Rate Limiting Based on Request Complexity
+
+Token quotas handle cost, but they do not handle processing time. A prompt that takes forty seconds to execute can block GPU resources even if it only costs five dollars. An attacker can craft prompts that are deliberately expensive in compute time while staying under token quotas. You need a second dimension of rate limiting: complexity-based throttling.
+
+**Complexity-based rate limiting** estimates the computational cost of a request before executing it and applies dynamic limits based on that estimate. The estimation does not need to be perfect. It needs to be directional. Factors that increase complexity: long context windows, multi-turn conversations with large history, requests that require tool use or function calling, requests that specify high quality or reasoning models, requests with images or other multimodal inputs.
+
+A simple complexity scoring system: base score of one point for any request, add one point per 10,000 tokens in the context, add two points if the request includes images, add three points if the request uses a reasoning model like GPT-5.2 or Claude Opus 4.5, add one point per tool in the tool set if tools are enabled. Sum the score. Assign each user a complexity budget per hour. When they exhaust the budget, queue their requests or reject them with a retry-after header.
+
+This prevents the attacker who stays under token quotas by sending moderately sized prompts but uses reasoning models and large context windows to maximize processing time. They hit their complexity limit long before they hit their token limit. Legitimate users who occasionally send complex requests are not meaningfully impacted — they get queued for a few seconds. The attacker who sends nothing but complex requests is stopped cold.
+
+## Rate Limit Bypass Detection
+
+Sophisticated attackers do not accept rate limits. They work around them. The two most common bypass techniques: account cycling and credential sharing. Your rate limiting system must detect and block both.
+
+**Account cycling** is when an attacker creates multiple accounts and rotates through them to evade per-user quotas. They hit the limit on account one, switch to account two, hit the limit, switch to account three. If you have open account creation with email verification only, this attack is trivial. The attacker scripts account creation, verifies emails through disposable email services, and automates the rotation. A single attacker can look like fifty unique users, each staying well under quota.
+
+Detection relies on behavioral signals and infrastructure signals. Track account creation velocity. If fifty accounts are created from the same IP block within an hour, flag them. Track usage patterns. If ten accounts all start using the system within minutes of creation and immediately max out their quotas, flag them. Track prompt similarity. If multiple accounts are sending near-identical prompts, flag them. When an account is flagged, apply stricter limits: lower quotas, longer cooldowns, require additional verification. Do not ban immediately — false positives will occur — but move flagged accounts into a higher-scrutiny tier.
+
+**Credential sharing** is when multiple users share a single account to pool their quotas. User A hits their daily limit, logs out, and hands their credentials to User B, who logs in and continues. This is harder to detect than account cycling because the account is legitimate and the usage pattern may look normal from a single-account perspective. Detection requires cross-session analysis.
+
+Track login locations and devices. If an account logs in from New York at 9am, then logs in from Singapore at 9:05am, flag it. Require re-authentication. Track session overlap. If an account has multiple active sessions from different IP addresses simultaneously and all sessions are sending requests, flag it. Some legitimate users will have multiple devices, but they will not typically use them simultaneously to send requests. Track quota exhaustion patterns. If an account consistently uses exactly 100% of its quota every single day, and the usage is spread across multiple locations or devices, investigate. Legitimate power users exist, but they have natural variance. Attackers maximizing shared credentials use the quota fully and consistently.
+
+## Integration with Identity Systems
+
+Rate limiting is only as strong as your identity layer. If an attacker can forge identities or escalate privileges, your quotas mean nothing. Your rate limiting system must integrate tightly with your identity provider and enforce quotas at the authentication boundary, not at the application layer.
+
+Use your identity provider to assign user IDs and tie quotas to those IDs. Do not rely on session cookies or application-level user identifiers. These can be tampered with. Tie quotas to the authenticated identity returned by your SSO provider or IAM system. When a user authenticates, load their current quota usage from a durable store — Redis, DynamoDB, or a dedicated quota service. Check usage before processing any request. Increment usage after the request completes, using the actual token count and complexity score. If the request fails or is rejected, do not increment the quota. The user should not pay for requests your system could not fulfill.
+
+For systems with role-based access control, assign different quotas to different roles. Standard users get 500,000 tokens per day. Power users or analysts get two million. Administrators get ten million or unlimited. Define roles in your identity system, not in your application. Enforce role-based quotas at the API gateway or rate limiting layer. This prevents privilege escalation attacks where a user manipulates their application-level role to gain higher quotas. The identity provider is the source of truth.
+
+For systems that serve external customers, integrate rate limiting with your subscription or billing system. Free-tier users get 50,000 tokens per day. Paid users get 500,000. Enterprise customers get ten million or custom limits negotiated in their contract. Tie the quota to the subscription status. If a user's subscription expires or their payment fails, downgrade their quota immediately. Do not wait for a manual admin action. The rate limiter should query the billing system in real time or receive quota updates via webhook when subscription status changes.
+
+## Communicating Limits to Users and Graceful Degradation
+
+Rate limits are not just a security control. They are a user experience boundary. How you communicate limits determines whether users trust your system or circumvent it. Poor communication turns legitimate users into adversaries. Clear communication turns quotas into an expected part of the product.
+
+When a user approaches their quota, warn them before they hit it. At 80% of their daily token quota, show a banner: "You have used 400,000 of your 500,000 daily tokens. Your quota resets at midnight UTC." Give them visibility into their current usage. Provide a dashboard or API endpoint where they can check their remaining quota at any time. Users should never be surprised when they hit a limit.
+
+When a user hits their quota, return a clear error message with actionable information. Do not return a generic 429 status with no details. Return a structured error: "You have exceeded your daily token quota of 500,000 tokens. Your quota resets in 7 hours. To increase your quota, contact your administrator or upgrade your plan." Include the reset time. Include the contact path for requesting higher limits. Give the user a path forward that does not involve creating a new account or sharing credentials.
+
+For soft limits, consider graceful degradation instead of hard cutoffs. When a user hits 100% of their quota, instead of rejecting all requests, switch them to a cheaper model. They requested GPT-5.2, but they are over quota. Fulfill the request with GPT-5-mini instead. Inform them of the downgrade: "You have exceeded your standard quota. This response was generated using a smaller model. Your full quota resets in 6 hours." This keeps the user productive while protecting your budget. They get a lower-quality response instead of no response. Many will accept this trade-off rather than stopping work entirely.
+
+For critical workflows, allow quota overrides with approval. If a user hits their quota but has a legitimate business need to continue, let them request a temporary increase. The request goes to their manager or an admin. If approved, grant a one-time quota extension. Log every override. Track who requested it, who approved it, and how much additional quota was granted. Overrides should be rare and auditable, but they should exist. A quota system with no escape valve will be bypassed through unofficial channels.
+
+Rate limiting and quotas form the first layer of economic defense, but they are not sufficient alone. Quotas tell you when a user has consumed too many tokens. They do not tell you when a user is spending too much money or when your entire system is about to exceed its budget. That requires budget caps and cost controls, which layer on top of quotas to provide spending visibility and hard financial limits across every dimension of your deployment.
+
