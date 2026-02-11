@@ -1,0 +1,113 @@
+# 3.2 — Error-Based vs Quality-Based Circuit Breakers
+
+The customer service AI at an insurance company had a circuit breaker protecting its calls to OpenAI. The breaker was configured to trip if error rates exceeded 8% over 45 seconds or if latency exceeded 3 seconds for 60 seconds. Standard configuration, implemented according to distributed systems best practices. In March 2025, the model began hallucinating policy details with increasing frequency due to a prompt configuration change that interacted poorly with a model version update. Over four days, hallucination rates climbed from baseline 3% to 14%. The circuit breaker never tripped. Every API call succeeded. Every response returned in under 800 milliseconds. The HTTP status was 200 OK for every request. The error-based circuit breaker saw a healthy system. Customers saw wildly incorrect policy information. The company discovered the issue only after a customer posted on social media about receiving contradictory coverage explanations.
+
+Error-based circuit breakers protect infrastructure. Quality-based circuit breakers protect users. You need both.
+
+## Error-Based Circuit Breakers: The Traditional Approach
+
+Error-based breakers monitor infrastructure signals: HTTP status codes, connection failures, timeouts, exceptions. When a provider returns a 503 Service Unavailable, when a connection times out after 30 seconds, when the API throws a rate limit error, when the response is malformed JSON that cannot be parsed — these are clear failures. Count them. When the count exceeds threshold, trip the breaker.
+
+This works perfectly for infrastructure outages. OpenAI experiences a platform incident and starts returning 500 errors at scale. Your error-based breaker detects the spike within 30 seconds and trips. Traffic fails over to Anthropic. Your users experience a seamless transition instead of error messages. The breaker protected the user experience from an infrastructure failure.
+
+This works for rate limiting. Your model provider implements sudden rate limits or you exceed your quota unexpectedly. Requests start returning 429 Too Many Requests. The error-based breaker trips. You fall back to a secondary provider or queue requests for retry rather than hammering the rate-limited endpoint. This is correct behavior.
+
+This works for transient network issues. A regional network problem causes connection timeouts between your application and the model provider. The error-based breaker detects the timeouts and trips. Traffic routes to a provider in a different region or falls back to a locally-hosted model. The breaker isolated the network failure.
+
+Error-based breakers are necessary. They are the foundation. Infrastructure reliability requires them. But they are blind to the failure mode that matters most for AI systems: the model is running fine, but the outputs are wrong.
+
+## Why Error-Based Is Not Enough for AI
+
+The model API can be perfectly healthy while the model itself is broken. This disconnect does not exist in traditional systems. A database that returns syntactically correct data is a working database. An API that returns well-formed responses with correct schemas is a working API. But an AI model that returns well-formed, grammatically correct, fluent text can be producing complete nonsense.
+
+The insurance company's hallucination spike is the canonical example. The API worked. Latency was normal. Throughput was stable. Error rates were baseline. Every traditional health signal was green. The model was confidently inventing policy details that did not exist. Error-based circuit breakers cannot catch this because there is no error from the API perspective.
+
+Consider a RAG system whose retrieval component starts returning documents from the wrong knowledge base due to a configuration error. Every document retrieval call succeeds. The API returns document IDs, text chunks, and metadata exactly as expected. The response time is normal. The error rate is zero. But every single document is wrong. The downstream model is grounded in irrelevant information and produces irrelevant answers. An error-based circuit breaker sees perfect health. Users see a broken product.
+
+Consider a fine-tuned model that experiences catastrophic forgetting due to a training mistake. The model loses the ability to perform tasks it previously handled well. But it still generates fluent text. It still responds within normal latency bounds. It still returns HTTP 200. The API is healthy. The model is not. Error-based monitoring is blind to this.
+
+Consider a safety classifier that regresses after a model update. It was catching 93% of policy violations. It now catches 81%. But it still returns a classification for every input. The API calls all succeed. The circuit breaker sees no errors. Twelve percentage points of policy violations are now slipping through. The only way to detect this is to measure classification accuracy against known test cases.
+
+The pattern is consistent: semantic failures present as infrastructure success. You cannot protect users from bad outputs by monitoring for API errors. You must monitor the outputs themselves.
+
+## Quality-Based Circuit Breakers: Tripping on Output Degradation
+
+Quality-based circuit breakers evaluate the actual outputs produced by the AI component and trip when quality drops below threshold. This requires three things: a way to measure quality automatically, thresholds that define acceptable quality, and integration into the circuit breaker logic so quality signals can trip the breaker the same way error signals do.
+
+Measuring quality automatically means running evaluation on a sample of production traffic in near-real-time. For a chatbot, this might be an LLM-as-judge model scoring relevance and helpfulness on a scale of one to five. For a classification system, it might be confidence scores compared to expected ranges. For a RAG system, it might be relevance scoring of retrieved documents against the query. For a code generation system, it might be syntax checking and simple test execution. The evaluation must be fast enough to run in-line or with minimal delay and cheap enough to run continuously.
+
+Thresholds define when quality has degraded enough to warrant action. If your baseline relevance score is 4.2 out of 5 and current quality is 3.8, is that bad enough to trip the breaker? It depends on the use case. A customer-facing chatbot might trip at 3.9 because users notice quality drops immediately. An internal tool might tolerate 3.5 because stakes are lower. The threshold is not universal. It is system-specific and based on acceptable user experience.
+
+Integration means the circuit breaker checks quality metrics in addition to error metrics. Every request that flows through the breaker is sampled probabilistically: 5% of requests are sent to the quality evaluator. Results are aggregated in a sliding window: what is the average quality over the last 60 seconds? If quality drops below threshold, trip the breaker, exactly the same way an error rate spike trips it. The breaker logic is identical. The signal is different.
+
+## The Latency of Quality Detection vs Error Detection
+
+Error detection is instantaneous. A 500 error is evident the moment the response is received. A timeout is evident when the timeout duration elapses. Error-based circuit breakers operate on every request and can detect spikes within seconds. If 20 requests fail in the next 30 seconds, the breaker trips.
+
+Quality detection has latency. You must receive the response, send it to an evaluation model, wait for the evaluation to complete, and record the result. If the evaluation model takes 400 milliseconds and you are sampling 5% of traffic, you are evaluating one in twenty requests with a 400-millisecond delay. The sliding window aggregates these delayed signals. By the time the breaker detects quality degradation, potentially hundreds or thousands of low-quality responses have already been served.
+
+This latency is unavoidable but manageable. The key is to sample frequently enough and aggregate over short enough windows that degradation is caught within seconds to minutes rather than hours. A 5% sample rate means that over 100 requests, you evaluate 5. If your traffic is 10 requests per second, you evaluate 0.5 requests per second, or one every 2 seconds. At that rate, you will detect a quality drop within 30 to 60 seconds if the window is 60 seconds and the threshold is crossed by multiple consecutive low-quality samples.
+
+Increase the sample rate to detect faster. At 10% sampling, you evaluate 1 request per second with 10 requests per second of traffic. This doubles the evaluation cost but halves the detection latency. At 20% sampling, you evaluate 2 per second and detect within 15 to 30 seconds. The trade-off is cost versus detection speed. The right balance depends on traffic volume, evaluation cost, and acceptable detection delay.
+
+Use faster evaluation methods to reduce per-evaluation latency. An LLM-as-judge call to GPT-5-mini takes 300 to 600 milliseconds. A lightweight classifier trained on your task takes 50 to 150 milliseconds. A rule-based heuristic takes 5 to 20 milliseconds. Faster evaluation allows higher sample rates with the same cost budget. The evaluation need not be perfect. It must be fast and directionally correct. You are detecting degradation, not measuring absolute quality.
+
+## Hybrid Approaches: Error OR Quality Triggers
+
+The most robust circuit breakers use both signals. Trip if error rate exceeds threshold OR if quality drops below threshold. This creates defense in depth. Infrastructure failures trip the error condition. Semantic failures trip the quality condition. The breaker protects against both failure modes.
+
+Implementation is straightforward: the breaker maintains two separate sliding windows. One tracks error rate over the last 30 seconds. One tracks average quality score over the last 60 seconds. On every request, update the error window immediately based on success or failure. On every evaluated request, update the quality window with the score. If either window crosses its threshold, trip the breaker.
+
+The thresholds are independent. Your error threshold might be 10% errors over 30 seconds. Your quality threshold might be an average score below 3.8 over 60 seconds. The error threshold is more sensitive because errors are clear failures. The quality threshold allows more degradation because quality metrics are noisier and some variance is normal. Tune each threshold independently based on observed behavior.
+
+Alerts should distinguish between error-tripped and quality-tripped breakers. When a breaker opens due to error rate, the alert should indicate an infrastructure or availability problem. When it opens due to quality degradation, the alert should indicate a semantic or model problem. These require different response playbooks. The first leads to provider failover or network debugging. The second leads to model rollback or prompt investigation.
+
+Recovery testing must verify the condition that caused the trip. If the breaker opened due to error rate, the half-open probes can check for successful responses. If the breaker opened due to quality degradation, the half-open probes must include quality evaluation. Do not close the circuit just because API calls succeed again. Verify that quality has returned to baseline.
+
+## Threshold Setting for Quality-Based Breakers
+
+Setting the quality threshold too tight causes false positives. Quality metrics are noisier than error rates. A model that normally scores 4.3 out of 5 will occasionally have 60-second windows that average 4.0 due to variance in traffic, evaluation model behavior, or sampling luck. If the threshold is 4.1, the breaker will flap. You will experience unnecessary failovers and degraded service when the model is actually fine.
+
+Setting the threshold too loose means significant degradation passes undetected. If your baseline is 4.3 and the threshold is 3.5, quality can drop by nearly a full point before the breaker trips. Users will notice long before the breaker does. The threshold must be close enough to baseline that it catches degradation before user experience degrades noticeably.
+
+The correct threshold is derived from baseline measurement plus acceptable variance. Measure quality over a week or month of normal operation. Calculate the mean and standard deviation. A reasonable threshold is mean minus two standard deviations. This catches unusual degradation while tolerating normal variance. If your mean is 4.3 and standard deviation is 0.2, the threshold is 3.9. Quality must drop by two standard deviations before the breaker trips.
+
+Adjust for skewed distributions. If quality scores are not normally distributed — for example, most scores are between 4 and 5 but there is a long tail of 1s and 2s — standard deviation-based thresholds may not work well. Use percentile-based thresholds instead: trip if the 10th percentile of quality scores in the current window falls below the 10th percentile of baseline by more than a threshold amount. This is more robust to outliers.
+
+Re-baseline regularly. Quality distributions change as your model, prompts, and traffic evolve. A threshold derived from January data may be wrong in March. Recompute baseline statistics weekly or monthly and adjust thresholds accordingly. Automate this if possible. Manual threshold updates are forgotten and baselines drift out of sync with reality.
+
+## The Cost Trade-Off: Evaluation Expense vs Detection Speed
+
+Evaluating every request is prohibitively expensive for most systems. If you are using GPT-5-mini to score relevance at 0.15 cents per evaluation and you handle 1000 requests per hour, evaluating every request costs 150 dollars per hour or 3600 dollars per day or 109,000 dollars per month. This is untenable unless your product revenue per request is very high.
+
+Sampling reduces cost linearly. At 10% sampling, the cost is 10% of full evaluation: 10,900 dollars per month. At 5% sampling, it is 5,450 dollars per month. At 1% sampling, it is 1,090 dollars per month. The trade-off is detection latency. Lower sample rates mean longer time to detect degradation. The question is: what is the cost of serving bad outputs while degradation goes undetected?
+
+Calculate the break-even point. If serving bad outputs for an extra five minutes costs more in user trust, support load, or business impact than the cost of higher sampling, increase the sample rate. If the incremental detection speed is not worth the cost, decrease it. This is a business decision, not a technical one. The engineering team should present the trade-off. Product and leadership should decide the acceptable balance.
+
+Use tiered evaluation: cheap heuristics on every request, expensive evaluation on samples. A rule-based quality check that runs in 10 milliseconds can be applied to 100% of traffic at negligible cost. It will not catch subtle quality issues, but it will catch obvious ones: responses that are too short, responses that do not answer the question type, responses that trigger keyword-based safety rules. Route the 5% that pass heuristics but are borderline to expensive evaluation. This catches both obvious failures immediately and subtle failures with some delay.
+
+Pre-compute evaluation for known test cases. If you have a golden set of 500 high-value queries with known-good responses, run those through the model every minute. Evaluate them with full fidelity using expensive models. This is 500 evaluations per minute, or 720,000 per day, but the cost is predictable and capped. Detection latency is one minute: if the model regresses, the next test run catches it. This complements sampling-based evaluation of live traffic.
+
+## Practical Limits: What Quality Can Be Measured in Real-Time
+
+Not all quality dimensions can be measured in real-time. Factual accuracy often requires external lookup or human verification. Assessing whether a medical diagnosis is correct requires clinical expertise. Evaluating whether legal advice is sound requires legal review. These cannot be done in-line at the speed required for circuit breaker decisions.
+
+Focus on measurable proxies. You cannot verify factual accuracy in real-time, but you can check if the response includes citations, if the confidence score is within expected range, if the response contains hedging language that indicates uncertainty. You cannot verify legal correctness in real-time, but you can check if the response cites relevant statutes, if the reasoning structure is coherent, if the conclusion is definitive or appropriately hedged. Proxies are imperfect but fast.
+
+Use model-based evaluation for subjective dimensions. Relevance, helpfulness, tone, coherence — these can be scored by an LLM judge in hundreds of milliseconds. The judge is not perfect, but it is consistent and fast enough for circuit breaker purposes. You are not looking for perfect quality measurement. You are looking for degradation detection. A judge that scores outputs consistently will detect when average scores drop even if the absolute scores are noisy.
+
+Defer expensive evaluation to post-incident analysis. When a quality-based circuit breaker trips, it is based on fast proxy metrics. After the incident, run expensive evaluation on a sample of the traffic that triggered the trip. Verify that the breaker was correct. Use this analysis to tune thresholds and improve the proxy metrics. The circuit breaker decision happens in seconds. The validation happens in hours. Both are necessary.
+
+## When Quality-Based Breakers Are Overkill
+
+Small, internal tools with limited user impact do not need quality-based circuit breakers. If you are running an internal data labeling assistant used by five people, error-based breakers are sufficient. The cost of building and maintaining quality evaluation exceeds the cost of occasionally serving bad outputs and having users report issues.
+
+Systems with human review in the loop do not need quality-based breakers for every component. If every AI output is reviewed by a human before reaching end users, the human acts as the quality gate. A quality-based breaker adds defense in depth, but it is not critical. Focus quality-based breakers on paths that bypass human review.
+
+Use cases with very high tolerance for errors do not need quality-based breakers. If you are generating creative writing prompts for entertainment and users understand the outputs are experimental, occasional low-quality outputs are not damaging. Error-based breakers are enough to catch infrastructure failures. Quality breakers add little value.
+
+But for customer-facing AI systems where quality directly impacts user trust, revenue, safety, or compliance, quality-based circuit breakers are not optional. They are the primary mechanism for preventing bad outputs from reaching users at scale. Build them.
+
+---
+
+Next: **3.3 — Provider Circuit Breakers: Detecting and Routing Around Outages**

@@ -1,0 +1,115 @@
+# 3.5 — Agent Circuit Breakers: Stopping Runaway Autonomous Behavior
+
+Why do most agent projects stay in pilot forever? Because nobody trusts them in production without a human in the loop. And why don't they trust them? Because agents can enter infinite loops, burn thousands of dollars in minutes, and take actions that are impossible to undo. The moment you give a language model autonomy — the ability to call tools, query databases, send messages, execute code — you need circuit breakers that understand agent-specific failure modes.
+
+In December 2025, a customer support automation platform deployed an agent designed to resolve common user issues. The agent could query account status, reset passwords, update billing information, and escalate to humans when stuck. Within two hours of production deployment, one agent entered a loop. A user's account had inconsistent state across two databases. The agent detected the inconsistency, attempted to fix it, re-checked the state, detected the inconsistency again, attempted to fix it again. This loop executed 847 times in six minutes. The agent made 3,388 database writes. It triggered 847 password reset emails to one user. It cost the company $1,200 in API fees and customer trust they never fully recovered. They had rate limits on the model API. They did not have circuit breakers on agent behavior.
+
+Agents need different circuit breakers than simple LLM calls. A single LLM request fails or succeeds in seconds. An agent runs for minutes or hours, making dozens or hundreds of decisions. Each decision can spawn more decisions. Failure modes compound. Your circuit breakers must detect runaway behavior and stop it before it causes irreversible damage.
+
+## Why Agents Need Different Circuit Breakers
+
+Traditional circuit breakers monitor one component — a database, an API, a model endpoint. Agent circuit breakers monitor behavior across time and across actions. An agent can make 50 successful API calls and still be failing. The loop is the failure, not the individual calls.
+
+Agents have state. They maintain conversation history, tool call results, and internal reasoning chains. State grows over time. Unbounded state growth causes memory exhaustion, context window overflow, and degraded decision quality. Your circuit breaker must monitor state size and stop agents that are accumulating too much history.
+
+Agents have autonomy. Once you start an agent, it keeps running until it decides to stop or hits a termination condition. If the agent's stop condition is never satisfied, it runs forever. Your circuit breaker must enforce external termination conditions independent of the agent's internal logic.
+
+Agents have side effects. They write to databases, send emails, charge credit cards, execute code. Side effects are often irreversible. Sending 847 password reset emails cannot be undone. Your circuit breaker must detect harmful action patterns before they cause irreversible damage.
+
+Agents have cost. Every tool call costs API fees, compute time, or rate limit quota. An agent stuck in a loop can burn your monthly budget in an hour. Your circuit breaker must track cumulative cost and stop agents that exceed thresholds.
+
+## Loop Detection Circuit Breakers
+
+The most common agent failure mode is the infinite loop. The agent attempts an action, evaluates the result, decides the result is unsatisfactory, attempts the same action again. This continues forever or until external termination.
+
+Loop detection starts with action tracking. You log every tool call the agent makes. You record the tool name, the arguments, and the timestamp. You maintain a sliding window of the last 20 actions. After each action, you check if the current action matches any action in the recent history.
+
+Exact match detection is simple. If the agent calls the same tool with identical arguments three times in the last 20 actions, trip the circuit breaker. The agent is repeating itself. This catches the simplest loops — the agent keeps trying the exact same thing expecting different results.
+
+Fuzzy match detection catches variants. If the agent calls the same tool with slightly different arguments five times in 20 actions, trip the circuit breaker. For example, the agent queries user balance with user IDs 12345, 12346, 12345, 12347, 12345. This is a loop with noise. The agent is cycling through a small set of similar actions. You detect this by grouping actions by tool name and measuring argument similarity. If more than 25% of recent actions are variants of the same action, trip the breaker.
+
+State oscillation detection catches higher-order loops. The agent takes action A, checks state, takes action B, checks state, takes action A again. This is a two-step loop. You track state check results — the agent's observations of the world. If the agent observes the same state snapshot three times after taking actions, trip the circuit. The agent is not making progress. It's cycling through states without reaching its goal.
+
+When the loop detection circuit breaker trips, you stop the agent immediately. You log the full action history, the loop pattern detected, and the state at termination. You return an error to the user explaining that the agent was unable to complete the task and got stuck. You escalate to human review. Most loop failures indicate bugs in agent logic or tool implementations. They require code fixes, not just retries.
+
+## Cost Circuit Breakers
+
+The second most dangerous failure mode is cost explosion. The agent makes hundreds or thousands of expensive API calls, either in a loop or pursuing a valid but expensive strategy. Your budget disappears before anyone notices.
+
+Cost circuit breakers track cumulative spend per agent instance. You instrument every tool call with its cost. Model API calls have per-token pricing. Database queries cost compute time. External API calls have per-request fees. You sum these costs in real time as the agent runs.
+
+Per-agent cost limits are your first line of defense. You set a maximum spend per agent invocation — say $5. After each tool call, you check if cumulative cost exceeds the limit. If so, trip the circuit. Stop the agent. Return an error. Log the actions taken so far. Most user-facing tasks should complete in under $1. If an agent hits $5, something is wrong.
+
+Rate-of-spend detection catches acceleration. If an agent spends $0.50 in the first minute and $3 in the second minute, it's accelerating toward budget exhaustion. You track spend per time window. If spend in the current window is more than 5 times the spend in the previous window, trip the circuit. The agent is spinning out of control.
+
+Tooling cost stratification helps prioritize which calls to limit. Some tools are cheap — reading from a cache costs fractions of a cent. Other tools are expensive — calling GPT-5 with 10,000-token context costs $0.15 per call. You set per-tool invocation limits. The agent can call the cache 1,000 times but can only call GPT-5 20 times. This prevents runaway calls to expensive dependencies.
+
+When the cost circuit breaker trips, you stop the agent and return a partial result if possible. If the agent completed 80% of the task before hitting the cost limit, return what it accomplished and flag the task as incomplete. If the agent accomplished nothing useful, return an error. You alert on-call to investigate why cost exploded. Common causes are loops, inefficient tool use, or underestimating task complexity.
+
+## Action Rate Limiters
+
+Even when agents are not looping or burning money, they can take too many actions in a short time. This overwhelms downstream systems, triggers external rate limits, or looks like abuse to third-party APIs.
+
+Action rate limiters enforce maximum actions per time window. You allow 10 database writes per minute, 50 API calls per minute, 5 emails per minute. These limits are per-agent-instance. After each action, you check if the agent has exceeded the rate limit for that action type. If so, pause the agent for the remainder of the time window or trip the circuit breaker.
+
+Pausing is appropriate for transient rate limits. If the agent hits 50 API calls in one minute, pause for 60 seconds, then let it continue. This prevents external API rate limit errors without stopping the agent entirely. You use pausing when you trust the agent to eventually complete the task within rate constraints.
+
+Tripping is appropriate for sustained overuse. If the agent hits the rate limit three consecutive minutes, trip the circuit breaker. The agent is not slowing down. It's making too many calls too fast. Continuing will either cause external errors or indicate the agent is stuck in a high-frequency loop.
+
+Per-action-type rate limits prevent abuse of specific tools. An agent might legitimately need 100 read calls per minute but should never need 100 email sends per minute. You tune rate limits per tool based on expected usage patterns. Tools with side effects get tighter limits than read-only tools.
+
+Global rate limiters across all agent instances prevent system-wide overload. If you're running 50 agents simultaneously, each allowed 10 database writes per minute, that's 500 writes per minute total. If your database can only handle 200 writes per minute, you need a global rate limiter. You use a shared counter or distributed rate limiter to enforce cross-agent limits. When the global limit is hit, new agents queue or fail fast.
+
+## Harm Circuit Breakers
+
+Some agent actions carry risk beyond cost or load. Deleting data, exposing sensitive information, initiating financial transactions — these actions can cause irreversible harm. Harm circuit breakers prevent dangerous action sequences.
+
+Action risk classification starts at design time. You label each tool with a risk tier. Tier 0 is read-only — zero risk. Tier 1 is low-risk writes — updating a cache, logging an event. Tier 2 is medium-risk writes — updating a database record, sending a notification. Tier 3 is high-risk actions — deleting data, initiating payment, exposing PII. Tier 4 is critical actions — actions that should always require human approval.
+
+Risk budget tracking works like cost budgets. Each agent instance gets a risk budget — say 10 risk points. Tier 0 actions cost 0 points. Tier 1 costs 1 point. Tier 2 costs 3 points. Tier 3 costs 10 points. Tier 4 is not allowed. The agent spends its risk budget as it takes actions. When the budget is exhausted, the circuit breaker trips. The agent must stop or escalate to a human.
+
+Dangerous action sequences trigger immediate trips. If an agent attempts two Tier 3 actions in a row, trip the circuit. High-risk actions clustered together indicate the agent is in an unstable state. Even if each individual action is within risk budget, the sequence pattern is unsafe.
+
+Rollback-incapable actions get extra scrutiny. Some actions can be undone — creating a database record can be rolled back by deleting it. Other actions cannot be undone — sending an email, charging a credit card, posting to a public API. You flag rollback-incapable actions and enforce stricter limits. The agent can make 10 rollback-capable writes but only 2 rollback-incapable writes before tripping the harm breaker.
+
+When the harm circuit breaker trips, you stop the agent immediately and escalate to human review. You log the action sequence, the risk budget consumption, and the state at termination. A human reviews the agent's intended actions and decides whether to approve, modify, or reject them. Harm breakers have zero false-positive tolerance — better to stop a safe agent than allow a harmful one to proceed.
+
+## Time-Based Circuit Breakers
+
+Agents have a time budget. Tasks should complete in seconds or minutes, not hours. If an agent runs for 30 minutes without completing, something is wrong. Time-based circuit breakers enforce maximum runtime.
+
+Wall-clock timeouts are simple. Set a maximum runtime — say 5 minutes. Start a timer when the agent begins. If the timer expires before the agent terminates, trip the circuit breaker. Stop the agent. Return a timeout error. This prevents agents from running indefinitely and consuming resources.
+
+Progress-based timeouts are smarter. If the agent is making progress — completing tool calls, changing state, moving toward a goal — allow more time. If the agent is stalled — repeating actions, not changing state — trip the breaker early. You track tool call frequency. If the agent goes more than 60 seconds without making a tool call, trip the breaker. The agent is stuck thinking or waiting for something that will never arrive.
+
+Idle detection catches agents waiting on external dependencies. If the agent calls a tool and waits for a response, you track the wait time. If a single tool call takes more than 30 seconds, trip the breaker. Either the tool is broken or the agent called it with bad arguments. Do not wait indefinitely for a response that may never come.
+
+Dynamic timeout adjustment handles variable task complexity. Simple tasks get 1-minute timeouts. Complex tasks get 10-minute timeouts. You set the timeout based on task metadata at agent invocation. This prevents false positives — stopping agents that are legitimately working on hard problems — while still catching truly stuck agents.
+
+## The Intervention Problem: Safely Stopping In-Progress Agents
+
+Stopping an agent mid-execution is not trivial. The agent might be holding locks, have pending transactions, or be in the middle of a multi-step operation. You cannot just kill the process. You need graceful shutdown.
+
+Graceful shutdown starts with a stop signal. When a circuit breaker trips, you set a stop flag that the agent checks between actions. After each tool call, the agent checks if the stop flag is set. If so, it stops making new tool calls, finalizes any pending operations, and terminates cleanly. This prevents leaving systems in inconsistent states.
+
+Forced termination is the fallback. If the agent does not respond to the stop signal within 10 seconds, you forcibly terminate it. You kill the process, roll back any open transactions, release any held locks, and log the forced shutdown. Forced termination is dangerous — it can leave systems in bad states — but it's necessary when graceful shutdown fails.
+
+Cleanup hooks run after termination. When an agent stops, you run cleanup logic to release resources, log final state, and alert on-call if necessary. Cleanup hooks ensure that circuit breaker trips do not leak resources or leave silent corruption behind.
+
+Resumability is rare but valuable. Some tasks can be resumed after a circuit breaker trip. If an agent was uploading a large file and hit a time limit, you can resume the upload from where it left off. Most agent tasks are not resumable — they depend on ephemeral state that disappears at termination. But when resumability is possible, you persist agent state at regular checkpoints. After a circuit breaker trip, you resume from the last checkpoint instead of starting over.
+
+## Agent-Specific Recovery Strategies
+
+When agent circuit breakers trip, recovery depends on the failure mode. Loop failures require code fixes. Cost explosions require budget increases or task redesigns. Harm breakers require human review. Time limits require faster tools or simpler tasks.
+
+Automatic retries are rarely safe for agents. Retrying an agent that looped once will likely cause it to loop again. Retries make sense only when the failure was clearly transient — a network blip, a temporary rate limit. Most agent circuit breaker trips indicate systemic problems that retries will not fix.
+
+Human escalation is the default recovery path. When a circuit breaker trips, you surface the failure to a human operator. The operator reviews the agent's actions, identifies the problem, and decides whether to retry with adjustments, redesign the task, or handle it manually. This is slower than automatic recovery but much safer.
+
+Degraded mode is sometimes viable. If an agent hits a cost limit before completing a task, you might return a partial result and let the user decide whether to pay more to finish. If an agent hits a time limit, you might return the work completed so far and offer to continue later. Degraded mode requires tasks that are naturally decomposable and results that are useful even when incomplete.
+
+Agent circuit breakers are fundamentally different from model or retrieval breakers. They monitor behavior across time and actions, enforce budgets for cost and risk, and stop autonomous systems before they cause harm. They are the reason some teams can deploy agents to production with confidence. Next, we look at nested circuit breakers — what happens when you have breakers at multiple levels of a complex system and need to coordinate their behavior.
+
+---
+
+**Next: 3.6 — Nested Circuit Breakers: Managing Multi-Layer Dependencies**

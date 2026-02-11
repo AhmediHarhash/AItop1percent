@@ -1,0 +1,119 @@
+# 3.6 — Nested Circuit Breakers: Managing Multi-Layer Dependencies
+
+Your production AI system has circuit breakers at the model provider layer, the retrieval layer, the agent layer, and the application layer. When one trips, what happens to the others? In February 2025, an enterprise document automation platform discovered the answer the hard way. Their vector database circuit breaker tripped due to high latency. This caused their RAG circuit breaker to trip. This caused their agent circuit breaker to trip because agents could not retrieve context. This caused their application-level circuit breaker to trip because all agents were failing. Within 90 seconds, every circuit breaker in the system was open. The vector database recovered after two minutes. The circuit breakers took 15 minutes to reset, cascading back up through layers. Users saw 15 minutes of downtime for a 2-minute database hiccup. The circuit breakers amplified the failure instead of containing it.
+
+Nested circuit breakers are circuit breakers within circuit breakers. Your system has multiple dependency layers. Each layer has its own circuit breaker monitoring its own health. When inner breakers trip, outer breakers must decide whether to trip in response. When inner breakers reset, outer breakers must decide whether to reset. Coordination failures cause cascading trips or delayed recovery. Getting this right is the difference between resilience and fragility.
+
+## The Nesting Problem
+
+Modern AI systems are layered architectures. At the bottom, you have infrastructure — model providers, vector databases, external APIs. In the middle, you have components — retrieval pipelines, agents, routers. At the top, you have applications — user-facing features, workflows, integrations. Each layer depends on the layer below.
+
+Circuit breakers naturally nest with these layers. The model provider circuit breaker monitors OpenAI API health. The retrieval circuit breaker monitors your RAG pipeline, which depends on embeddings from OpenAI. The agent circuit breaker monitors your agent, which depends on retrieval. The application circuit breaker monitors your feature, which depends on agents. Four layers, four circuit breakers.
+
+The nesting problem is coordination. When the model provider breaker trips, should the retrieval breaker trip too? Retrieval depends on embeddings. If embeddings are unavailable, retrieval will fail. Tripping the retrieval breaker preemptively prevents wasted calls. But maybe embeddings are unavailable, and retrieval has a fallback to keyword search. If the retrieval breaker trips immediately, you lose the fallback option.
+
+When the retrieval breaker trips, should the agent breaker trip? Agents depend on retrieval for context. If retrieval is unavailable, agents might produce lower-quality outputs or hallucinate. But maybe the agent can proceed without retrieval for some tasks. If the agent breaker trips immediately, you lose the ability to handle retrieval-independent tasks.
+
+When the agent breaker trips, should the application breaker trip? Applications depend on agents to complete tasks. If agents are unavailable, the application might fail. But maybe the application has a non-agent fallback — a rules-based system, a manual workflow, a cached response. If the application breaker trips immediately, you lose the fallback.
+
+Nesting creates coupling. Inner breaker state affects outer breaker behavior. Outer breaker state affects recovery timing. You must decide how tightly to couple breakers and how much independence to preserve.
+
+## Propagation: When Inner Breaker State Affects Outer Breakers
+
+Propagation is the rule that decides whether outer breakers trip when inner breakers trip. You have three propagation modes: immediate, delayed, and independent.
+
+Immediate propagation means outer breakers trip instantly when inner breakers trip. If the model provider breaker opens, the retrieval breaker opens immediately. If the retrieval breaker opens, the agent breaker opens immediately. This is the safest approach. It prevents wasted calls to components that depend on failed dependencies. It fails fast at every layer. The downside is loss of fallback opportunities. If retrieval has a non-LLM fallback, immediate propagation prevents using it.
+
+Delayed propagation means outer breakers wait before tripping in response to inner breaker state. If the model provider breaker opens, the retrieval breaker waits 30 seconds before opening. During that 30 seconds, retrieval attempts proceed. If they fail consistently, the retrieval breaker trips. If they succeed using fallbacks, the retrieval breaker stays closed. Delayed propagation preserves fallback opportunities. The downside is wasted calls during the delay window. You send requests to systems you suspect are failing, hoping fallbacks work.
+
+Independent propagation means outer breakers ignore inner breaker state entirely. Each breaker monitors only its own component's health. If the model provider breaker trips, the retrieval breaker does not react. Retrieval attempts continue. They either succeed via fallbacks or fail on their own merits. Only after retrieval itself shows sustained failure does its circuit breaker trip. Independent propagation maximizes fallback usage. The downside is cascading failures. If fallbacks do not exist or do not work, you waste time and resources attempting doomed calls at every layer.
+
+Most systems use a mix. Critical dependencies get immediate propagation. If the model provider is down and you have no fallback embedding model, trip the retrieval breaker immediately. Optional dependencies get delayed or independent propagation. If the reranker is down but vector search works, let the retrieval breaker stay closed and skip reranking.
+
+Propagation rules are configured per dependency. You define which inner breakers should cause which outer breakers to trip and with what delay. A configuration might say: "If model-provider breaker is open for more than 1 minute, trip retrieval breaker. If retrieval breaker is open, do not trip agent breaker — let agents attempt and fail naturally."
+
+## Independence: When Breakers Operate Without Coordination
+
+Independence is the opposite of propagation. Some circuit breakers should never affect others. They monitor orthogonal concerns and should fail independently.
+
+Horizontal independence applies to sibling components. Your system might use two retrieval pipelines — one for document search, one for FAQ lookup. Each has its own circuit breaker. If the document search breaker trips, the FAQ breaker should not trip. They share no dependencies. Failures are independent. Coupling their breakers would cause unnecessary outages.
+
+Vertical independence applies when upper layers have non-dependent fallbacks. Your application might support both agent-based and rules-based workflows. The agent circuit breaker monitors agent health. The application circuit breaker monitors overall feature health. If the agent breaker trips, the application breaker should not trip — the application can fall back to rules. The breakers operate independently because the dependency is optional, not mandatory.
+
+Partial independence applies when some operations depend on an inner component and others do not. Your agent might use retrieval for some tasks and skip it for others. If the retrieval breaker trips, the agent breaker should not trip — but the agent should stop attempting retrieval-dependent tasks. You implement partial independence with task-level routing. The agent checks retrieval breaker state before attempting retrieval-dependent tasks. If the breaker is open, the agent skips those tasks or returns errors for them. Non-retrieval tasks proceed normally.
+
+Independence is valuable because it prevents overreaction. If every circuit breaker trips in response to any failure anywhere, your system becomes brittle. A minor component failure causes system-wide outage. Independence preserves availability for unaffected components.
+
+## The Cascade Trip Problem
+
+The cascade trip problem is what happened to the document automation platform. One circuit breaker trips. This causes another to trip. This causes another to trip. Within seconds, every breaker in the system is open. The system is completely offline despite only one component actually failing.
+
+Cascade trips happen when propagation rules are too aggressive. If every circuit breaker immediately trips when any inner breaker trips, you get full-system failure from single-component failure. This is appropriate only when every component is a hard dependency with no fallbacks. Most systems have more graceful degradation options.
+
+Preventing cascade trips requires breaking propagation chains. You identify which circuit breakers are true hard dependencies and which are soft. Hard dependencies get immediate propagation. Soft dependencies get delayed or no propagation. This creates firebreaks in the propagation chain. If a leaf-level breaker trips, the trip propagates up a few levels but stops before reaching the application level.
+
+Threshold-based propagation helps. Instead of tripping immediately when an inner breaker trips, require multiple inner breakers to trip or require sustained inner breaker open state. For example: "Trip retrieval breaker only if both embedding breaker and vector DB breaker are open for more than 1 minute." This prevents transient inner failures from causing outer failures.
+
+Health checks at every level provide independent signals. Instead of relying solely on inner breaker state, each circuit breaker runs its own health checks. The retrieval breaker checks end-to-end retrieval success rate, not just whether embeddings and vector DB are available. If retrieval is succeeding despite an inner breaker being open — perhaps due to fallbacks — the retrieval breaker stays closed. This decouples outer breaker state from inner breaker state.
+
+Manual override capability is your escape hatch. If circuit breakers cascade trip and you know the underlying issue is resolved, you should be able to manually reset breakers without waiting for automatic recovery. This requires operator access to circuit breaker state and the ability to force breakers closed. Use this sparingly — manual overrides bypass safety mechanisms — but have it available for cascade trip scenarios.
+
+## Coordination Strategies for Nested Breakers
+
+Coordination means circuit breakers at different levels communicate their state and intentions. This prevents race conditions and conflicting decisions.
+
+Shared breaker state means circuit breakers expose their state to other breakers. Each breaker publishes whether it's open, half-open, or closed. Other breakers subscribe to this state. When making trip decisions, a breaker checks the state of breakers it depends on. If an inner breaker is open, the outer breaker factors this into its decision. Shared state enables propagation rules without tight coupling.
+
+State hierarchy means breakers are aware of their position in the dependency tree. A breaker knows which breakers are upstream (dependencies) and which are downstream (dependents). When tripping, a breaker can notify downstream breakers. When resetting, a breaker can wait for upstream breakers to reset first. Hierarchy enables ordered recovery.
+
+Coordination logs capture breaker interactions. When a breaker trips, it logs which breakers it notified and how they responded. When a breaker resets, it logs which upstream breakers are open and whether it's waiting for them. Coordination logs make debugging cascade trips possible. Without them, you see breakers tripping but cannot trace causality.
+
+Health check deduplication prevents redundant checks. If the model provider breaker runs a health check against OpenAI every 10 seconds, the retrieval breaker does not need to run its own OpenAI health check. It can subscribe to the model provider breaker's health check results. Deduplication reduces load on dependencies and ensures consistency — all breakers see the same health signals.
+
+## Priority and Precedence Rules
+
+When multiple circuit breakers want to trip or reset simultaneously, priority rules determine the order. Priority prevents race conditions and ensures critical breakers trip first.
+
+Safety priority means circuit breakers that prevent harm take precedence over circuit breakers that prevent cost or latency issues. If an agent harm breaker wants to trip at the same time as an agent cost breaker, the harm breaker trips first. Harm is worse than cost. The agent stops before causing damage, even if cost is also out of control.
+
+Dependency priority means upstream breakers trip before downstream breakers. If the model provider breaker and the retrieval breaker both want to trip, the model provider breaker trips first. This makes sense — the model provider failure is the root cause. Tripping it first provides clearer signal to operators. Downstream breakers can decide whether to trip based on upstream breaker state.
+
+Recovery priority means downstream breakers reset before upstream breakers. If both the model provider breaker and the retrieval breaker are open, the retrieval breaker resets first once the model provider recovers. This ensures that when upstream dependencies recover, downstream components are ready to use them immediately. You do not wait for layer-by-layer recovery.
+
+Application-level priority means user-facing circuit breakers take precedence during recovery. If you have limited capacity after a partial outage, you prioritize resetting breakers that affect user-facing features over breakers that affect internal tools. Users come first.
+
+Precedence rules are configured globally. You define a priority ordering for all circuit breakers in your system. When multiple breakers want to trip or reset simultaneously, the system consults the precedence ordering. Higher-priority breakers act first. Lower-priority breakers wait or adjust their behavior based on higher-priority breaker state.
+
+## Observability Across Nested Breakers
+
+Debugging nested circuit breaker behavior requires visibility into every layer. You cannot just look at application-level metrics. You need to trace failures through the full dependency tree.
+
+Circuit breaker dashboards show state for all breakers in one view. You see which breakers are open, which are closed, which are half-open. You see trip counts, reset counts, time in each state. You see health check pass/fail rates. This dashboard is your system's nervous system. When something is wrong, you look at the dashboard first.
+
+Dependency graph visualization shows how breakers are nested. You render a graph with nodes for each breaker and edges for propagation rules. When a breaker trips, the graph highlights which breakers it affected. When a breaker resets, the graph shows which upstream breakers it's waiting for. Visual dependency graphs make complex nesting understandable.
+
+Trace propagation through breakers attaches breaker state to request traces. When a request fails, the trace shows which circuit breakers were open at the time and whether they contributed to the failure. If a request failed because the retrieval breaker was open, the trace shows the breaker state, the trip reason, and the timestamp of the trip. Trace propagation connects user-facing errors to root-cause breaker state.
+
+Breaker event logs record every state transition. When a breaker trips, you log the trip reason, the health check results that triggered it, the breakers it notified. When a breaker resets, you log the reset conditions, the health checks that passed, the breakers that were notified. Event logs are your audit trail. They make post-mortems possible.
+
+Alerting on cascade trips triggers when multiple breakers trip within a short time window. If three or more breakers trip within 60 seconds, alert on-call. Cascade trips indicate propagation rule problems or system-wide failures. They require immediate investigation. Single breaker trips are routine. Cascade trips are incidents.
+
+## Testing Nested Circuit Breaker Behavior
+
+Testing nested breakers is harder than testing single breakers. You must test propagation rules, coordination logic, and recovery ordering. You cannot test this in production without causing outages.
+
+Chaos testing injects failures at different layers and verifies breaker behavior. You simulate model provider failures and check that retrieval breakers propagate correctly. You simulate retrieval failures and check that agent breakers respond appropriately. You simulate cascade trip scenarios and verify that firebreaks prevent full-system failure. Chaos testing runs in staging environments with production-like traffic.
+
+State transition testing verifies every breaker transition. You force a breaker into each state — closed, open, half-open — and verify that dependent breakers react correctly. You test propagation delays, independence rules, and priority ordering. State transition testing is exhaustive. Every breaker state, every propagation rule, every priority rule gets tested.
+
+Recovery ordering tests verify that breakers reset in the correct order. You trip multiple breakers, then restore health at the lowest layer. You verify that breakers reset layer by layer in the correct sequence. You check that downstream breakers do not reset before upstream breakers are healthy.
+
+Race condition testing simulates simultaneous breaker events. You trip two breakers at the same instant and verify that priority rules determine the outcome. You reset two breakers simultaneously and verify that recovery ordering is respected. Race condition testing finds coordination bugs that only appear under concurrent load.
+
+Load testing with breaker trips verifies that your system remains stable when breakers trip under load. You run high request volume and inject failures. You check that tripping breakers does not cause memory leaks, thread exhaustion, or cascading timeouts. You verify that resetting breakers under load does not cause thundering herd problems.
+
+Nested circuit breakers are essential for complex AI systems. They prevent single-component failures from causing system-wide outages. They enable graceful degradation and fast recovery. But they require careful coordination, clear propagation rules, and thorough testing. Get nesting right, and your system is resilient. Get it wrong, and your circuit breakers become the failure mode. Next, we examine how circuit breakers manage state — tracking failure history, learning from patterns, and adapting thresholds over time.
+
+---
+
+**Next: 3.7 — Circuit Breaker State Management and Adaptation**

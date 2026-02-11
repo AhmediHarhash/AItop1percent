@@ -1,0 +1,85 @@
+# 7.2 — State Recovery for Conversational and Agent Systems
+
+Most software is stateless. A REST API receives a request, processes it, returns a response, and forgets the request ever happened. When the API crashes and restarts, it resumes operation with no memory of prior requests. Recovery is trivial — restart the service, wait for health checks to pass, restore traffic. Conversational AI and agent systems are not stateless. They maintain memory of prior interactions, context about ongoing tasks, learned preferences, and long-running workflows. When these systems fail, state is lost, corrupted, or inconsistent. Recovery is not just restarting a process. It is reconstructing state, validating that the reconstructed state is correct, and ensuring users experience continuity rather than amnesia.
+
+In August 2025, a customer support agent system crashed during a database migration. The migration was supposed to be seamless, but a lock timeout caused the agent orchestration service to lose connection to the memory store for fourteen minutes. During those fourteen minutes, 400 conversations were in progress. When the system recovered, the agents had no memory of those conversations. Users who had been mid-conversation with an agent about a billing issue returned to find the agent asking "How can I help you today?" as if the previous exchange had never happened. Users had to re-explain their problems, re-provide account information, and re-answer questions. The company's support satisfaction score dropped by 22 points that week. The technical failure lasted fourteen minutes. The user experience failure lasted until every affected user either re-engaged or gave up in frustration. The incident was resolved in fourteen minutes. Recovery took three days.
+
+## What State Do AI Systems Maintain
+
+State is any information the system remembers between interactions. For conversational AI, state includes conversation history — the sequence of user messages and assistant responses that provide context for the current exchange. It includes user preferences — tone, verbosity, formality. It includes factual information the user provided earlier in the conversation, like account numbers, dates, or names. It includes the conversation's goal or intent — is the user troubleshooting a problem, seeking information, or completing a transaction?
+
+For agent systems, state is more complex. Agents maintain task state — the sequence of steps in a workflow, what has been completed, what remains. They maintain external system state — which APIs have been called, what data has been retrieved, what side effects have been triggered. They maintain decision history — what the agent tried, what worked, what failed, and what it learned from each attempt. They maintain memory across sessions — not just this conversation, but all prior interactions with this user or on this task.
+
+When an AI system fails, this state is at risk. It might be lost entirely if the memory store crashes. It might be inconsistent if the failure happens mid-write and only part of the state is persisted. It might be corrupted if the failure leaves the system in an undefined state and the agent resumes operation based on incorrect assumptions.
+
+## The Amnesia Problem
+
+The most obvious state recovery failure is amnesia — the system forgets everything. The user returns to a conversation expecting continuity and instead gets a greeting as if they are a new user. The agent system that was halfway through booking a flight forgets the user's destination, dates, and seat preferences and starts over. The RAG-backed assistant that was answering a multi-turn question forgets the context of the earlier turns and gives an answer that makes no sense.
+
+Amnesia is particularly damaging in long-running interactions. A user who spent twenty minutes working with an agent to troubleshoot a technical issue does not want to start over. A user who provided sensitive information — a social security number, a password reset token — does not want to provide it again, and often cannot because the token has expired. A user who was promised a specific outcome — "I'll book that reservation for you" — returns expecting the task to be complete and finds no record of the request.
+
+The user experience failure is compounded by the fact that users cannot tell whether the system forgot or is pretending not to remember. Conversational AI often says "I don't have access to prior conversations" when it does but retrieval failed, or "Let me help you with that" when it has no idea what "that" refers to. The ambiguity erodes trust. Users stop believing the system will remember anything, so they stop investing effort in training it or providing context.
+
+## State Recovery Architecture
+
+Stateful AI systems must be designed with state recovery as a first-class requirement. This means state is persisted durably, not just held in memory. It means state writes are transactional or idempotent so that partial writes do not leave the system in an inconsistent state. It means state is versioned so that if recovery requires rolling back to a prior version, the system knows which version is safe. It means state is replicated so that the failure of a single node does not lose all memory.
+
+The persistence layer for conversational state is typically a database — relational, document, or key-value, depending on the structure of the state. Each conversation has a unique identifier. Each turn in the conversation is appended to the conversation record. When the system crashes and restarts, it loads conversation state from the database and resumes as if nothing happened. But this architecture only works if writes to the database complete before the system acknowledges the response to the user. If the system responds to the user, then crashes before writing state, the user believes the conversation progressed but the system has no record. The next interaction starts from the wrong context.
+
+Transactional writes solve this problem. The system writes the new state, waits for the database to confirm the write succeeded, then returns the response to the user. If the system crashes before the database confirms, the write does not complete, and the user does not receive the response. The next interaction resumes from the last confirmed state. This is correct behavior — the user and the system agree on what happened.
+
+Idempotent writes are an alternative when transactions are too slow. The system assigns each conversation turn a unique identifier. If the system crashes after sending the response but before confirming the state write, the retry on restart uses the same identifier. The database recognizes the duplicate write and ignores it. The conversation state is consistent even if the write happens twice.
+
+## Conversation History Recovery
+
+When a conversational system recovers from a failure, it must load conversation history for every active conversation. This is straightforward in design but operationally complex at scale. If thousands of conversations are active when the system fails, recovery requires thousands of database queries to load state. If these queries are synchronous and sequential, recovery is slow. If they are parallel, the database is overwhelmed and recovery still fails.
+
+The solution is lazy loading. The system does not load all active conversations at startup. It loads conversation state on-demand when a user sends a new message. The first message after recovery experiences slightly higher latency while state loads, but recovery completes in seconds rather than minutes. The trade-off is acceptable because the alternative is extended downtime while state preloads.
+
+Lazy loading requires the system to distinguish between "new conversation" and "existing conversation with no state loaded yet." If the system treats every conversation as new during recovery, users experience amnesia. The correct behavior is to check for conversation history on every incoming message. If history exists and is not yet loaded, load it. If history does not exist, treat it as a new conversation.
+
+## User Session State Recovery
+
+Session state is shorter-lived than conversation state. It includes information that is only relevant for the current interaction session — context from the past few messages, the user's current intent, intermediate results from multi-step reasoning. Session state is often held in memory for performance. When the system crashes, session state is lost. This is acceptable for session-scoped data — the next interaction starts a new session. But the system must communicate this to the user.
+
+A user who was in the middle of a multi-turn interaction expects the system to remember the context from earlier in the session. If session state is lost, the system must acknowledge the discontinuity rather than pretending continuity exists. A graceful degradation message might be: "I apologize, I lost context from earlier in our conversation. Could you remind me what you were asking about?" This is better than giving an answer that ignores the earlier context and confuses the user.
+
+Session state recovery is more complex for systems where session state includes expensive computation. If the system spent thirty seconds retrieving and synthesizing documents to answer the first part of a multi-turn question, losing that session state means re-doing the computation when the user asks the follow-up. The user experiences high latency and does not understand why. The solution is to persist intermediate results — not as permanent conversation history, but as temporary cache with a TTL. If the system crashes and restarts, it can reload cached intermediate results and resume the session without re-computation.
+
+## Agent Memory Reconstruction
+
+Agent systems maintain more complex state than conversational systems. An agent orchestrating a multi-step workflow must remember not just the conversation history, but the task plan, the steps completed, the results of external API calls, the decisions made at each branch point, and the state of external systems. Reconstructing agent memory after a failure is a multi-layer problem.
+
+The task plan is recoverable if it was persisted when created. When the agent starts a task, it writes the plan to durable storage. When the system recovers, the agent loads the plan and sees what steps remain. But the plan is not sufficient. The agent also needs to know which steps completed successfully and what their results were. If the agent calls an external API, receives a response, then crashes before persisting the response, the next iteration does not know whether to retry the API call or proceed to the next step.
+
+The solution is to persist state after every step. When the agent completes a step — calls an API, retrieves a document, makes a decision — it writes the result to storage before proceeding. This is slow, so high-performance agent systems batch writes or use asynchronous persistence. But some form of persistence is necessary. Without it, the agent has no reliable memory of what happened.
+
+External system state is more difficult. If the agent booked a flight reservation, then crashed before persisting the confirmation number, recovery is ambiguous. Did the reservation succeed? The agent cannot tell by looking at its own state. It must query the external system to check. This is a common failure mode — the agent retries the reservation because it has no memory of success, and the external system books a duplicate reservation.
+
+The solution is idempotency tokens. When the agent calls an external API, it includes a unique token identifying the request. If the agent crashes and retries, the external system sees the duplicate token and returns the original result rather than executing the request twice. This requires cooperation from the external API, which is not always available. When idempotency is not possible, the agent must query the external system's state to determine whether the action succeeded before retrying.
+
+## Graceful Degradation When State Is Lost
+
+Not all state is recoverable. If the memory store itself fails and backups are unavailable, state is lost permanently. If the failure corrupts the state and the corruption is not detected until after healthy state is overwritten, recovery to a prior version may not be possible. In these scenarios, the system must degrade gracefully rather than fail catastrophically.
+
+Graceful degradation means acknowledging the state loss to users, providing partial functionality based on whatever state is available, and allowing users to re-establish context manually. A conversational assistant that loses state might say: "I'm sorry, I lost track of our conversation. I can still help, but I'll need you to provide some context again." An agent system that loses task state might say: "I was working on booking your reservation, but I lost track of the details. Can you confirm your destination and dates?"
+
+This is not ideal, but it is vastly better than pretending the state still exists and giving incorrect responses based on missing or corrupted data. Users can recover from acknowledged state loss. They cannot recover from the system lying about what it remembers.
+
+Partial functionality is another form of graceful degradation. If conversation history is lost but user preferences are intact, the system uses the preferences. If task plan is lost but external system state is intact, the agent queries the external system to determine what actions have already been taken. The system operates at reduced capability until full state is recovered.
+
+## State Validation After Restore
+
+Restored state is not necessarily correct state. The recovery process might load stale state, load state from the wrong conversation, or load state that was partially written and is inconsistent. State validation is a required step after restore. The system checks that the loaded state is plausible, consistent, and fresh enough to use.
+
+Plausibility checks detect obviously invalid state. If the loaded conversation history claims to have 10,000 turns, it is likely corrupted. If the loaded task plan has circular dependencies or references steps that do not exist, it is invalid. If timestamps are in the future or decades in the past, the state is suspect.
+
+Consistency checks detect state that is internally contradictory. If the conversation history says the user provided their account number in message five, but the extracted account number field is empty, the state is inconsistent. If the task plan says step three is complete, but the result of step three is missing, the state is invalid.
+
+Freshness checks detect state that is too old to be useful. If the conversation was active six months ago and has been idle since, the loaded state is unlikely to be relevant to a new message from the user. If the task plan was created weeks ago and the external systems it references have changed, the plan is stale.
+
+When state validation fails, the system does not use the invalid state. It treats the conversation or task as new and informs the user of the discontinuity. This is safer than proceeding with bad state, which leads to confusing or incorrect behavior.
+
+Recovery for stateful AI systems is an engineering discipline that separates production-grade systems from prototypes. The systems that recover well persist state durably, load it correctly, validate it thoroughly, and degrade gracefully when recovery is incomplete. The systems that recover poorly leave users confused, frustrated, and distrustful. Recovery is not an afterthought. It is a design requirement from day one.
+
+Next, we examine the specific problem of agent state corruption — when memory is not just lost, but actively wrong, poisoned by failed interactions or bad feedback.

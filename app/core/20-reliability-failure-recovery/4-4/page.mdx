@@ -1,0 +1,91 @@
+# 4.4 — Cached Response Fallbacks: When Any Answer Beats No Answer
+
+A customer service AI went down at 9:17 AM Pacific on a Monday in November 2025. The primary model provider was experiencing elevated error rates—not a full outage, just enough instability that 40% of requests were timing out. The company's fallback chain kicked in: retry once, then route to a secondary provider. But the secondary provider was also experiencing latency issues that morning. Within eight minutes, the entire customer service interface was showing error messages. No responses. No help. Just apologies.
+
+The support queue exploded. Live chat requests quintupled. Phone lines jammed. The company had a cache of 340,000 previously successful responses stored from the past six months, semantically indexed and ready to serve. But the fallback logic didn't include cached responses—it only tried live model providers. When both failed, the system failed. Any answer would have been better than no answer. Most customer questions that morning were variations of questions the system had successfully answered hundreds of times before.
+
+## When Cached Responses Are the Right Fallback
+
+Cached response fallbacks work when the cost of staleness is lower than the cost of unavailability. Not every AI system can tolerate cached responses. A medical diagnosis system cannot serve six-month-old diagnostic reasoning. A financial fraud detection system cannot rely on cached decisions about new transactions. But many customer-facing systems can serve cached responses during outages without material harm.
+
+The decision depends on three factors: query repeatability, acceptable staleness, and user expectations. If your users ask the same questions repeatedly, if those questions have stable answers, and if your users would prefer an older correct answer to no answer at all, cached responses belong in your fallback chain. Customer support, documentation retrieval, internal knowledge bases, and informational chatbots all fit this pattern. Real-time decision systems, personalized recommendations based on recent behavior, and systems where freshness is a regulatory requirement do not.
+
+The test is simple: would you rather tell the user "the system is down, try again later" or "here's an answer from our knowledge base that may help"? If the second option is better, build cached response fallback.
+
+## Cache Key Design for Semantic Similarity
+
+The naive approach to cached response fallback uses exact query matching. User asks "how do I reset my password," system looks for that exact string in the cache, finds a match, returns the cached response. This works for maybe 5% of queries. The other 95% use different phrasing, different word order, different punctuation, or ask the same question with added context.
+
+Effective cache key design for fallback responses uses semantic similarity, not exact matching. You embed the incoming query using the same embedding model you use for retrieval, then search your cache for the most semantically similar previous query. If the similarity score exceeds a threshold—commonly 0.88 to 0.92 for fallback use—you return the cached response associated with that previous query.
+
+This requires maintaining two data structures: the cache of query-response pairs and an embedding index of all cached queries. When the primary system fails and the request reaches the cached response fallback layer, you embed the new query, search the embedding index for the nearest neighbor, retrieve the similarity score, and if it exceeds the threshold, return the cached response. If no cached query is similar enough, the fallback fails and the request moves to the next fallback layer.
+
+The similarity threshold matters. Set it too low and you serve responses that don't match the user's question. Set it too high and the cache hit rate drops to single digits, making the fallback useless. The right threshold depends on your domain and your tolerance for mismatch. Start at 0.90, measure cache hit rate and user feedback during fallback events, and adjust. Most systems land between 0.87 and 0.93.
+
+## Staleness Versus Availability Tradeoffs
+
+Cached responses are stale by definition. The question is how stale and whether that staleness matters. A cached response from three hours ago is effectively identical to a fresh response for most informational queries. A cached response from three months ago may contain outdated information—old pricing, deprecated features, changed policies.
+
+The staleness window defines how old a cached response can be before it's excluded from fallback. Some teams set this at 24 hours, re-caching only today's successful responses and discarding older ones overnight. Others set it at 30 days, accepting that policies and features change slowly enough that month-old responses are usually still correct. Others segment by query type: FAQs tolerate 90-day staleness, product-specific questions tolerate 7-day staleness, account-specific questions are never cached.
+
+The tradeoff is direct. Shorter staleness windows mean fresher responses but lower cache hit rates during fallback. Longer staleness windows mean higher hit rates but more risk of serving outdated information. The worst outcome is serving cached information that's not just old but wrong—telling a user a feature exists when it was deprecated two months ago, giving pricing that's no longer accurate, referencing a process that changed.
+
+Track this during normal operations, not just during fallback. Log every cache-eligible query during successful operation and check whether the cache contains a response above the similarity threshold and within the staleness window. This gives you the fallback hit rate you'd see during an outage. If it's below 40%, your staleness window is too short or your cache isn't large enough. If it's above 85%, you have room to tighten the staleness constraint.
+
+## Cache Warming Strategies
+
+A cold cache is a useless fallback. If you enable cached response fallback after the outage starts, it takes minutes to hours to build a useful cache, and by then the outage may be over. Cached response fallbacks require warm caches maintained continuously during normal operation.
+
+The simplest warming strategy is write-through caching: every successful response gets written to the fallback cache with a timestamp and the query embedding. This keeps the cache current with zero additional work. The downside is cache size—if you serve 10 million queries per day, your cache grows by 10 million entries per day, and most of them are duplicates or near-duplicates. Within a week, the cache is unwieldy and search performance degrades.
+
+The better approach is selective caching with deduplication. Before writing a successful response to the fallback cache, check whether a semantically similar query already exists. If the similarity score exceeds 0.95, skip the write—you already have a cached response for this query. If no similar query exists, write the new entry. This keeps the cache size manageable while covering the query space.
+
+Cache warming during low-traffic periods is another pattern. Some teams run nightly jobs that identify the 10,000 most common queries from the past 30 days, generate fresh responses for each, and write them to the fallback cache. This ensures the most frequently asked questions always have recent cached responses. The downside is cost—you're running inference on 10,000 queries per night even when the system is stable. The upside is guaranteed coverage of high-frequency queries during fallback.
+
+## The Freshness Problem: When Cached Data Is Dangerously Old
+
+Not all stale responses are harmless. Some are actively dangerous. A healthcare chatbot serving cached medical advice from before a drug recall. A travel assistant serving cached flight information after schedule changes. A financial assistant serving cached regulatory guidance after rule changes. These scenarios cause real harm.
+
+The freshness problem requires explicit exclusion rules. Identify query categories where staleness is unacceptable and exclude them from cached response fallback entirely. Medical advice, financial transactions, regulatory compliance, real-time scheduling, and personalized account actions should never serve cached responses. Build a classifier or use rule-based routing to detect these query types during fallback and skip the cached response layer entirely.
+
+For queries where cached responses are acceptable, add metadata that indicates sensitivity to freshness. Mark responses that reference prices with a 7-day staleness limit. Mark responses that reference features with a 30-day limit. Mark responses that reference policies with a 90-day limit. During fallback, check both the similarity threshold and the category-specific staleness limit before serving a cached response.
+
+The hard cases are queries that mix fresh and stale components. A user asks about account balance and also asks how to reset their password. The balance requires fresh data, but the password reset instructions are stable. Serving a fully cached response is wrong because the balance is stale. The right answer is either partial response fallback—serve cached password instructions but skip the balance—or no cached response at all. This requires query decomposition during fallback, which adds latency and complexity. Most systems choose to skip cached responses entirely for mixed queries.
+
+## Communicating Cached Responses to Users
+
+Transparency is not optional. Serving a cached response during fallback without telling the user is deceptive. Users assume responses are fresh. When they discover information is outdated, they lose trust in the entire system, not just the fallback layer.
+
+The simplest transparency mechanism is a banner or label: "Our AI system is currently experiencing issues. This response is from our knowledge base and may not reflect the most recent information." This sets expectations. Users know the response may be stale. They can decide whether to trust it or wait for the system to recover.
+
+Some teams add timestamps: "This answer was generated on January 15, 2026." This gives users information to judge staleness themselves. A three-day-old answer about password reset is fine. A three-day-old answer about current pricing may not be. The user can decide.
+
+The communication should happen before the response, not after. Users read the response first, internalize it, and may not notice a disclaimer at the end. Lead with the fallback notice, then deliver the cached response. This prevents users from acting on stale information before realizing it's stale.
+
+During long outages, update the messaging over time. The first hour of fallback: "Our AI system is temporarily unavailable. Responses are from our knowledge base." After four hours: "We're working to restore full service. In the meantime, responses are from our knowledge base and may be outdated. For urgent issues, contact support directly." This escalates the transparency as the outage duration increases.
+
+## Cache Invalidation for Fallback Caches
+
+Cached responses persist until explicitly invalidated. If your product pricing changes, the fallback cache still contains responses with old pricing until you purge them. If a feature is deprecated, the cache still tells users the feature exists until you invalidate those entries. Cache invalidation is not a background concern—it's a production reliability requirement.
+
+The brute-force approach is full cache purge on every product change. This guarantees no stale information, but it also drops your cache hit rate to zero until the cache warms again. If changes happen daily, your cache is perpetually cold and the fallback is ineffective.
+
+Targeted invalidation is better. When pricing changes, identify all cached responses that mention pricing and purge only those. When a feature is deprecated, search the cache for responses mentioning that feature and remove them. This preserves the rest of the cache while eliminating known-stale information. The challenge is identifying which cache entries are affected—you need semantic search over cached responses, not just over queries.
+
+Some teams use cache versioning. Every cache entry has a version tag corresponding to the product version or knowledge base version it was generated from. When the product version increments, all cache entries with older version tags are excluded from fallback. This is simple to implement but coarse-grained—a small pricing change invalidates the entire cache if it increments the version.
+
+The pragmatic approach combines targeted invalidation for known-critical changes and time-based expiration for everything else. When pricing or major features change, purge targeted cache entries. For everything else, let the staleness window handle it. A 30-day staleness window means outdated information naturally expires within a month. This balances freshness and availability without requiring manual invalidation on every change.
+
+## Hybrid Approaches: Cached Context with Fresh Generation
+
+The most sophisticated cached response fallback doesn't serve fully cached responses—it serves cached context with fresh generation. During fallback, the system retrieves relevant documents from a cache, then generates a response using a smaller, faster model that's less likely to be affected by provider outages.
+
+This works when the primary failure is model API unavailability, not infrastructure failure. If the model provider is down but your application infrastructure is still running, you can fall back to a locally hosted or alternative-provider model that's lighter and faster. The cached context ensures you're not generating responses from scratch—you're using pre-retrieved documents that were relevant to similar queries.
+
+The pattern: during normal operation, cache not just responses but also the retrieved context that informed those responses. Store query-context pairs, not query-response pairs. During fallback, retrieve cached context for the semantically similar query, then pass that context to a fallback model for generation. The response is fresh—generated in real-time—but the retrieval step is cached.
+
+This reduces staleness risk because generation happens during fallback using current information from cached documents. If your documents are recent and your cache staleness window is short, the generated response is nearly as fresh as a normal response. The limitation is that you need a fallback model that can run during provider outages, which usually means a smaller model or a different provider, and that model may produce lower-quality responses than your primary model.
+
+Cached response fallback is not a substitute for robust infrastructure. It's a last-resort layer in the fallback chain, used when retries, secondary providers, and simplified responses all fail. But when the entire AI provider ecosystem experiences issues—as happened during several major outages in 2025—cached responses keep your application partially functional instead of completely down.
+
+The next subchapter covers partial response fallbacks: when a request involves multiple components and some fail, serve what you can instead of failing entirely.

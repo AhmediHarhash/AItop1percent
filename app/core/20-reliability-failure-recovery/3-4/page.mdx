@@ -1,0 +1,85 @@
+# 3.4 — Retrieval Circuit Breakers: When RAG Components Fail
+
+In October 2025, a legal research platform experienced what they called "the hallucination incident." Their RAG system answered user queries for two hours using only the language model's parametric knowledge — no retrieved context at all. Their vector database had degraded silently. The model generated plausible-sounding case citations that didn't exist. Three law firms cited the fake cases in draft briefs before anyone noticed. The company spent six weeks doing damage control and lost two enterprise contracts. The system had no circuit breaker to detect retrieval failure. It kept serving answers as if nothing was wrong.
+
+RAG systems have a distinct failure surface. You have embedding models that encode queries, vector databases that retrieve documents, rerankers that sort results, and the language model that synthesizes answers. Each component can fail independently. Each failure mode creates a different kind of danger. Your circuit breakers must match the failure surface.
+
+## The Retrieval Failure Surface
+
+Every RAG pipeline has at least four components that can degrade or fail. The embedding model can become slow, produce corrupted embeddings, or return errors. The vector database can experience latency spikes, partial outages, or index corruption. The reranker can time out, crash, or produce nonsense scores. The synthesis model can refuse to answer, hallucinate, or ignore retrieved context. Each failure creates different downstream effects.
+
+The embedding model is your entry point. If embeddings fail, you cannot retrieve relevant context. Some systems proceed anyway, sending the query to the language model without context. This creates the hallucination scenario — the model answers from parametric memory, and users have no way to know the answer is unsupported. Other systems refuse to answer, returning an error to the user. Both approaches have consequences. The circuit breaker decides which risk you accept.
+
+The vector database is your retrieval engine. When it degrades, you get slow responses, partial results, or complete failure. Slow retrieval means your system either waits and times out or proceeds with incomplete context. Partial results mean some relevant documents are missing, weakening answer quality. Complete failure means no context at all. Your circuit breaker must distinguish between these modes and choose appropriate fallback behavior.
+
+The reranker is your quality filter. When it fails, you either skip reranking and use raw vector search results, use a fallback reranker, or refuse to answer. Skipping reranking often means lower precision — more irrelevant documents in your context window. Fallback rerankers are simpler models that run faster but score less accurately. Refusing to answer means users get no response even though retrieval succeeded. The circuit breaker encodes this priority decision.
+
+## Embedding Circuit Breakers
+
+The embedding circuit breaker monitors your embedding model's health and decides when to stop sending queries. You track three signals: error rate, latency, and output quality. Error rate measures how often the embedding API returns failures. Latency measures how long embeddings take to generate. Output quality measures whether embeddings are semantically meaningful — some degradation modes produce valid-looking vectors that are actually garbage.
+
+Error rate thresholds are straightforward. If more than 5% of embedding calls fail in a one-minute window, trip the circuit. Send errors to users instead of proceeding without embeddings. This prevents the hallucination scenario. Users know the system is degraded. They can retry later or escalate to human help. You avoid generating confident-sounding wrong answers.
+
+Latency thresholds are context-dependent. If embeddings normally take 20 milliseconds and suddenly take 500 milliseconds, something is wrong. You set a percentile threshold — if p95 latency exceeds 5 times the baseline for two minutes, trip the circuit. This prevents your RAG system from timing out while waiting for embeddings. Users get fast errors instead of slow timeouts.
+
+Output quality is the hardest signal. Some embedding model failures produce vectors that are syntactically valid but semantically meaningless. You cannot inspect every vector in real time. Instead, you use sentinel queries — known queries with known expected neighbors. Every minute, embed a sentinel query and check if the top retrieved documents match expectations. If sentinel queries fail to retrieve expected documents three times in a row, trip the circuit. The embedding model is producing corrupted outputs.
+
+When the embedding circuit breaker trips, you have three options. Refuse to answer and return an error. Use a fallback embedding model with lower quality but higher availability. Proceed without embeddings and rely solely on keyword search. Most systems refuse to answer. The risk of hallucination outweighs the benefit of partial availability.
+
+## Vector Database Circuit Breakers
+
+The vector database circuit breaker monitors retrieval health and decides when to stop querying the index. You track error rate, latency, result count, and result quality. Error rate measures database failures. Latency measures query time. Result count measures whether you're getting fewer documents than expected. Result quality measures whether retrieved documents are relevant.
+
+Error rate thresholds work like embedding breakers. If more than 5% of queries fail in a one-minute window, trip the circuit. Database outages are binary — either the index is up or it's down. If it's down, stop querying it. Return errors to users or switch to a fallback index.
+
+Latency thresholds are tighter for vector databases because they're synchronous dependencies. If queries normally take 50 milliseconds and suddenly take 2 seconds, you're heading toward timeout cascades. Set a threshold at p95 latency exceeding 10 times baseline for one minute. Trip the circuit before timeouts propagate to user-facing requests.
+
+Result count degradation is subtle. If queries normally return 20 documents and suddenly return 3, your index might be corrupted or partially offline. You set a minimum result threshold — if more than 10% of queries return fewer than half the expected document count, trip the circuit. This catches partial index failures that don't show up as errors or latency spikes.
+
+Result quality is measured with sentinel queries, just like embeddings. Known queries should retrieve known documents. If sentinel queries fail to retrieve expected top-5 documents on three consecutive checks, trip the circuit. The index is returning garbage.
+
+When the vector database circuit breaker trips, you have four options. Return errors to users. Switch to a replica or backup index. Fall back to keyword search. Proceed without retrieval and answer from parametric knowledge. Most systems return errors or switch to replicas. Proceeding without retrieval creates hallucination risk. Keyword search is viable if you have a parallel search index, but rare in pure vector RAG systems.
+
+## Reranker Circuit Breakers
+
+The reranker circuit breaker monitors reranking health and decides when to skip reranking. You track error rate, latency, and score sanity. Error rate measures API failures. Latency measures reranking time. Score sanity measures whether reranker scores make sense.
+
+Error rate thresholds follow the same pattern. If more than 5% of reranking calls fail in one minute, trip the circuit. Rerankers are optional — you can proceed without them by using raw retrieval scores. Tripping the reranker circuit does not stop the RAG pipeline. It skips reranking and proceeds with vector search results.
+
+Latency thresholds are looser for rerankers because they're often the slowest component. If reranking normally takes 200 milliseconds and spikes to 2 seconds, you're adding latency to every query. Set a threshold at p95 latency exceeding 5 times baseline for two minutes. Trip the circuit and skip reranking to keep overall latency acceptable.
+
+Score sanity checks catch reranker degradation. Rerankers should assign higher scores to more relevant documents. If the top-scored document after reranking has a lower vector similarity score than the tenth-ranked document, something is wrong. You track score inversions — cases where reranking produces obviously worse orderings than raw retrieval. If more than 20% of queries show score inversions, trip the circuit. The reranker is producing garbage.
+
+When the reranker circuit breaker trips, you skip reranking and use raw retrieval scores. This degrades answer quality but keeps the system functional. Users get slightly worse answers instead of no answers. You log the degradation and alert on-call. Reranker failures are rarely user-visible if vector search is working.
+
+## The No-Context Degradation Mode
+
+The hardest decision in RAG circuit breaker design is what to do when retrieval completely fails. You have the user's query. You have a language model capable of generating answers. Do you proceed without context or refuse to answer?
+
+Proceeding without context means the model answers from parametric knowledge. For some queries, this is fine. For others, it's dangerous. If the user asks "What is the capital of France?" the model can answer correctly without retrieval. If the user asks "What was our revenue in Q3?" the model will hallucinate a number. You cannot reliably distinguish these cases at runtime.
+
+Most systems refuse to answer when retrieval fails completely. You return an error message explaining that the system cannot access its knowledge base. Users understand this. They retry later or contact support. You avoid generating confident-sounding wrong answers based on nothing.
+
+Some systems attempt selective degradation. They classify queries as retrieval-dependent or retrieval-independent. General knowledge questions proceed without context. Fact-based questions about specific documents refuse to answer. This requires a query classifier, which is another component that can fail. Most teams skip this complexity and refuse all queries when retrieval is down.
+
+The exception is latency-based degradation. If retrieval is slow but not failing, you might proceed with partial results. Retrieve for 500 milliseconds, then answer with whatever documents you found. This trades answer quality for latency. It works when some context is better than no context and users value speed over completeness. You must measure whether partial-context answers are better than no answers. Sometimes they're worse.
+
+## Monitoring Retrieval Health for Circuit Breaker Decisions
+
+Circuit breakers depend on accurate health signals. You need instrumentation at every layer of your RAG pipeline. Embedding calls log latency, errors, and vector checksums. Vector database queries log latency, errors, result counts, and result IDs. Reranker calls log latency, errors, and score distributions. Synthesis calls log whether the model used retrieved context or ignored it.
+
+Sentinel queries are your smoke detector. You define 10 to 20 representative queries with known expected results. Every minute, you run each sentinel query through the full RAG pipeline. You check that embeddings succeed, retrieval returns expected documents, reranking preserves expected top results, and synthesis references expected sources. If any sentinel query fails two consecutive checks, you investigate. If three consecutive checks fail, you trip circuit breakers.
+
+Percentile tracking prevents false positives. A single slow query does not indicate degradation. The p95 latency spiking for two minutes indicates degradation. You track rolling percentiles for each component — embedding p95, retrieval p50/p95/p99, reranking p95. You alert when percentiles cross thresholds sustained over time windows.
+
+Error rate tracking aggregates across all requests. You track embedding error rate, retrieval error rate, reranker error rate. You compute rates over one-minute and five-minute windows. You trip circuit breakers on one-minute windows. You alert humans on five-minute windows. This separates transient blips from sustained degradation.
+
+Health checks run continuously in the background. They do not wait for user queries. This gives you leading indicators. If sentinel queries start failing at 3:00 AM, you trip circuit breakers before users arrive at 9:00 AM. You fix the problem before it impacts users. Reactive circuit breakers wait for user queries to fail. Proactive health checks fail fast.
+
+Your monitoring system exports circuit breaker state as a metric. You track how long each circuit breaker stays open. You track how often breakers trip per day. You track whether breaker trips correlate with user-reported issues. If circuit breakers trip often but users never complain, your thresholds are too sensitive. If users complain but breakers never trip, your thresholds are too loose. You tune thresholds based on this feedback loop.
+
+Retrieval circuit breakers are your defense against RAG-specific failures. They prevent hallucination when components degrade. They degrade gracefully when possible and fail fast when necessary. They give you observability into which layer is failing. Next, we look at circuit breakers for AI agents — systems that take actions in the world and need different failure modes.
+
+---
+
+**Next: 3.5 — Agent Circuit Breakers: Stopping Runaway Autonomous Behavior**

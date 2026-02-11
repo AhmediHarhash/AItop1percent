@@ -1,0 +1,99 @@
+# 9.2 — Provider Failure Simulation
+
+Between January and March 2025, OpenAI experienced four partial outages affecting specific API endpoints. Most teams discovered during these outages that their failover logic had never been tested in production. Some discovered it had never been tested at all. Code that was supposed to route traffic to Anthropic when OpenAI returned errors instead crashed with an uncaught exception. Timeouts that were supposed to trigger after three seconds were actually set to 30 seconds, causing request queues to back up. Fallback models that were supposed to maintain quality were never validated against the same eval suite. The teams that had practiced provider failure simulation through chaos engineering handled these outages with zero user impact. The teams that assumed their failover code would work discovered it did not, in production, in front of users.
+
+Provider failure simulation is the most critical chaos experiment for any AI system that depends on external model APIs. You cannot rely on provider uptime SLAs. Every major provider has experienced outages. Your system must be able to detect provider failures, route traffic to healthy alternatives, and maintain quality and latency within acceptable bounds. The only way to verify this works is to simulate the failure before it happens for real.
+
+## Why Provider Outages Must Be Simulated
+
+Provider outages are not rare events. They are operational reality. In 2024 and 2025, every major model provider experienced at least one significant outage or degradation event. OpenAI had API latency spikes and regional availability issues. Anthropic had rate limiting tighter than documented during high-demand periods. Google's Gemini API had intermittent 503 errors during model version rollouts. Azure OpenAI had authentication failures affecting enterprise customers. These are not hypotheticals. They are events that happened to real systems serving real users.
+
+Your system must survive these events. Hoping that your failover logic works is not a strategy. The only way to verify that failover works is to test it. Provider failure simulation forces you to test the entire failover path: detecting the failure, making the routing decision, invoking the fallback provider, validating the response, and measuring whether quality and latency remain acceptable.
+
+The gaps chaos reveals are not obvious from code review. A fintech company had failover logic that looked correct on paper: if OpenAI returns an error, retry twice, then switch to Anthropic. The code passed code review. It passed integration tests in staging. Chaos testing in production revealed a fatal flaw: the retry logic introduced a 12-second delay before failing over, causing timeouts for users. The problem was not that the logic was wrong — it was that the timing was unacceptable in production. Chaos revealed what code review could not.
+
+Provider failure simulation also tests whether your system can sustain the fallback load. Your primary provider might handle 10,000 requests per hour. Your fallback provider might have rate limits that only support 3,000 requests per hour. If your primary provider goes down, can your system shed load gracefully, or does it overwhelm the fallback provider and cause both to fail? Chaos testing reveals capacity mismatches before they cause compounding failures.
+
+## Simulation Approaches
+
+There are three primary approaches to simulating provider failures: mocking, blocking, and error injection. Each has different trade-offs in realism, safety, and implementation complexity.
+
+**Mocking** replaces the real provider API with a mock service that returns errors, latency, or degraded responses according to your experiment design. Mocking is the safest approach because no real API calls are made. It is also the least realistic because it does not test the actual network path, authentication, or provider behavior. Mocking is best for early-stage chaos experiments in development or staging environments where you want to verify basic failover logic without incurring API costs or risking production traffic.
+
+A mocking setup for provider failure might return HTTP 503 errors for all requests, or return successful responses with 10-second delays, or return syntactically valid but semantically incorrect JSON. The mock service simulates the failure mode you want to test. Your system treats the mock exactly like it would treat the real provider. If your failover logic works against the mock, it is a signal that the logic might work in production. But it is not proof. Mocking cannot simulate race conditions, network partitions, or provider-specific edge cases.
+
+**Blocking** uses network-level controls to prevent your system from reaching the provider. Firewall rules, DNS overrides, or proxy configurations block traffic to the provider's API endpoints. Your system experiences connection timeouts or connection refused errors, which trigger failover logic. Blocking is more realistic than mocking because it tests the actual error handling and timeout behavior. It is also riskier because if your failover logic fails, real requests are dropped.
+
+Blocking is useful for testing full outage scenarios where the provider is completely unreachable. A logistics company used iptables rules to block all traffic to OpenAI's API during a chaos experiment. Their system correctly detected the connection failures and failed over to Anthropic within 400 milliseconds. The experiment revealed that their timeout was set to five seconds, which was too long. They reduced it to two seconds and re-ran the experiment. Failover improved to 2.1 seconds, which was acceptable.
+
+**Error injection** intercepts API responses and modifies them to simulate failures. A proxy or middleware layer sits between your system and the provider, and it injects errors, latency, or malformed responses according to the experiment design. Error injection is the most realistic approach because it tests the full network path, authentication, and provider response handling. It is also the most complex to implement because it requires infrastructure to intercept and modify traffic in flight.
+
+Error injection can simulate partial failures that are harder to test with mocking or blocking. You can inject errors for 10 percent of requests, simulating a degraded provider that is intermittently failing. You can inject random latency between one and ten seconds, simulating a provider under load. You can inject malformed JSON responses, simulating a provider bug. These scenarios test whether your system can handle partial degradation, not just full outages.
+
+## Full Outage vs Partial Degradation
+
+Full outages are the easiest failure mode to simulate and the easiest to detect. The provider returns errors or is unreachable. Your system detects the failure quickly and fails over. Full outages are also the rarest failure mode. Most real-world provider issues are partial degradation: higher latency, increased error rates, or quality drops. Chaos experiments must simulate both.
+
+Partial degradation is harder to detect and harder to respond to. If your provider's latency increases from 800 milliseconds to three seconds, do you fail over immediately or tolerate the degradation? If error rates increase from 0.1 percent to 3 percent, at what threshold do you switch providers? Chaos experiments that simulate partial degradation force you to define these thresholds and test whether your monitoring and circuit breakers respond appropriately.
+
+A customer support AI company ran a chaos experiment that gradually increased OpenAI latency from 1 second to 6 seconds over a ten-minute window. They expected their circuit breaker to trip at 3 seconds, the documented threshold. Chaos revealed it never tripped. Investigation showed the circuit breaker measured average latency across all requests, not per-request latency. Because most requests were still fast, the average stayed below the threshold even as individual requests took 6 seconds. They changed the circuit breaker to trip on p95 latency instead of average. The next chaos experiment confirmed the fix worked.
+
+Partial degradation experiments also test whether your system's response is proportional. If 5 percent of requests to your primary provider are failing, do you fail over 5 percent of traffic or all traffic? The answer depends on your quality requirements and your tolerance for split-brain scenarios where different users see different model outputs. Chaos experiments let you test both strategies and measure the trade-offs.
+
+## Testing Failover Timing
+
+Failover timing is the gap between when a failure occurs and when your system successfully routes traffic to a healthy alternative. Shorter failover timing means less user impact. Longer failover timing means more requests fail or time out. Chaos experiments measure actual failover timing, not theoretical timing.
+
+The components of failover timing: failure detection time, decision time, routing time, and connection establishment time. Failure detection time is how long it takes your system to recognize that the provider is failing. Decision time is how long it takes to choose the fallback provider. Routing time is how long it takes to send the request to the fallback. Connection establishment time is how long it takes to authenticate and receive the first response from the fallback provider.
+
+A healthcare AI company measured failover timing during chaos experiments and found surprising results. Failure detection took 200 milliseconds. Decision time took 50 milliseconds. Routing time took 30 milliseconds. Connection establishment took 4 seconds because their fallback provider authentication cached expired credentials and required a full re-authentication on first use. Total failover time: 4.3 seconds, far above their 1-second target. They implemented credential pre-warming that kept fallback provider connections authenticated and ready. Failover time dropped to 280 milliseconds. Chaos revealed what load testing never would have.
+
+Failover timing also depends on retries. If your system retries the failing provider twice before failing over, and each retry has a two-second timeout, you add four seconds to failover time. Chaos experiments reveal whether your retry logic is helping or hurting. Retries are useful for transient errors. Retries are harmful for sustained outages. The optimal retry strategy depends on the failure mode, and chaos experiments test whether your strategy is correct for the scenarios you care about.
+
+## Verifying Fallback Quality During Chaos
+
+Failover is not successful if it routes traffic to a fallback provider that produces unacceptable quality. Chaos experiments must measure quality during failover, not just availability. You need to run your eval suite against the fallback traffic and compare results to your quality thresholds.
+
+The setup: during a provider failure chaos experiment, tag all requests that are routed to the fallback provider. Run your eval suite on a sample of those requests. Measure quality, latency, and cost. Compare to your baseline metrics. If fallback quality is below your threshold, the chaos experiment failed even if availability was maintained.
+
+A fintech company ran a chaos experiment that failed over from GPT-5.2 to Claude Opus 4.5. Availability was perfect — zero errors, acceptable latency. Quality was not. Their eval suite showed that Claude outputs for financial document summarization scored 0.82 compared to 0.93 for GPT-5.2. The 11-point quality drop was below their 0.85 threshold. Chaos revealed that their fallback model was inadequate. They switched to GPT-5.1 as the fallback and re-ran the experiment. Quality improved to 0.89, which was acceptable.
+
+Quality verification during chaos also tests whether your prompts are cross-provider compatible. Prompts optimized for one provider often produce different results on another provider, even when both providers are high-quality. Instruction formatting, role definitions, and output structure expectations differ across providers. Chaos experiments reveal these incompatibilities before they affect users. If your prompts are not cross-provider compatible, failover will succeed but quality will degrade.
+
+## Provider Chaos in Staging vs Production
+
+Provider failure simulation should start in staging and eventually move to production with careful blast radius control. Staging experiments are where you discover the major gaps. Production experiments are where you verify that staging findings transfer to the real environment.
+
+Staging chaos is safer but less realistic. Staging traffic does not match production traffic patterns. Staging load is lower. Staging data might be synthetic. These differences mean that chaos results in staging are indicative but not conclusive. A failover strategy that works in staging might fail in production because production load is 10x higher, or because production prompts are more complex, or because production requests have tighter latency requirements.
+
+Production chaos is riskier but more realistic. Production chaos tests the actual system under actual conditions with actual user expectations. The blast radius controls described earlier — starting with one percent of traffic, using feature flags, having kill switches — make production chaos safe enough to be valuable. Start small, measure carefully, expand gradually.
+
+A logistics company ran provider failure chaos in staging for three months and achieved 100 percent success rate. When they ran the same experiment in production with one percent of traffic, they discovered a race condition that caused 8 percent of failover attempts to return errors. The race condition only surfaced under production load patterns. Staging chaos gave them confidence. Production chaos gave them truth.
+
+## Common Surprises from Provider Chaos
+
+Chaos experiments reveal surprises that no amount of code review or planning anticipates. Here are the most common surprises teams encounter when they simulate provider failures for the first time.
+
+**Authentication credentials expire during failover.** Your system maintains an authenticated connection to your primary provider. When you fail over to the fallback provider, the fallback connection has not been used in hours or days. The credentials have expired. Re-authentication adds seconds to failover time. The fix: pre-warm fallback connections by making low-cost test requests periodically to keep credentials fresh.
+
+**Rate limits on fallback providers are lower than documented.** You assume your fallback provider can handle the full load when your primary provider fails. Chaos reveals that the fallback provider's rate limits are lower than expected, either because the documented limits are optimistic or because you are on a lower-tier plan. The fix: verify actual rate limits through load testing or negotiate higher limits before you need them.
+
+**Failover works but costs spike.** Your primary provider costs 2 dollars per 1,000 requests. Your fallback provider costs 8 dollars per 1,000 requests. During a six-hour outage, your costs quadruple. Chaos experiments reveal the cost impact of failover and force you to decide whether the cost is acceptable or whether you need a cheaper fallback option.
+
+**Circuit breakers trip too aggressively.** You set your circuit breaker to trip after three errors. Chaos experiments reveal that transient provider errors cause the circuit breaker to trip even when the provider recovers within seconds. The fix: adjust circuit breaker sensitivity to distinguish between transient errors and sustained failures.
+
+**Monitoring does not cover failover paths.** Your dashboards show primary provider metrics. Chaos reveals that you have no dashboards for fallback provider metrics. When you fail over, you are blind. The fix: add monitoring for all failover paths before running production chaos.
+
+## Documenting Provider Chaos Results
+
+Every provider failure chaos experiment should produce documentation that future engineers can reference. The documentation should answer: What failure mode was simulated? What was the hypothesis? What actually happened? Did the system behave as expected? What gaps were discovered? What action items were created? What metrics were measured?
+
+The documentation becomes part of your incident response runbook. When a real provider outage occurs, the on-call engineer can reference the chaos documentation to understand what should happen and what to watch for. If chaos revealed that failover takes 4 seconds, the on-call engineer knows that a 4-second latency spike during an outage is expected, not a new problem. If chaos revealed that fallback quality drops by 8 percent, the on-call engineer knows to expect user complaints about accuracy and can proactively communicate the temporary degradation.
+
+Documentation also tracks improvement over time. Your first provider chaos experiment might reveal ten gaps. You fix them and re-run the experiment. It reveals three new gaps. You fix those. Eventually, chaos experiments reveal no gaps, which means your resilience is real. The documentation shows the progression from fragile to resilient. That progression is valuable for demonstrating to leadership that chaos engineering is worth the investment.
+
+A customer support company maintains a chaos log that includes experiment ID, date, failure mode, hypothesis, results, action items, and follow-up experiments. After 18 months of chaos experiments, their log contains 40 entries. Every entry represents a resilience improvement they would not have made without chaos. Every entry is a failure mode they handled gracefully in production because they had already practiced it in chaos. The log is their institutional memory for reliability.
+
+Provider failure simulation is non-negotiable for any AI system that depends on external APIs. You simulate full outages and partial degradation. You measure failover timing, quality, and cost. You run experiments in staging first, then carefully in production. You document results and fix gaps. The alternative is hoping your failover works when it matters. Hope is not a strategy. Chaos is.
+
+Next: 9.3 — Model Degradation Simulation

@@ -1,0 +1,93 @@
+# 3.3 — Provider Circuit Breakers: Detecting and Routing Around Outages
+
+On November 18, 2025, OpenAI experienced a regional outage affecting API traffic from European data centers. The status page updated 14 minutes after the outage began. By that time, a financial services company in London had already failed over to Anthropic. Their provider circuit breaker detected the spike in timeouts within 40 seconds, tripped after 90 seconds when the error threshold was exceeded, and automatically rerouted all traffic to their secondary provider. Users experienced a brief latency increase during failover but no visible errors. The company's customer support received zero tickets related to the outage. The circuit breaker closed automatically 22 minutes later when OpenAI recovered and probe requests succeeded. Total user-facing downtime: zero seconds.
+
+The same outage affected a competing financial services company that relied on OpenAI exclusively with no circuit breaker implementation. Their application returned error messages to users for 18 minutes until engineers manually switched to a backup provider. Customer support received 140 tickets. Three enterprise customers escalated to account managers. One threatened to cancel their contract. The technical root cause was identical for both companies. The user experience was completely different.
+
+Provider circuit breakers are the highest-value resilience pattern for AI systems. Model providers will fail. This is not speculation. It is operational reality. The question is not whether you will experience provider outages. The question is whether you will detect them automatically and route around them or whether your users will report them to you.
+
+## Provider Health Monitoring Beyond Status Pages
+
+Status pages are lagging indicators. By the time a provider updates their status page to reflect an incident, the outage has been ongoing for minutes or tens of minutes. Users are already experiencing failures. Engineers are already debugging. The status page confirms what you already know. It does not give you early warning. It does not enable proactive action.
+
+You must monitor provider health independently using synthetic probes and real traffic analysis. Synthetic probes are scheduled requests sent to the provider at regular intervals: every 30 seconds, every minute. The probes use real API calls with production authentication but test prompts designed to complete quickly and predictably. Measure response time, error rate, and response quality. Graph these metrics over time. Establish baseline behavior. Detect deviations.
+
+Real traffic analysis monitors production requests to the provider. Track success rate, latency distribution, error types, and throughput. Compare current metrics to historical baselines. A sudden spike in 500 errors indicates provider infrastructure issues. A sudden increase in timeouts indicates network or load problems. A sudden latency increase from 450 milliseconds to 2.1 seconds indicates the provider is under stress even if requests are succeeding.
+
+Regional health varies. Providers often experience issues in specific geographic regions while others remain healthy. OpenAI's us-east-1 region might be degraded while eu-west-1 is fine. Anthropic's API might be healthy in North America but experiencing issues in Asia-Pacific. Monitor each region independently. If your application serves global traffic, run synthetic probes from multiple regions. Do not assume that health in one region indicates health everywhere.
+
+Model-specific health varies. A provider might have issues with one model while others are unaffected. OpenAI's GPT-5 endpoint might be degraded while GPT-5-mini is healthy. Anthropic's Claude Opus 4.5 might be slow while Claude Sonnet 4.5 is fast. If you use multiple models from the same provider, monitor each separately. A provider-level circuit breaker that treats all models identically will trip unnecessarily when only one model is affected.
+
+## Tripping Conditions: Error Rate, Latency Spike, Quality Degradation
+
+Error rate thresholds catch hard failures. If more than 10% of requests to a provider return errors within a 30-second window, something is wrong. The errors might be HTTP 500, 503, 429 rate limits, timeouts, connection failures, or malformed responses. The specific error type matters less than the rate. A sudden increase indicates the provider is unhealthy. Trip the circuit breaker.
+
+Latency thresholds catch performance degradation. If p95 latency increases from baseline 600 milliseconds to 2.8 seconds, the provider is under load or experiencing infrastructure stress. Even if requests are eventually succeeding, the latency increase degrades user experience and risks cascading timeouts in your system. Trip the breaker before the situation worsens.
+
+Quality thresholds catch semantic degradation. If the provider is returning responses but those responses are lower quality than baseline — measured by automated evaluation as described in the previous subchapter — the provider's model may have been updated, their infrastructure may be serving stale model weights, or their load balancing may be routing to degraded instances. Quality degradation is the hardest signal to detect but often the earliest warning of issues. Trip the breaker when quality drops below threshold.
+
+Combined conditions provide defense in depth. Trip if error rate exceeds 10% over 30 seconds OR if p95 latency exceeds baseline by more than 150% over 60 seconds OR if quality drops below threshold over 90 seconds. At least one condition will catch any provider issue. Infrastructure failures trigger errors. Performance issues trigger latency. Semantic issues trigger quality. The circuit breaker responds regardless of failure mode.
+
+Threshold tuning requires baseline measurement. You cannot set a latency threshold without knowing normal latency. You cannot set an error rate threshold without knowing normal error rates. Measure provider behavior over weeks. Calculate mean, median, p95, p99 for latency. Calculate average error rate and variance. Set thresholds at two to three standard deviations from baseline or at percentile boundaries that indicate unusual behavior. The goal is to catch genuine problems without tripping on normal variance.
+
+## Routing Strategies When Circuit Is Open
+
+Failover to a secondary provider is the most common strategy. When the OpenAI circuit breaker opens, route all traffic to Anthropic. When Anthropic's breaker opens, route to Google. When Google's breaker opens, route back to OpenAI or to a self-hosted model. The routing logic is simple: maintain a priority list of providers and send traffic to the highest-priority provider whose circuit is closed.
+
+Proportional failover splits traffic across multiple healthy providers. Instead of sending 100% of traffic to the secondary when the primary fails, send 70% to the secondary and 30% to a tertiary. This prevents overwhelming the secondary if it has lower capacity than the primary. It also provides redundancy: if the secondary also degrades under the increased load, the tertiary is already warm and handling some traffic.
+
+Model downgrade uses a cheaper or faster model from the same provider when the preferred model is unhealthy. If GPT-5 is degraded, fall back to GPT-5-mini. If Claude Opus 4.5 is slow, fall back to Claude Sonnet 4.5. This keeps traffic on the same provider, which avoids issues with prompt compatibility, output format differences, or authentication. The trade-off is quality: the fallback model may not be as capable. But a working cheaper model is better than a broken expensive one.
+
+Self-hosted fallback routes to a locally-hosted or privately-deployed model when all external providers are unhealthy. If OpenAI, Anthropic, and Google are all degraded simultaneously — rare but not impossible — fall back to a Llama 4 instance running in your infrastructure. This guarantees availability but requires maintaining self-hosted inference infrastructure. The cost is high. The reliability benefit is meaningful for critical systems.
+
+Graceful degradation returns a static response or cached result when no healthy provider is available. If every circuit is open and fallback is not possible, return the last known good response for this query if it is cached, or return a message indicating the service is temporarily unavailable. This is the last resort. It prevents errors but does not solve the user's problem. Use it only when all other options are exhausted.
+
+## The Warm Standby Problem: Backup Provider Readiness
+
+A cold standby is a provider you fail over to only when the primary is down. The first request after failover is slow because the provider's infrastructure must allocate resources, load model weights, and warm caches. If you have not sent traffic to the backup provider in days, the failover is painful. Users experience timeouts or very high latency on the first batch of requests. This is unacceptable for customer-facing systems.
+
+A warm standby is a provider that receives a small percentage of traffic continuously even when the primary is healthy. Send 5% of production traffic to the backup provider at all times. This keeps their infrastructure warm, validates that the integration works, and ensures that failover is seamless. When the circuit breaker trips and routes 100% of traffic to the backup, there is no cold-start penalty. The backup was already handling requests and scales smoothly.
+
+The cost of warm standby is that you pay for two providers continuously. If you send 95% of traffic to OpenAI and 5% to Anthropic, you pay both for their respective shares of traffic. This is more expensive than using only one provider. The cost is insurance against downtime. The question is whether the cost of warm standby is less than the cost of downtime. For most production systems, the answer is yes.
+
+Warm standby also validates compatibility continuously. If you change your prompt or output schema and it breaks compatibility with the backup provider, you discover this immediately when the 5% of traffic to the backup starts failing. If you only tested the backup provider in staging and then failed over during an incident, you would discover the compatibility issue when the primary is already down and you are under pressure. Continuous traffic to the backup is continuous validation.
+
+Test failover regularly. Even with warm standby, simulate a complete failover monthly. Manually open the circuit breaker for the primary provider and verify that 100% of traffic routes to the backup correctly. Verify that alerts fire as expected. Verify that performance is acceptable. Verify that no errors occur. Verify that failback works when you close the circuit. Treat this as a fire drill. If the drill exposes problems, fix them before a real incident occurs.
+
+## Geographic Considerations: Different Regions, Different Health
+
+Global applications serve traffic from multiple geographic regions. Your users in Europe, North America, and Asia-Pacific all interact with your AI system. Model providers have regional endpoints. OpenAI has us-east-1, eu-west-1, asia-southeast-1. Anthropic has similar regional deployments. Provider health varies by region. An outage in Europe does not affect North America. A slowdown in Asia-Pacific does not impact Europe.
+
+Region-aware circuit breakers trip independently per region. If OpenAI's European endpoint degrades, the European circuit breaker trips and European traffic fails over to Anthropic in Europe. OpenAI's North America endpoint remains healthy, so the North America circuit breaker stays closed and traffic continues flowing to OpenAI in North America. Users in different regions experience different provider routing based on regional health.
+
+This requires regional routing logic. Your application must determine the user's region, select the appropriate regional provider endpoint, and check the circuit breaker state for that region-provider pair. The complexity is manageable: maintain a routing table that maps region to provider list and check the circuit breaker for the selected region-provider pair. The benefit is that regional failures affect only the impacted region.
+
+Latency-based region selection optimizes performance. Even when all providers are healthy, route each request to the provider with the lowest expected latency for that user's region. European users go to the European endpoint. North American users go to the North American endpoint. This minimizes round-trip time. Combined with circuit breakers, it provides both performance and resilience: users get the fastest healthy provider for their region.
+
+Cross-region failover is a last resort. If all providers in a user's region are unhealthy, fail over to a provider in a different region. European traffic might route to North America if European endpoints are down. The latency increase is significant — adding 100 to 200 milliseconds for transatlantic round trips — but it is better than complete unavailability. This requires circuit breakers that track both regional and global health and can make cross-region routing decisions.
+
+## Provider Circuit Breaker Observability
+
+Dashboards must show provider health and circuit state in real-time. For each provider and region, display current error rate, p95 latency, quality score, and circuit state. Use color coding: green for closed, red for open, yellow for half-open. Show time-series graphs of these metrics over the last hour, day, and week. This gives operators immediate visibility into which providers are healthy and which are being bypassed.
+
+Alerts fire on state transitions. When a circuit breaker trips, send an alert to the on-call engineer and post to the incident channel. Include the provider name, region, the metric that triggered the trip, the threshold that was exceeded, and the current value. When a circuit breaker remains open for more than five minutes, escalate. This indicates the provider has not recovered and manual investigation is needed.
+
+Traffic distribution metrics show where requests are actually going. Display the percentage of traffic routed to each provider over the last minute, hour, and day. This reveals whether failover is working as expected. If 100% of traffic is going to the backup provider and the primary provider's circuit has been open for an hour, you know the primary has not recovered. If traffic is split 50-50 when you expected 95-5, something is wrong with the primary even if its circuit has not tripped.
+
+Incident correlation links circuit breaker trips to provider status pages and public incident reports. When a circuit breaker trips, automatically check the provider's status page and post the status to the incident channel. This confirms whether the issue is provider-side or your-side. If the status page shows an incident, the circuit breaker correctly detected and routed around it. If the status page shows all clear, the issue may be network, authentication, or configuration on your side.
+
+Historical tripping patterns inform reliability planning. Track how often each provider's circuit breaker trips, how long it stays open, and what percentage of time each provider spends in each state. A provider whose circuit trips weekly is less reliable than one whose circuit trips quarterly. A provider whose circuit stays open for 30 minutes on average recovers more slowly than one whose circuit closes within 5 minutes. Use this data to adjust warm standby percentages, choose primary vs backup assignments, and inform contract negotiations.
+
+## When Multi-Provider Resilience Is Overkill
+
+Internal tools with limited users do not need multi-provider setups. If you are building an AI assistant for your 12-person engineering team, the cost and complexity of maintaining multiple provider integrations exceeds the cost of occasional downtime. Use a single provider and accept that outages will cause unavailability. Communicate this trade-off clearly to users.
+
+Batch workloads that do not require real-time responses tolerate provider outages gracefully without circuit breakers. If you are generating summaries of documents overnight, a provider outage just means the job runs slower or retries later. Circuit breakers add little value. Focus on retry logic and job queuing instead.
+
+Systems with human fallback do not need automated provider failover. If your AI handles customer support inquiries but a human agent takes over when the AI is unavailable, provider outages degrade to human-only operation. This may be acceptable depending on human capacity and traffic volume. Evaluate whether the cost of multi-provider resilience exceeds the cost of increased human load during outages.
+
+But for customer-facing systems with real-time requirements, no human fallback, and high availability expectations, multi-provider resilience with circuit breakers is not optional. It is baseline production reliability. One provider will fail. You must route around it automatically. Build the circuit breakers.
+
+---
+
+Next: **3.4 — Retrieval Circuit Breakers: When RAG Components Fail**

@@ -1,0 +1,81 @@
+# 3.7 — Circuit Breaker State Management and Persistence
+
+In September 2025, a healthcare platform's circuit breakers appeared to be working perfectly in testing. Their monitoring showed clean transitions between open and closed states. But in production, users reported something strange: some requests to their symptom analysis service would succeed while others immediately failed with circuit breaker errors. Refreshing the page sometimes fixed it. Sometimes it didn't. The team discovered they were running twelve application instances, each with its own in-memory circuit breaker state. Seven instances thought the circuit was open. Five thought it was closed. Users were randomly hitting different instances with different opinions about whether the service was available. They spent $89,000 over three weeks rebuilding their circuit breaker implementation with proper state management.
+
+Circuit breaker state must be consistent across all instances that make decisions about whether to allow traffic through. When one instance opens a circuit, all instances must know within seconds. When the circuit closes again, all instances must agree on the transition. Without this consistency, your circuit breakers work in development with one process and fail in production with dozens.
+
+## The Distributed State Consistency Problem
+
+A circuit breaker has three states: closed (traffic flows normally), open (all traffic blocked immediately), and half-open (test traffic allowed to probe recovery). Every instance of your application that calls a downstream service needs to know which state that service's circuit breaker is in. If Instance A thinks the circuit is open and Instance B thinks it's closed, Instance B will send traffic to a failing service that Instance A is correctly protecting against.
+
+The problem emerges immediately when you scale beyond one process. Your load balancer distributes requests across instances. A user's first request hits Instance 3, which opens the circuit after seeing three consecutive timeouts. Their second request hits Instance 7, which hasn't seen any failures yet and happily sends the request to the same broken service. The user experiences exactly the failures the circuit breaker was supposed to prevent.
+
+You have three architectural approaches: shared external state, local state with synchronization, or hybrid models that accept temporary inconsistency in exchange for reduced coordination overhead.
+
+## Shared State with External Storage
+
+The simplest consistent approach stores circuit breaker state in a shared data store that all instances read and write. Redis is the most common choice because it provides atomic operations with low latency. When Instance A opens a circuit, it writes the state change to Redis. Instance B checks Redis before sending each request and sees the open state immediately.
+
+You store three pieces of data per circuit: current state (closed, open, half-open), the timestamp when the state last changed, and failure counts or success counts depending on state. Every request checks this state. Every state transition writes it. The Redis key typically looks like "circuit:breaker:symptom-analysis-service:state" with a JSON value containing state details.
+
+The latency cost is small but real. Every protected request now requires a Redis read before proceeding. At high throughput, this adds up. A service handling 50,000 requests per second to five downstream services needs 250,000 Redis reads per second just for circuit breaker state checks. You can mitigate this with local caching: read from Redis every 100 milliseconds and cache the state locally. Requests use the cached state. This introduces a small inconsistency window where an instance might use stale state for up to 100 milliseconds, but most systems tolerate this better than the latency of checking Redis on every single request.
+
+State transitions must be atomic. When an instance decides to open a circuit, it needs to set the state to open AND record the transition timestamp in a single operation. Redis MULTI/EXEC transactions or Lua scripts provide this atomicity. Without it, you get race conditions where two instances simultaneously try to transition state and end up with corrupted data.
+
+## Local State with Gossip Synchronization
+
+An alternative approach keeps circuit breaker state local to each instance but synchronizes state changes across the cluster using a gossip protocol. When Instance A opens a circuit, it updates its local state immediately and broadcasts the change to other instances. Those instances update their local state and rebroadcast to their neighbors. Within a few hundred milliseconds, all instances converge on the same state.
+
+This pattern eliminates the external dependency and reduces latency for the common case. Most requests just check local memory. The cost is complexity: you need a gossip implementation, cluster membership tracking, and partition handling. If two instances open the same circuit simultaneously because they both saw failures before the gossip messages propagated, the system must converge to a consistent final state.
+
+Gossip-based circuit breakers work well in environments where eventual consistency is acceptable and where you already have gossip infrastructure for other purposes. If you're building a service mesh or already using something like Consul or Serf for service discovery, adding circuit breaker state to the gossip payload is straightforward. If you don't have this infrastructure, the operational complexity usually outweighs the benefits compared to just using Redis.
+
+## State Persistence Across Restarts
+
+Circuit breaker state must survive application restarts. If your service deploys new code while a downstream dependency is degraded and its circuit is open, the circuit should remain open after the restart. Otherwise, the restart floods the already-struggling downstream service with a spike of traffic from instances that forgot the circuit was open.
+
+With external shared state, this happens automatically. Redis persists the state. Instances read it on startup. With local state, you must persist to disk or reconstruct state from recent history. Most teams using local state accept that restarts reset all circuits to closed. They mitigate the restart flood problem with gradual traffic ramp-up during deployment: new instances start receiving 1% of traffic, then 5%, then 10%, allowing circuits to open again before full traffic hits.
+
+The persistence decision trades off restart behavior against operational complexity. External state adds a dependency but provides true persistence. Local state removes the dependency but requires careful restart orchestration. Neither approach is universally better. Teams with high deployment frequency and already-complex orchestration often prefer local state. Teams with less frequent deploys and simpler orchestration prefer external state.
+
+## Race Conditions in State Transitions
+
+Multiple instances can simultaneously decide to change circuit breaker state. Three instances each see the fifth consecutive failure at nearly the same moment and all try to open the circuit. With naive implementations, this causes last-write-wins races or corrupted failure counts.
+
+Atomic state transitions prevent this. With Redis, use compare-and-swap operations: read the current state, compute the new state, write it only if the current state hasn't changed since you read it. If another instance modified it in the meantime, retry the transition logic with the new state. With local state, use atomic operations or locks within each instance and accept that different instances might open the circuit at slightly different times.
+
+The failure counter requires special care. When the circuit is closed, multiple instances are simultaneously incrementing a failure count. Each sees a timeout and increments. If Instance A reads count equals 4, increments to 5, and writes 5, while Instance B simultaneously reads count equals 4, increments to 5, and writes 5, the actual failure count should be 6 but the stored value is 5. Redis INCR operations are atomic and prevent this. If using a database, use atomic increment SQL. If using local state, the count is per-instance and you open the circuit based on instance-local thresholds.
+
+## The Split-Brain Circuit Breaker Problem
+
+Network partitions can split your application cluster into isolated groups. If you have twelve instances and a network partition divides them into a group of seven and a group of five, both groups might make independent circuit breaker decisions. The group of seven sees continued failures and opens the circuit. The group of five sees occasional successes (perhaps because they're hitting a different replica of the downstream service) and keeps the circuit closed. Users hitting different groups experience different behavior.
+
+With external shared state, the partition also affects access to Redis. If the seven-instance group can reach Redis but the five-instance group cannot, the five-instance group falls back to local state or fail-open behavior. This creates the split-brain scenario. Most implementations default to fail-closed during partitions: if an instance cannot reach the shared state store, it treats all circuits as closed and allows traffic through. This prevents a Redis outage from taking down your entire application, but it also means circuit breakers stop protecting during the partition.
+
+The alternative is fail-open: during a partition, treat all circuits as open and block all traffic. This maximizes protection of downstream services but can cause complete application unavailability if your state store has a brief hiccup. Most teams choose fail-closed because a brief period of unprotected traffic is less severe than blocking all user requests.
+
+## TTL and State Expiration
+
+Circuit breaker state should expire if not actively updated. If a circuit opens at 2:00 PM and no traffic attempts to use that service for three hours, the circuit should eventually close automatically rather than remaining open forever. Without expiration, a service that experiences a brief outage stays circuit-broken until manual intervention, even after it fully recovers.
+
+Set a TTL on open circuits. A common pattern: when opening a circuit, set the state to open with a TTL of 60 seconds. If the circuit remains open (because half-open probes continue to fail), instances refresh the TTL on each failed probe. If the service recovers and no instance attempts to use it, the state expires after 60 seconds and the circuit automatically closes. The next request will try the service again.
+
+The TTL value balances recovery speed against protection. A 30-second TTL closes circuits quickly but might close while a service is still recovering. A 5-minute TTL provides longer protection but delays recovery for intermittently-used services. Most teams use 60 seconds as a reasonable middle ground.
+
+Half-open state should also have a TTL. If an instance transitions a circuit to half-open and sends a test request, but that instance crashes before receiving a response, the circuit should not remain stuck in half-open forever. Set a TTL of 10-30 seconds on half-open state. If no instance completes the half-open test within that window, the circuit automatically reopens or closes based on your conservative default.
+
+## Testing State Management Under Failure
+
+Circuit breaker state management is infrastructure code that only truly matters during cascading failures. Testing it requires simulating the exact conditions it exists to handle. Most teams discover state management bugs in production during incidents because their testing never exercised the distributed edge cases.
+
+Test these scenarios explicitly. Partition your test cluster and verify that circuit breaker state remains consistent or fails safe. Kill instances while circuits are transitioning and verify that state converges correctly. Simulate slow state propagation and verify that the inconsistency window doesn't cause request storms. Make your shared state store unavailable and verify your fail-closed or fail-open behavior works as designed.
+
+Test state persistence by opening circuits, restarting instances, and verifying that circuits remain open. Test concurrent state transitions by having many instances simultaneously trigger circuit opens. Test TTL expiration by opening circuits, stopping all traffic, and verifying they close automatically. Test each of these scenarios annually at minimum, quarterly if circuit breakers protect critical paths.
+
+The teams with reliable circuit breakers test them in chaos engineering exercises. They deliberately degrade downstream services during low-traffic periods and observe circuit breaker behavior with real production traffic patterns. They verify that circuits open when they should, that state stays consistent across instances, that half-open probing works correctly, and that circuits close cleanly when services recover. Testing circuit breakers with synthetic traffic in staging is necessary but insufficient. Production testing under controlled conditions reveals the edge cases that staging never encounters.
+
+State management is the unsexy foundation that makes circuit breakers work at scale. Get it right once, and your circuit breakers protect reliably across deployments, partitions, and years of operation. Get it wrong, and your circuit breakers look like they work until the moment you need them most — and then they fail in subtle, distributed ways that are nearly impossible to debug under incident pressure.
+
+---
+
+Next, we examine the half-open testing strategy — how circuit breakers safely probe whether a failed service has recovered without causing another cascade.

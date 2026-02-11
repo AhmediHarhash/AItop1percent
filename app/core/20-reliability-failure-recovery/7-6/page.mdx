@@ -1,0 +1,112 @@
+# 7.6 — Cache Warming After Recovery
+
+Your AI system just recovered from a two-hour outage. The incident is resolved. The service is back online. Traffic starts flowing. And then performance collapses. Median response time spikes from 340 milliseconds to 4.8 seconds. Users see loading spinners. Support tickets flood in. The system is healthy — but the caches are cold.
+
+AI systems depend on caches to deliver acceptable performance. Embedding caches eliminate redundant embedding generation. Response caches serve repeated queries instantly. Model weight caches avoid re-loading multi-gigabyte files from disk. When those caches are empty — which they always are immediately after recovery — the system runs at a fraction of normal speed. Cold cache performance is so bad that users assume the system is still broken. Cache warming is the process of rebuilding those caches before you declare the incident fully resolved and before you restore full user traffic.
+
+## What Caches Exist in AI Systems
+
+AI systems cache at multiple layers. Each layer contributes to overall performance, and each layer requires warming after recovery.
+
+**Embedding caches** store vector representations of text, images, or other inputs. Generating embeddings is computationally expensive — embedding a document with 2,000 tokens might take 120 to 300 milliseconds depending on the embedding model. If your RAG system processes the same user query repeatedly, you do not want to re-embed the query every time. An embedding cache stores the query text as the key and the embedding vector as the value. Cache hits serve in under 5 milliseconds. After recovery, the embedding cache is empty. Every query requires embedding generation. Latency spikes.
+
+**Response caches** store complete LLM responses for repeated queries. If ten users ask "what is your refund policy" and the answer is deterministic, you can serve the first response from the LLM and cache it for subsequent requests. Response caches are especially valuable for high-frequency, low-variability queries — FAQ answers, product descriptions, standard responses. After recovery, the response cache is empty. Every query hits the LLM. Cost and latency increase.
+
+**Retrieval caches** store the results of vector similarity searches. A RAG system might retrieve the top 10 documents for a given query embedding. That retrieval operation queries a vector database, which may take 40 to 200 milliseconds depending on index size and query complexity. Caching retrieval results avoids repeated database queries. After recovery, the retrieval cache is empty. Every query re-executes retrieval.
+
+**Model weight caches** store model parameters in GPU memory or fast system RAM. Loading a 70-billion-parameter model from disk to GPU memory takes 15 to 45 seconds depending on disk speed and model quantization. Once loaded, the model serves requests in milliseconds. But if the model is evicted from memory — which often happens after a crash or restart — the first request after recovery pays the full load cost. After recovery, model weight caches are empty. The first requests are slow.
+
+**Context window caches** store recently used prompt prefixes for models that support prompt caching. Anthropic's Claude models and others cache portions of the prompt context to reduce cost and latency for repeated prefixes. If you send the same 10,000-token system prompt across hundreds of requests, the model caches that prefix after the first use. After recovery, the context window cache is empty. Every request pays full cost and latency for the entire context.
+
+A legal research platform runs a RAG system with five cache layers: an embedding cache for user queries, a retrieval cache for vector search results, a response cache for frequently asked questions, a model weight cache for their fine-tuned Llama 4 Maverick model, and a context window cache for their 8,000-token system prompt. During normal operation, 68 percent of queries hit at least one cache layer. Cache hit requests average 210 milliseconds end-to-end. Cache miss requests average 1,800 milliseconds. After a June 2025 outage, all caches were empty. The first hour after recovery saw median latency of 2,400 milliseconds — more than ten times normal — until caches warmed naturally.
+
+## The Cold Cache Performance Cliff
+
+The performance difference between a warm cache and a cold cache is not gradual — it is a cliff. Cache hit rates determine performance, and hit rates after recovery start at zero percent.
+
+Assume your system normally serves 60 percent of requests from cache. Those requests are 10 times faster and 10 times cheaper than uncached requests. After recovery, zero requests hit cache. Performance and cost metrics are both 10 times worse. Users notice immediately. If your normal median latency is 400 milliseconds and uncached latency is 3 seconds, users accustomed to subsecond responses suddenly face multi-second delays. They assume the system is still broken and report the problem to support or on social media.
+
+The cold cache cliff is steeper for high-traffic systems. If your system serves 10,000 requests per minute, and 60 percent normally hit cache, you are handling 4,000 uncached requests per minute at steady state. After recovery, all 10,000 requests are uncached. Your backend capacity, which was sized for 4,000 uncached requests per minute, now faces 10,000. Backends overload. Latency spikes further. You may trigger cascading failures or rate limits that would never occur under normal cache hit rates.
+
+A customer support AI handles 42,000 queries per hour during peak periods. With warm caches, 71 percent of queries hit the response cache and return in under 150 milliseconds. The remaining 29 percent hit the LLM and return in 1,200 milliseconds. The system is sized for 12,000 uncached requests per hour — the 29 percent that miss the cache. After a March 2026 outage, caches were cold. All 42,000 queries hit the LLM. The backends, sized for 12,000 per hour, immediately overloaded. Queue depth spiked to 8,000 requests. Latency increased to 22 seconds. The team had to throttle traffic to 30 percent of normal volume for the first 25 minutes after recovery while caches warmed. Users experienced reduced capacity even though the underlying system was healthy. The cold cache cliff turned a successful recovery into a second incident.
+
+## Cache Warming Strategies
+
+Cache warming is the process of proactively populating caches before restoring full traffic. Instead of letting caches warm naturally through user traffic, you prime them with high-value entries so that the first real user requests hit cache instead of cold backend.
+
+**Top-N warming** populates the cache with the most frequently accessed items. Before recovery, you identify the top 100 or top 1,000 most common queries from historical logs. After recovery, you execute those queries to populate the cache. The first real user requests are likely to be among the top-N, so they hit cache immediately. Top-N warming is fast and covers the majority of traffic if your access distribution is skewed — which it usually is.
+
+**Recent warming** populates the cache with items accessed in the past hour or past day before the outage. Users who were actively using the system before the outage are likely to return after recovery and repeat similar queries. Recent warming ensures those returning users experience warm cache performance. Recent warming requires retaining a snapshot of pre-outage cache state or recent access logs.
+
+**Priority warming** populates the cache with items marked as high-priority regardless of frequency. These might include: queries from enterprise customers with SLA guarantees, queries related to critical workflows like checkout or payment processing, queries required by internal tools or monitoring systems. Priority warming ensures that the most important use cases are fast even if they are not the most frequent.
+
+**Progressive warming** populates the cache in stages while gradually increasing traffic. You warm the top 100 items, then restore 10 percent of traffic. You warm the next 500 items, then restore 30 percent of traffic. You continue warming and increasing traffic until caches are fully populated and traffic is at 100 percent. Progressive warming avoids overwhelming backends with uncached traffic while caches are still cold.
+
+**Natural warming** skips proactive warming and allows caches to warm through real user traffic. This is the simplest approach but results in the worst user experience. The first users after recovery see slow performance. As caches warm, performance improves. Natural warming is appropriate only if your traffic is low enough that cold cache performance is acceptable or if warming infrastructure is not available.
+
+A SaaS platform uses progressive warming. Their cache warming script queries the top 500 most frequent user queries from the past 24 hours, weighted by enterprise customer accounts. The script executes in parallel across 20 worker processes and completes in approximately 90 seconds. After warming completes, the cache hit rate is 52 percent — not full warmth, but enough to avoid the cold cache cliff. The team restores traffic in 10 percent increments every 2 minutes, monitoring latency and error rates at each step. By the time traffic reaches 100 percent, natural warming from real user queries has pushed the cache hit rate to 67 percent — close to normal. The entire recovery and warming process takes 12 minutes and maintains acceptable performance throughout.
+
+## Priority-Based Cache Warming
+
+Not all cache entries are equally valuable. Some queries are accessed hundreds of times per minute. Others are accessed once per week. Priority-based cache warming populates the highest-value entries first.
+
+Priority is determined by multiple factors: access frequency, user importance, query cost, and business impact. A query accessed 1,000 times per day by free-tier users has high frequency. A query accessed 10 times per day by an enterprise customer with a 99.9 percent uptime SLA has high user importance. A query that requires embedding generation, retrieval, and LLM inference has high cost. A query related to checkout or payment has high business impact. Combine these factors into a priority score.
+
+A priority score might look like: priority equals frequency times user tier weight times cost weight times business impact weight. User tier weight is 1 for free users, 5 for paid users, 20 for enterprise users. Cost weight is 1 for cached responses, 3 for retrieval-only queries, 10 for full LLM inference. Business impact weight is 1 for informational queries, 5 for product queries, 20 for transactional queries. Compute the score for every query in recent logs. Warm the highest-scoring queries first.
+
+Priority-based warming ensures that limited warming capacity is spent on entries that provide the most value. If you can only warm 200 cache entries before restoring traffic, you want those 200 to cover the highest-frequency, highest-value queries — not random queries that may never be accessed again.
+
+A fintech platform caches API responses for account balance queries, transaction history queries, and payment processing. During normal operation, account balance queries are 65 percent of traffic, transaction history is 30 percent, and payment processing is 5 percent. But payment processing queries have 100 times the business impact — a slow or failed payment query directly costs revenue. The platform's cache warming prioritizes payment processing queries first, then account balance queries, then transaction history. Even though payment queries are only 5 percent of traffic, they are warmed first because the cost of a cache miss is unacceptable. The warming script completes in 40 seconds and ensures zero payment query cache misses immediately after recovery.
+
+## Background Warming vs On-Demand
+
+Cache warming can happen in the background before traffic is restored, or on-demand as traffic returns. Each approach has trade-offs.
+
+**Background warming** executes cache population before you restore user traffic. The warming process runs against the recovered system while traffic is still blocked or throttled. Once warming completes, you restore traffic. Users never experience cold cache performance because caches are already warm when they arrive. Background warming requires time — warming might take 30 seconds to 5 minutes depending on cache size and backend capacity. It delays full recovery but ensures good performance from the first user request.
+
+**On-demand warming** restores traffic immediately and allows caches to warm through real user requests. The first users see cold cache performance, but subsequent users benefit from warmed caches. On-demand warming is faster to restore service but results in worse initial user experience. On-demand warming is appropriate if background warming takes too long or if user traffic is low enough that cold cache performance is acceptable.
+
+**Hybrid warming** uses background warming for high-priority entries and on-demand warming for the long tail. You warm the top 100 or top 500 entries in the background, then restore traffic. The majority of requests hit cache immediately. The remaining requests warm the cache on-demand. Hybrid warming balances fast recovery with good performance for most users.
+
+The decision depends on cache warming time versus user impact tolerance. If warming takes 90 seconds and you can delay full recovery by 90 seconds, use background warming. If warming takes 10 minutes and users are demanding service restoration, use hybrid warming — warm high-priority entries in 90 seconds, then restore traffic.
+
+A healthcare AI platform's cache warming takes approximately 3 minutes to populate embedding and retrieval caches for the top 1,000 patient queries. The team uses background warming. After an incident, they block user traffic for 3 minutes while warming completes, then restore traffic. Users experience a 3-minute delay to service restoration, but once traffic is restored, performance is normal from the first request. The team considers the 3-minute delay acceptable because the alternative — restoring traffic immediately and having users experience 5-second latencies for the first 15 minutes — generates more support load and user dissatisfaction than the delay.
+
+## Measuring Cache Warmth
+
+You need to know when your caches are warm enough to handle full traffic. Cache warmth is measured by cache hit rate — the percentage of requests served from cache without hitting the backend.
+
+Your baseline cache hit rate is the rate during normal operation before the outage. If your system normally achieves a 65 percent hit rate, that is the target for full warmth. You do not need to reach 65 percent before restoring traffic — even 40 percent is enough to avoid the cold cache cliff — but you should monitor hit rate during recovery to understand when performance will return to normal.
+
+Cache hit rate is measured per cache layer. Your embedding cache might warm faster than your response cache because embedding queries are more repetitive. Track hit rates separately for each cache layer so you understand which layers are slowing recovery.
+
+Hit rate is also measured over time. In the first minute after traffic restoration, hit rate might be 15 percent. After 5 minutes, it might reach 40 percent. After 20 minutes, it might stabilize at 62 percent. Plot hit rate over time to understand the warming curve. The warming curve tells you how long recovery will take to reach acceptable performance.
+
+A content moderation AI tracks cache hit rate across three cache layers: text embedding cache, image embedding cache, and classification response cache. During normal operation, hit rates are 72 percent for text embeddings, 58 percent for image embeddings, and 81 percent for classification responses. After a January 2026 outage, the team monitored hit rates during recovery. Text embeddings reached 50 percent hit rate within 4 minutes due to high query repetition. Image embeddings reached 30 percent after 12 minutes due to lower repetition. Classification responses reached 60 percent after 8 minutes because many text and image inputs were cached, allowing classification results to be reused. The team considered the system fully recovered when all three hit rates reached 80 percent of their baseline values — approximately 18 minutes after traffic restoration.
+
+## Warming Duration Estimates
+
+Before you start cache warming, estimate how long it will take. Warming duration determines whether you delay traffic restoration or restore traffic immediately with degraded performance.
+
+Warming duration depends on: the number of entries to warm, the cost of generating each entry, and the parallelism available for warming. If you need to warm 1,000 entries, each entry takes 500 milliseconds to generate, and you can generate 10 entries in parallel, warming takes approximately 50 seconds. If you can only generate entries sequentially, warming takes 500 seconds — too long to block traffic restoration.
+
+Warming duration also depends on backend capacity. If your backends are sized for steady-state uncached traffic, they can handle warming load in addition to limited user traffic. If your backends are near capacity, warming and user traffic compete. You must choose: delay traffic restoration until warming completes, or throttle warming to allow user traffic through at the cost of slower cache population.
+
+Estimate warming duration in advance by profiling your warming scripts during testing or drills. Measure how long it takes to warm 100, 500, and 1,000 entries. Understand the relationship between entry count and warming time. Use that data to set expectations during recovery.
+
+A recommendation engine's cache warming script warms the top 800 product embedding vectors and the top 1,200 user preference vectors. The script runs 40 warming tasks in parallel. Each embedding generation takes approximately 180 milliseconds. Total warming time is approximately 36 seconds for product embeddings and 54 seconds for user embeddings, or 54 seconds total if both run in parallel. The team budgets 60 seconds for warming, including startup and verification time. During recovery, the incident commander announces "we are warming caches, estimated 60 seconds to traffic restoration." The estimate sets user expectations and ensures stakeholders understand why traffic is not restored immediately.
+
+## Communicating Warming Status to Users
+
+Users waiting for service restoration need to know what is happening. If you block traffic for 2 minutes while caches warm, communicate that. If you restore traffic with degraded performance while caches warm naturally, communicate that.
+
+The communication should include: what is happening — "we are warming system caches to restore performance," how long it will take — "estimated 90 seconds to completion," and what users should expect afterward — "performance will return to normal once warming is complete." Do not hide behind technical jargon. "Warming caches" is fine. "Rebuilding internal performance optimizations" is unnecessarily vague.
+
+If you restore traffic before caches are fully warm, warn users that performance may be slower than normal for the first few minutes. "The service is back online. Performance may be slower than usual for the next 5-10 minutes as the system stabilizes. Thank you for your patience." This heads off support tickets and social media complaints from users who see slow performance and assume the system is still broken.
+
+Status page updates should reflect warming status. If your status page says "service restored" but users experience 5-second latencies because caches are cold, the status page is lying. Instead: "Service partially restored. Performance is currently degraded while systems warm. Expected return to normal performance: 3:47 PM." Update the status page when warming completes and performance is normal.
+
+A SaaS platform's incident in December 2025 included cache warming in their user communication. The status page update: "3:22 PM — The underlying issue has been resolved. We are now warming system caches to restore performance. Estimated time to full service restoration: 3:26 PM." At 3:26 PM: "Service fully restored. Performance has returned to normal. Thank you for your patience." The clear communication set expectations and reduced support load. Users knew why the service was not immediately available and when to expect full restoration. Support received only 14 inquiries during the 4-minute warming window, compared to an average of 60 inquiries per minute during the earlier outage.
+
+The next subchapter covers gradual traffic restoration — the canary pattern that catches problems before they affect all users.
+

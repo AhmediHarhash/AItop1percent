@@ -1,0 +1,83 @@
+# 3.8 — The Half-Open Testing Strategy: Safe Recovery Probing
+
+Why do most circuit breakers take 10-30 seconds longer than necessary to close after a service recovers? Because their half-open testing strategy is too conservative. They send a single test request every 30 seconds. If the service recovers at 14 seconds after the circuit opens, the circuit doesn't close until 30 seconds. If the test request happens to hit a still-recovering instance, the circuit reopens for another 30 seconds. A service that recovers in 15 seconds might take 90 seconds to restore from the circuit breaker's perspective. The result is reduced availability and user-visible errors that could have been avoided.
+
+The half-open state exists to answer one question: has the downstream service recovered enough that we should try using it again? The state sits between fully open (blocking all traffic) and fully closed (allowing all traffic). It allows a small amount of test traffic through to probe the service's health. If the test traffic succeeds, the circuit closes. If it fails, the circuit reopens. Getting this strategy right determines how quickly your system recovers from transient failures and how much unnecessary user impact you create.
+
+## The Half-Open State Mechanics
+
+When a circuit breaker opens, it starts a timer. After the timer expires (typically 10-60 seconds), the circuit transitions from open to half-open. In the half-open state, the circuit allows some requests through while continuing to block most traffic. These requests are your test probes. The circuit measures their success or failure to decide whether to fully close or reopen.
+
+The transition from open to half-open should be automatic based on the timer. Some implementations require an actual incoming request to trigger the transition: the circuit stays open until a user request arrives after the timer expires, then that request triggers the half-open transition. This is simpler to implement but delays recovery. If your circuit opens at 2:00:00 PM, the timer expires at 2:01:00 PM, but no user request arrives until 2:01:30 PM, you've added 30 seconds of unnecessary unavailability. Better implementations use background timers that automatically transition to half-open regardless of incoming traffic.
+
+Once in half-open state, the circuit applies a test traffic policy. The simplest policy: allow exactly one request through. If it succeeds, close the circuit. If it fails, reopen. This minimizes risk to the downstream service but slows recovery. If the single test request happens to hit a slow replica or experience a network hiccup, you reopen the circuit even though the service is mostly recovered. You wait another 30 seconds and try again. A service with 95% availability during recovery might take three or four half-open cycles before the test request succeeds and the circuit closes.
+
+## Determining Test Traffic Volume
+
+A more resilient half-open strategy allows multiple test requests and requires a threshold of successes before closing. Allow ten requests through. If eight or more succeed, close the circuit. If fewer than eight succeed, reopen. This provides statistical confidence that the service is genuinely recovered, not just experiencing a lucky single success.
+
+The test volume trades off recovery speed against risk. More test requests give you higher confidence but send more traffic to a potentially still-degraded service. Fewer test requests protect the downstream service but might reopen unnecessarily due to single-request variance. Most teams use between 5 and 20 test requests as a reasonable balance.
+
+The test requests should represent real production traffic. If your circuit breaker protects an API endpoint, the test requests should be actual API calls, not synthetic health checks. The downstream service might pass health checks while still failing real requests due to database connection pool exhaustion or specific query patterns. Use representative requests to test whether the service can actually handle the work you need it to do.
+
+You can draw test requests from the blocked queue. While the circuit is open, some implementations queue incoming requests rather than immediately failing them. When transitioning to half-open, send the first 10 queued requests as your test traffic. If they succeed, close the circuit and drain the entire queue. This recovers gracefully without requiring users to retry. If the test requests fail, reject the queued requests and reopen the circuit.
+
+## Measuring Success During Half-Open
+
+What counts as success during half-open testing? The same criteria that would keep a circuit closed: response received within timeout, status code indicating success (typically 2xx for HTTP), and any application-level success indicators. If your closed circuit requires responses under 500 milliseconds, your half-open test should use the same threshold. Don't relax success criteria during testing or you'll close the circuit prematurely and immediately reopen when normal traffic reveals the service is still degraded.
+
+Some teams use stricter criteria during half-open than during normal operation. Require responses in 300 milliseconds during testing when your normal threshold is 500 milliseconds. Require zero errors during testing when you normally tolerate 1% error rate. This conservative approach prevents premature closure but extends recovery time. It's appropriate when the downstream service is critical and reopening the circuit is extremely expensive. For less critical services, using identical criteria for half-open and closed operation provides faster recovery.
+
+Track not just success rate but also latency distribution during half-open testing. If nine out of ten test requests succeed but the one failure took 10 seconds to time out, the service might still be experiencing issues. If all ten requests succeed but P99 latency is 2 seconds when normal P99 is 100 milliseconds, the service is still degraded. Some advanced implementations reopen based on latency regression even when error rate is acceptable.
+
+## Success and Failure Thresholds for State Transitions
+
+The circuit closes when the half-open test succeeds. But what defines success? Common strategies:
+
+First is the single-success pattern: one successful request closes the circuit. This is fast but risky. A single lucky request closes the circuit, then the flood of restored traffic immediately reopens it when the service can't handle the load.
+
+Second is the threshold pattern: N out of M requests must succeed. Allow 10 requests, require 8 successes to close. This is more resilient but slower. Each half-open cycle takes longer because you wait for multiple requests.
+
+Third is the consecutive-success pattern: require N consecutive successful requests with no failures. Allow requests through one at a time until you see 5 consecutive successes, then close. A single failure resets the count and reopens the circuit. This pattern provides high confidence but has the slowest recovery because requests must be sequential.
+
+Fourth is the time-based pattern: stay in half-open for 5 seconds. If error rate during those 5 seconds is below threshold (say 5%), close the circuit. If error rate exceeds threshold, reopen. This decouples test duration from request volume and works well for high-traffic services where you naturally get many requests during any 5-second window.
+
+Most teams use the threshold pattern with 10 test requests and 7-8 required successes. It balances confidence against recovery speed. The optimal values depend on downstream service characteristics: if the service usually fails completely or succeeds completely, you can use fewer test requests. If the service sometimes operates in a degraded state with partial availability, you need more test requests to distinguish recovering from still-broken.
+
+## The Thundering Herd When Circuits Close
+
+When a circuit closes after half-open testing, all instances of your application suddenly start sending traffic again. If you have 50 instances and each was blocking 100 requests per second during the open circuit, closing the circuit releases 5,000 requests per second all at once. This can immediately overload a recently-recovered service and reopen the circuit.
+
+Gradual restoration prevents the thundering herd. Don't transition directly from half-open to fully closed. Add an intermediate state: recovering. When half-open tests succeed, transition to recovering and gradually increase allowed traffic over 30-60 seconds. Start by allowing 10% of requests through. After 10 seconds with acceptable performance, allow 25%. After 20 seconds, allow 50%. After 40 seconds, allow 100% and transition to fully closed. If error rate exceeds threshold at any point during recovery, reopen the circuit immediately.
+
+This gradual restoration pattern is particularly important for services with database connection pools or other fixed-capacity resources. A service that failed because it exhausted its connection pool needs time to rebuild those connections as traffic returns. Sending full traffic immediately prevents the pool from recovering. Sending 10% of traffic allows the service to establish connections, warm caches, and stabilize before receiving more load.
+
+Coordinating gradual restoration across multiple application instances requires shared state. All instances must agree on the current traffic percentage. Use the same state management patterns described in the previous subchapter: external shared state or gossip synchronization. Without coordination, each instance independently decides when to increase traffic, creating unintentional traffic spikes.
+
+## Canary Requests in Half-Open State
+
+Some implementations use dedicated canary requests rather than real user traffic for half-open testing. Generate synthetic requests that exercise the downstream service's critical path without affecting real data or user experience. Send these canary requests during half-open. If they succeed, allow real traffic. If they fail, keep the circuit open without impacting users.
+
+Canary requests work well when test failures have user-visible consequences you want to avoid. If you're testing a payment processing service, you don't want test requests to create accidental charges. Generate canary payment requests to a test account. If they succeed, open the circuit to real payments. This protects users from test-related errors.
+
+The disadvantage is that canary requests might not match real traffic patterns. A service might successfully process canary requests while still failing real requests due to specific input patterns, edge cases, or database queries that only occur with production data. Canary requests provide a useful signal but shouldn't be your only signal. Use both: canary requests as a first gate, then a small percentage of real traffic as confirmation before fully closing the circuit.
+
+## Timeout Considerations for Half-Open Tests
+
+Half-open test requests should use shorter timeouts than normal operation. If your closed circuit allows 2-second timeouts, your half-open tests should timeout after 500 milliseconds or 1 second. The rationale: if a service is still experiencing high latency, you want to detect that quickly and reopen the circuit before sending more traffic. Long timeouts during half-open testing waste time and delay recovery or reopening.
+
+But very short timeouts cause false negatives. If a service typically responds in 100 milliseconds but you set a half-open timeout of 50 milliseconds, you'll reopen the circuit even when the service has fully recovered. The timeout should be shorter than normal operation but longer than the service's P95 healthy latency. If healthy P95 is 100 milliseconds and normal timeout is 2 seconds, set half-open timeout to 200-300 milliseconds.
+
+Failed half-open tests should not count toward the closed circuit's failure threshold. If you allow 10 test requests during half-open and 6 fail, don't transition to closed and immediately reopen because you just recorded 6 failures. Reset the failure count when transitioning to closed. The half-open test failures already determined you should reopen. Don't double-count them.
+
+## Observability During Half-Open Testing
+
+Emit detailed metrics during half-open state. Track the number of test requests sent, the number that succeeded, the number that failed, and the decision to close or reopen. Track the duration of the half-open state. Track how many half-open cycles occur before successful closure. This data reveals how well your half-open strategy matches your service's actual failure and recovery patterns.
+
+If you frequently see multiple half-open cycles before closing, your success threshold might be too conservative or your downstream service recovers intermittently. If you see rapid reopen-close-reopen cycles, your success threshold is too lenient or your gradual restoration is too fast. If you see very long half-open durations, you're sending too few test requests or waiting too long between them.
+
+The half-open testing strategy directly controls how long your users experience degraded service after a downstream dependency recovers. Optimize this strategy with the same care you optimize your core application logic. The difference between a 60-second recovery time and a 15-second recovery time is 45 seconds of unnecessary user errors, unnecessary fallback costs, and unnecessary damage to user trust. Test your half-open strategy, measure it, and tune it to your actual failure patterns.
+
+---
+
+Next, we examine circuit breaker observability — the dashboards, metrics, and alerts that let you understand circuit breaker behavior and diagnose incidents.

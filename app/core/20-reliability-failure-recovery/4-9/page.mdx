@@ -1,0 +1,121 @@
+# 4.9 — The Fallback Cascade Problem: Preventing Stampedes
+
+The primary model went down at 2:17 PM. Traffic cut over to fallback immediately. For 90 seconds, everything looked fine. Then the fallback started returning errors. Load balancers detected the errors and routed traffic to the secondary fallback. That system stayed up for 45 seconds, then also started failing. By 2:20 PM, a three-minute primary outage had cascaded through two fallback tiers and taken down the entire service. This happened to a customer support automation platform in late 2025. The root cause wasn't a bug in any single system. It was a capacity planning failure. Each fallback tier was sized to handle normal load, not the full production traffic that would hit it if the previous tier failed. When primary went down, 100% of traffic instantly shifted to tier one. Tier one saturated, started dropping requests, and triggered cutover to tier two. Tier two had even less capacity than tier one. It fell over in under a minute. The stampede created a cascade that turned a recoverable primary failure into total system unavailability.
+
+The fallback cascade problem is simple in concept but vicious in practice. When a system fails, all the load it was handling has to go somewhere. If that somewhere isn't ready for it, it fails too. And if your architecture assumes each fallback tier will catch what the previous tier dropped, you've built a system where failure propagates faster than recovery.
+
+## The Thundering Herd Pattern
+
+The term "thundering herd" comes from operating systems. When a shared resource becomes available, all waiting processes try to access it simultaneously. The same pattern happens in distributed systems during failover. When the primary system fails and a fallback activates, every in-flight request and every new request immediately routes to the fallback. The fallback goes from handling 0% of load to 100% of load in milliseconds.
+
+Most systems can't handle that transition gracefully. Connection pools need to warm up. Caches need to populate. Auto-scaling infrastructure needs time to provision new capacity. If you go from zero to full load instantly, these systems don't have time to adapt. The fallback gets overwhelmed before it can scale.
+
+The thundering herd is worse when multiple fallback consumers share infrastructure. If you have 50 services all depending on the same fallback model endpoint, and all 50 fail over simultaneously, the fallback endpoint sees 50x load spike in an instant. Even if each service individually tested their fallback path and confirmed it worked under load, they never tested all 50 failing over at once.
+
+Thundering herd failures often look like this in metrics: fallback activates, request rate spikes, latency spikes to 10-20 seconds, error rate jumps to 20-40%, then the fallback gives up entirely and returns 503 errors for everything. The whole sequence takes 30 to 90 seconds. By the time incident responders realize what's happening, the cascade is complete.
+
+## Capacity Planning for Fallback Paths
+
+The fundamental rule: every fallback tier must be provisioned to handle 100% of primary load, not just the load you expect it to handle under normal conditions. If your primary system serves 10,000 requests per minute, your tier-one fallback needs capacity for 10,000 requests per minute. If your tier-two fallback is only meant to catch spillover from tier-one, it still needs capacity for 10,000 requests per minute, because tier-one might fail completely and all traffic will land on tier-two.
+
+This is expensive. You're paying for capacity that sits mostly idle, waiting for incidents. But it's the cost of reliable fallback. Undersized fallback infrastructure is a false economy. You think you're saving money by running a smaller fallback pool, but when the primary fails and the fallback can't handle load, you're offline. The cost of downtime typically exceeds the cost of properly-sized fallback capacity by orders of magnitude.
+
+Capacity planning for fallbacks also needs to account for cold start time. If your fallback infrastructure auto-scales when traffic increases, how long does it take to add capacity? If it takes five minutes to spin up new instances, and your fallback saturates in 60 seconds, auto-scaling won't save you. You need enough baseline capacity to handle full load until auto-scaling catches up.
+
+One approach: keep fallback infrastructure warm. Run a small percentage of production traffic through fallback continuously — even when primary is healthy — to keep caches warm, connection pools open, and instances provisioned. This costs more than cold fallback infrastructure, but it eliminates cold start delays during cutover. A warm fallback can handle full load instantly. A cold fallback needs minutes to warm up.
+
+Another approach: over-provision fallback capacity. If primary handles 10,000 requests per minute, provision fallback for 15,000. The extra 50% buffer accounts for load spikes, retries, and traffic growth between when you provisioned fallback and when you need it. Fallbacks often sit unused for months. Your traffic might have grown 30% since you last tested the fallback. If you didn't account for that growth, the fallback is already undersized before the incident starts.
+
+## Load Shedding During Fallback
+
+If your fallback cannot handle 100% of primary load — either because it's undersized or because it's running a less capable model that's slower per request — you need a load shedding strategy. Load shedding means intentionally dropping some requests to keep the system functional for the rest.
+
+The simplest load shedding: random sampling. Admit 60% of requests to fallback, reject 40% with a 503 error. This keeps fallback load within capacity limits. The downside is that it's indiscriminate. High-value requests and low-value requests are dropped at the same rate.
+
+Better load shedding: priority-based. Tag requests with priority tiers. Enterprise customers get priority one. Free-tier users get priority three. During fallback, admit priority-one requests, shed priority-three requests, and admit priority-two requests if capacity allows. This keeps your most valuable users operational during incidents while free-tier users experience degraded service.
+
+Another load shedding approach: request complexity filtering. Some queries are expensive — multi-step reasoning, long context windows, large retrieval sets. During fallback, route simple queries to fallback and reject complex queries. This keeps the fallback system operational for the queries it can handle efficiently while avoiding the expensive queries that would saturate it.
+
+Load shedding needs to communicate clearly to users. A 503 error is better than a 60-second timeout, but best is a 503 with a clear message: "We're currently experiencing high load. Please try again in a few minutes." Some systems include retry-after headers that tell the client how long to wait before retrying. This prevents clients from immediately retrying and making the stampede worse.
+
+Load shedding is not failure. It's a deliberate strategy to keep the system partially operational when full operation isn't possible. A system that serves 60% of users successfully during an incident is better than a system that tries to serve 100% and ends up serving 0% because it crashes under load.
+
+## Gradual Traffic Shift vs Instant Cutover
+
+The thundering herd problem is worst when cutover is instant. One moment, fallback handles 0% of traffic. The next moment, it handles 100%. A better approach: gradual traffic shift. When primary starts showing problems, begin routing 10% of traffic to fallback. If fallback handles that fine, increase to 25%, then 50%, then 75%, then 100%.
+
+Gradual shift gives the fallback system time to warm up. Caches populate. Connection pools expand. Auto-scaling infrastructure provisions capacity. By the time you reach 100% traffic on fallback, the system has adapted to the load.
+
+The challenge with gradual shift is that it requires detecting primary degradation early. If the primary fails hard — complete unavailability, not gradual degradation — you don't have time for gradual shift. You need instant cutover. But many primary failures are gradual. Latency increases over 10 minutes. Error rates climb slowly. These are scenarios where gradual shift can prevent stampedes.
+
+Another gradual shift strategy: route traffic based on user cohorts. Start by routing 5% of users to fallback — enough to validate that fallback works under real load, but small enough that if fallback fails, only 5% of users are impacted. If fallback quality looks good, expand to 20% of users, then 50%, then 100%. This is safer than instant cutover but requires the ability to route users consistently — the same user should always go to the same system during a gradual shift, not bounce between primary and fallback.
+
+Some teams use gradual shift even when primary is completely down. Instead of routing 100% of traffic to fallback immediately, they route 50% to fallback and reject the other 50% with clear error messages. This keeps fallback load manageable and avoids saturating it. Once fallback proves it can handle 50% of load stably, they increase to 75%, then 100%. The cost is that some users experience rejected requests during the shift, but the benefit is that you avoid a cascade where fallback fails under full load and takes down the entire system.
+
+## Circuit Breakers for Fallbacks Themselves
+
+Circuit breakers are common for protecting primary systems from overload. You need the same for fallbacks. A circuit breaker monitors fallback health — error rate, latency, capacity utilization — and trips if fallback starts failing. When the circuit trips, traffic stops routing to that fallback and either routes to the next tier or gets rejected outright.
+
+A circuit breaker for tier-one fallback might use these thresholds: if error rate exceeds 15% for 30 seconds, or if p95 latency exceeds 10 seconds, or if request queue depth exceeds 1,000, trip the circuit. Once tripped, stop sending traffic to tier-one and route to tier-two instead. This prevents you from piling more load onto a failing fallback and gives it time to recover.
+
+Circuit breakers need hysteresis. Once tripped, the circuit should stay open for a minimum duration — say, 60 seconds — before attempting to close again. This prevents rapid open-close cycles where the system detects fallback failure, stops routing traffic, fallback recovers, traffic resumes, fallback fails again. Rapid cycling is worse than just accepting that the fallback is down and routing to the next tier.
+
+When a circuit breaker trips, log it clearly. Circuit breaker trip events are critical signals during incidents. They tell you which systems are failing and in what order. If tier-one circuit breaker trips, then tier-two circuit breaker trips 30 seconds later, you're watching a cascade in realtime. That's when you need to make hard decisions about load shedding or accepting downtime.
+
+Some teams build circuit breakers that fail closed instead of open. Instead of stopping traffic to a failing fallback, they rate-limit traffic to it. Send 20% of normal load to a degraded fallback instead of 0%. This keeps some load flowing while preventing overload. The risk is that it prolongs the recovery time for the fallback. The benefit is that you're serving some requests instead of none.
+
+## The Cold Start Problem
+
+Many fallback systems sit idle until needed. When primary fails, fallback infrastructure needs to cold start — boot instances, load models into memory, establish database connections, warm caches. This takes time. If cold start takes three minutes and primary fails catastrophically, you're down for three minutes.
+
+The solution is to keep fallback infrastructure warm. Run it continuously at low utilization. Route 1-5% of production traffic to fallback even when primary is healthy. This keeps instances running, models loaded, caches warm, and connection pools open. When you need to fail over, the fallback is already operational.
+
+Warming fallback infrastructure costs money. You're running servers that aren't serving meaningful load. But the cost is usually much smaller than the revenue loss from downtime. A three-minute cold start during a primary outage can cost hundreds of thousands of dollars in lost transactions, customer churn, and reputation damage. Spending a few thousand dollars a month to keep fallback warm is usually worth it.
+
+For large models, the cold start problem is severe. Loading a 70B parameter model from disk into GPU memory can take two to five minutes. If that model is your fallback and it's not already loaded, you're down for the full load time. Keep fallback models loaded in memory on warm instances. The cost of keeping GPU instances running is high, but the cost of five-minute cold starts is higher.
+
+Some teams use tiered warming strategies. Tier-one fallback is always warm — instances running, models loaded. Tier-two fallback is partially warm — instances running, but models not loaded. Tier-three fallback is cold — nothing running. This balances cost and recovery time. If tier-one handles most incidents, you get fast failover. If you cascade to tier-two, you accept 30-90 seconds of cold start time, which is better than the three to five minutes you'd have with fully cold infrastructure.
+
+## Rate Limiting During Fallback Activation
+
+Even if your fallback has enough capacity for full primary load, the instant spike when cutover happens can overwhelm connection pools, API rate limits, and downstream dependencies. Rate limiting during fallback activation smooths the spike.
+
+One approach: exponential ramp-up. When fallback activates, start at 20% of full load. Every five seconds, increase by 20%. Within 25 seconds, you're at full load, but the initial spike is softened. This gives downstream dependencies time to adapt and gives auto-scaling time to provision capacity.
+
+Another approach: request queueing. When fallback activates, queue incoming requests instead of immediately processing them. Drain the queue at a controlled rate — say, 200 requests per second — even if the fallback system could technically handle 500 per second. This prevents overwhelming downstream systems and creates a buffer that absorbs traffic spikes.
+
+Rate limiting during fallback needs to be visible to users. If requests are being queued or delayed, users should see progress indicators. "Your request is queued. Estimated wait time: 15 seconds." This is better than a loading spinner with no information. Users tolerate delays better when they know the system is working and they're in a queue.
+
+Some teams combine rate limiting with load shedding. Queue requests up to a maximum queue depth — say, 5,000 requests. Once the queue hits that depth, reject new requests with 503 errors. This prevents unbounded queue growth and gives users clear feedback that the system is overloaded. A request that fails fast with a 503 is better than a request that sits in a queue for three minutes and then times out.
+
+## Coordinated Fallback Across Distributed Systems
+
+If you run a microservices architecture where multiple services each have their own fallback paths, you need coordination. If Service A fails over to fallback, and Service A's fallback depends on Service B, and Service B is also under load, you can create a cascade where Service A's fallback saturates Service B and takes it down.
+
+One coordination strategy: centralized fallback orchestration. A central service monitors the health of all systems and makes failover decisions. If Service A's primary fails, the orchestrator fails over Service A to its fallback and also proactively scales up Service B to handle the increased load from Service A's fallback. This prevents cascades by anticipating downstream impact.
+
+Another strategy: fallback health advertisement. Each service advertises its fallback health status. "Tier-one fallback healthy, capacity at 40%." "Tier-one fallback degraded, capacity at 95%." Services considering failover can see whether their fallback dependencies are healthy. If Service A's fallback depends on Service B, and Service B's fallback capacity is at 95%, Service A knows that failing over will likely trigger a cascade. It might choose to shed load instead or fail over to a tier-two fallback that doesn't depend on Service B.
+
+Distributed systems also need deadlock prevention. Service A falls back to Service B. Service B falls back to Service C. Service C falls back to Service A. This creates a circular dependency where cascading failures can loop. Map your fallback dependencies and eliminate cycles. Every fallback chain should terminate in a system with no further dependencies — typically a static response generator or a simple rule-based system.
+
+## Testing the Cascade
+
+You cannot know if your fallback chain is cascade-resistant until you test it under realistic failure scenarios. Chaos engineering for fallback systems means deliberately failing primary, then failing tier-one fallback, then failing tier-two fallback, and verifying that each tier can actually handle full load without cascading.
+
+Run these tests during low-traffic periods but with production-scale load. Synthetic load generators are fine, but make sure the load profile matches production traffic. If production has 60% simple queries and 40% complex queries, your test load should have the same distribution.
+
+During cascade tests, watch for the symptoms we've described: latency spikes, error rate spikes, capacity saturation, circuit breaker trips, queue depth growth. If any tier shows these symptoms, you've found a cascade risk. Fix it before you need the fallback in production.
+
+Test coordinated failure scenarios. Fail primary for Service A and Service B simultaneously. Do their fallbacks interfere with each other? Does one saturate a shared dependency and take down the other? Distributed system cascades are often caused by shared infrastructure or shared dependencies that individually look fine but collectively can't handle multiple services failing over at once.
+
+## The Cost of Cascade Prevention
+
+Preventing cascades is expensive. You pay for fallback capacity that sits mostly idle. You pay for warm instances. You pay for over-provisioning. You pay for circuit breakers and orchestration systems. This cost is justified by the risk of cascade failure. A cascade that takes down your entire service for 30 minutes costs more than months or years of fallback capacity costs.
+
+Some teams try to save money by under-provisioning fallback infrastructure and accepting that fallback might fail under full load. This is fine if you've made the decision explicitly and have accepted the risk. It's catastrophic if you've assumed fallback will work and never tested it under full load. The worst position is thinking you have reliable fallback when you actually have a cascade waiting to happen.
+
+The real cost is not the infrastructure. The real cost is the engineering effort to build, test, and maintain cascade-resistant fallback systems. This is not a one-time project. As your traffic grows, as your architecture changes, as you add new services, your fallback chains need to evolve. Capacity planning needs to be revisited quarterly. Cascade tests need to run monthly. Fallback health monitoring needs to be part of your standard operating procedures.
+
+Cascades are preventable. But prevention requires treating fallback infrastructure with the same rigor you treat primary infrastructure. Fallback is not a backup plan you hope never runs. It's a parallel production system that activates during incidents. It needs capacity, monitoring, testing, and operational discipline. Teams that understand this build systems that degrade gracefully. Teams that treat fallback as an afterthought build systems that cascade.
+
+Next we explore how to test fallback systems proactively through fire drills and chaos engineering, ensuring that your fallback chains work before you need them in production incidents.

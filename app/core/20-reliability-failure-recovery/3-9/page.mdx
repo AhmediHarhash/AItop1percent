@@ -1,0 +1,107 @@
+# 3.9 — Circuit Breaker Observability: Dashboards and Alerts
+
+In November 2025, a logistics company's API started timing out intermittently. Customer support tickets spiked. Engineers investigated the API service, the database, the cache layer. Everything looked healthy. Latency was normal, error rates were normal, CPU and memory were fine. They spent four hours debugging before someone thought to check their circuit breaker dashboard. The circuit protecting their address validation service had been open for 90 minutes. Every API request that needed address validation was immediately failing. The address validation service itself was healthy and had been for the last 80 minutes, but the circuit breaker was stuck open due to a configuration bug in their half-open testing strategy. Their 90 minutes of unavailability included 80 minutes when the downstream service was completely healthy. They had no alerts configured for circuit breaker state changes. They only discovered the problem when someone manually opened the dashboard during an unrelated investigation.
+
+Circuit breakers protect your system from cascading failures. But circuit breakers themselves can cause availability issues when they open unnecessarily, stay open too long, or fail to open when they should. Without visibility into circuit breaker state and behavior, you debug phantom problems, miss real problems, and can't tune thresholds effectively. Circuit breaker observability is not optional infrastructure. It's the control panel that lets you understand what your defensive systems are actually doing.
+
+## Essential Circuit Breaker Metrics
+
+Every circuit breaker must emit these metrics continuously:
+
+Current state: closed, open, half-open, or recovering. Emit this as a gauge metric with value 0 for closed, 1 for half-open, 2 for open. This lets you graph state over time and see exactly when transitions occurred. Tag the metric with circuit breaker name so you can track multiple breakers independently.
+
+State duration: how long the circuit has been in its current state. A circuit that's been open for 3 minutes has a very different meaning than one that's been open for 3 seconds. Emit this as a gauge in seconds. It helps identify circuits that are stuck open or flapping between states.
+
+Trip count: how many times the circuit has opened in the last hour, day, or week. This is your primary signal for circuit breaker health. A circuit that trips once per week is fine. A circuit that trips 50 times per hour indicates either an unstable downstream service or misconfigured thresholds. Emit this as a counter that you can query with rate functions to see trips per minute.
+
+Request counts by state: how many requests succeeded, failed, or were blocked in each state. While closed, track successes and failures to understand failure rate. While open, track how many requests you blocked (and therefore protected the downstream service from). While half-open, track test request outcomes. This shows both circuit breaker behavior and downstream service health.
+
+Latency by state: P50, P95, and P99 latency for requests in each state. Open circuit requests should have near-zero latency (immediate failure). Closed circuit requests should show normal downstream service latency. Half-open requests show recovery latency. Latency spikes often precede circuit opens and provide leading indicators.
+
+These metrics must be emitted every 10 seconds at minimum. Circuit breakers change state on seconds-to-minutes timescales. If you only emit metrics every 60 seconds, you miss short-duration opens and can't reconstruct the timeline during incident investigation.
+
+## Dashboard Design for Circuit Breaker Visibility
+
+Your circuit breaker dashboard should answer these questions within 5 seconds:
+
+Which circuits are currently open? Display a list or grid of all circuit breakers with current state highlighted. Color-code: green for closed, yellow for half-open, red for open. This should be the largest, most prominent element on the dashboard. When an incident starts, this view immediately shows which dependencies are circuit-broken.
+
+How long has each circuit been in its current state? Display state duration next to each breaker. A circuit that's been open for 2 minutes is recovering from a transient issue. A circuit that's been open for 20 minutes indicates a sustained outage or a stuck circuit. This helps prioritize investigation.
+
+What's the trip rate for each circuit? Show trips per hour or trips per day. A circuit that opened once three hours ago and has been closed since is healthy. A circuit that's opened six times in the last hour is flapping and needs investigation. Use a sparkline or small time-series graph to show trip pattern over the last 24 hours.
+
+What traffic volume is being blocked? When circuits are open, show how many requests per second are being blocked. This quantifies user impact. If your payment processing circuit is open and blocking 200 requests per second, you know approximately how many users are experiencing payment failures right now. This helps incident commanders prioritize response.
+
+What's the failure rate for closed circuits? Show the current failure rate (failed requests divided by total requests) for all closed circuits. A circuit with 15% failure rate is approaching its trip threshold (typically 20-50%). This is your leading indicator that a circuit is about to open. Teams that monitor this metric proactively investigate before circuits trip.
+
+The dashboard should have one view per circuit breaker showing detailed state history. Graph the state (closed, half-open, open) over time as a state timeline. Graph request success rate, request latency, and traffic volume on the same timeline. This lets you correlate state changes with downstream service behavior. You should be able to see: circuit opened at 2:35 PM, stayed open until 2:36 PM, transitioned to half-open, reopened at 2:36:30 PM, transitioned to half-open again at 2:37 PM, closed at 2:37:15 PM. You should see that failure rate spiked to 80% in the 30 seconds before the first open, and that latency was elevated for 5 minutes before the failure rate spike. This tells the story of the incident.
+
+## Alerting on Circuit Breaker Events
+
+Alert when any circuit opens. This is your tier-one circuit breaker alert. It means user-facing functionality just degraded because a downstream dependency is failing. The alert should include circuit name, failure rate that triggered the open, and request volume being blocked. Most teams route this to their primary on-call channel with medium urgency. It doesn't require immediate response in the way a total outage does, but it requires investigation within minutes to determine severity and user impact.
+
+Alert when a circuit stays open for longer than expected. If your circuits typically reclose within 60 seconds but one has been open for 5 minutes, something is wrong. Either the downstream service is experiencing a sustained outage, or your circuit is stuck due to configuration issues. Set this threshold to 2-3x your normal recovery time. If circuits usually close within 60 seconds, alert on any circuit open for more than 120-180 seconds. This catches stuck circuits that would otherwise remain open until manual intervention.
+
+Alert on high trip rates. If a circuit opens more than five times in an hour, the downstream service is unstable or your thresholds are misconfigured. Set up an alert that fires when any circuit trips more than 3-5 times in a 30-minute window. This indicates a problem that requires investigation even if the circuit eventually closes successfully.
+
+Alert when circuits never trip during load tests or chaos experiments. You should verify your circuit breakers actually work by testing them at least monthly. Deliberately degrade downstream services and verify that circuits open as expected. If a circuit never opens during testing, it might have configuration bugs, incorrect thresholds, or might not be active at all. Automate this verification: your chaos testing should emit metrics showing which circuits opened during the test. Alert if expected circuits didn't trip.
+
+Do not alert on every state transition. If a circuit opens and closes within 30 seconds, this is normal protection behavior. Alerting on every open creates alert fatigue. Alert on opens that exceed duration thresholds or on high trip rates, not on individual opens.
+
+## Trip Rate as a Leading Indicator
+
+The frequency of circuit breaker trips predicts downstream service reliability more accurately than most health checks. A service can pass health checks while experiencing elevated failure rates under load. A circuit that trips once per day is a healthy pattern for a service with occasional transient issues. A circuit that trips ten times per day indicates an unreliable service that's barely staying available.
+
+Track trip rate over time for each circuit. Graph trips per day over the last 30 days. An increasing trend indicates degrading downstream service reliability. A service whose circuit tripped 2 times per day in January but 15 times per day in February is experiencing a reliability regression. This metric catches problems before they escalate to sustained outages.
+
+Trip rate also reveals seasonal patterns. A circuit might trip more frequently during business hours when traffic is high, then close overnight when traffic drops. This is normal. But if a circuit that never tripped overnight suddenly starts tripping at 3 AM, the downstream service's resource exhaustion problem just got worse. It can no longer handle even off-peak load.
+
+Correlate trip rate with deployment events. If trip rate increases after a downstream service deploys new code, the deployment probably introduced a regression. If trip rate increases after your service deploys new code, you probably changed usage patterns or increased traffic volume to the downstream dependency. Circuit breaker trip rate is a high-signal deployment health metric.
+
+## The Circuit That Trips Too Often
+
+A circuit that trips multiple times per hour is telling you something. Either the downstream service is genuinely unstable and needs fixing, or your circuit breaker thresholds are too sensitive and need tuning. Both require action.
+
+First, investigate the downstream service. Look at its own metrics during circuit open periods. Is it experiencing elevated error rates, high latency, resource exhaustion, or database issues? If yes, the circuit breaker is working correctly by protecting you from a failing service. The problem is the downstream service, not the circuit breaker. Work with the downstream team to fix their reliability.
+
+If the downstream service metrics look healthy during circuit open periods, your circuit breaker thresholds are probably too sensitive. You're opening the circuit based on transient errors that don't represent true service unavailability. Increase your failure rate threshold from 20% to 40%, or increase the minimum request count from 5 to 20, or increase the failure window from 10 seconds to 30 seconds. Test the new thresholds in staging by introducing controlled failure and verify that the circuit opens when it should and stays closed when it shouldn't.
+
+High trip rates cause availability problems even when the downstream service is healthy. Each time a circuit opens, you block requests for at least 10-60 seconds. If a circuit trips ten times per hour, you're creating 100-600 seconds of unnecessary unavailability per hour. Your users experience this as intermittent failures that look random. This damages trust more than a single sustained outage because users can't predict when the service will work.
+
+## The Circuit That Never Trips
+
+A circuit breaker that never opens might not be working at all. You configured it wrong, pointed it at the wrong service, or set thresholds so high that nothing will ever trigger it. A circuit that stays closed for months is suspicious unless you're certain the protected service has perfect reliability.
+
+Test each circuit breaker at least quarterly. During a maintenance window or low-traffic period, deliberately degrade the downstream service and verify the circuit opens. Make the service timeout, return errors, or go completely unavailable. Confirm that your circuit breaker detects this, opens the circuit, and blocks subsequent requests. If it doesn't, you have a configuration bug that will cause cascading failures during real incidents.
+
+Some teams automate this testing with chaos engineering. Every week, their chaos system deliberately breaks one downstream service and verifies that protecting circuit breakers open. This continuous verification ensures circuits remain correctly configured even as code changes, dependencies shift, and infrastructure evolves.
+
+Never assume circuit breakers work without testing. Configuration drift happens. Someone changes timeout values without updating circuit breaker thresholds. Someone migrates a service to a new endpoint without updating circuit breaker configuration. Someone adds retry logic that interferes with circuit breaker failure detection. Test every circuit breaker, measure its behavior, and verify it opens when it should.
+
+## Historical Analysis for Pattern Detection
+
+Circuit breaker history reveals patterns that current-state metrics miss. Store all circuit breaker state transitions with timestamps in a queryable database. This historical data answers questions like:
+
+Which downstream services cause the most circuit opens over time? Calculate total circuit open duration per service over the last month. A service whose circuit is open for 300 minutes total across many short incidents is less reliable than a service whose circuit is open for 10 minutes total. This prioritizes reliability improvement work.
+
+What time of day do circuits trip most frequently? If circuits always trip between 9 AM and 11 AM, your system can't handle morning traffic peaks and you need to scale capacity. If circuits trip randomly throughout the day, you have transient service issues unrelated to load.
+
+How long do circuits stay open on average? Calculate median and P95 duration of open circuits. If most circuits close within 30 seconds but P95 is 10 minutes, you have a long tail of incidents where either services take a very long time to recover or circuits get stuck. This helps tune your half-open testing strategy.
+
+How many half-open cycles occur before successful closure? If circuits typically transition to half-open, immediately close, and stay closed, your half-open strategy is well-tuned. If circuits require multiple half-open attempts before closing, you might need to increase test traffic volume or decrease success thresholds.
+
+This historical analysis drives configuration improvements. Circuit breakers ship with default thresholds that don't match your specific services. Use historical data to tune thresholds, half-open strategies, and timeouts to your actual traffic patterns and failure modes.
+
+## Integration with Incident Management
+
+Circuit breaker state should feed directly into incident detection and response systems. When a circuit opens, automatically create an incident or page the on-call engineer depending on the protected service's criticality. Include circuit name, failure rate, blocked request volume, and a link to the detailed circuit breaker dashboard in the incident context.
+
+During incident response, circuit breaker dashboards provide critical information. When users report errors, checking circuit breaker state immediately shows which dependencies are failing. When investigating root cause, circuit breaker trip times show exactly when the cascade started. When communicating status to stakeholders, blocked request counts quantify user impact.
+
+After incidents, circuit breaker history is essential for timeline reconstruction and root cause analysis. You can see that the database circuit opened at 2:47 PM, which caused the cache circuit to open at 2:48 PM as requests that would normally hit cache now hit the database directly, which caused the API circuit to open at 2:49 PM as both cache and database were unavailable. The circuit breaker timeline reveals the cascade that user-facing metrics alone don't show.
+
+Teams with mature circuit breaker observability treat circuit breaker dashboards as first-class operational tooling. They're shown on war-room displays during incidents. They're the first dashboard on-call engineers check when paged. They're reviewed in every post-incident analysis. The teams that build comprehensive circuit breaker observability resolve incidents faster, understand failure patterns more deeply, and tune their defensive systems more effectively than teams that treat circuit breakers as invisible infrastructure.
+
+---
+
+Next, we examine timeout and retry patterns — the defensive techniques that work alongside circuit breakers to prevent cascading failures at the request level.

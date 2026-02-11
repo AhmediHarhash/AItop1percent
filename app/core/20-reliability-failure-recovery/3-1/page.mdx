@@ -1,0 +1,83 @@
+# 3.1 — The Circuit Breaker Pattern for AI Systems
+
+Three states control the flow of traffic to a component. Closed means healthy: requests flow normally. Open means broken: requests are immediately rejected without attempting the operation. Half-open means testing: a small number of probe requests are allowed through to check if the component has recovered. The circuit breaker transitions between these states based on health signals. When failure thresholds are exceeded, the breaker trips from closed to open. After a cooldown period, it moves to half-open to test recovery. If probes succeed, it returns to closed. If probes fail, it returns to open for another cooldown cycle.
+
+This pattern exists in every distributed system built for reliability. Microservices use circuit breakers to prevent cascading failures when dependencies go down. API gateways use them to protect backends from traffic surges. Load balancers use them to remove unhealthy instances from rotation. The pattern is fundamental to resilience engineering. AI systems need it more than traditional systems because AI failures are often silent, gradual, and undetectable through infrastructure metrics alone.
+
+## Why AI Systems Need Circuit Breakers More
+
+Traditional services fail loudly. A database crashes and returns connection errors. A cache becomes unavailable and timeouts occur. An API starts returning HTTP 500s. These failures are self-announcing. Infrastructure monitoring catches them immediately. Circuit breakers trip based on clear error signals.
+
+AI systems fail quietly. A model provider experiences degradation and latency increases from 400 milliseconds to 1.8 seconds, but responses still return. A retrieval component starts returning irrelevant documents at higher rates, but the API still responds with HTTP 200. A fine-tuned model regresses to baseline quality after a deployment, but syntactically the outputs look identical. An agent begins looping in its reasoning without completing tasks, but from the infrastructure perspective it is simply processing longer.
+
+These silent failures do not trigger traditional circuit breakers. Error rates stay flat because the errors are semantic, not syntactic. Status codes remain 200 because the components are technically responding. Latency may increase slightly but not enough to trip timeout-based breakers. Without quality-aware circuit breakers, traffic continues flowing to degraded components until users complain, support tickets accumulate, or executive escalations force investigation.
+
+The cost of this delay is measured in bad outputs served, downstream effects amplified, and trust eroded. A degraded model that runs for two hours before manual intervention serves potentially tens of thousands of poor-quality responses. A retrieval system returning irrelevant documents for ninety minutes poisons every downstream decision made during that window. An agent stuck in loops wastes compute at scale and blocks real tasks. Circuit breakers that trip on quality signals contain these failures within seconds or minutes instead of hours.
+
+## The Three States and State Transitions
+
+The closed state is normal operation. Traffic flows through the circuit breaker to the protected component without interference. The breaker monitors success and failure rates, latency, and any quality metrics configured for the component. As long as health remains above thresholds, the breaker stays closed and invisible. This is the happy path: everything works, users are served, the breaker just watches.
+
+The open state is protection mode. When failure thresholds are exceeded, the breaker trips to open. No traffic is sent to the protected component. Requests are immediately rejected with a circuit-open error. This serves two purposes. First, it prevents bad traffic from reaching users. A degraded model does not continue serving poor outputs. Second, it gives the component time to recover. Models experiencing load-related quality drops get breathing room. Providers handling incidents are not bombarded with continued traffic from your system.
+
+The half-open state is recovery testing. After a configured timeout in the open state, the breaker moves to half-open and allows a small number of probe requests through. If these probes succeed according to the same health criteria that triggered the breaker, the circuit transitions back to closed and normal traffic resumes. If probes fail, the circuit returns to open for another timeout cycle. This prevents premature recovery that would immediately re-trigger the failure.
+
+State transitions must be deterministic and based on clear thresholds. The transition from closed to open typically uses a sliding window: if more than X percent of requests fail within the last Y seconds, trip the breaker. The transition from open to half-open uses a fixed timeout: remain open for Z seconds before testing recovery. The transition from half-open back to closed or open uses a small sample: if N out of M probe requests succeed, close the circuit; otherwise reopen.
+
+These parameters must be tuned for each component. A model provider might use a 10% error rate over 30 seconds to trip, a 60-second cooldown before half-open testing, and 3 out of 5 successful probes to close. A retrieval component might use a 15% relevance drop over 60 seconds to trip, a 120-second cooldown, and 5 out of 5 successful probes to close. The specifics depend on baseline behavior, acceptable failure rates, and recovery time expectations.
+
+## When to Trip the Circuit Breaker
+
+Error-based tripping is the traditional approach. Count HTTP errors, timeouts, connection failures, and any response that indicates the component is not functioning. When the error rate exceeds threshold within the monitoring window, trip the breaker. This works well for infrastructure failures: provider outages, network issues, service crashes.
+
+Latency-based tripping catches performance degradation. When response times increase significantly above baseline, the component is under stress even if responses are technically successful. A model that normally responds in 500 milliseconds but is now taking 4 seconds is unhealthy. Continued traffic will likely make the situation worse. Trip the breaker and give it time to recover or fail over to an alternative.
+
+Quality-based tripping is specific to AI systems. Measure the quality of outputs using automated evaluation: relevance scores, factual accuracy checks, hallucination detection, safety classifiers. When quality drops below threshold, the model is producing bad outputs even though the API is technically working. This is the most important signal for AI circuit breakers and the one most teams miss.
+
+Combined tripping uses multiple signals. A circuit breaker can trip if error rate exceeds threshold OR latency exceeds threshold OR quality drops below threshold. This creates defense in depth: infrastructure failures trip the error condition, performance issues trip the latency condition, and semantic degradation trips the quality condition. At least one signal will catch the failure regardless of failure mode.
+
+## Recovery Conditions and Half-Open Probing
+
+The open state timeout must be long enough for meaningful recovery but short enough that you are not offline unnecessarily. Sixty seconds is a reasonable starting point for most AI components. This gives a degraded provider time to shed load or fix issues, gives a model time to recover from memory pressure, gives a retrieval service time to clear backlogs. Adjust based on observed recovery patterns: if components typically recover within 30 seconds, shorten the timeout; if recovery takes multiple minutes, lengthen it.
+
+Half-open probing must test the same conditions that caused the trip. If the circuit opened due to quality degradation, the probe requests must include quality evaluation. If it opened due to latency spikes, the probes must verify latency is back to baseline. If it opened due to errors, the probes must confirm error rates are back below threshold. Probing only infrastructure health when quality caused the trip will lead to premature closure and immediate re-tripping.
+
+Probe volume must be small enough that it does not cause harm if the component is still unhealthy. Three to five probe requests is typical. This is enough to establish a signal but not enough to overwhelm a recovering component or serve a significant volume of bad outputs to users if the component has not actually recovered.
+
+Probe selection matters for quality-based breakers. Use test cases with known ground truth rather than live traffic. You want to verify the model can produce correct outputs, not sample random production requests that you cannot evaluate definitively. A retrieval circuit breaker should probe with queries that have known relevant documents. A classification circuit breaker should probe with examples that have verified labels. This gives clear pass-fail criteria for recovery.
+
+## Implementation Patterns for AI Systems
+
+Circuit breakers sit at system boundaries: between your application and external model providers, between your orchestration layer and RAG components, between your agent framework and tool calls, between any consumer and any dependency that can fail. They are implemented as wrapper logic around API calls. The calling code remains unaware of circuit state; the wrapper handles state management and makes the trip-or-allow decision on every request.
+
+State storage must be shared across instances. If you have multiple application servers, they must share circuit breaker state. Storing state in local memory means each instance maintains independent breakers, which defeats the purpose. One instance trips its breaker while others continue sending traffic to the failing component. Use a shared data store: Redis, Memcached, or a distributed cache. The breaker checks and updates shared state on every request.
+
+Fallback behavior must be defined for the open state. When the circuit is open, what happens to the request? Options include returning a cached response, routing to a backup component, degrading to a simpler approach, or returning an error to the user. The correct choice depends on the system: a chatbot might fall back to a cheaper model, a recommendation system might return cached results, a classification system might route to a backup model. The key is that fallback is predetermined, not improvised during an incident.
+
+Monitoring and alerting must track circuit state changes. When a breaker trips, it should fire an alert. Engineering needs to know immediately that a component is being protected. When a breaker remains open for extended periods, it should escalate. This indicates the component is not recovering and manual intervention is needed. When a breaker flaps between open and closed repeatedly, it indicates instability that needs investigation.
+
+## Common Mistakes in Circuit Breaker Implementation
+
+Setting thresholds too loose renders breakers useless. If the error threshold is 50% over 300 seconds, the breaker will only trip during catastrophic failures that are already obvious. By the time 50% of requests are failing over five minutes, significant damage has been done. Thresholds must be tight enough to catch degradation early: 10% errors over 30 seconds is far more protective.
+
+Setting thresholds too tight causes false positives. If the threshold is 2% errors over 10 seconds, normal variance will trip the breaker constantly. Users will experience unnecessary failovers and degraded service when the primary component is actually healthy. Thresholds must account for baseline noise: if your normal error rate is 1%, a 2% threshold over 10 seconds is too sensitive.
+
+Not implementing quality-based tripping leaves the most important failure mode undetected. Teams that only use error-based breakers will not catch semantic degradation. A model producing hallucinations at increasing rates, a retrieval system returning progressively less relevant documents, an agent generating unsafe outputs more frequently — none of these trip error-based breakers. Quality monitoring must be integrated into circuit breaker logic.
+
+Sharing a single breaker across multiple independent components creates false coupling. If you have one circuit breaker for all model providers, a failure in OpenAI trips the breaker and stops traffic to Anthropic as well, even though Anthropic is healthy. Circuit breakers must be per-component: one breaker for each provider, one breaker for each major subsystem, one breaker for each independently-failing dependency.
+
+Not implementing half-open recovery testing means manual intervention is required to restore service. If a breaker opens and stays open indefinitely until a human resets it, you have lost the benefit of automatic recovery. The breaker must automatically test recovery and restore service when the component is healthy again. Otherwise you have built a kill switch, not a circuit breaker.
+
+Ignoring breaker state in load balancing creates uneven traffic distribution. If you have three model providers and one has its circuit open, requests must not be routed to it. Load balancing logic must be aware of circuit state and exclude open circuits from the rotation. Otherwise the breaker opens but traffic continues flowing through the load balancer as if nothing changed.
+
+## The Circuit Breaker as Organizational Communication
+
+When a circuit breaker trips, it is a public declaration that a component is unhealthy. Unlike silent degradation that only monitoring teams see, an open circuit affects traffic and is visible to anyone observing the system. This is valuable organizational communication. Engineering learns immediately that a dependency is failing. Product learns that fallback behavior is active. Leadership learns that the system is in a degraded state.
+
+This visibility creates accountability. If the breaker is open for 10 minutes, the team responsible for that component knows they must investigate. If it is open for an hour, leadership knows there is an ongoing incident. If it flaps repeatedly over days, everyone knows the component is unstable and architectural work is needed. The circuit breaker state becomes a shared reality that aligns the organization around reliability problems.
+
+This only works if breaker state is observable. Dashboards must show which circuits are open, how long they have been open, how often they trip, and what percentage of time each component spends in each state. Alerts must fire on state changes. Incident channels must be notified when breakers open. The more visible the circuit state, the faster the organization responds to reliability issues.
+
+---
+
+Next: **3.2 — Error-Based vs Quality-Based Circuit Breakers**

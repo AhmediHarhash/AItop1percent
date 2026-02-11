@@ -1,0 +1,74 @@
+# 4.2 — Model Fallback Strategies: When Your Primary Provider Fails
+
+Your primary model provider just went down. You have three seconds to decide where to route the next 10,000 requests. Do you fall back to a different provider? A smaller cheaper model? A locally-hosted model? A cached response? Each choice has different latency, quality, cost, and failure characteristics. The teams that survive outages are the ones who made these decisions months earlier, tested every path, and provisioned capacity before it was needed.
+
+Model fallback is the most common and most complex fallback type in AI systems. The primary challenge: different providers have different APIs, different prompt formats, different capabilities, and different failure modes. A prompt optimized for GPT-5.1 may produce mediocre results on Claude Opus 4.5. A request that requires 128,000-token context may work on your primary model but fail on your fallback with a 32,000-token limit. A streaming response from one provider may need to be converted to batch format for another. Effective model fallback requires upfront compatibility work, not just hope.
+
+## Fallback to Backup Provider
+
+The cleanest model fallback strategy is routing to a backup provider. Your primary is OpenAI GPT-5.1. Your fallback is Anthropic Claude Opus 4.5. When OpenAI returns errors or exceeds latency thresholds, you route to Anthropic. This works well when both providers offer similar capabilities, similar context window sizes, and similar pricing. It works poorly when they do not.
+
+The first design decision: do you adapt prompts for the fallback provider, or use the same prompt across both? Adapting prompts maximizes fallback quality but requires maintaining two versions of every prompt and a prompt-swapping layer that activates during failure. Using the same prompt is simpler but typically produces 10-30% worse results on the fallback provider. Most teams start with the same-prompt approach for simplicity, then selectively adapt prompts for high-value use cases where quality degradation is unacceptable.
+
+The second design decision: do you maintain live contracts and provisioned capacity with backup providers during normal operation, or spin up capacity only during failure? Maintaining live contracts costs money—you are paying for capacity you are not using 99% of the time. But spinning up capacity during failure introduces delay. A team using Google Gemini 3 Pro as fallback discovered that their Gemini rate limit was set to a low default because they rarely used it. When primary failed and traffic switched to Gemini, they immediately hit rate limits and had to request an emergency increase, which took 45 minutes. By the time capacity was available, the primary outage had resolved. The fallback provided zero value.
+
+The best practice for critical systems: maintain active contracts with at least one backup provider, negotiate rate limits sufficient to handle 100% of your primary traffic, and route 1-5% of production traffic to the backup provider continuously. The continuous routing serves two purposes: it tests the fallback path under real conditions daily, and it keeps the provider relationship warm so you are not a dormant account requesting emergency capacity during an outage.
+
+## Fallback to Smaller or Cheaper Model
+
+If your primary model is GPT-5.1, your fallback can be GPT-5-mini. If your primary is Claude Opus 4.5, your fallback can be Claude Sonnet 4.5. Smaller models from the same provider avoid the prompt adaptation problem—the API is identical, the prompt format is identical, only the quality differs. The trade-off: smaller models produce worse results, sometimes significantly worse. The decision hinges on whether degraded quality is acceptable for your use case.
+
+Some use cases tolerate quality degradation better than others. A customer service chatbot answering simple FAQs can fall back to a smaller model with minimal user impact. A legal contract analyzer cannot—a small model that misses key clauses causes real harm. A code generation assistant falling back to a smaller model will produce more bugs and less idiomatic code, but may still be useful for simple tasks. You must define per-use-case or per-request-type quality floors below which fallback should refuse to serve rather than serve badly.
+
+The smaller-model fallback works best when paired with request classification. Simple requests route to the smaller fallback. Complex requests either route to a backup provider with a larger model or fail explicitly and queue for manual handling. The classification logic must be fast and reliable—if classifying requests takes 500 milliseconds, it erodes the latency benefit of the smaller model.
+
+One team implemented a three-tier model fallback: GPT-5.1 as primary, GPT-5 as Tier 2 fallback, GPT-5-mini as Tier 3. During a partial GPT-5.1 outage, 60% of traffic served successfully from primary, 30% fell back to GPT-5 with acceptable quality, and 10% fell back to GPT-5-mini with noticeable but tolerable degradation. Average response quality during the outage was 85% of normal, but availability remained at 99%. Users saw slower and slightly worse responses but the service stayed up.
+
+## Fallback to Local or Self-Hosted Model
+
+Some teams deploy a local or self-hosted model as a final fallback tier. The model runs on-premise, in a private cloud, or on dedicated infrastructure you control. The advantage: complete independence from external provider availability. If every external provider fails simultaneously—rare but not impossible—your local model continues serving. The disadvantages: local models are typically smaller and less capable, they require significant infrastructure investment, and they introduce operational complexity.
+
+The local fallback strategy works best for high-volume, high-availability systems where uptime matters more than peak quality. A fraud detection system that processes millions of transactions per day cannot tolerate extended outages. A local fallback model running Llama 4 Maverick or Mistral Large 3 provides a quality floor that keeps the system operational even when all external providers are unavailable. The model may catch fewer fraud cases than the primary GPT-5.2 model, but it catches enough to provide value.
+
+The infrastructure requirements are non-trivial. Running a frontier-quality local model requires GPU servers, model deployment tooling, monitoring, and ongoing maintenance. A team deploying Llama 4 Maverick as a local fallback invested $180,000 in GPU infrastructure, two months of engineering time to build deployment pipelines, and ongoing operational costs of $8,000 per month. The infrastructure sat idle 99.7% of the time. But during a six-hour multi-provider outage, it served 2.3 million requests that would otherwise have failed. The ROI calculation: $8,000 per month buys insurance against catastrophic unavailability.
+
+Some teams use quantized or distilled models for local fallback. A quantized Llama 4 model runs on cheaper hardware with lower latency but somewhat worse quality than the full-precision version. A distilled model trained to mimic GPT-5 behavior runs faster and cheaper but introduces quality variance. These trade-offs make sense when the goal is "serve something acceptable" rather than "serve at primary quality."
+
+## Fallback to Cached Similar Responses
+
+If live model generation fails, serving a previously-generated response to a similar request can be better than serving nothing. A customer asking "How do I reset my password?" at 3 PM receives the same answer as a customer who asked the identical question at 9 AM. If your model is unavailable at 3 PM, serving the cached 9 AM response provides a good user experience at zero inference cost.
+
+The cached-response fallback requires three components: a request similarity system that matches new requests to cached ones, a cache of high-quality responses with metadata about when they were generated and for what input, and logic that determines when cached responses are safe to serve versus when freshness or specificity matters too much. This strategy works well for FAQ-style systems, customer support chatbots, and informational assistants. It works poorly for tasks requiring real-time data, user-specific context, or transactional operations.
+
+The similarity matching must be fast. If it takes 800 milliseconds to search your cache for a similar request, you have eroded most of the latency benefit. Most teams use vector similarity: embed the incoming request, search for the nearest cached request embedding, return the cached response if similarity exceeds a threshold like 0.92. The threshold determines the trade-off between recall and quality. A threshold of 0.99 means you only serve cached responses for near-identical requests—high quality but low recall. A threshold of 0.85 means you serve responses for loosely-similar requests—higher recall but more risk of slight mismatches.
+
+The freshness problem is critical. A cached response from two hours ago explaining your product's features is fine. A cached response from two months ago, before a major product update, is actively harmful. You need cache invalidation logic that expires responses based on time, based on upstream data changes, or based on explicit signals like product releases. A financial services chatbot serving cached answers about interest rates must invalidate those answers the moment rates change. Stale financial information is worse than no information.
+
+One team used cached-response fallback for 12% of requests during a three-hour primary outage. User satisfaction surveys showed no statistically significant difference in satisfaction between users who received live-generated responses and users who received cached responses—because most questions were FAQ-style where cached answers were just as good. But 2% of users received slightly-mismatched cached responses and reported confusion. The trade-off: serve 98% of users well during an outage at the cost of slightly confusing 2%.
+
+## Fallback to Template or Rule-Based Responses
+
+When all model-based fallbacks fail, some teams fall back to template responses or rule-based logic. A user asks "What is the status of my order?" The system cannot reach any model. Instead of failing, it uses a rule: extract order ID from the query, look up order status in the database, fill a template with the result. No AI inference required. The response is rigid and cannot handle variations or follow-up questions, but it provides basic value.
+
+Template fallbacks work best for narrow, structured use cases. Order status lookup, account balance inquiry, appointment scheduling for predefined slots—these can be handled with deterministic logic when AI fails. Open-ended conversations, complex reasoning, creative generation—these cannot. The key is recognizing which requests can be served without AI and routing only those to template fallbacks.
+
+A healthcare scheduling assistant used a three-tier fallback: GPT-5 as primary, Claude Opus 4.5 as backup provider, and a rule-based appointment booking system as final fallback. During a dual-provider outage, 40% of requests were simple scheduling tasks that the rule-based system handled perfectly. The other 60% required conversational interaction that rules could not handle—those requests were queued for manual handling. The rule-based fallback kept core functionality operational even when no AI was available.
+
+## The Prompt Adaptation Problem for Backup Providers
+
+Different model providers respond better to different prompt styles. GPT models often prefer structured instructions with clear role definitions. Claude models respond well to conversational framing with examples. Gemini models handle complex multi-turn interactions differently than single-turn requests. If you optimize your prompt for your primary provider, using that exact prompt on a fallback provider often yields mediocre results.
+
+The prompt adaptation challenge: do you maintain provider-specific prompts, or accept quality degradation on fallbacks? Maintaining multiple prompts doubles prompt engineering work, doubles eval effort, and introduces the risk that prompts drift over time as you improve one but forget to update the other. Accepting degradation simplifies engineering but frustrates users when fallback quality drops noticeably.
+
+The middle ground: maintain a single universal prompt tested across all providers, optimize it for acceptable performance on all rather than peak performance on one. This costs 5-10% quality on your primary provider but ensures 80-90% quality on fallbacks. A team using this approach tested every prompt change against GPT-5.1, Claude Opus 4.5, and Gemini 3 Pro simultaneously. Prompts that performed well on all three were kept. Prompts that optimized for one provider at the expense of others were rejected. The result: seamless fallback behavior with minimal user-visible quality drop.
+
+## Capability Degradation During Fallback
+
+Even with good prompt adaptation, fallback models often have capability limitations that primary models do not. Your primary model supports 200,000-token context. Your fallback supports 32,000 tokens. When a request exceeds 32,000 tokens and primary fails, what do you do? The options: truncate context and serve a degraded response, refuse the request and return an error, or queue it for manual handling. None are perfect.
+
+The capability gap becomes visible during fallback. Users who rely on extended context, multimodal inputs, or advanced reasoning capabilities will notice when fallback models cannot support them. The best practice: detect capability requirements at request time and route to fallbacks that can handle them. If no fallback can handle a request, fail explicitly rather than serve a broken response.
+
+A legal document analysis system required 128,000-token context for complex contracts. The primary model was GPT-5.1 with 200,000-token support. The fallback was Claude Sonnet 4.5 with 200,000-token support—no problem. But the tertiary fallback was a local Llama 4 Maverick model with 32,000-token limit. When both primary and secondary failed, the system detected that 40% of queued requests exceeded the tertiary fallback's capability. Those requests were held for manual processing. The other 60%, with shorter documents, were served by the local model. Capability-aware fallback prevented serving garbage results from truncated context.
+
+The next subchapter covers quality-aware fallback—routing requests not just to available fallbacks, but to fallbacks that can serve specific requests well. Not all fallbacks can handle all requests. Knowing which fallback to use for which request type is the difference between graceful degradation and invisible failure.
+

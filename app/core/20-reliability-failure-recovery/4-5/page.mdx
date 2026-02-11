@@ -1,0 +1,97 @@
+# 4.5 — Partial Response Fallbacks: Serving What You Can
+
+Your multi-modal travel assistant handles complex queries: flight status, hotel recommendations, weather forecast, and local transportation options, all in one response. In January 2026, the weather API went down during a busy travel weekend. The fallback logic was binary—if any component failed, return an error for the entire request. Thousands of users asked about their trips and received "service temporarily unavailable" messages, even though flight status, hotel data, and transportation were all working perfectly. The team lost an estimated 18,000 interactions over six hours because they treated partial failure as total failure.
+
+The fix took 40 minutes to deploy: detect which components succeeded, assemble responses from successful components, and add a note about missing information. Users got flight status and hotel recommendations with a message that weather data was temporarily unavailable. Engagement dropped only 12% instead of going to zero. Partial response fallback turned a complete outage into a degraded service event.
+
+## Identifying Decomposable Requests
+
+Not every request can be partially fulfilled. A request for your account balance cannot be served without the balance—that's the entire request. A request to book a flight cannot be partially completed—you either book it or you don't. But many AI interactions are composites of multiple independent retrievals, each of which can succeed or fail independently.
+
+Decomposable requests have separable components that provide value on their own. A customer support query asking "what's my order status and how do I return an item" contains two components: order status lookup and return policy retrieval. If order status fails, you can still serve return policy. If return policy fails, you can still serve order status. Each component answers part of the question.
+
+Identify decomposability during request processing, not during failure. When a request arrives, your routing layer should recognize whether it's asking for one thing or multiple things. Single-component requests fail atomically—if the component fails, the request fails. Multi-component requests fail partially—if one component fails, serve the others. This requires query understanding and intent classification before you start processing.
+
+Some teams build explicit decomposition into their prompts and agent instructions. The system breaks complex queries into sub-tasks, executes each sub-task independently, and assembles results. This makes partial failure handling straightforward—each sub-task is a component, and components that fail are simply omitted from the final response. The cost is added latency from the decomposition step and potential for incorrect decomposition.
+
+## Which Components Can Fail Independently
+
+Not all components in a multi-component request are independent. Some depend on others. If a user asks "what's the weather in my destination city this weekend," you need three things: the user's destination, the weather forecast, and the dates of their trip. These are not independent. Without the destination, you can't fetch weather. Without the dates, you can't narrow the forecast.
+
+Map component dependencies during system design. For each request type, identify which components are prerequisites for others. Travel destination is a prerequisite for weather. Account ID is a prerequisite for order history. User preferences are prerequisites for recommendations. When a prerequisite component fails, all dependent components fail too, even if their underlying systems are healthy. Serve only the components that have no failed prerequisites.
+
+The simplest dependency model is linear: component A is needed for component B, component B is needed for component C. If A fails, B and C cannot run. If B fails, C cannot run but A can still be returned. This maps directly to execution order—run A first, then B, then C, and stop at the first failure.
+
+The more common model is tree-shaped: component A is a prerequisite for components B and C, but B and C are independent of each other. If A fails, nothing runs. If A succeeds but B fails, return A and C. This requires parallel execution and conditional assembly based on which branches succeeded.
+
+The hardest model is graph-shaped with cycles or mutual dependencies. Component A needs data from B and C, but B needs confirmation from A. These requests are not cleanly decomposable. Attempting partial response fallback with cyclical dependencies creates incomplete or incoherent responses. Mark these requests as non-decomposable and fail them atomically.
+
+## Partial Response Assembly
+
+When some components succeed and others fail, you must assemble a response that makes sense. The naive approach concatenates successful component outputs with a disclaimer about missing data. This works when components are independent and order doesn't matter. It fails when components have implicit ordering or when the absence of one component makes another component's output confusing.
+
+Structured assembly uses templates with conditional sections. Each component fills a specific part of the template. If a component fails, that section is omitted and a fallback message is inserted. The template ensures the response is coherent even with missing pieces. Travel itinerary responses use this pattern: sections for flight status, hotel info, weather, and local tips, each of which can be present or absent depending on component success.
+
+Some requests require rewriting after partial failure. If a user asks for product recommendations and the recommendation engine fails, you can't just return nothing—that's confusing. Instead, rewrite the response to acknowledge the failure and offer an alternative: "I can't generate personalized recommendations right now, but here are our most popular products in this category." This isn't a partial response—it's a fallback response that requires understanding which component failed and why.
+
+Assembly logic belongs in the orchestration layer, not in individual components. Components should not know about each other or about failure handling. They receive input, do their work, and return output or an error. The orchestrator collects component results, detects failures, decides which components to include in the response, and assembles the final output. This separation keeps components simple and makes fallback logic reusable across request types.
+
+## Communicating Partial Responses to Users
+
+Users expect complete answers. When you serve a partial response, you must be explicit about what's missing and why. Silent omission confuses users—they assume the information isn't relevant, not that it failed to load. Explicit disclosure sets correct expectations.
+
+The standard pattern is a leading disclaimer: "I was unable to retrieve weather data, but here's the rest of your travel information." This tells the user immediately that the response is incomplete. Follow with the partial response, structured so the missing component's absence is obvious.
+
+Some teams use inline annotations. Instead of a leading disclaimer, they insert notes at the point where missing information would appear: "Flight status: On time, departing at 3:45 PM. Weather: Currently unavailable. Hotel: Confirmed, check-in at 4 PM." This makes the incompleteness clear without requiring the user to remember the disclaimer.
+
+The tone matters. Avoid apologetic or overly technical explanations. Don't say "the weather service API returned a 503 error." Say "weather data is temporarily unavailable." The user doesn't need to know the technical cause. They need to know what's missing and whether they should retry later.
+
+For high-stakes requests, add guidance about what to do with partial information. A financial assistant serving partial portfolio data should tell the user "some account balances are missing, so this total may be incomplete—check back in a few minutes for full data." This prevents users from making decisions based on incomplete information.
+
+## The Coherence Problem: Partial Responses That Don't Make Sense Together
+
+Some component combinations produce responses that are technically correct but semantically incoherent. A user asks about product availability and shipping time. The availability component succeeds and reports "in stock." The shipping component fails, so you serve only availability. The user assumes fast shipping—why else would you mention availability without shipping time? They order, then discover shipping takes three weeks. The partial response misled them.
+
+Coherence rules define which component combinations are safe to serve together. Some components must appear together or not at all. Availability and shipping time are a coherent pair—serve both or serve neither. Price and availability are another pair. Order status and tracking information are another. Build these rules into your assembly logic.
+
+When a required component fails, decide whether to serve the rest as partial response or fail the entire request. This is context-dependent. For informational queries, partial responses are usually better than nothing. For transactional queries, partial responses risk creating confusion or incorrect user action. A request to book a flight cannot be partially fulfilled—either the booking succeeds or it doesn't.
+
+Test coherence by showing partial responses to users who didn't see the original query. If they can understand the response and take appropriate action, it's coherent. If they're confused about what's missing or why, the component combination is incoherent. This test surfaces issues that aren't obvious from technical logic alone.
+
+## When Partial Is Worse Than Nothing
+
+There are situations where serving partial responses causes more harm than returning an error. Medical diagnosis systems are the clearest example. If a diagnostic query involves checking symptoms against multiple databases and one database is unavailable, serving partial results is dangerous—the missing database might contain the most relevant diagnosis. Fail the request and tell the user to retry.
+
+Financial calculations are another case. A user asks about tax implications of a transaction. Your system checks federal tax rules, state tax rules, and local tax rules. If state tax data is unavailable, serving only federal and local creates a false picture of tax liability. The user might make financial decisions based on incomplete data. Fail the request.
+
+Real-time decision systems cannot tolerate partial responses. Fraud detection evaluates multiple signals: transaction amount, location, device fingerprint, behavioral patterns, velocity checks. If any signal is unavailable, the fraud score is meaningless. Either compute the complete score or fail the check and fall back to manual review.
+
+The rule: if the missing component changes the user's action or decision, don't serve a partial response. If the missing component is supplementary or nice-to-have, partial response is acceptable. Order status is essential. Return policy is supplementary. If order status fails, don't serve return policy alone. If return policy fails, serving order status is fine.
+
+## Timeout-Based Partial Responses
+
+Some partial failures are latency failures, not system failures. The component is working but slow. If you wait long enough, it will respond. But users have limited patience. Waiting five seconds for a complete response loses more engagement than serving a partial response after one second.
+
+Timeout-based fallback sets component-level timeouts shorter than the user-facing request timeout. If a component doesn't respond within 800 milliseconds, treat it as failed and proceed with the components that did respond. The slow component might complete eventually, but the user has already received a partial response.
+
+This creates a tradeoff between completeness and latency. Longer component timeouts mean more complete responses but higher user-facing latency. Shorter component timeouts mean faster partial responses but more frequent incompleteness. The right timeout depends on user expectations and component criticality.
+
+Critical components get longer timeouts. Supplementary components get shorter timeouts. In a product search system, the search results component might have a 2-second timeout, while the "customers also viewed" component has a 500-millisecond timeout. If the recommendations are slow, serve search results alone. If search results are slow, wait the full 2 seconds before failing.
+
+Progressive response delivery is the sophisticated version: return fast components immediately, then stream slow components as they complete. The user sees search results in 300 milliseconds, then recommendations appear 800 milliseconds later. This avoids the partial-vs-complete tradeoff—the user gets both, just not simultaneously. The implementation cost is higher: you need streaming response protocols and client-side handling of progressive updates.
+
+## Progress Indicators During Degraded Service
+
+When serving partial responses repeatedly over an extended outage, users need to know whether the degradation is getting better or worse. A progress indicator or status message helps users decide whether to wait for recovery or try an alternative.
+
+The simplest indicator is a banner: "Some features are currently unavailable. We're working to restore full service." This tells users the system is degraded but doesn't give specifics about which features or when recovery is expected.
+
+Better indicators are component-specific: "Weather data is temporarily unavailable. All other features are working normally." This tells users exactly what's missing and reassures them that the rest of the system is stable.
+
+Real-time status pages give users visibility into ongoing issues. When a component is failing and you're serving partial responses, update the status page with the affected features, the start time of the degradation, and expected resolution time if known. Users can check the status page instead of repeatedly trying the affected feature.
+
+Avoid false precision. Don't promise "expected recovery in 15 minutes" unless you have high confidence. Users remember missed ETAs and lose trust. If you don't know when recovery will happen, say so: "We're investigating the issue and will update this message as soon as we have more information."
+
+Partial response fallback is infrastructure for resilience. It keeps your system partially functional during component failures instead of completely down. But it requires design up front—decomposable request structure, explicit component dependencies, coherence rules, and user-facing communication. You cannot retrofit partial response handling onto a system that was designed assuming all components always succeed.
+
+The next subchapter covers human-in-the-loop fallbacks: when AI fails, escalate to humans without overwhelming your human operators.

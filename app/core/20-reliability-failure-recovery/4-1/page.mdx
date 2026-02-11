@@ -1,0 +1,64 @@
+# 4.1 — The Fallback Chain Architecture
+
+The incident started at 2:14 PM. The primary model provider experienced an outage. Traffic automatically failed over to the backup provider. That backup provider, now receiving 100% of load instead of 0%, collapsed under the sudden traffic spike within minutes. The tertiary fallback—a smaller on-premise model—had never been tested at scale and could not handle the request volume. The final fallback, a cached response system, returned stale answers that violated compliance policies. Four layers of fallbacks. All four failed. The system served nothing for three hours.
+
+A fallback chain is a prioritized list of alternatives to try when the primary path fails. The architecture seems simple: if primary fails, try fallback A, if A fails try B, if B fails try C. The complexity lies in designing each tier to actually work when invoked, ensuring fallbacks do not share failure modes with primary, determining when to trigger each tier, and preventing fallbacks from causing cascading failures. A fallback chain is not a list of options you hope will work. It is a tested, monitored, cost-provisioned backup architecture.
+
+## The Chain Structure
+
+A fallback chain has at least three tiers. **Tier 1** is your primary path—the model, provider, or system you use under normal operation. **Tier 2** is your first fallback, typically a backup provider or smaller model that can handle most requests with some quality degradation. **Tier 3** is your second fallback, usually a cached response system, rule-based fallback, or human escalation queue. Some systems have four or five tiers. More tiers mean more complexity, more things to test, and more ways for the chain to fail in unexpected ways.
+
+Each tier must be explicitly defined with trigger conditions, expected capabilities, and monitored quality metrics. Tier 1 triggers under normal operation. Tier 2 triggers when Tier 1 returns errors, exceeds latency thresholds, or becomes unavailable. Tier 3 triggers when Tier 2 fails by the same criteria. The trigger logic must be fast, deterministic, and must not itself become a single point of failure. If your fallback trigger logic depends on a database that goes down, your entire chain is broken.
+
+## The Priority Order Problem
+
+Priority order determines which fallback to try first. The default instinct is to order by quality: try the best fallback first, then the next-best, then the cheapest or simplest. This works when fallbacks have similar response times. It fails when higher-priority fallbacks are much slower than lower-priority ones. A team using a high-quality backup provider as Tier 2 discovered that provider had 3-second latency under load. Their Tier 3 cached response system returned answers in 50 milliseconds. During an outage, users waited three seconds for Tier 2 to timeout before seeing the instant Tier 3 response. The system looked broken even though it was working.
+
+The corrected priority order considers both quality and latency. For latency-sensitive applications, a fast mediocre fallback can outrank a slow excellent fallback. Some teams implement parallel fallback attempts: invoke Tier 2 and Tier 3 simultaneously, return whichever completes first, cancel the other. This costs more but eliminates the latency penalty of waiting for higher-tier fallbacks to timeout. The trade-off: higher cost during failure, better user experience.
+
+Some systems use request-aware priority. A simple question routes to a fast cheap fallback. A complex multi-step task routes to a slower higher-quality fallback. This requires request classification logic that itself must be reliable—if your classifier fails, your entire fallback chain breaks. The classifier becomes a single point of failure unless it too has fallbacks.
+
+## Fallback Triggers: When to Invoke the Chain
+
+Fallback triggers define when to stop trying primary and start trying fallback. The most common triggers: explicit errors from the primary provider, timeout after a specified duration, rate limit exceeded, elevated latency beyond a threshold, and health check failures. Each trigger type requires different handling.
+
+Explicit error codes are the clearest signal. The provider returns HTTP 503, or the model API returns an overload error. You immediately invoke Tier 2. Timeout triggers are harder. If your primary model usually responds in 800 milliseconds, when do you declare it failed? Timeout too early and you invoke fallbacks unnecessarily, increasing cost and complexity. Timeout too late and users experience slow failures before seeing fallback responses. The typical timeout threshold is 1.5 to 2 times the 95th percentile latency—long enough to tolerate normal variation, short enough to detect real failures quickly.
+
+Rate limit triggers are tricky. If you hit your provider rate limit, falling back to another provider works only if the second provider has remaining quota. If both providers rate-limit you simultaneously—common during usage spikes—your fallback does nothing. You need either over-provisioned rate limits on fallback providers or a cached response tier that does not depend on external quotas.
+
+Some systems trigger fallbacks preemptively based on leading indicators. If primary latency climbs from 800ms to 1.2 seconds without hitting the timeout threshold, you can begin routing a percentage of traffic to fallback while primary is still operational. This "soft failover" reduces the shock when primary fully fails. It also lets you test fallback under real load incrementally instead of all at once.
+
+## Chain Depth: How Many Fallbacks Are Enough
+
+Most production systems have two to three fallback tiers. Two tiers—primary and one fallback—is sufficient for simple use cases where availability matters more than perfect continuity. Three tiers covers most complex scenarios: primary, high-quality fallback, fast degraded fallback. Four or more tiers become difficult to test and reason about. Each added tier multiplies the testing matrix and increases the chance that some combination of failures has never been exercised.
+
+The decision depends on your availability requirements and acceptable degradation. A system that must serve something, even a cached stale response, needs at least three tiers. A system where a bad answer is worse than no answer can use two tiers: primary and one high-quality fallback, then fail explicitly if both are unavailable. A financial compliance assistant cannot fall back to a cached response that might contain outdated regulations—better to return an error and escalate to a human.
+
+The final tier is often the most creative and the most critical. Common final-tier fallbacks: serve a template response explaining the service is degraded, queue the request for asynchronous processing and notify the user when complete, escalate to a human operator who manually handles the request, or return a simplified version of the response based on rules rather than generated content. The final tier is your "we will serve something rather than nothing" layer.
+
+## Independence: Fallbacks Must Not Share Failure Modes
+
+A fallback that shares a failure mode with primary is not a fallback—it is a duplicate of the problem. The most common shared failure mode: both primary and fallback depend on the same infrastructure component. A team using OpenAI as primary and Anthropic as fallback thought they had independence. Both providers ran on cloud infrastructure that experienced a regional outage, taking down both simultaneously. The fallback provided zero value.
+
+Another shared failure mode: both tiers depend on the same upstream service. Your primary path calls a model, which calls your retrieval system to fetch context, which queries your vector database. Your fallback path calls a different model but uses the same retrieval system and database. If the database fails, both primary and fallback fail. You need a fallback that bypasses the shared dependency—perhaps a cached response system or a fallback that does not use retrieval at all.
+
+Network dependencies are another common shared failure. If primary and fallback both route through the same API gateway, load balancer, or authentication service, a failure in that shared component kills both. The fallback must have an independent path to the user. Some teams deploy fallback models on-premise or in a different cloud region to ensure complete infrastructure independence.
+
+The independence audit: for each component in your primary path, ask whether your fallback depends on it. If yes, ask whether that component is sufficiently reliable that you accept the shared risk. If no, ask whether you can redesign the fallback to bypass it.
+
+## The Single Point of Failure Audit
+
+Even with independent tiers, fallback chains often contain hidden single points of failure. The routing logic itself is a single point of failure. If the code that decides "primary failed, invoke fallback" crashes, the entire chain breaks. This logic must be simple, tested, and isolated from the failures it is detecting. A team using a complex retry-and-fallback library discovered the library had a bug that caused it to crash when both primary and fallback returned errors simultaneously. The bug was triggered only during the exact failure scenario the fallback was meant to handle.
+
+Configuration is another single point of failure. If your fallback provider credentials are stored in the same config service as your primary credentials, a failure in that config service disables both. Fallback credentials should be embedded, cached locally, or stored in a separate highly-available config system.
+
+Monitoring and alerting can be single points of failure. If your alerting system depends on the same infrastructure as your primary service, you may not receive alerts when primary fails. A team whose monitoring ran in the same Kubernetes cluster as their AI service lost all visibility when the cluster failed. They did not know primary was down, did not know fallback had activated, and did not know fallback was serving degraded responses. Monitoring for fallback chains should be hosted separately from the services being monitored.
+
+## Fallback Chain as a First-Class Architectural Concern
+
+Fallback chains are not an afterthought. They are not something you add after the system is built. They are a first-class component of the system architecture, designed alongside primary paths, tested with the same rigor, and maintained as the system evolves. When evaluating a new model provider, you evaluate both its performance as primary and its viability as a fallback. When changing your retrieval pipeline, you consider how that change affects fallback paths.
+
+The best fallback chains are documented, diagrammed, and regularly reviewed. The documentation specifies each tier, its trigger conditions, its expected quality and latency, its cost, and its dependencies. The diagram shows the flow from primary through each fallback tier and highlights shared dependencies and single points of failure. The review happens quarterly or after any major incident—did fallbacks work as designed, did we discover new failure modes, do we need additional tiers or different triggers?
+
+A fallback chain that is not tested is not a fallback. It is a hope. It is a plan that exists on paper but has never been proven under real conditions. The next subchapter covers model fallback strategies—when your primary provider fails, where do you route traffic, and how do you ensure the backup provider can handle it?
+
