@@ -1,0 +1,120 @@
+# 3.6 — Capacity Planning for LLM Workloads: Tokens, Latency, Cost
+
+Most teams plan capacity the way they plan for web services: estimate requests per second, multiply by some headroom factor, provision servers. This fails for LLMs within the first week of production.
+
+A fintech company launched an AI document analyzer in March 2025. They estimated 2000 requests per hour based on user testing. They provisioned GPUs to handle 3000 requests per hour with 50 percent headroom. On launch day, they received 1800 requests per hour. The system collapsed. Not because they underestimated request volume—they overestimated it. But one request was a 200-page financial filing that consumed 180,000 input tokens. Twenty other requests that hour were simple queries under 500 tokens. The average was meaningless. The 99th percentile was 400 times larger than the median. The GPUs ran out of memory trying to process the long document, and the entire service went down. When they rebuilt capacity planning around tokens instead of requests, they discovered they needed 4x the GPUs they had provisioned, not because of request volume, but because of token distribution.
+
+Capacity planning for LLMs is not about requests. It is about tokens, latency distribution, and cost per token at target utilization. Every other method is guessing.
+
+## Why Request-Based Planning Fails for LLM Workloads
+
+A request to a traditional API consumes roughly constant resources. A request to retrieve a user profile costs the same whether the user has 2 friends or 2000. A request to a search API costs the same whether the query is 5 words or 50. You can plan capacity by counting requests because requests are uniform.
+
+LLM requests vary by 100x in resource consumption within the same application. One user sends a 50-token question. Another user sends a 4000-token document with a 50-token question. The first request completes in 1.2 seconds and consumes 450 tokens total. The second request completes in 18 seconds and consumes 5800 tokens total. Both are valid uses of your API. Both count as one request. But the second request consumes 13 times the resources.
+
+Averaging across this distribution hides the problem. If you measure 10,000 requests per hour with an average of 800 tokens per request, you might provision for 8 million tokens per hour. But if the distribution is heavily skewed—90 percent of requests are under 400 tokens, and 10 percent are over 4000 tokens—your peak instantaneous token demand is far higher than the average. The long-tail requests queue up, memory usage spikes, and the system becomes unstable.
+
+The correct model is token throughput, not request throughput. Measure tokens per second, not requests per second. Measure the distribution of request sizes in tokens, not just the mean. Measure peak token demand per minute, not average token demand per hour. The system does not care how many requests you send. It cares how many tokens it must process.
+
+## Token-Based Capacity Modeling: Input, Output, and Peak
+
+Token-based capacity planning starts with measuring your actual token consumption over time. You need four numbers: input tokens per time period, output tokens per time period, peak tokens per minute, and the distribution of request sizes.
+
+Input tokens per day tells you how much prompt and context you are processing. A customer support chatbot might process 12 million input tokens per day across 150,000 requests. A document summarization service might process 80 million input tokens per day across 8,000 requests. The cost and latency of input token processing depends on the model's prefill speed. Prefill is the phase where the model processes the input prompt before generating output. For long inputs, prefill dominates latency.
+
+Output tokens per day tells you how much generation you are performing. Generation is slower than prefill on a per-token basis. A model might prefill 3000 tokens per second but generate only 60 tokens per second. If your application generates long outputs, generation time dominates latency, and output token throughput is your bottleneck.
+
+Peak tokens per minute tells you the worst-case instantaneous load. Your average might be 8,000 tokens per minute, but your peak might be 40,000 tokens per minute during business hours. You must provision for the peak, not the average. If you provision for the average, the system fails during every peak. The ratio of peak to average is critical. A ratio of 2x means you need twice the capacity you would naively estimate. A ratio of 5x means you need five times the capacity. Many production systems see peak-to-average ratios between 3x and 6x.
+
+The distribution of request sizes tells you how to optimize batch processing and memory allocation. If 95 percent of requests are under 1000 tokens, you can use smaller batch sizes and tighter memory limits for the common case. If 20 percent of requests are over 10,000 tokens, you need a separate processing path for long-context requests. The distribution also reveals whether your application has distinct workload classes. A system with bimodal distribution—lots of tiny requests and lots of huge requests—needs different architecture than a system with uniform distribution.
+
+## Throughput Estimation: Tokens Per Second Per GPU
+
+Throughput is the number of tokens your system can process per second per GPU. This depends on the model size, the quantization level, the batch size, the serving framework, and the hardware. You cannot estimate it accurately from spec sheets. You must measure it.
+
+For a given model on a given GPU, throughput varies by 3x depending on configuration. A GPT-5 equivalent model served on an H100 GPU with batch size 1 might process 50 tokens per second. The same model with batch size 16 might process 180 tokens per second. The batch size determines how many requests the GPU processes simultaneously. Higher batch size increases throughput but also increases latency for each individual request, because requests wait for the batch to fill.
+
+The serving framework also matters. vLLM, TensorRT-LLM, and Hugging Face TGI all have different throughput characteristics for the same model on the same hardware. vLLM with continuous batching typically achieves 40 to 60 percent higher throughput than naive Hugging Face Transformers. TensorRT-LLM with FP8 quantization can double throughput again. The framework is not a detail. It is a primary capacity variable.
+
+The only way to know your throughput is to benchmark it. Deploy the model you plan to use, on the GPU you plan to use, with the serving framework you plan to use, and measure tokens per second under realistic load. Run the benchmark with request sizes that match your production distribution. A benchmark that tests only 512-token requests will not predict performance when 20 percent of your requests are 8000 tokens.
+
+The benchmark must include both prefill and generation. Some teams benchmark prefill throughput in isolation and generation throughput in isolation, then try to combine them. This does not work. Prefill and generation have different memory access patterns, and their interaction determines overall throughput. Benchmark the full request lifecycle, from input token ingestion to final output token generation.
+
+## Latency Budgeting: P50, P95, P99, and TTFT
+
+Capacity planning is not just about throughput. It is about latency at target throughput. You might be able to process 10,000 tokens per second, but only if you accept P95 latency of 20 seconds. If your application requires P95 under 3 seconds, your effective throughput is much lower.
+
+Your latency budget starts with target percentiles. For an interactive chatbot, you might target P50 under 1 second, P95 under 2.5 seconds, and P99 under 5 seconds. For a document analysis tool, you might target P50 under 8 seconds, P95 under 20 seconds, and P99 under 40 seconds. The targets depend on user expectations and the task type. Users tolerate longer latency for complex tasks and shorter latency for simple tasks.
+
+Time to first token (TTFT) is critical for streaming applications. TTFT is the time from request arrival to the first output token. For a chatbot, TTFT determines perceived responsiveness. A TTFT of 400ms feels instant. A TTFT of 2 seconds feels broken. If you stream output, optimize for TTFT. If you return the full response at once, optimize for total latency.
+
+Time per output token is the second component. Once the first token is generated, how fast do subsequent tokens arrive? For a 500-token response, if time per token is 50ms, the user waits 25 seconds after TTFT to see the full response. If time per token is 15ms, the user waits 7.5 seconds. Time per token depends on generation throughput, which depends on batch size and GPU utilization.
+
+Your end-to-end latency budget must account for all components: network time, queue time, prefill time, generation time, and post-processing time. If your target P95 is 3 seconds and your network and queue time consume 800ms, you have 2.2 seconds left for prefill, generation, and post-processing. This constrains how large your prompts can be, how long your outputs can be, and how complex your post-processing can be.
+
+The latency budget is a forcing function for architecture decisions. If you cannot meet your latency target with your current model on your current hardware, you have three options: use a smaller model, use more GPUs per request with tensor parallelism, or relax your latency target. There is no fourth option. Latency is physics. You can trade money for latency, but you cannot wish latency away.
+
+## Capacity Calculation: Peak Tokens, Throughput, and Headroom
+
+Once you know your peak token demand per second and your throughput per GPU, the capacity calculation is straightforward: divide peak tokens per second by throughput per GPU. If your peak demand is 12,000 tokens per second and your measured throughput is 150 tokens per second per GPU, you need 80 GPUs to meet peak demand with zero headroom.
+
+Zero headroom is unacceptable. You need buffer capacity for three reasons: traffic bursts beyond measured peak, GPU failures, and rolling updates. A typical production system runs at 60 to 75 percent utilization at measured peak. This means if you need 80 GPUs to meet peak demand, you provision 100 to 110 GPUs.
+
+The headroom for bursts depends on how predictable your traffic is. If your traffic has tight daily patterns and low variance, 20 percent headroom is sufficient. If your traffic is spiky and unpredictable, 50 percent headroom is safer. The cost of under-provisioning is service degradation during bursts. The cost of over-provisioning is wasted GPU spend. The trade-off depends on your business. A high-margin enterprise product can afford 50 percent headroom. A low-margin consumer product cannot.
+
+The headroom for failures depends on your deployment topology. If you use a single large GPU pool with no isolation, one GPU failure reduces capacity by 1/N, which is negligible for large N. If you use multiple isolated pools for different customer segments, one GPU failure reduces capacity by 1/pool-size, which is significant for small pools. For pools smaller than 10 GPUs, use N+1 redundancy: always have one spare GPU. For pools larger than 20 GPUs, the law of large numbers protects you, and per-instance redundancy is unnecessary.
+
+The headroom for rolling updates depends on your deployment velocity. If you update your model weekly, you need enough extra capacity to drain traffic from a subset of GPUs, update them, and shift traffic back without user impact. A common pattern is to update 25 percent of capacity at a time, which requires 33 percent headroom. If you update daily, this becomes expensive. The alternative is blue-green deployment at the model level, where you keep two full capacity pools and switch traffic between them. This doubles cost during the transition but eliminates the need for permanent headroom.
+
+## Cost Modeling: GPU Cost, Utilization, and Cost Per Token
+
+Cost is the product of GPU cost per hour, number of GPUs, and hours of operation. A single H100 GPU costs approximately 2 to 4 dollars per hour depending on cloud provider and commitment term. If you run 100 H100 GPUs for 720 hours per month, your GPU cost is 144,000 to 288,000 dollars per month before discounts.
+
+The relevant cost metric is cost per million tokens at your target utilization. If you process 500 million tokens per month and spend 200,000 dollars on GPUs, your cost is 40 cents per million tokens. If a competitor processes 500 million tokens per month and spends 120,000 dollars, their cost is 24 cents per million tokens. They have 40 percent better unit economics. Over time, better unit economics allows them to price lower or invest more in quality.
+
+Utilization is the critical variable. If you provision for peak traffic but run at peak for only 10 percent of the day, your average utilization is low, and your cost per token is high. If you can flatten traffic with queuing, caching, or demand shifting, you can run at higher average utilization and lower cost per token. An 80 percent utilized GPU delivers twice the value of a 40 percent utilized GPU at the same cost.
+
+High utilization is only valuable if it does not degrade latency. Running at 95 percent utilization with P95 latency of 8 seconds is worse than running at 70 percent utilization with P95 latency of 2 seconds, even though cost per token is lower. The right target utilization depends on your latency requirements. Latency-sensitive applications target 60 to 70 percent. Batch-processing applications target 85 to 95 percent.
+
+Cost modeling must include the cost of over-provisioning. If you provision 120 GPUs but use 80 GPUs on average, you waste 40 GPUs worth of spend. For some teams, this waste is acceptable because the alternative—under-provisioning and losing users during peaks—is worse. For other teams, the waste is unacceptable, and they use auto-scaling to match capacity to demand in real time. Auto-scaling for GPUs is slower than auto-scaling for CPUs, because GPU instances take minutes to start and model loading takes additional time. The minimum viable auto-scaling window is 5 to 10 minutes, which means you cannot react to sub-minute bursts.
+
+## Capacity Planning Process: Historical Data and Growth Projection
+
+Capacity planning is not a one-time calculation. It is a process that repeats monthly or quarterly as traffic grows and workload characteristics change.
+
+The process starts with historical traffic analysis. Pull logs for the last 30 to 90 days. Calculate total tokens per day, broken into input and output. Calculate peak tokens per minute for each day. Calculate the distribution of request sizes. Identify trends: is traffic growing? Is the distribution shifting toward longer or shorter requests? Are there seasonal patterns, like higher traffic on weekdays or lower traffic in summer?
+
+Next, apply growth projection. If traffic is growing 15 percent per month, project forward six months. If you process 500 million tokens per month today, you will process 1 billion tokens per month in six months. If you have 80 GPUs today, you will need 160 GPUs in six months, assuming workload characteristics stay constant.
+
+The peak-to-average ratio is the third input. If your peak is 4x your average, you must provision for 4x your average token demand, not 1x. If the ratio is increasing over time—more spiky traffic as you add users—you need even more headroom.
+
+Seasonal patterns must be accounted for. A tax preparation service sees 10x traffic in March and April compared to the rest of the year. Provisioning for peak traffic year-round is wasteful. The better strategy is baseline capacity for off-peak and temporary capacity for peak season. This requires auto-scaling or manual scaling in advance of known peaks.
+
+The final input is new feature launches. If you plan to launch a new feature that increases output token length by 50 percent, you need 50 percent more generation capacity even if request volume stays constant. Feature launches are predictable capacity changes. Plan for them explicitly.
+
+## Buffer Strategies: Reserved, On-Demand, and Spot Capacity
+
+Your capacity can come from three sources: reserved, on-demand, and spot. Reserved capacity is committed long-term at a discount. On-demand capacity is provisioned as needed at full price. Spot capacity is spare cloud capacity available at steep discounts but with no availability guarantee.
+
+Reserved capacity should cover your baseline traffic. If your minimum traffic is 50 GPUs worth of demand every day, reserve 50 GPUs with a one-year or three-year commitment. The discount is 40 to 60 percent compared to on-demand. Reserved capacity is the cheapest per-GPU cost, but you pay for it whether you use it or not.
+
+On-demand capacity should cover your peaks. If your peak traffic requires 120 GPUs but your baseline requires 50 GPUs, use on-demand capacity for the 70-GPU delta. You pay full price, but you only pay when you use it. On-demand is more expensive per GPU but cheaper than reserving capacity you do not need.
+
+Spot capacity is for fault-tolerant batch workloads, not latency-sensitive production traffic. Spot instances can be reclaimed by the cloud provider with 30 seconds notice. For training jobs, data processing, or offline eval, spot capacity is 70 to 80 percent cheaper than on-demand. For real-time inference, spot capacity is too risky. If your spot instances disappear during peak traffic, your service goes down.
+
+The optimal mix depends on traffic predictability. Highly predictable traffic: 80 percent reserved, 20 percent on-demand. Moderately predictable traffic: 60 percent reserved, 40 percent on-demand. Highly variable traffic: 40 percent reserved, 60 percent on-demand. The more variable your traffic, the more you pay for flexibility.
+
+## Monitoring Capacity: Utilization, Headroom, and Planning Cadence
+
+Capacity monitoring answers three questions in real time: what is current utilization, how much headroom remains, and when will you run out of capacity?
+
+Utilization is the percentage of provisioned capacity currently in use. If you have 100 GPUs and 70 are actively processing requests, utilization is 70 percent. Utilization above 85 percent is a warning signal. Utilization above 95 percent is an emergency. The system is at the edge of capacity, and any burst will cause degradation.
+
+Headroom is the inverse: how much spare capacity you have. If utilization is 70 percent, headroom is 30 percent. Headroom below 20 percent should trigger an alert. Headroom below 10 percent should page someone. The alert gives you time to scale before hitting limits.
+
+Time to capacity exhaustion is a projection. If traffic is growing 10 percent per month and you are currently at 70 percent utilization, you will hit 100 percent utilization in three months. This projection should be visible on a dashboard and reviewed monthly. If time to exhaustion is less than six months, start procurement. If time to exhaustion is less than three months, expedite procurement.
+
+The planning cadence depends on your growth rate. Fast-growing startups review capacity weekly. Stable enterprises review capacity quarterly. The review includes traffic trends, growth projections, upcoming feature launches, and cost per token. The output is a decision: do nothing, add capacity, or optimize workload to reduce token demand.
+
+Capacity planning for LLMs is harder than capacity planning for traditional services, but not because the math is harder. It is harder because the units are unfamiliar and the variance is extreme. Once you shift from requests to tokens, once you measure the distribution instead of the mean, and once you provision for peaks instead of averages, the problem becomes tractable. The teams that plan capacity well spend less and serve users better. The teams that plan capacity poorly spend more and still experience outages.
+

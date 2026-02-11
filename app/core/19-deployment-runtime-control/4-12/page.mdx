@@ -1,0 +1,110 @@
+# 4.12 — Rate Limiting for Agents and Multi-Step Workflows
+
+Why do most agent deployments fail production readiness reviews? Not because the agent performs poorly. Because the agent consumes resources unpredictably. A customer service agent that resolves 90 percent of tickets successfully looks like a success until you see the cost data. The agent averages 14 model calls per conversation, with a standard deviation of 22. Some conversations complete in 3 calls. Others spiral to 87 calls before timing out. The longest conversation consumed 340,000 tokens and cost $68 to resolve a $12 billing question. The team built rate limits for single requests. The agent operates as a multi-request workflow. The rate limits protect nothing. In late 2025, a logistics company deployed an agent that planned delivery routes. The agent worked beautifully in testing with 5 to 8 API calls per route. In production, an edge case caused the agent to enter a retry loop, making 2,400 calls in 40 minutes before an engineer manually killed the process. The company's API bill for that hour was $11,000. The agent was not broken. The rate limiting was not designed for agents.
+
+Agent rate limiting is the discipline of controlling resource consumption across multi-step, iterative workflows where the number of steps, tokens per step, and tools invoked are unknown at the start. Single-request rate limiting tracks tokens per request. Agent rate limiting tracks tokens per session, steps per workflow, and tool calls per agent invocation. The difference is not subtle. It is the difference between protecting against known load and protecting against unbounded, unpredictable load.
+
+## Why Agent Rate Limiting Is Different
+
+A single API request is predictable. You tokenize the input. You know the input cost exactly. You estimate output cost from max tokens. You calculate total cost before execution. The request completes in one model call. The cost is bounded. You can enforce limits at request time. If the request would exceed limits, reject it. This is straightforward.
+
+An agent workflow is unpredictable. The user asks a question. The agent decides how many steps to take. Each step may call the model. Each step may invoke tools. Tools may fail, causing retries. The agent may explore multiple reasoning paths before converging on an answer. You do not know how many steps the agent will take. You do not know how many tokens each step will consume. You do not know which tools the agent will invoke or how many times. The cost is unbounded. You cannot calculate total cost before execution because the execution path is determined dynamically.
+
+This unpredictability makes agents dangerous in production. A bug in agent logic can cause infinite loops. A misconfigured tool can cause endless retries. An adversarial input can cause the agent to spiral into expensive, unproductive computation. Without agent-specific rate limiting, these failure modes consume unlimited resources until the system crashes or the budget is exhausted. Agent rate limiting adds guardrails that single-request rate limiting cannot provide.
+
+## Rate Limiting Dimensions for Agents
+
+Agent rate limiting operates on four dimensions. First, per-step token limit. Each individual step the agent takes must respect a token budget. If a step would consume more tokens than allowed, the step is rejected. The agent must adjust its approach. This dimension prevents a single agent step from consuming excessive resources. It is the equivalent of per-request rate limiting, but applied at the agent step level instead of the user request level.
+
+Second, per-workflow total token limit. The sum of tokens across all steps in the workflow must not exceed a threshold. Even if each individual step is small, the cumulative cost may be large. An agent that takes 50 steps of 2,000 tokens each consumes 100,000 tokens. If the workflow limit is 50,000 tokens, the agent must stop at step 25. This dimension prevents runaway workflows from consuming unlimited resources. It is the most critical dimension for agent safety.
+
+Third, per-workflow time limit. The agent must complete within a maximum duration. If the workflow has not completed after 5 minutes, it is terminated. Time limits prevent agents from running indefinitely. They also improve user experience. A user who waits 10 minutes for an agent response will abandon the session. A 5-minute time limit forces the agent to produce a result or fail fast. Time limits are measured in wall-clock time, not CPU time. An agent that spends 4 minutes waiting for tool responses and 1 minute in model inference is subject to the same 5-minute limit as an agent that spends 5 minutes in model inference.
+
+Fourth, per-workflow step limit. The agent must complete within a maximum number of steps. If the agent takes more than 30 steps, it is terminated. Step limits prevent infinite loops and detect agents that are stuck in unproductive reasoning. An agent that takes 50 steps to answer "what is 2 plus 2" is clearly malfunctioning. Step limits are a debugging tool as much as a resource control mechanism. They surface agent logic bugs that would otherwise be invisible until they cause a cost disaster.
+
+## Session-Based Rate Limiting
+
+Agents operate within sessions. A session is a conversation or workflow that spans multiple agent steps. The user initiates a session. The agent takes steps. The session ends when the agent completes the task or the user terminates the session. Session-based rate limiting tracks resource consumption across the entire session, not per request. This is the fundamental difference from request-based rate limiting.
+
+Each session has a token budget. The budget is allocated at session start. Every agent step consumes part of the budget. The agent framework tracks remaining budget after each step. Before starting the next step, the framework checks whether sufficient budget remains. If budget is exhausted, the agent stops and returns a partial result or an error. The user cannot issue more steps until the session ends and budget resets, or until the user upgrades their plan.
+
+Session budgets are separate from request budgets. A user may have a request budget of 100,000 tokens per day and a session budget of 10,000 tokens per session. The user can start 10 sessions per day, each consuming up to 10,000 tokens. The session budget prevents a single session from consuming the entire daily budget. Without session budgets, the first session could consume 100,000 tokens, leaving zero budget for subsequent sessions. Session budgets ensure fair distribution of daily capacity across multiple sessions.
+
+Session timeouts are critical. A session that is started but never completed leaks resources. The session holds a budget allocation that is never released. After a timeout period, typically 1 hour, the session is automatically terminated and its budget is released. The user can start a new session. Timeouts prevent resource leaks and allow the system to reclaim budget from abandoned sessions.
+
+## Workflow Cost Estimation
+
+Unlike single requests, agent workflows cannot be costed precisely before execution. But they can be estimated. The agent framework estimates cost based on historical data. The agent has completed 1,000 sessions. The median session consumed 8,000 tokens across 6 steps. The 95th percentile session consumed 24,000 tokens across 18 steps. Based on this distribution, the framework estimates that the next session will consume between 8,000 and 24,000 tokens. If the user's remaining budget is 5,000 tokens, the framework warns the user before starting the session: "This session is estimated to consume 8,000 to 24,000 tokens. You have 5,000 tokens remaining. Upgrade or wait until your budget resets."
+
+Estimation improves as the session progresses. After the first step, the framework knows the actual cost of that step. It updates the estimate for the remaining steps. After three steps consuming 6,000 tokens, the framework recalculates. If the session typically completes in 6 steps and has consumed 6,000 tokens in 3 steps, the remaining steps are estimated to consume another 6,000 tokens. Total estimated cost is 12,000 tokens. The framework compares this to remaining budget. If budget is insufficient, the framework stops the session before consuming more resources.
+
+This progressive estimation allows the framework to decide whether to continue the session. Continuing a session that will exceed budget is wasteful. The agent takes additional steps, consumes additional tokens, and then fails because budget is exhausted. The partial work is wasted. Stopping early, when the framework detects that budget is insufficient, avoids waste. The user receives a partial result and retains some budget for future sessions.
+
+## Checkpointing for Limit Handling
+
+Agents that exceed limits mid-workflow lose all progress. The session is terminated. The tokens consumed are wasted. The user receives no result. Checkpointing solves this problem. The agent saves state periodically. When a limit is hit, the agent saves a checkpoint and terminates. When the user's budget resets or they upgrade their plan, the agent resumes from the checkpoint. Progress is not lost.
+
+Checkpoints include the conversation history, intermediate results, and the agent's internal state. When the agent resumes, it loads the checkpoint and continues from where it stopped. The user experience is: "Your session exceeded the token limit. Progress has been saved. Resume after your limit resets in 6 hours, or upgrade to continue now." The user does not need to start over. They pick up where they left off.
+
+Checkpointing is especially valuable for long-running research or analysis tasks. An agent that analyzes 50 documents may take 20 steps and consume 80,000 tokens. If the user's budget is 50,000 tokens, the agent completes 30 documents, saves a checkpoint, and stops. The user waits for budget reset, then resumes. The agent analyzes the remaining 20 documents. Without checkpointing, the user would need to start over, and the first 30 documents would be analyzed again, wasting tokens.
+
+Checkpoints also enable partial results. Even if the agent cannot complete the full task, it can return results from the work completed so far. The user receives value from the partial work instead of receiving nothing. Partial results are better than no results.
+
+## Tool Call Rate Limiting
+
+Agents invoke tools. Tools are external actions: API calls, database queries, web searches, file operations. Tools consume resources beyond model tokens. API calls cost money. Database queries consume database capacity. Web searches have rate limits. The agent framework must limit tool calls separately from token limits. A tool call limit might be 20 calls per workflow. If the agent invokes more than 20 tools, the workflow is terminated.
+
+Different tools have different costs. A web search costs $0.01. A database query costs negligible amounts. An external API call costs $0.50. The framework tracks cost per tool type. Tool call limits can be cost-based instead of count-based. The workflow has a $5 tool budget. The agent can make 500 web searches or 10 API calls or any combination that totals less than $5. Cost-based tool limits align with economic reality. The concern is not the number of tool calls but the cumulative cost of those calls.
+
+Tool call failures must be limited. If a tool fails, the agent may retry. Retries are necessary for transient failures. But unlimited retries are dangerous. A misconfigured tool that always fails causes the agent to retry forever. The framework limits retries per tool. After 3 failures, the tool is marked as unavailable for this session. The agent must complete the task without that tool or fail gracefully. Retry limits prevent retry storms that waste resources.
+
+Tool call timeouts are also necessary. A tool that takes 2 minutes to respond is effectively broken. The framework enforces per-tool timeouts. If a tool does not respond within 10 seconds, the call is canceled and marked as failed. The agent can retry or proceed without the tool. Timeouts prevent agents from waiting indefinitely for tools that will never respond.
+
+## Concurrent Agent Limits
+
+A user can run multiple agent sessions concurrently. Each session consumes resources. Without limits, a user can start 100 concurrent sessions, each consuming tokens and tool calls. The total resource consumption is 100 times higher than a single session. This creates two problems. First, the user can exhaust their daily budget in minutes instead of hours. Second, the user monopolizes shared infrastructure, starving other users.
+
+Concurrent agent limits cap the number of simultaneous sessions per user. A free-tier user can run 1 concurrent session. A paid-tier user can run 5 concurrent sessions. If the user tries to start a 6th session while 5 are running, the 6th session is queued. It waits until one of the first 5 completes. This limit prevents resource hoarding. It ensures that one user cannot monopolize the agent infrastructure.
+
+Concurrent limits also apply to tool calls. If 5 agent sessions are running concurrently and each invokes 4 tools per step, the system must handle 20 concurrent tool calls. This may exceed the capacity of downstream APIs or databases. The framework limits concurrent tool calls across all sessions for a user. If the limit is 10 concurrent tool calls, the 11th tool call waits until one of the first 10 completes. This limit prevents the agent from overwhelming downstream systems.
+
+## Orchestration Layer Enforcement
+
+Agent rate limiting must be enforced at the orchestration layer, not the model layer. The model has no concept of sessions, workflows, or steps. The model receives a prompt and generates a response. The model cannot enforce per-workflow token limits or per-session step limits. The orchestration layer wraps the model. It tracks session state, counts tokens, counts steps, and enforces limits. If a limit is exceeded, the orchestration layer stops calling the model. The limit enforcement happens before the model request, not after.
+
+This is a critical architectural requirement. Teams that rely on model-level rate limiting for agents fail to control agent resource consumption. The model enforces per-request token limits, but those limits do not aggregate across agent steps. An agent that takes 50 steps, each within the per-request limit, still consumes 50 times the per-request budget. The orchestration layer is the only component that has visibility into the full workflow. It is the only component that can enforce workflow-level limits.
+
+The orchestration layer must be robust. If the orchestration layer crashes mid-workflow, the session's resource tracking is lost. The agent may continue executing without limits. The orchestration layer must persist session state to durable storage after each step. If the orchestration layer restarts, it reloads session state and continues tracking. This persistence ensures that limits are enforced even across restarts.
+
+## Billing for Agent Workflows
+
+Billing for agents is more complex than billing for single requests. The user issues one request but the system executes many model calls and tool calls. The bill must reflect the total cost. Billing happens at session granularity. When the session completes, the system calculates total tokens consumed, total tool calls made, and total cost. The user is charged for the session as a single line item: "Agent session on January 15: 24,000 tokens, 12 tool calls, $2.40."
+
+The bill must include a breakdown. The user needs to understand what they paid for. The breakdown shows tokens per step, tools invoked, and cost per component. This transparency allows the user to identify expensive sessions. If one session cost $20 and others cost $2, the user investigates. Maybe the $20 session was justified because it solved a complex problem. Maybe it was a bug that caused the agent to spiral. The breakdown enables that analysis.
+
+Tool costs must be included in the bill. If the agent made 10 API calls at $0.50 each, the session cost includes $5 for tools plus the model token cost. Users need to understand that agent costs include more than model inference. Omitting tool costs from the bill creates confusion. The user sees a $10 bill but expects a $5 bill based on token consumption. They contact support. The support team explains that tool calls added $5. This conversation is unnecessary if the bill includes the breakdown from the start.
+
+Billing must handle partial sessions. If a session is terminated due to limits, the user is charged for the work completed. If the agent consumed 15,000 tokens before hitting the limit, the user pays for 15,000 tokens. They do not pay for the full estimated cost because the full work was not completed. Partial billing is fair. The user pays for resources consumed, not resources estimated.
+
+## User Experience
+
+Agent rate limiting affects user experience more than single-request rate limiting. When a request is rate-limited, the user retries later. When an agent session is rate-limited mid-workflow, the user loses progress and context. The user experience must be carefully designed. First, show progress indication. The user should see how many steps the agent has taken, how many tokens have been consumed, and how much budget remains. This transparency allows the user to anticipate when limits will be hit.
+
+Second, show budget remaining during the session. A progress bar or text indicator: "3,000 of 10,000 tokens used." The user can decide whether to let the agent continue or stop early to conserve budget. If the agent has consumed 9,000 tokens and the user realizes the answer is not what they need, they can stop the session and save the remaining 1,000 tokens for a new session.
+
+Third, offer the option to extend budget mid-workflow. If the agent is at 9,500 tokens with 500 tokens remaining and the task is nearly complete, offer: "Extend budget by 5,000 tokens to complete this session?" The user can purchase additional tokens on-demand. This avoids the frustration of a session that stops 90 percent complete. The user pays a little more but gets the full result.
+
+Fourth, provide clear error messages when limits are hit. "This session exceeded the 30-step limit. Progress has been saved. Review the agent's reasoning to identify loops or inefficiencies, or contact support if you believe this limit is too strict." The message explains what happened, why, and what the user can do. Users who understand limits are less frustrated by limits.
+
+## Monitoring and Optimization
+
+Agent rate limiting generates rich monitoring data. Track tokens per session, steps per session, tool calls per session, and sessions terminated due to limits. These metrics reveal agent efficiency. A well-designed agent completes most sessions in 6 to 10 steps with 8,000 to 12,000 tokens. A poorly designed agent completes sessions in 20 to 40 steps with 40,000 to 80,000 tokens. The metrics surface agent quality issues.
+
+Track the distribution of session costs. Plot a histogram. If most sessions cost between $0.10 and $0.50 and a few outliers cost $10 to $50, investigate the outliers. What made those sessions expensive? Was it a rare but legitimate use case? Was it a bug? Outliers often reveal bugs or adversarial inputs. Fixing outliers improves agent efficiency and reduces costs.
+
+Track termination reasons. How many sessions were terminated due to token limits? Step limits? Time limits? Tool call limits? Termination reasons indicate where the limits are too strict or where the agent is misbehaving. If 20 percent of sessions hit the token limit, either the limit is too low or the agent is inefficient. Raise the limit or optimize the agent. If 1 percent of sessions hit the step limit, the limit is appropriate. It catches rare failure modes without affecting most users.
+
+Use monitoring data to optimize agent prompts and logic. If sessions frequently hit step limits because the agent retries the same action repeatedly, improve the agent's error handling. If sessions frequently hit token limits because the agent generates verbose reasoning, shorten the reasoning prompts. Monitoring data drives agent improvement.
+
+Agent rate limiting is not optional. It is the difference between an agent that operates safely in production and an agent that destroys your infrastructure budget in a weekend. Every agent in production must have per-workflow token limits, step limits, time limits, and tool call limits. The orchestration layer must enforce these limits reliably. Billing must reflect actual consumption. Monitoring must surface efficiency issues. Teams that treat agent rate limiting as an afterthought ship agents that cannot scale. Teams that design agent rate limiting from the start ship agents that are safe, efficient, and economically sustainable.
+

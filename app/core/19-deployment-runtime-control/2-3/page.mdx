@@ -1,0 +1,106 @@
+# 2.3 — Cold Start Optimization: Reducing Time-to-First-Token
+
+Why do 40 percent of autoscaling events make user experience worse instead of better? Because the moment you need capacity most — when traffic spikes and queue depth grows — is the moment your autoscaler spins up new pods that take 3 minutes to become ready. Those 3 minutes are 3 minutes where requests pile up, users see timeout errors, and your SLA is violated. By the time the new pods are finally ready, the traffic spike is over and you're left with excess capacity that costs money. Cold start latency is not a minor optimization problem. It is the difference between autoscaling that works and autoscaling that thrashes.
+
+Cold start is the time from pod creation to first inference response. It includes container scheduling, image pull, model weight loading, GPU memory allocation, model compilation or warmup, and any initialization logic your serving code requires. For a typical 70B parameter model on Kubernetes with weights stored in S3, cold start ranges from 90 seconds in the best case to 5 minutes in the worst case. During those 90 to 300 seconds, the pod consumes infrastructure resources but delivers zero value. It sits there pulling weights, initializing CUDA contexts, and loading model layers into GPU memory while user requests queue or fail.
+
+The cost of cold starts compounds. If your autoscaler decides you need 10 new pods during a traffic spike, and each pod takes 3 minutes to start, you don't get 10 pods worth of capacity in 3 minutes. You get zero capacity for 3 minutes, then suddenly 10 pods all at once. Meanwhile, the autoscaler sees that queue depth is still high after 1 minute and decides to scale up even more. Now you have 20 pods starting, and by the time they're all ready, you have 5 times the capacity you need. The autoscaler scales down, killing 15 pods. Ten minutes later traffic spikes again, and the cycle repeats. This is the cold start death spiral.
+
+## The Anatomy of Time-to-First-Token
+
+Time-to-first-token, TTFT, is the metric users perceive. It's the milliseconds from when they hit send to when they see the first word of the response. TTFT has four components: network latency, queue time, model load time, and prefill computation.
+
+Network latency is the round-trip time from client to server. For users on the same continent as your data center, this is 20 to 80 milliseconds. For users on a different continent, it's 150 to 300 milliseconds. Network latency is mostly fixed — you reduce it by deploying closer to users, not by optimizing serving infrastructure. It's the baseline you can't eliminate.
+
+Queue time is how long a request waits before inference starts. If your serving infrastructure is under capacity — more pods ready than needed — queue time is near zero. If infrastructure is at capacity or over capacity, queue time grows. Under extreme load, queue time can be seconds or tens of seconds. This is the component that autoscaling tries to control. Scale up when queue time grows, scale down when queue time is near zero.
+
+Model load time is the cold start component. If a request hits a pod that already has the model loaded, model load time is zero. If a request hits a brand-new pod, model load time is the full cold start duration — 90 seconds to 5 minutes. This is the component you optimize in this subchapter.
+
+Prefill computation is the time to process the input prompt through the model before generation starts. For a 2000-token input, prefill takes 100 to 300 milliseconds on an H100 depending on model size and batch size. Prefill time is proportional to input length. You reduce it by using faster GPUs, smaller models, or prompt compression. But you can't eliminate it — every LLM request requires prefill.
+
+Add these up. Best case: 30 milliseconds network, 0 milliseconds queue, 0 milliseconds load, 150 milliseconds prefill. Total: 180 milliseconds TTFT. Worst case: 150 milliseconds network, 5000 milliseconds queue, 180,000 milliseconds load, 300 milliseconds prefill. Total: 185 seconds TTFT. The difference between a great experience and a failed request is whether you hit a warm pod or a cold pod.
+
+## The Sources of Cold Start Latency
+
+Container image pull is the first bottleneck. Your image is 12 GB. Kubernetes nodes pull images from a container registry over the network. On a fast cloud network, pulling 12 GB takes 30 to 60 seconds. On a slow network or a congested registry, it takes 3 to 5 minutes. Image pull is per-node, not per-pod — once a node has pulled an image, future pods on that node reuse the cached image. But the first pod on a new node always pays the full image pull cost.
+
+Model weight loading is the second bottleneck. Your model weights are 140 GB and live in S3. The pod downloads them at container startup. S3 bandwidth from the same region is 100 to 300 MB per second per connection, so downloading 140 GB takes 8 to 25 minutes with a single connection. Parallelizing downloads across multiple connections reduces this to 2 to 5 minutes. But every new pod pays this cost because model weights aren't cached the way images are.
+
+GPU memory allocation and model initialization is the third bottleneck. Once weights are downloaded, the serving framework loads them into GPU memory. For a 70B model across 2 GPUs, this takes 30 to 90 seconds depending on the framework and GPU type. During this time, the pod is running, consuming GPU resources, but not yet ready to serve requests.
+
+Model compilation or warmup is the fourth bottleneck. Some serving frameworks like TensorRT-LLM compile models into optimized kernels at first run. Compilation can take 5 to 20 minutes depending on model size and optimization level. Other frameworks like vLLM warm up the model by running a few inference passes to initialize CUDA kernels and fill caches. Warmup takes 5 to 15 seconds. Either way, the pod can't serve production traffic until this phase completes.
+
+## Keep-Warm Strategies
+
+The simplest cold start optimization is to never go cold. Keep a minimum number of pods running at all times, even when traffic is low. If your baseline traffic needs 5 pods and your autoscaler scales up to 20 during peaks, configure minimum replicas at 5 instead of 0. Now scaling events only need to start 15 pods instead of 20, and your baseline 5 pods are always warm.
+
+The cost is idle capacity. If traffic drops to near zero overnight, you're still running 5 pods and paying for 5 GPUs. At 3 dollars per hour per H100, that's 15 dollars per hour or 360 dollars per day for capacity that serves no traffic. But compare this to the cost of cold starts. If cold starts cause 5 percent of requests to time out during scaling events, and each failed request costs 1 dollar in lost revenue or customer satisfaction, how many failed requests per day justify spending 360 dollars on warm capacity? If you have more than 360 requests per day, the math favors keep-warm.
+
+Advanced keep-warm strategies vary the warm pool size by time of day. If your traffic is predictable — high during business hours, low at night — scale the minimum replica count up before traffic arrives and down after traffic drops. Run 10 warm pods from 8am to 6pm, 2 warm pods overnight. This cuts idle capacity cost by 70 percent while still avoiding cold starts during high traffic.
+
+Predictive scaling takes this further. Use historical traffic patterns or leading indicators to scale up before traffic arrives. If traffic always spikes at 9am when users start work, scale up at 8:45am. If traffic correlates with email campaigns, trigger scaling when an email goes out. If traffic follows stock market open, scale up 5 minutes before market open. Predictive scaling eliminates cold starts during the most critical moments because capacity is already warm when traffic arrives.
+
+## Model Weight Caching and Fast Loading
+
+Downloading 140 GB from S3 on every cold start is the biggest time sink. Eliminate the download, eliminate 80 percent of cold start latency. The most effective approach is local NVMe caching. Cloud GPU instances come with fast local NVMe storage — 1 to 4 TB SSDs with read speeds of 3 to 7 GB per second. Store model weights on local NVMe instead of downloading from S3. Now loading 140 GB takes 20 to 50 seconds instead of 3 to 5 minutes.
+
+The implementation: the first pod on a new node downloads weights from S3 to local NVMe and caches them. Subsequent pods on the same node load weights from NVMe. This is a one-time cost per node instead of per pod. With 8 pods per node, the first pod pays a 3 minute penalty, the next 7 pods pay a 30 second penalty. Average cold start drops from 180 seconds to 50 seconds.
+
+The complication is cache invalidation. When you deploy a new model version, cached weights become stale. Pods loading from cache serve the old model. You need a versioning strategy. The simplest is to include model version in the cache path — cache-model-v1, cache-model-v2. New pods look for v2, don't find it, download from S3, and cache it. Old pods keep using v1 until they're terminated. This works but wastes disk space — you store multiple versions until old pods are fully drained.
+
+A more sophisticated strategy uses content-addressed storage. Hash model weights and cache them by hash. Pods check if the hash exists in cache. If yes, load from cache. If no, download and cache. This automatically handles versioning — new weights get a new hash, so they're cached separately. Old weights remain cached until disk space is needed and a garbage collector removes the least-recently-used weights.
+
+The biggest operational risk is cache corruption. A pod downloads weights, the download is interrupted or corrupted, and the corrupted weights are cached. Future pods load corrupted weights and serve garbage. Detect this with checksums. Verify the hash of cached weights before loading. If the hash doesn't match, delete the cache and re-download. This adds 5 to 10 seconds for hashing 140 GB, but it prevents the disaster scenario where 20 pods all load corrupted weights and your entire service serves broken responses.
+
+## Lazy Loading and Partial Model Loading
+
+Not all model layers are needed immediately. A model might have 80 transformer layers. Loading all 80 layers into GPU memory takes 60 seconds. But the first inference request only needs the first few layers to compute the first token. Lazy loading loads layers on-demand as they're needed. The first request is slow because it triggers loading. Subsequent requests are fast because layers are already loaded.
+
+This trades cold start latency for first-request latency. Instead of making the pod wait 60 seconds before marking itself ready, the pod marks itself ready immediately and loads layers during the first few requests. Users see slower responses for the first 5 to 10 requests, then normal speed afterward. Whether this is better than a full cold start depends on your traffic pattern. If requests trickle in slowly, lazy loading spreads the cost over time and improves average latency. If requests arrive in a burst, lazy loading makes the burst slower because every request in the burst hits partially-loaded layers.
+
+Partial model loading is a variant where you load only the layers needed for short outputs. A model with 80 layers can generate 20 tokens using only the first 30 layers if you're willing to accept lower quality. Load 30 layers in 20 seconds, mark the pod ready, and serve low-quality responses while the remaining 50 layers load in the background. After 60 seconds, the full model is loaded and quality improves. This is acceptable for use cases where users tolerate degraded quality briefly — like a chatbot where the first response is slightly worse but still useful. It's unacceptable for use cases where quality is non-negotiable — like medical diagnosis or legal document generation.
+
+## Streaming Model Weights from Object Storage
+
+Downloading 140 GB before starting inference is slow. Streaming weights — loading them progressively while starting inference — cuts cold start time by allowing inference to begin before all weights are available. This requires support from the serving framework. vLLM added experimental weight streaming in late 2025. TensorRT-LLM does not support it as of early 2026.
+
+Weight streaming works by loading the model layers in the order they're needed for inference. Load the embedding layer first, then the first transformer layer, then the second, and so on. As each layer finishes loading, the model can process tokens through that layer. By the time the first token reaches the 10th layer, the 10th layer is loaded. The first token has high latency because it waits for layers to load. Subsequent tokens have normal latency because all layers are loaded by the time they're needed.
+
+The advantage is that time-to-first-token drops from 180 seconds to 30 seconds. The pod becomes ready much faster. The disadvantage is that throughput is lower until streaming completes — the model can't batch efficiently when layers are still loading. And if the network connection to object storage is slow or unstable, streaming stalls and inference fails.
+
+Weight streaming is most effective for traffic patterns where requests arrive gradually, not in bursts. If your autoscaler scales up one pod at a time and each pod starts serving immediately, streaming lets that pod contribute capacity 30 seconds after it starts instead of 180 seconds later. But if the autoscaler scales up 10 pods simultaneously and they all compete for object storage bandwidth, streaming is slower than parallel full downloads.
+
+## Warm Pool Management and Dynamic Sizing
+
+A warm pool is a set of pods that are running, have models loaded, and are ready to serve traffic but are not currently receiving traffic. The warm pool absorbs traffic spikes instantly — when traffic doubles, the load balancer immediately starts sending requests to warm pool pods. No cold start, no delay. The cost is that warm pool pods consume GPU resources without serving traffic most of the time.
+
+The optimal warm pool size depends on traffic variability. If traffic is stable and predictable, you need a small warm pool — just enough to handle minor fluctuations. If traffic is spiky and unpredictable, you need a larger warm pool to absorb the biggest spikes. The trade-off is cost versus latency. A larger warm pool costs more but delivers better latency during spikes. A smaller warm pool costs less but degrades latency when spikes exceed warm pool capacity.
+
+Dynamic warm pool sizing adjusts the pool based on traffic patterns. During high-traffic hours, increase the warm pool. During low-traffic hours, decrease it. The simplest implementation is a time-based schedule — warm pool of 10 from 9am to 5pm, warm pool of 2 overnight. A more sophisticated implementation uses traffic forecasting — predict traffic 10 minutes ahead and scale the warm pool proactively.
+
+The metric that determines warm pool size is spike magnitude. Measure the 95th percentile of traffic increase over a 5-minute window. If traffic typically increases by up to 30 percent in 5 minutes, your warm pool should handle a 30 percent increase. If traffic can double in 5 minutes, your warm pool should handle a 100 percent increase. Under-sizing the warm pool means spikes exceed warm capacity and trigger cold starts. Over-sizing the warm pool means you pay for capacity you never use.
+
+## Measuring and Monitoring Cold Start Impact
+
+You cannot optimize what you do not measure. Cold start optimization requires metrics that show how often cold starts happen, how long they take, and how they impact user experience. The core metrics are cold start rate, cold start duration, and cold start impact on latency.
+
+Cold start rate is the percentage of requests that hit a cold pod. Measure this by tracking whether each request is served by a pod that was started in the last 5 minutes. If 5 percent of requests hit pods younger than 5 minutes, your cold start rate is 5 percent. A cold start rate above 10 percent indicates that your autoscaling is too aggressive or your warm pool is too small. A cold start rate below 1 percent indicates that you're over-provisioned and paying for excess warm capacity.
+
+Cold start duration is the time from pod creation to pod readiness. Measure this by recording timestamps when Kubernetes creates the pod and when the pod's readiness probe succeeds. Median cold start duration tells you how long cold starts take under normal conditions. 99th percentile cold start duration tells you how long they take when things go wrong — slow networks, registry congestion, node resource contention. If 99th percentile cold start is 10 minutes, your worst-case scaling events take 10 minutes to add capacity.
+
+Cold start impact on latency is the difference in TTFT between requests that hit warm pods and requests that hit cold pods. Measure this by tagging requests with pod age and comparing latency distributions. If warm-pod TTFT is 200 milliseconds at the 50th percentile and cold-pod TTFT is 3000 milliseconds at the 50th percentile, cold starts add 2800 milliseconds of latency. This number justifies cold start optimization. If the impact is small — 50 milliseconds — optimization is not urgent. If the impact is large — 3000 milliseconds — optimization is critical.
+
+## The Cost-Latency Trade-Off in Cold Start Optimization
+
+Every cold start optimization trades cost for latency. Keep-warm strategies reduce latency but increase cost by running idle capacity. Weight caching reduces latency but increases cost by requiring larger NVMe storage. Streaming weights reduces latency but increases complexity and operational risk. The question is not "how do we eliminate cold starts?" The question is "how much are we willing to pay to reduce cold start latency by X milliseconds?"
+
+The math depends on your SLA and your traffic volume. If your SLA promises 500 millisecond TTFT at the 95th percentile, and cold starts push you to 3000 milliseconds, you're violating the SLA by 2500 milliseconds. If violating the SLA costs you 10 dollars per incident in support costs or refunds, and you have 100 cold start incidents per day, the SLA violation costs 1000 dollars per day. Spending 500 dollars per day on warm capacity to eliminate those incidents is profitable.
+
+If your SLA promises 1000 millisecond TTFT at the 95th percentile, and cold starts push you to 1500 milliseconds, you're violating by 500 milliseconds. If violations are rare and low-impact, spending 500 dollars per day on warm capacity to eliminate them is waste. Better to tolerate the occasional violation and spend the 500 dollars on something that improves product quality or delivers new features.
+
+The right approach is to measure the cost of cold starts in business terms — support tickets, customer complaints, revenue loss, SLA penalties — and compare it to the cost of optimization in infrastructure spend. Optimize when the business cost exceeds the infrastructure cost. Don't optimize when infrastructure cost exceeds business cost. This is not a technical decision. It is an economic decision.
+
+## The Handoff to Quantization
+
+Cold start optimization makes new pods ready faster. But once a pod is ready, its performance depends on the model itself — how fast it runs, how much memory it uses, how many requests it can handle per GPU. These are determined by quantization: the choice to run models in full precision, half precision, INT8, or INT4. Quantization trades model quality for speed and memory efficiency. The next subchapter covers how to make that trade-off in production, how to measure quality impact, and when quantization is worth the risk.
+

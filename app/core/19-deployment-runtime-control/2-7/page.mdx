@@ -1,0 +1,93 @@
+# 2.7 — Stateless vs Stateful Serving: Architecture Tradeoffs
+
+Why do most conversational AI systems recompute the entire conversation history on every turn? Because stateless serving is simple to operate. Every request is independent. Any replica can handle any request. Scaling is horizontal. Failures are isolated. But every turn recomputes 500 tokens of context to generate 50 new tokens. You pay for 10x more compute than necessary because operational simplicity is worth the cost. Until it is not.
+
+Stateful serving caches the conversation context — the key-value cache from previous turns — and reuses it on the next turn. The model only processes the new user message, not the entire history. Compute cost drops 80 percent. But now each user session is pinned to a specific replica. Scaling requires session migration. Failures lose session state. Operational complexity triples. You traded cost for complexity. The question is not which architecture is better. The question is which tradeoff matches your workload, your scale, and your tolerance for operational overhead.
+
+## Stateless Serving: Independence and Simplicity
+
+In stateless serving, each request carries all the information needed to generate a response. A conversational system includes the full conversation history in every request. The server loads the model, processes the input, generates the output, and discards all intermediate state. The next request starts from scratch. No session affinity. No persistent connections. No state to manage.
+
+This is the simplest architecture to operate. Any replica can handle any request. Load balancers distribute traffic with simple round-robin or least-connections algorithms. If a replica crashes, requests are automatically routed to healthy replicas. If traffic increases, you add replicas. If traffic decreases, you remove replicas. Kubernetes horizontal pod autoscaling works perfectly. Failures are isolated — one bad request does not affect other requests.
+
+Stateless serving is also the most compute-intensive. For a 10-turn conversation with 100 tokens per turn, the tenth turn processes 1,000 tokens of history to generate 100 new tokens. The prefill cost — processing the 1,000-token history — dominates compute. If prefill takes 0.8 seconds and generation takes 0.3 seconds, 73 percent of your compute is spent reprocessing context you already processed in the previous turn. You pay for redundant computation in exchange for operational simplicity.
+
+For short conversations, this tradeoff is acceptable. A customer support chat with three to five turns averages 300 to 500 tokens per request. Prefill takes 200 to 400 milliseconds. The cost is tolerable. For long conversations — 20 turns, 3,000 tokens of history — prefill takes 2 to 3 seconds. The user waits. The cost is no longer tolerable. Stateless serving does not scale to long conversations.
+
+## Stateful Serving: Efficiency Through Caching
+
+Stateful serving caches the key-value (KV) cache after each turn. The KV cache contains the intermediate representations of all previously processed tokens. When the next turn arrives, the server loads the cached KV state, processes only the new tokens, appends the new KV pairs to the cache, and generates the response. Prefill cost drops from 1,000 tokens to 100 tokens. Compute cost drops 90 percent. Latency drops 80 percent. The user experience improves. Your infrastructure cost drops.
+
+But caching introduces state. The KV cache for a single conversation at turn 10 with 1,000 tokens occupies 200 to 400 MB of GPU memory, depending on the model size. A replica serving 20 concurrent conversations holds 4 to 8 GB of cached state. That state is tied to the replica. If the user's next turn is routed to a different replica, the cache is not there. The new replica must either fetch the cache from somewhere — a cache store, the previous replica, or object storage — or recompute it from scratch.
+
+This is the session affinity problem. Stateful serving requires routing all requests from a single session to the same replica. The load balancer must track session IDs and route accordingly. Kubernetes ingress controllers support session affinity with cookie-based or header-based routing. The user's first request is assigned to a replica. The replica returns a session cookie or header. The load balancer uses that cookie to route all subsequent requests from that user to the same replica.
+
+Session affinity complicates scaling. You cannot freely remove replicas when traffic drops because replicas hold active sessions. Removing a replica loses its cached state and forces all its sessions to restart or migrate. Scaling down requires draining sessions — waiting for active sessions to complete before terminating the replica. This is slow. If you need to scale down quickly in response to a traffic drop, you lose sessions.
+
+Failures also complicate. If a replica crashes, all its sessions lose their cached state. Users experience a sudden latency spike as their next request recomputes the entire conversation history from scratch. The system does not fail — stateless fallback works — but the user experience degrades. You can mitigate this by persisting KV caches to a shared cache store, but that introduces network latency on every cache read and write, which partially erodes the latency gains from caching.
+
+## The KV Cache Decision: Compute vs Complexity
+
+The choice between stateless and stateful serving is a choice between paying for redundant compute or paying for operational complexity. Stateless serving recomputes. Stateful serving caches. Recomputing is expensive when conversations are long and traffic is high. Caching is complex when sessions are long-lived and failures must be tolerated gracefully.
+
+A hybrid approach caches hot sessions and recomputes cold sessions. Define a session as hot if it has received a request in the last 60 seconds. Hot sessions are pinned to replicas and cached. Cold sessions are evicted from cache and treated as stateless. The next request from a cold session recomputes the history. This reduces memory usage — you only cache active conversations, not idle ones — while maintaining the performance benefits of caching for interactive users.
+
+Another hybrid approach is speculative caching. The server caches the KV state after every turn but does not guarantee the cache will persist. If the cache is available on the next turn, use it. If not, recompute. This allows best-effort caching without strict session affinity. The user experiences fast responses most of the time and occasional slower responses when cache misses occur. For workloads where occasional latency spikes are acceptable, speculative caching delivers most of the performance benefits of stateful serving without the operational overhead of guaranteed session affinity.
+
+## Session Affinity Implementation: Sticky Sessions and Consistent Hashing
+
+Session affinity at the load balancer level is the simplest approach. The load balancer inspects incoming requests for a session ID — typically in a cookie or header — and routes all requests with the same session ID to the same backend replica. NGINX, HAProxy, and cloud-native load balancers all support sticky sessions. The first request from a user is routed based on standard load balancing (round-robin, least-connections). The load balancer assigns a session cookie that identifies the backend replica. Subsequent requests include that cookie, and the load balancer routes to the assigned replica.
+
+Sticky sessions work until the backend replica becomes unhealthy or is removed during scale-down. At that point, the load balancer must re-route the session to a different replica. The session loses its cached state unless the cache was persisted elsewhere. To handle this gracefully, implement cache persistence to a shared store — Redis, S3, or a distributed cache. When a replica receives a request and the KV cache is not in local memory, it fetches the cache from the shared store. Latency increases by 20 to 50 milliseconds for cache retrieval, but the session continues without recomputation.
+
+Consistent hashing is an alternative that distributes sessions more evenly across replicas and handles replica changes more gracefully. Each replica is assigned a position on a hash ring. Each session is hashed to a position on the ring and routed to the nearest replica. When a replica is added or removed, only a fraction of sessions are reassigned — not all sessions as in sticky session failover. This reduces the impact of scaling events on session stability. Consistent hashing is more complex to implement but more robust in dynamic environments where replicas scale frequently.
+
+## Scaling Stateful Services: Vertical, Partitioned, and Session Migration
+
+Stateless services scale horizontally. Add more replicas. Stateful services do not scale as cleanly. Adding a replica does not immediately increase capacity because new sessions must be routed to the new replica, and existing sessions remain pinned to old replicas. If your traffic grows 50 percent, adding 50 percent more replicas only helps for new sessions. Existing sessions continue to overload the old replicas until they complete or time out.
+
+Vertical scaling is simpler for stateful services. Instead of adding replicas, increase the resources per replica. A replica that can handle 20 concurrent sessions with 16 GB of memory can handle 40 concurrent sessions with 32 GB of memory. Vertical scaling does not require session migration and does not complicate routing. But vertical scaling has limits. You cannot scale a single replica beyond the largest available instance size. For high-volume workloads, you must scale horizontally.
+
+Partitioned scaling assigns sessions to replicas based on session ID ranges. Session IDs in the range 0 to 10,000 route to replica A. Session IDs 10,001 to 20,000 route to replica B. This is deterministic routing based on session ID, not load balancer affinity. When you add a replica, reassign a portion of the session ID range to the new replica. New sessions in that range route to the new replica. Existing sessions in that range either migrate to the new replica or remain on the old replica until they complete. Partitioned scaling requires application-level routing logic but provides predictable session distribution and clean scaling behavior.
+
+Session migration is the most complex scaling approach. When a replica is overloaded, migrate some of its sessions to another replica. The source replica serializes the KV cache for the session and transfers it to the destination replica. The load balancer updates its routing table to send future requests for that session to the destination replica. Migration works but introduces latency during the transfer — typically 100 to 500 milliseconds depending on cache size and network bandwidth — and requires coordination between replicas and the load balancer. Session migration is used in systems where scaling must happen dynamically in response to load without waiting for sessions to complete naturally.
+
+## Failure Handling: Automatic Failover vs Session Recovery
+
+Stateless serving handles failures automatically. A replica crashes. The load balancer detects the failure within one or two health check intervals — typically 5 to 10 seconds. The load balancer stops routing to the failed replica. In-flight requests fail and are retried by the client or a retry layer. New requests route to healthy replicas. The user experiences a brief delay but no data loss because there is no data to lose. Stateless failure recovery is clean.
+
+Stateful serving failures are messier. A replica crashes. All sessions pinned to that replica lose their cached state. The load balancer detects the failure and stops routing to the replica. The next request from a user whose session was on the failed replica is routed to a healthy replica, but that replica does not have the KV cache. The system has three options: recompute the history from scratch, fetch the cache from a shared store if it was persisted, or return an error and ask the user to restart the session.
+
+Recomputing is the most common fallback. The client sends the full conversation history with every request, even in stateful mode. If the cache is available, the server uses it. If not, the server recomputes. The user experiences a latency spike — the next response takes 2 seconds instead of 0.4 seconds — but the session continues. This is degraded performance, not failure. For conversational systems where occasional slow responses are acceptable, stateless fallback is sufficient.
+
+Persisting caches to a shared store enables faster recovery. After each turn, the replica writes the KV cache to Redis or S3 with a TTL (time-to-live) matching the session timeout. If the replica crashes, the next replica to receive a request from that session fetches the cache from the store. Latency increases by 30 to 100 milliseconds compared to local cache access, but this is better than recomputing 1,000 tokens. Cache persistence adds operational overhead — managing the cache store, monitoring cache hit rates, handling cache eviction — but reduces user-facing latency impact from failures.
+
+Returning an error and requiring session restart is the simplest approach but the worst user experience. If a replica fails, the session is lost. The user must start over. This is acceptable for stateless interactions — single-turn queries, FAQ bots — but not for long conversations. Do not treat stateful session loss as acceptable failure for interactive systems.
+
+## Cost Implications: Simpler Operations vs Lower Compute
+
+Stateless serving is more expensive in compute but cheaper in operations. You pay for redundant prefill computation on every turn, but your infrastructure is simple. No session affinity. No cache management. No migration. Scaling is horizontal. Monitoring is straightforward. For teams without deep infrastructure expertise, stateless serving is the safer choice even if the compute cost is higher.
+
+Stateful serving is cheaper in compute but more expensive in operations. You save 70 to 90 percent on prefill costs for long conversations, but you need session affinity, cache management, failure recovery, and scaling strategies that account for session persistence. If your team has strong infrastructure skills and your workload is dominated by long multi-turn conversations, the operational overhead is worth the compute savings. If your team is small, your workload is mixed, and your conversations are short, the operational overhead is not justified.
+
+The breakeven point is conversation length and traffic volume. For conversations averaging fewer than five turns and 500 tokens, stateless serving is cost-competitive. For conversations averaging 20 turns and 3,000 tokens at high volume — thousands of concurrent sessions — stateful serving cuts compute cost by 60 percent or more. The teams that choose correctly measure their workload first, calculate the cost difference, and compare it to the engineering cost of building and operating stateful infrastructure.
+
+## When to Choose Stateless, When to Choose Stateful
+
+Choose stateless for: single-turn queries, short conversations (fewer than five turns), batch workloads, low-traffic systems, teams without deep infrastructure expertise, workloads where operational simplicity is worth the compute cost. Stateless serving is the default. It works. It scales. It is easy to operate. Do not overcomplicate unless you have a clear reason.
+
+Choose stateful for: long multi-turn conversations (more than 10 turns), high-traffic systems where prefill cost is a significant fraction of total compute, latency-sensitive applications where reprocessing 1,000 tokens adds unacceptable delay, workloads where compute cost savings justify the engineering investment in session management. Stateful serving is an optimization. Optimize when the default is measurably insufficient.
+
+A customer support chatbot with an average of four turns per conversation and 50,000 conversations per day is stateless. The prefill cost is tolerable. Simplicity is more valuable than 50 percent compute savings. A conversational AI companion with an average of 30 turns per conversation and 500,000 active users is stateful. Recomputing 3,000 tokens on every turn at that scale costs 200,000 dollars per month in unnecessary compute. Caching is worth the operational complexity.
+
+## The Migration Story: From Stateless to Stateful at Scale
+
+An edtech company built a tutoring chatbot that helped students with homework. The average conversation was 18 turns. They launched with stateless serving because it was simple. At 10,000 users, compute cost was 8,000 dollars per month. Acceptable. At 100,000 users, compute cost hit 80,000 dollars per month. 65 percent of that cost was prefill — reprocessing conversation history on every turn. They analyzed the numbers. Stateful serving would cut compute cost to 35,000 dollars per month. Savings: 45,000 dollars per month.
+
+They built session affinity into their load balancer, implemented cache persistence to Redis, and added monitoring for cache hit rates and session migration. Engineering cost: six weeks of senior engineer time. Operational complexity increased — they now monitored cache store health, session eviction rates, and affinity failures. But compute cost dropped from 80,000 to 38,000 dollars per month. ROI: five months. After that, the savings compounded. At 300,000 users, stateless would have cost 240,000 dollars per month. Stateful cost 95,000 dollars per month.
+
+The teams that stay stateless when stateful is justified pay the difference every month. The teams that migrate to stateful when the ROI is clear save the difference every month. Architecture is not ideology. Architecture is economics. Choose based on your workload, your scale, and your team's capabilities.
+
+---
+
+The next subchapter covers multi-model serving — running multiple models on shared infrastructure.

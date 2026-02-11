@@ -1,0 +1,104 @@
+# 4.5 — Priority Tier Enforcement: Premium vs Free Tier Traffic
+
+In August 2025, a developer tools company with 2.3 million free-tier users and 18,000 paying customers watched their infrastructure buckle under load. A viral feature launch drove a spike in free-tier traffic, and their first-come-first-served request queue treated all users identically. Premium customers who paid $399 per month experienced the same degraded service as free users. Support tickets flooded in. "Why am I paying for this?" Twelve enterprise customers threatened cancellation within 48 hours. The company had rate limits, but no priority enforcement. Every user waited in the same queue. Revenue was at risk because they treated all traffic equally.
+
+The fix required three weeks of infrastructure work: priority queues, tier-aware routing, and load-shedding rules that degraded free traffic before touching premium. When the next spike hit in October, paying customers experienced zero degradation while free users saw slightly longer response times. Retention recovered. The lesson: not all traffic is equal, and your infrastructure must enforce that difference under load.
+
+## The Business Case for Priority Tiers
+
+Priority tier enforcement is not about punishing free users. It is about delivering the service level that paying customers bought. When a user upgrades from free to paid, they are purchasing better reliability, faster responses, and access to more powerful models. If your infrastructure cannot guarantee those differences under load, you are committing fraud. You sold something you cannot deliver.
+
+The resource allocation problem becomes acute during contention. When your system has capacity for 10,000 concurrent requests but receives 15,000, you must choose who to serve. Serving everyone equally means degrading everyone equally, which destroys the value proposition of your paid tiers. Serving premium users first and degrading or rejecting free users preserves the contract you made with paying customers. This is not cruelty. This is basic operational integrity.
+
+Priority enforcement also enables monetization. Users upgrade when they experience the limits of the free tier and see that the paid tier removes those limits. If free-tier performance is indistinguishable from paid under normal load, upgrade rates collapse. If free-tier performance degrades noticeably under load while paid performance remains excellent, upgrade rates climb. The infrastructure difference must be real and felt.
+
+Priority tiers also mitigate abuse. Attackers and cost-insensitive users gravitate toward free tiers. If free-tier traffic can saturate your infrastructure and degrade paid users, a single bad actor can hold your business hostage. Priority enforcement limits blast radius. Free-tier abuse affects free-tier users. Paid users remain insulated.
+
+## Priority Tier Dimensions
+
+Priority is not one thing. It is a bundle of enforcement mechanisms that combine to create a differentiated experience. The five critical dimensions are queue priority, model access, rate limits, latency SLA, and reliability guarantees. Each dimension can be tuned independently.
+
+Queue priority determines serving order. When multiple requests arrive simultaneously, premium requests move to the front of the queue. This is implemented with separate priority queues or weighted fair queuing algorithms. Under low load, all tiers are served immediately and queue priority is invisible. Under high load, free-tier requests wait while premium requests bypass the queue. The user experience difference becomes stark: premium users see 200-millisecond response times while free users see 8-second response times.
+
+Model access determines which models each tier can invoke. Premium tiers get access to GPT-5, Claude Opus 4.5, and Gemini 3 Pro. Standard tiers get GPT-5-mini, Claude Sonnet 4.5, and Gemini 3 Flash. Free tiers get access only to older or smaller models. This is enforceable at the routing layer: the model parameter in the request is checked against the user's tier entitlements before routing to inference. Attempts to access unauthorized models return a 403 with an upgrade prompt.
+
+Rate limits determine throughput ceilings. Free tiers might allow 10,000 tokens per day. Pro tiers allow 1 million tokens per day. Enterprise tiers have custom negotiated limits or no limits at all. Rate limits are enforced per account, not per API key, to prevent key-sharing abuse. When a user approaches their limit, responses include headers indicating remaining quota. When they exceed their limit, requests are rejected with 429 status and a timestamp indicating when quota resets.
+
+Latency SLAs determine guaranteed response time. Premium tiers promise P95 latency under 2 seconds. Standard tiers promise P95 under 5 seconds. Free tiers offer best-effort with no guarantee. These SLAs are enforced through timeout policies and load shedding. If a premium request would exceed the 2-second SLA due to queueing, the system sheds free-tier load to free up capacity. If even shedding free load is insufficient, the system scales horizontally or returns a 503 to free users while continuing to serve premium users.
+
+Reliability guarantees determine retry and failover behavior. Premium requests are automatically retried on transient failures, with failover to alternate providers if the primary fails. Standard requests are retried once. Free requests are not retried. The user sees the failure and must manually retry. This difference in reliability translates to user-visible uptime differences: premium users might see 99.95% success rate while free users see 99.5% success rate, purely due to automatic retry.
+
+## Implementing Queue Priority
+
+The simplest implementation is separate queues per tier. Incoming requests are routed to the appropriate queue based on tier. The scheduler always pulls from the premium queue first. If the premium queue is empty, it pulls from standard. If standard is empty, it pulls from free. This strict priority guarantees that premium work is never delayed by free work, but it introduces starvation risk: if premium traffic is continuous, free traffic never gets served.
+
+Starvation prevention requires a fairness mechanism. Weighted fair queuing serves N premium requests for every 1 free request, even under load. The weight ratio is tunable: 10-to-1 gives premium users strong priority while ensuring free users eventually get service. 100-to-1 gives even stronger priority. The right ratio depends on business model: consumer products might use 5-to-1, enterprise products might use 50-to-1.
+
+Another approach is deadline-based priority. Each request is assigned a deadline based on tier: premium requests get a 2-second deadline, standard get 5 seconds, free get 30 seconds. The scheduler always serves the request with the nearest deadline. Under low load, everyone is served quickly. Under high load, free requests accumulate and eventually their deadlines approach, forcing the scheduler to serve them before they time out. This provides starvation prevention without strict ratios.
+
+Queue priority requires low-latency tier identification. Looking up the tier from a database on every request adds 50-100 milliseconds, which destroys the value of priority queuing. The solution is to encode tier information in the API key itself or in a signed JWT. The gateway can extract tier from the credential without external lookups. Tier information is cached aggressively with a short TTL, so upgrades take effect within minutes but tier lookups add microseconds, not milliseconds.
+
+## Implementing Model Access Tiers
+
+Model access tiers are enforced at the routing layer, before requests reach inference infrastructure. The user's request includes a model parameter: "gpt-5" or "claude-opus-4.5" or "gemini-3-pro". The gateway checks the requested model against the tier entitlements table. If the user's tier allows access, the request is routed to the appropriate model endpoint. If not, the request is rejected with a clear error message and an upgrade link.
+
+Tier entitlements are stored as a mapping: free tier maps to a list of allowed models, standard tier maps to another list, premium maps to all models. This table is cached in the gateway with a 5-minute TTL. When entitlements change due to subscription changes, the cache expires quickly. The user does not need to wait hours for access.
+
+Model access enforcement prevents cost arbitrage. If free users could access GPT-5 at the same rate as GPT-5-nano, they would always choose the more expensive model, destroying unit economics. By restricting free users to cheaper models, you align their incentives with your cost structure. They can still get high-quality results, but if they want the absolute best model, they must upgrade.
+
+Model access also enables progressive disclosure. New models can be launched as premium-only, allowing early adopters and high-value customers to experiment while limiting blast radius. If the model has quality issues or cost surprises, only premium users are affected, and they are more tolerant because they signed up for cutting-edge access. Once the model is stable, it can be opened to standard or free tiers.
+
+## Implementing Rate Limit Tiers
+
+Rate limit tiers are enforced per account, not per API key. This prevents users from generating multiple keys to bypass limits. Each account has a unique identifier, and all API keys for that account decrement the same quota counter. The quota counter is stored in a distributed cache like Redis with expiration semantics: daily quotas reset at midnight UTC, hourly quotas reset on the hour.
+
+Quota enforcement happens at the gateway. Before routing a request, the gateway checks the account's remaining quota. If sufficient quota remains, the request proceeds and the estimated token cost is decremented. If insufficient quota remains, the request is rejected immediately with a 429 status code and a response header indicating when quota resets. The user's application can read this header and implement backoff or notify the user.
+
+Quota estimation is required because you do not know output length at request time. The system reserves a pessimistic estimate of output tokens based on max_tokens parameter or historical average. When the response completes, the actual token count is measured and the quota is adjusted: over-reserved tokens are refunded, under-reserved tokens are debited. This ensures accurate billing while preventing quota exhaustion mid-request.
+
+Free-tier quotas are set low enough to prevent abuse but high enough to enable meaningful experimentation. A common pattern: 10,000 tokens per day, which allows roughly 20 typical requests. This is enough to build a demo or prototype but insufficient for production use. Pro-tier quotas are set to enable production use for small teams: 1 million tokens per day supports hundreds of users. Enterprise quotas are negotiated based on expected load and may have no hard limit, relying instead on billing alerts.
+
+## Implementing Latency SLAs
+
+Latency SLAs are enforced through three mechanisms: request prioritization, timeout policies, and load shedding. Premium requests with a 2-second SLA are routed to high-priority queues and served immediately. If serving them would cause queueing delay, the system sheds lower-priority work to free capacity. If even after shedding the system cannot meet the SLA, it scales horizontally or rejects new low-priority work until load subsides.
+
+Timeout policies differ by tier. Premium requests are allowed to run for up to 10 seconds before timeout, because users paid for completion. Free requests are timed out at 5 seconds to free resources for paying customers. This asymmetry is invisible under normal load but becomes critical under overload. When every millisecond of capacity matters, premium users get more of it.
+
+Load shedding rules are tiered and progressive. At 70% capacity, free-tier requests experience increased queueing but are still served. At 85% capacity, new free-tier requests are rate limited: only every third request is accepted, the rest are rejected with 503. At 95% capacity, all free-tier requests are rejected. Standard-tier requests are shed only above 98% capacity. Premium requests are never shed unless the system is completely saturated.
+
+Latency monitoring and alerting are tier-aware. If free-tier P95 latency spikes to 10 seconds, that may be acceptable under load. If premium-tier P95 latency exceeds 2 seconds, that is an SLA breach and triggers an immediate page. The ops team scales capacity or investigates degradation. The system treats premium latency violations as high-severity incidents.
+
+## Enforcement Under Load
+
+Priority enforcement is most critical under load. Under normal conditions, all tiers receive good service. The infrastructure has excess capacity, and every request is served within milliseconds. Tier differences are invisible. Users do not notice whether they are premium or free because both experiences are excellent.
+
+The tier system activates when load climbs. At moderate load, free-tier requests experience slightly elevated latency as premium requests jump the queue. At high load, free-tier requests are rate limited or delayed significantly. At critical load, free-tier requests are rejected entirely. Premium users never notice the load spike. Their experience is identical to normal conditions. Free users see degraded or unavailable service.
+
+This tiered degradation is essential for business continuity. If load spikes cause uniform degradation across all tiers, your highest-value customers churn. If load spikes only affect free users, your revenue is protected and paying customers remain loyal. Free users who experience degradation under load are candidates for upgrade messaging: "Upgrade to Pro for guaranteed availability during peak times."
+
+Load shedding must be implemented carefully to avoid starvation. Even under critical load, some percentage of free requests should be served to maintain goodwill and allow free users to experience the product. A common pattern: reserve 5% of capacity for free-tier traffic even at peak load. This ensures that free users are deprioritized but not completely locked out.
+
+## Tier Identification and Enforcement
+
+Fast tier identification is essential. Every request must be mapped to a tier within microseconds, not milliseconds. The most common approach is to encode tier information in the API key itself. The key format includes a prefix indicating tier: "sk-free-...", "sk-pro-...", "sk-enterprise-...". The gateway parses the prefix and knows the tier without any external lookup.
+
+An alternative is JWT-based authentication where tier is encoded as a claim in the signed token. The gateway validates the JWT signature and extracts the tier claim. This is more flexible than key prefixes because tier can be changed without reissuing keys, but it requires slightly more computation to validate signatures.
+
+Account-based lookups are slower but more accurate. The API key maps to an account ID, and the account's current subscription tier is fetched from a database or cache. This adds 10-50 milliseconds per request depending on cache hit rate. For high-throughput systems, this latency is unacceptable, so account lookups are only used for tier changes or administrative operations, not per-request enforcement.
+
+Tier abuse prevention requires monitoring for suspicious patterns. If a single account generates 50 API keys and rotates them to evade rate limits, that pattern is detectable and should trigger an automatic ban. If multiple accounts share the same API key, that violates terms of service and should trigger an investigation. Key sharing detection looks for API keys used from multiple IP addresses or with usage patterns inconsistent with a single user.
+
+Rate limiting must be account-scoped, not key-scoped. If limits are per-key, users generate unlimited keys to bypass limits. If limits are per-account, generating more keys does not help. The quota is shared across all keys. This requires mapping keys to accounts and using the account ID as the rate limit key in Redis.
+
+## The Operational Reality
+
+Priority tier enforcement is not optional for any production AI system serving both free and paid users. Without it, paying customers subsidize free users under load, revenue is at risk, and abuse is uncontrolled. With it, you can scale free-tier traffic aggressively for growth while ensuring that paid users always receive the service they purchased.
+
+The infrastructure investment is non-trivial. Priority queues, tier-aware routing, quota enforcement, and load shedding require coordination across gateway, orchestration, and inference layers. The complexity is justified by the business value: higher upgrade conversion, lower churn, and protection against abuse.
+
+The hardest decision is calibrating the priority ratio. Deprioritize free users too aggressively and you create a hostile trial experience that prevents upgrades. Deprioritize too gently and paid users do not see sufficient differentiation to justify the price. The right balance is learned through experimentation and customer feedback, not guessed in advance.
+
+What happens when you skip priority enforcement entirely? Revenue customers churn because they cannot distinguish their experience from free users. Upgrade conversion collapses because free users see no reason to pay. Abusers flood the free tier because there is no cost to trying. You are left running infrastructure at a loss, serving users who will never pay, while losing the users who already paid. That is not a business. That is a public charity running on venture capital.
+
+The next question is how to allow controlled bursting while maintaining long-term rate limits. You need algorithms that let users send traffic in bursts without triggering rate limits immediately, but prevent sustained overuse. That is where token bucket algorithms come in.
+

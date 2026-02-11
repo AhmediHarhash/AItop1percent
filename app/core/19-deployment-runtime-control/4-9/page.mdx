@@ -1,0 +1,106 @@
+# 4.9 — Cost-Aware Request Rejection: When to Say No
+
+The hardest product decision is sometimes the simplest one: say no. In early 2025, a B2B SaaS platform spent seven months debugging mysterious profitability issues. Revenue was up. Active users were growing. But margin was negative 18 percent and worsening. The root cause was invisible at first: the product accepted every request, regardless of cost. A single enterprise customer discovered that the API had no per-request budget check. They built an internal tool that summarized 500-page regulatory documents by passing the entire document as context. Each request cost the platform $4.80 in model fees. The customer's contract paid $0.12 per request. The platform lost $4.68 on every call. That customer alone generated 140,000 requests in three months. The platform lost $655,000 serving a customer paying $16,800. The fix was not better rate limiting. The fix was learning to reject unprofitable requests before they executed.
+
+Cost-aware request rejection is the discipline of evaluating whether a request should run at all, based on economic and resource constraints. Not every request deserves an answer. Some requests would exceed budget. Some would cause loss. Some would starve other users. Some are likely abuse. The system must detect these cases and reject them before consuming resources. This is not throttling. Throttling delays execution. Rejection refuses execution entirely. The request never reaches the model. The tokens are never consumed. The cost is never incurred.
+
+## Why Reject Requests
+
+Request rejection serves four core purposes. First, it protects user budget. A user with a $50 monthly budget should not be able to issue a single request that costs $80. The system must reject the request and preserve the budget for smaller, viable requests. Without rejection, the first expensive request exhausts the budget and all subsequent requests fail. The user's experience degrades from "my budget ran out gradually" to "my budget disappeared on one request I didn't realize was expensive."
+
+Second, rejection protects platform economics. Free tiers, promotional credits, and loss-leader pricing are sustainable only with strict cost controls. If a free-tier user can issue requests that cost the platform $10 each, the free tier becomes economically unsustainable. The platform either removes the free tier or goes bankrupt subsidizing abuse. Rejection allows the platform to offer generous free tiers by ensuring no single request can destroy unit economics.
+
+Third, rejection protects other users. In multi-tenant systems, one user's expensive request consumes resources that other users need. A request that takes 45 seconds of GPU time blocks requests from 30 other users. If that expensive request is unprofitable or abusive, rejecting it frees resources for legitimate workloads. Rejection is a fairness mechanism. It prevents one user from monopolizing shared infrastructure.
+
+Fourth, rejection detects abuse. Unusually expensive requests often indicate misuse, misconfiguration, or deliberate exploitation. A user who suddenly starts sending 100,000-token inputs after weeks of 500-token inputs is either testing the system's limits or accidentally introduced a bug. Rejecting the anomalous requests protects the platform and alerts the user to investigate. Rejection is both a safety mechanism and a signal.
+
+## Cost-Aware Rejection Criteria
+
+The system rejects requests based on four measurable criteria. First, input token count. Every request's input is tokenized before execution. If the input exceeds the user's remaining token budget, the request is rejected. A user with 5,000 tokens remaining cannot issue a request with 8,000 input tokens. The cost is predictable because input tokens are known exactly at request time. This is the simplest and most reliable rejection criterion.
+
+Second, expected output token count. Output tokens are not known until generation completes, but they can be estimated. The request specifies max tokens, which bounds the output. If the user requests max tokens of 4,000 but has only 2,000 tokens remaining, the request is rejected. The estimate is conservative: assume the model will generate the full max tokens. Better to reject a request that might have generated fewer tokens than to allow a request that will definitely exceed budget.
+
+Third, model cost tier. Different models have different per-token costs. GPT-5 costs more than GPT-5-mini. Claude Opus 4.5 costs more than Haiku 4.5. If a user's remaining budget is $0.30 and they request a model whose minimum viable request costs $0.50, the request is rejected. The system calculates the cheapest possible request for that model and compares it to the user's budget. If even the cheapest request would exceed budget, reject immediately.
+
+Fourth, operation type cost. Some operations are inherently more expensive than others. A request with ten tool calls is more expensive than a request with zero tool calls. A request with structured output parsing is more expensive than plain text generation. A request with vision input is more expensive than text-only input. The system estimates total operation cost based on all components. If the estimate exceeds budget, reject.
+
+## Pre-Request Cost Estimation
+
+Cost estimation happens before the request reaches the model. The system calculates three numbers. First, input cost. Input tokens are counted exactly. Multiply token count by the model's input price per token. For GPT-5 at $2.50 per million input tokens, an 8,000-token input costs $0.02. This number is precise and known immediately.
+
+Second, output cost. Output tokens are estimated from max tokens. If the user specifies max tokens of 4,000, assume the model will generate 4,000 tokens. Multiply by the model's output price per token. For GPT-5 at $10 per million output tokens, 4,000 output tokens costs $0.04. This number is an upper bound. The actual cost may be lower if the model generates fewer tokens.
+
+Third, total estimated cost. Add input cost and output cost. For the example above, total estimated cost is $0.06. Compare this number to the user's remaining budget. If the user has $0.10 remaining, the request is allowed. If the user has $0.05 remaining, the request is rejected. The comparison happens in milliseconds, before any model inference begins.
+
+The estimation must account for all cost components. Tool calls add cost. Each tool call may trigger external API requests, database queries, or additional model inference. Vision inputs add cost. Image tokens are more expensive than text tokens. Structured output parsing adds cost. The model may need multiple attempts to produce valid JSON. The estimation logic must include all these factors. A conservative estimate is better than an optimistic one. Over-rejecting is safer than under-rejecting.
+
+## Rejection Strategies
+
+The system has four rejection strategies. First, hard reject. Return an error immediately. The error message explains why the request was rejected and what the user can do. This is the default strategy for requests that clearly exceed budget. The user receives a 402 Payment Required or 403 Forbidden response with a clear explanation. No model inference occurs. No cost is incurred.
+
+Second, offer alternatives. Instead of rejecting outright, suggest a cheaper option. If the user requested GPT-5 but has insufficient budget, offer GPT-5-mini. If the user requested max tokens of 4,000 but can only afford 2,000, suggest reducing max tokens. The response includes the alternative options with their estimated costs. The user can resubmit the request with the cheaper configuration. This strategy improves user experience by guiding the user toward viable requests.
+
+Third, queue for later. If the request exceeds the current budget but the budget will refresh soon, queue the request. For example, a user with a daily budget that resets at midnight can queue a request at 11:58 PM to execute at 12:01 AM. The request waits in a queue until budget becomes available. This strategy is useful for non-urgent workloads where the user values eventual completion over immediate response.
+
+Fourth, partial execution. For multi-part requests, execute what fits within budget and reject the rest. If a user requests summarization of ten documents but has budget for only six, summarize the first six and return an error for the remaining four. This strategy is complex to implement but valuable for batch workloads where partial results are useful.
+
+## Communicating Rejection
+
+Clear communication is essential. A rejected request without explanation feels like a system failure. The user does not know whether they hit a bug, a limit, or a billing issue. The error response must include four elements. First, the reason for rejection. "Request rejected: estimated cost of $0.08 exceeds remaining budget of $0.05." This tells the user exactly what went wrong.
+
+Second, the user's current state. "You have $0.05 remaining in your monthly budget of $100." This provides context. The user understands how much budget remains and when it resets.
+
+Third, what the user can do. Three options: upgrade to a higher tier, wait until budget resets, or modify the request to reduce cost. The error message includes all viable options. "You can upgrade to the Pro plan for unlimited requests, wait until your budget resets on March 1, or reduce max tokens to 2,000 to fit within your remaining budget."
+
+Fourth, how to estimate cost before submitting. Point the user to a cost estimation API or dashboard. "Estimate request cost before submitting using the /estimate endpoint." This empowers the user to avoid future rejections by checking cost first.
+
+The error response should be machine-readable and human-readable. Machine-readable for automated clients that can parse the error and retry with adjustments. Human-readable for developers debugging integrations. Both audiences matter.
+
+## Abuse Detection
+
+Cost-aware rejection also detects abuse. Abusive patterns are easy to spot. First, unusually long inputs. A user who has sent 500-token requests for weeks and suddenly sends a 100,000-token request is anomalous. The system flags the request as potential abuse. It may reject automatically or flag for manual review, depending on risk tolerance.
+
+Second, rapid repeated requests. A user who sends the same expensive request 50 times in one minute is either misconfigured or testing the system's limits. The system detects identical or near-identical requests within a short time window and rejects after the first few. This prevents a runaway loop from consuming the entire budget.
+
+Third, context stuffing patterns. Some users attempt to bypass input limits by stuffing irrelevant text into the context. The input is 50,000 tokens, but only 500 tokens are meaningful and the rest is padding. The system can detect this pattern by analyzing token entropy or semantic coherence. Low-entropy inputs with repetitive content are flagged as potential stuffing.
+
+Fourth, automated versus human patterns. Automated abuse generates requests at machine speed with machine regularity. Human users generate requests at human speed with human irregularity. The system tracks request timing, intervals, and distribution. A user who sends exactly one request every 10 seconds for six hours straight is almost certainly automated. The system applies stricter limits to automated patterns.
+
+When abuse is detected, the system has two options. Reject the request and alert the user. Or allow the request but flag the account for review. The choice depends on confidence. If the system is 95 percent confident the request is abuse, reject immediately. If the system is 60 percent confident, allow the request but monitor the account closely.
+
+## Cost-Aware Routing
+
+Rejection is not the only option. Cost-aware routing redirects expensive requests to cheaper models instead of rejecting them. If a user requests GPT-5 but the request would exceed budget, the system offers to route the request to GPT-5-mini automatically. The user can opt in to automatic downgrading. This strategy maximizes the likelihood that the user gets an answer, even if the answer comes from a less powerful model.
+
+Routing requires user consent. Automatically downgrading a model without consent creates trust issues. The user expected GPT-5 quality and received GPT-5-mini quality. The system must ask: "Your request would cost $0.08, which exceeds your remaining budget of $0.05. Route to GPT-5-mini for $0.03 instead?" The user can accept or decline. If they accept, the request executes on the cheaper model. If they decline, the request is rejected.
+
+Routing also applies to output length. If a user requests max tokens of 4,000 but can only afford 2,000, the system offers to reduce max tokens automatically. "Your request would cost $0.06, which exceeds your remaining budget of $0.04. Reduce max tokens to 2,000 to fit within budget?" Again, the user must consent. Automatic modification without consent is a breach of trust.
+
+Cost-aware routing improves user experience by reducing rejections. But it introduces complexity. The system must track which model actually executed, not just which model the user requested. Logs and analytics must reflect the routed model, not the requested model. Billing must reflect the actual cost, not the estimated cost of the rejected model. Routing requires careful implementation to avoid confusion.
+
+## Economic Sustainability
+
+Request rejection is a requirement for economic sustainability. Free tiers must have limits. Loss leaders must have caps. Unit economics must work. A free tier that allows unlimited expensive requests is not a free tier. It is a money-losing product with a countdown timer to shutdown.
+
+Free tiers are sustainable when they impose strict per-request limits. Free users can issue up to 10,000 tokens per day. Requests that exceed 2,000 input tokens are rejected. Requests that use GPT-5 are rejected. Only GPT-5-mini is allowed. These limits ensure that free-tier costs remain predictable and bounded. The platform can budget for free-tier costs with confidence. Free users still receive value, but the platform does not subsidize abuse.
+
+Loss leaders are promotional offerings where the platform intentionally loses money to acquire customers. A new user receives $10 in free credits. The platform expects to lose money on these credits but hopes the user converts to a paid plan. Loss leaders are sustainable only if the loss is capped. If a user can spend $10 in free credits on 200 requests or on 2 requests, the unit economics are wildly different. The system must cap the cost per request to ensure the $10 budget stretches across enough usage for the user to experience value. Rejection caps the downside risk of loss leaders.
+
+Paid tiers must also reject unprofitable requests. A user on a $50-per-month plan should not be able to issue a single request that costs the platform $80. The platform loses $30 on that request. Rejection protects the platform's margin. The user is told they need a higher tier to issue that request. This is not anti-user. It is honest pricing. The user pays for the resources they consume. If they consume more, they pay more.
+
+## Rejection Rate Monitoring
+
+The system must monitor rejection rates. Track rejections by reason: budget exceeded, input too long, output too long, model too expensive, abuse detected. Each reason indicates a different issue. A spike in budget exceeded rejections means users are hitting their limits. This could indicate that limits are too low or that users are trying to do more than their plan allows. A spike in input too long rejections means users are sending larger inputs than expected. This could indicate a shift in use case or a misconfiguration.
+
+Alert on rejection spikes. If the rejection rate jumps from 2 percent to 15 percent in one hour, something changed. Either user behavior shifted, or the system introduced a bug that incorrectly rejects valid requests. The operations team must investigate immediately. Rejection spikes often correlate with user complaints. Users who were successfully issuing requests suddenly cannot. The spike is the early warning signal.
+
+Analyze rejected requests for patterns. Are rejections concentrated in one user segment? One API endpoint? One time of day? Patterns reveal opportunities for improvement. If free-tier users have a 30 percent rejection rate and paid users have a 2 percent rejection rate, the free-tier limits may be too strict. If rejections spike every Monday morning, users may be batching weekend work into Monday requests. The system can adjust limits dynamically to accommodate these patterns.
+
+Rejection rates should trend downward over time as users learn the system's limits and adjust their usage. A rejection rate that stays high or increases indicates poor communication or misaligned limits. The system is rejecting requests that users believe should succeed. This is a product problem, not a technical problem. The solution is better documentation, clearer error messages, or more generous limits.
+
+Request rejection is not a failure. It is a feature. It protects users, protects the platform, and ensures economic sustainability. The goal is not zero rejections. The goal is intelligent rejections that prevent harm while maximizing value for all users.
+
+---
+
+The system must also consider the user's perception. A rejection feels like a denial of service. The user asked for something and the system said no. Poor communication turns a reasonable rejection into a frustrating experience. Clear communication turns a rejection into a learning moment. The user understands why the request was rejected and how to succeed next time. Cost-aware rejection is as much about user experience as it is about cost control.
+

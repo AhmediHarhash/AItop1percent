@@ -1,0 +1,99 @@
+# 6.2 — Response Caching: Full Request-Response Memoization
+
+The simplest cache is the most underrated. Exact-match response caching handles more traffic than most teams realize. The assumption is that users phrase questions uniquely, that conversation history prevents exact matches, that LLM non-determinism makes caching pointless. The reality is that twenty to forty percent of production traffic consists of identical queries—same text, same context, same parameters—and exact-match caching captures all of it with zero false positives and single-digit millisecond latency.
+
+The teams that skip straight to semantic caching or prefix caching miss the low-hanging fruit. They build complex vector similarity systems while identical queries hit their inference infrastructure thousands of times per day. They spend engineering months on embedding pipelines when a Redis instance with a well-designed cache key would cut their bill by thirty percent. Exact-match response caching is not glamorous. It is not novel. It is not a conference talk. It is also the highest ROI optimization most production systems can deploy.
+
+## Exact-Match Caching Fundamentals
+
+Exact-match caching stores the full response for a given request and serves it again when the identical request arrives. The cache key includes everything that affects the response: the user query, the model name, the temperature setting, the system prompt, the conversation history, any retrieval results, and any other parameters passed to the inference API. If two requests have identical keys, they get the same cached response. If anything differs, they miss the cache and generate a new response.
+
+The advantage is simplicity and safety. You cannot get a false positive. If the cache returns a response, it is exactly the response the model would have generated for that input. No semantic similarity thresholds to tune. No vector search infrastructure to maintain. No embedding model to keep updated. Just a hash function and a key-value store.
+
+The disadvantage is that the cache key is large and sensitive to small changes. A single token difference in conversation history produces a different key. A trailing space in the query produces a different key. A system prompt updated by one word invalidates every cached response. You must normalize inputs carefully to maximize hit rate without compromising correctness.
+
+Normalization means stripping irrelevant variation before hashing. Lowercase the query unless case matters. Remove leading and trailing whitespace. Normalize Unicode characters. Sort JSON keys if the request includes structured data. The goal is to make equivalent requests produce identical keys. A user typing "How do I reset my password?" and "how do I reset my password?" should hit the same cache entry. A user submitting a request with newline characters and one without should hit the same entry if newlines do not affect the response.
+
+The mistake teams make is over-normalizing. They strip punctuation, remove stop words, or lemmatize tokens, assuming it will increase hit rate. It does increase hit rate—by introducing false positives. "Delete my account" and "delete my account?" are different questions with different intents. "I want to cancel" and "I don't want to cancel" are opposite requests. Aggressive normalization destroys meaning. The safe default is minimal normalization—whitespace, case, and Unicode only—and measure hit rate before adding more.
+
+## Cache Key Design
+
+The cache key must include every variable that affects the response. Miss one variable and you serve the wrong cached response. Include unnecessary variables and you get cache misses for queries that should hit. The balance is precise: include exactly what matters, exclude what does not.
+
+The query text always matters. The model name always matters—a response from GPT-5 is not interchangeable with a response from Claude Sonnet 4.5. The temperature setting always matters if it is non-zero. The system prompt always matters because it shapes every response. The conversation history usually matters unless you are running stateless single-turn queries.
+
+Few-shot examples matter if they vary per request. Some systems include dynamic few-shot examples based on retrieval results. Those must be part of the cache key. Static few-shot examples do not vary per request and should be part of the system prompt hash, not duplicated in every key. Retrieval results matter if they are passed as context to the model. Some systems retrieve documents, embed them in the prompt, and generate a response. Those documents are part of the cache key.
+
+User identity sometimes matters. If the response includes user-specific data—account balance, order history, personalized recommendations—the user ID must be in the key. If the response is generic knowledge—FAQ answers, documentation—user ID should not be in the key because it prevents sharing cached responses across users. The decision depends on whether the response depends on user state.
+
+Timestamps rarely matter unless you are caching time-sensitive queries. A query like "what happened today" needs a date in the key. A query like "how do I export data" does not. Including timestamps by default destroys cache effectiveness because every request gets a unique key based on request time. Only add timestamps if response correctness depends on them.
+
+The practical implementation hashes these components into a fixed-length key. You concatenate model name, temperature, system prompt hash, query text, conversation history hash, and any other relevant fields, then run a cryptographic hash like SHA-256. The resulting hash is your cache key. The hash must be deterministic—same inputs always produce the same hash—and collision-resistant—different inputs almost never produce the same hash.
+
+## TTL Strategies
+
+Time-to-live determines how long a cached response remains valid before expiration. Set TTL too short and you lose cost savings because responses expire before they can be reused. Set TTL too long and you serve stale responses that no longer reflect current reality. The correct TTL depends on content type, update frequency, and business requirements.
+
+Static knowledge has long TTL. A cached response to "what is machine learning" remains valid for months. The concept does not change weekly. A cached response to "how do I format JSON" remains valid indefinitely. Programming syntax is stable. These queries can use TTL measured in weeks or months, maximizing cache hit rate without risking staleness.
+
+Dynamic content has short TTL. A cached response to "what are today's top stories" expires in hours. A cached response to "what is the current stock price" expires in minutes if you are building a financial application, or days if you are building a general knowledge assistant. The TTL must match user expectations for freshness. Users asking about news expect recent information. Users asking about historical facts tolerate old information.
+
+User-specific data has TTL tied to update frequency. A cached response to "what is my account balance" expires when the balance changes—which might be minutes for high-frequency trading accounts, hours for active consumer accounts, or days for dormant accounts. The safe default is short TTL—five to fifteen minutes—but sophisticated systems track update events and invalidate cache entries reactively rather than waiting for TTL expiration.
+
+The implementation uses TTL as a default with manual invalidation as an override. You set a reasonable TTL—one hour, one day, one week—based on content classification. When the underlying data changes—documentation updates, model retraining, system prompt edits—you flush all cache entries affected by that change. This combines the simplicity of TTL-based expiration with the correctness of event-driven invalidation.
+
+Most teams start with a single global TTL and discover it does not work. They set it to one hour, then find that half their cached responses are outdated while the other half are evicted prematurely. The mature approach classifies queries by content type and assigns per-category TTL. FAQ queries get seven days. News queries get two hours. Documentation queries get until next release. The classification logic lives in the caching layer and evolves as traffic patterns change.
+
+## Cache Warm-Up
+
+A cold cache has zero hit rate until traffic arrives and populates it. The first user who asks a question generates a cache miss, triggers inference, and stores the response. The second user asking the same question gets a cache hit. The first user always pays full latency and cost. Cache warm-up pre-populates the cache with responses to common queries before users arrive, so the first user gets a cache hit too.
+
+The value depends on traffic predictability. If ninety percent of queries are repeated from a known set—FAQ questions, documentation lookups—warm-up eliminates most cold-start misses. If queries are highly diverse and unpredictable, warm-up has limited value because you cannot anticipate which queries will arrive. The sweet spot is systems with a recognizable head of common queries and a long tail of rare ones. You warm up the head and let the tail populate naturally.
+
+The implementation runs a batch job before deploying cache infrastructure. You query historical logs to identify the top one hundred, five hundred, or one thousand most frequent queries from the past week or month. You generate responses for each query using the current model and system prompt. You store those responses in the cache with appropriate TTL. When the cache goes live, it already contains answers to the most common questions.
+
+The risk is serving outdated responses. If you warm up the cache with responses generated a week ago, and your system prompt changed yesterday, the cached responses reflect old behavior. Users get answers that do not match current system capabilities. The safe approach regenerates warm-up responses immediately before cache deployment, ensuring they reflect the current configuration. Some teams automate this—every system prompt update triggers cache flush and regeneration of warm-up entries.
+
+Warm-up is most valuable after cache invalidation events. When you update the model or change the system prompt, you flush the cache. The next hour of traffic experiences zero hit rate until the cache repopulates. Warm-up restores hit rate immediately by regenerating responses to common queries. This is standard practice for high-traffic systems where even one hour of cold cache represents thousands of dollars in unnecessary inference costs.
+
+## Cache Invalidation
+
+Cache invalidation is the hardest problem in computer science, and LLM caching is no exception. You must invalidate cached responses when the underlying system changes—model updates, prompt changes, data refreshes—without invalidating responses that remain valid. Flush too aggressively and you lose cache effectiveness. Flush too conservatively and you serve stale or incorrect responses.
+
+The clearest invalidation trigger is model version change. When you deploy GPT-5.2 replacing GPT-5.1, every cached response generated by GPT-5.1 is invalid because the new model produces different outputs. You flush the entire cache and start fresh. This is unambiguous and safe. The cost is a few hours of cold cache until traffic repopulates it.
+
+System prompt changes require selective invalidation. If you update the system prompt to add one instruction, responses cached before the change may no longer match current behavior. But if the instruction only affects a specific query type—say, adding guidance for handling medical questions—then cached responses to non-medical questions remain valid. The safe default is full flush. The optimized approach tracks which prompt changes affect which query types and invalidates only affected entries.
+
+Data refresh requires invalidation if responses depend on that data. A RAG system that embeds retrieved documents in prompts must invalidate cached responses when the document corpus updates. A user-specific query that includes account data must invalidate when that account updates. The challenge is identifying which cache entries depend on which data. Most teams avoid this complexity by setting short TTL for data-dependent queries rather than building dependency tracking.
+
+The implementation uses cache namespaces or version prefixes. Every cache key includes a version identifier—a hash of the system prompt, the model name, and any other global configuration. When configuration changes, the version identifier changes, and all old cache entries are orphaned. They remain in the cache until TTL expires but are never retrieved because new requests generate new keys with the new version. This avoids the latency spike of flushing millions of keys synchronously while ensuring correctness.
+
+Manual invalidation is the escape hatch. When you discover that cached responses are incorrect—due to a bug, a policy change, or an unforeseen dependency—you need a way to flush specific entries immediately. The interface is a pattern-based flush: delete all entries where the query contains a specific keyword, or where the response includes a specific phrase, or where the timestamp falls within a specific range. This requires secondary indexes on cache entries, which adds complexity but is essential for incident response.
+
+## Measuring Cache Effectiveness
+
+Hit rate measures what percentage of requests are served from cache. It is the primary metric for cache health. A hit rate below ten percent suggests poor cache key design, high query diversity, or incorrect TTL. A hit rate above fifty percent suggests effective caching of a concentrated query distribution. The target depends on traffic patterns—some systems have inherently low hit rates due to unique queries, others should achieve seventy percent or higher.
+
+Hit rate alone is misleading because not all cache hits are equal. A cache hit on a cheap query saves less than a cache hit on an expensive query. Cost savings rate measures the percentage of inference cost avoided due to caching. It accounts for query cost by weighting each cache hit by the cost of the inference call it replaced. A cache with thirty percent hit rate that only caches cheap queries might save ten percent of cost. A cache with fifteen percent hit rate that caches expensive multi-turn conversations might save forty percent of cost.
+
+Latency improvement measures the difference between cache hit latency and inference latency. A cache hit served from Redis takes two to eight milliseconds. A full inference takes two hundred milliseconds to five seconds depending on query complexity and model size. The latency improvement is typically fifty to five hundred times faster for cache hits. This improvement matters for user experience—a system with fifty percent hit rate delivers noticeably faster responses than one with zero caching, even though half the queries still take full inference time.
+
+False positive rate measures how often the cache serves a response that does not satisfy the user. For exact-match caching, false positive rate should be zero—if the query is identical, the cached response is correct. But implementation bugs, normalization errors, or incorrect cache key design can cause false positives. You detect them by tracking user behavior after cache hits. If users frequently rephrase queries immediately after a cache hit, the cached response likely did not answer their question. High rephrase rates indicate cache correctness problems.
+
+Cache memory usage measures how much storage the cache consumes. Each cached response includes the full response text, which can be hundreds to thousands of tokens. A cache with one million entries at an average of five hundred tokens per response stores five hundred million tokens, or roughly one gigabyte of text. Add metadata—cache key, timestamp, TTL—and total storage is larger. You must provision enough memory to hold the working set of cacheable queries without evicting hot entries prematurely.
+
+Eviction rate measures how often cache entries are removed due to memory pressure before TTL expires. High eviction rates indicate undersized cache or poor TTL configuration. If you are evicting entries that would have been reused, you are wasting potential cache hits. The solution is either increase cache size or shorten TTL for low-frequency queries to make room for high-frequency ones.
+
+## Implementation Patterns
+
+Redis is the default implementation for most teams. It provides single-digit millisecond latency, simple key-value semantics, built-in TTL support, and horizontal scalability. You store cache keys as Redis keys and responses as values. You set TTL on each key using SETEX. You retrieve cached responses using GET. Redis handles expiration, eviction, and memory management. The infrastructure is mature, well-documented, and widely supported.
+
+Memcached is the alternative for teams that need simpler semantics or lower memory overhead. It does not support persistence, complex data types, or rich expiration policies, but it is faster and lighter than Redis for pure key-value workloads. The trade-off is less flexibility—no Lua scripts, no pub-sub, no clustering without external tools. Most teams choose Redis because the flexibility is worth the marginal cost.
+
+Application-level caching is the option for teams that want to avoid external dependencies. You store cached responses in a dictionary or LRU cache within your application process. This works for low-traffic systems or for caching non-persistent data like configuration. The limitation is that each application instance has its own cache, so cache hit rate is lower unless you deploy a single-instance application. For multi-instance deployments, external cache stores like Redis are necessary to share cached responses across instances.
+
+Multi-layer caching combines local and remote cache. Each application instance maintains a small local cache—perhaps the top one hundred most frequent queries—with sub-millisecond lookup time. Cache misses check the remote Redis cache, which has higher latency but much larger capacity. Remote cache misses trigger inference and populate both layers. This pattern maximizes hit rate and minimizes latency for the hottest queries while still capturing long-tail queries in the remote cache.
+
+The operational requirements include monitoring, alerting, and failover. You monitor hit rate, latency, and memory usage continuously. You alert when hit rate drops below baseline, indicating cache invalidation or traffic shift. You design the system to degrade gracefully if the cache becomes unavailable—fall back to inference rather than failing requests. The cache is a performance optimization, not a critical dependency. Losing the cache should increase latency and cost but should never take the system down.
+
+Exact-match response caching is the foundation. It handles the majority of cacheable traffic with minimal complexity and zero false positives. But it misses the queries where users ask the same question in different words—and that is where semantic caching takes over.

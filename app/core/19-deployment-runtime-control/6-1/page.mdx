@@ -1,0 +1,79 @@
+# 6.1 — Why Caching Is Different for LLMs: Determinism, Context, and Cost
+
+Caching for LLMs should be easy—same input, same output—but it is not. And the reasons reveal everything about what makes AI systems different from the APIs, databases, and microservices you have been caching for years. The teams that treat LLM caching like traditional HTTP caching discover the problem when their cache hit rate stays below five percent and their infrastructure costs remain unchanged. The teams that understand why LLM caching is different build systems that achieve forty to seventy percent hit rates and cut inference costs by half.
+
+The difference is not about cache infrastructure. Redis works the same whether you are caching database queries or LLM responses. The difference is about what determinism means, what context includes, and what the economic value of a cache hit actually represents. Traditional caching assumes that the same request always produces the same response. LLM caching must account for the fact that the same request should often produce different responses depending on who is asking, when they are asking, and what temperature setting controls the model's randomness.
+
+## The Determinism Problem
+
+A traditional API is deterministic. Call the weather API with the same latitude and longitude, you get the same temperature reading. Cache it for five minutes, serve it to every user who asks. Simple.
+
+An LLM with temperature set to 0.7 is non-deterministic. Send the same prompt twice, you get different responses. The model samples from a probability distribution over possible tokens, and randomness is a feature, not a bug. It makes responses more creative, more varied, more human-like. It also makes caching impossible if you treat it like a pure function.
+
+The solution is not to disable temperature. Most production systems run at temperature 0.4 to 0.9 because deterministic responses feel robotic and repetitive. The solution is to cache strategically. You cache at temperature zero for queries where consistency matters—FAQ answers, documentation lookups, structured data extraction. You skip caching for queries where creativity matters—brainstorming, content generation, conversational variety. You measure which queries repeat and which do not, then apply caching only to the repeating ones.
+
+The mistake teams make is assuming non-determinism means no caching. The reality is that most production traffic consists of repeated questions phrased slightly differently. Users ask the same fifteen questions in a hundred different ways. The model generates different responses each time, but the underlying query is identical. That is where semantic caching enters—matching by meaning rather than by exact string. But even before semantic caching, exact-match caching at temperature zero captures more traffic than most teams expect.
+
+## The Context Sensitivity Challenge
+
+The same question with different context requires different answers. A user asking "what is my balance" needs their account data, not someone else's. A user asking "summarize this document" while viewing document A needs a different response than when viewing document B. A user asking "is this safe" in a healthcare context needs medical guidelines, while the same question in a financial context needs fraud detection rules.
+
+Traditional caching handles context by including it in the cache key. You hash the user ID, the document ID, the session state, and use that composite key to look up cached responses. But LLM context is larger and more varied than traditional context. The context includes the system prompt, which might be five hundred tokens. It includes conversation history, which grows with every turn. It includes few-shot examples, which change based on user behavior patterns. It includes retrieval results from a vector database, which vary based on semantic similarity scores.
+
+A naive cache key that includes all context means almost no cache hits. Two users asking the same question with slightly different conversation histories produce different cache keys, even though the response should be identical. The cache becomes a write-through store that never serves anything. You spend memory and infrastructure on cache misses while gaining nothing.
+
+The effective approach separates cacheable components from variable ones. The system prompt and few-shot examples are cacheable because they are shared across users. The KV-cache for these prefixes can be reused, cutting inference time by thirty to fifty percent. The conversation-specific parts are not cached because they vary per user. You cache the computation for shared prefixes and recompute only the variable suffix. This is prefix caching, and it is the most impactful optimization in modern LLM serving.
+
+## The Cost Dimension
+
+LLM inference is expensive in ways that traditional API calls are not. A database query costs microseconds of CPU time. An LLM inference costs milliseconds to seconds of GPU time, and GPU time is measured in dollars per hour, not pennies. A cache hit that saves one LLM call saves real money—often one to five cents per request at current pricing for GPT-5, Claude Opus 4.5, or Gemini 3 Pro.
+
+The economics change how you think about caching. In traditional systems, you cache to reduce latency. Cost savings are secondary. In LLM systems, you cache to reduce cost. Latency improvement is a bonus. A ten percent cache hit rate on a system serving one million requests per day saves three thousand to fifteen thousand dollars per month, depending on model pricing. That is enough to justify dedicated cache infrastructure, semantic embedding models, and engineering time to optimize cache key design.
+
+The cost dimension also changes how you measure cache effectiveness. Traditional caching tracks hit rate as a percentage of requests served from cache. LLM caching tracks cost savings as a percentage of inference budget avoided. A cache with a twenty percent hit rate that only caches cheap queries saves less money than a cache with a ten percent hit rate that caches expensive multi-turn conversations. You optimize for dollars saved, not for hit rate percentage.
+
+This creates a prioritization problem. Which queries should you cache? The ones that repeat most frequently, or the ones that cost most per call? A FAQ query repeated ten thousand times per day costs fifty dollars total if each call is half a cent. A complex reasoning query repeated one hundred times per day costs three hundred dollars total if each call is three dollars. You cache the reasoning queries first because they deliver higher ROI. Most teams cache the wrong queries because they optimize for frequency rather than for cost.
+
+## The Freshness Problem
+
+How stale is too stale for an AI response? A cached weather report older than ten minutes is useless. A cached answer to "what is the capital of France" is valid for decades. LLM responses fall somewhere in between, and the correct TTL depends on content type, not on request type.
+
+A cached response to a documentation question remains valid until the documentation changes. That might be weekly for fast-moving products, monthly for stable APIs, or annually for regulatory compliance guides. You set TTL based on update cadence, not on arbitrary time windows. A cached response to "what are today's top news stories" becomes stale in hours. A cached response to "how do I format a business letter" remains valid indefinitely.
+
+The challenge is that LLMs do not label their outputs by freshness requirements. The model does not know whether it is answering a time-sensitive question or a timeless one. You must infer it from query patterns. Queries containing "today," "now," "current," or "latest" likely need fresh responses. Queries containing "how to," "what is," or "explain" likely tolerate stale cache. You build heuristics to classify queries by freshness needs, then set TTL accordingly.
+
+The mistake teams make is using a single global TTL for all cached responses. They set it to one hour as a compromise between freshness and cost savings. The result is that half their cached responses are fresher than necessary—wasting cache capacity on re-fetching unchanged content—and half are staler than acceptable—serving outdated information to users. Effective caching requires per-query-type TTL policies, which means classification logic and configuration management.
+
+## Safety Considerations
+
+Cached responses bypass safety checks. When you serve a response from cache, you skip the model entirely. That means you skip prompt injection detection, content filtering, PII masking, and any other safety mechanisms that run during inference. A malicious user who triggers a harmful response that gets cached can expose that harmful response to other users, even if your safety systems have since been updated to block it.
+
+The risk is highest with semantic caching. Exact-match caching only serves a cached response if the query is identical, which limits exposure. Semantic caching serves a cached response if the query is similar enough, which means a benign query can retrieve a cached response from a malicious one. A user asking "how do I reset my password" might retrieve a cached response from a user who asked "how do I bypass password requirements to access accounts without authorization" if the similarity threshold is set too loosely.
+
+The safe approach runs safety checks on cached responses as if they were fresh. You store the response in cache, but before serving it, you verify that it still passes current safety policies. This adds latency—typically ten to fifty milliseconds—but eliminates the bypass risk. The alternative is to store safety metadata with each cached response, including the policy version that approved it. When policy updates, you invalidate all cache entries approved under old policies. This avoids per-request checks but requires cache invalidation infrastructure.
+
+Most teams ignore this until an incident occurs. A support chatbot caches a response containing PII because the masking layer failed during that inference. The cached response gets served to fifty users before someone notices. The PII exposure is now a breach affecting fifty users, not one. The correct approach is to treat cached responses as untrusted and re-validate them before serving, even though it reduces the latency benefit of caching.
+
+## The Semantic Similarity Challenge
+
+When are two queries close enough to share a cached response? A user asking "how do I change my email address" and a user asking "how can I update my email" are asking the same question. A user asking "how do I change my email address" and a user asking "how do I delete my email address" are asking different questions. Semantic caching must distinguish between these cases, and the boundary is not obvious.
+
+The threshold is a trade-off. Set similarity too high—requiring near-identical embeddings—and you get few cache hits because queries must be almost exact matches. Set similarity too low—allowing distant embeddings—and you get false positives where users receive responses that do not answer their actual question. The optimal threshold depends on query diversity, response generality, and user tolerance for imperfect answers.
+
+A FAQ system can tolerate a lower threshold because responses are designed to answer multiple phrasings of the same question. A conversational assistant needs a higher threshold because responses are context-specific and exact. A customer support chatbot falls in between—some queries are FAQ-like, others are case-specific. You cannot use a single threshold for all query types.
+
+The effective approach measures false positive rate and adjusts per query category. You log every semantic cache hit along with user feedback—did they rephrase the query afterward, did they escalate to a human agent, did they abandon the session? High false positive rates appear as clusters of cache hits followed by query rephrasing. You raise the similarity threshold for those query categories until false positives drop below an acceptable rate, typically one to three percent of cache hits.
+
+The challenge is that measuring false positives requires user feedback, and most users do not explicitly signal dissatisfaction. They simply rephrase or leave. You infer dissatisfaction from behavioral signals, which means you need telemetry that tracks query sequences, not just individual requests. Most teams build semantic caching without this telemetry and discover the false positive problem months later when users complain that the system "never understands what I am asking."
+
+## Economic Prioritization
+
+Not all queries are worth caching. A query that occurs once per week and costs two cents is not worth the cache infrastructure to serve it. A query that occurs ten thousand times per day and costs five cents per call is worth significant engineering effort. Effective caching starts with economics—which queries deliver the highest cost savings if cached?
+
+You measure query frequency and cost per call, then multiply to get total cost per query type. A query costing three dollars per call that repeats one hundred times per day costs three hundred dollars per day. A query costing one cent per call that repeats one hundred thousand times per day costs one thousand dollars per day. You cache both, but you prioritize the one-cent query because it delivers higher total savings.
+
+The mistake teams make is caching everything indiscriminately. They enable response caching for all traffic, discover that ninety percent of queries never repeat, and end up with a cache full of single-use entries that evict each other constantly. The result is low hit rates and wasted memory. The effective approach whitelists cacheable query patterns based on frequency analysis, then expands the whitelist as traffic grows.
+
+This requires query classification. You cluster queries by semantic similarity, measure cluster frequency, and enable caching for high-frequency clusters. A cluster of password reset queries repeated fifty thousand times per day gets cached. A cluster of unique troubleshooting questions repeated five times per day does not. You revisit the classification monthly as traffic patterns evolve. The system that caches the right queries achieves fifty to seventy percent hit rates on cacheable traffic, even if total traffic hit rate is only ten to twenty percent.
+
+Understanding why caching is different for LLMs is the foundation for every caching strategy that follows. The next step is implementing response caching—the simplest and most underrated form of LLM caching, capable of handling more traffic than most teams realize.

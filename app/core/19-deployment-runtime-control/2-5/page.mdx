@@ -1,0 +1,87 @@
+# 2.5 — Batch vs Streaming Inference: When to Use Which
+
+The simplest architectural choice in model serving has the largest impact on user experience. A customer support chatbot that returns nothing for eight seconds, then dumps a full response, feels broken — even if the total time to first token is identical to a streaming version. Your infrastructure team optimized for throughput. Your users experienced silence. You chose batch when you needed streaming, and no amount of GPU optimization fixes that perceptual gap.
+
+Batch and streaming inference are not merely implementation details. They represent fundamentally different contracts with your users, different scaling properties, and different operational complexity. The engineering team that understands when to use which — and why — builds systems that feel fast even when the models are slow, and systems that cost less even when traffic is high.
+
+## The Streaming Experience: Tokens as They Arrive
+
+Streaming inference delivers tokens to the user as the model generates them. The user sees the first word within 200 to 400 milliseconds, then watches the response build in real time. For a 500-token response that takes 12 seconds to generate fully, the user spends those 12 seconds reading, not waiting. The psychological difference is enormous. Perceived latency — the time before the user sees progress — is sub-second. Actual latency is still 12 seconds, but the experience is not one of delay.
+
+This is why every modern conversational interface uses streaming. ChatGPT, Claude, Gemini — all stream. The alternative is a spinning loader for 12 seconds followed by a wall of text. Users interpret that delay as a system failure, even when it is not. Streaming transforms wait time into read time, and read time does not feel like waiting.
+
+But streaming is not free. It requires persistent connections between client and server, infrastructure that can handle long-lived HTTP streams or WebSocket connections, and load balancers configured to not timeout during generation. Your serving layer must track each request individually, stream tokens as they are produced, and handle connection failures mid-generation. A user who closes their browser tab three seconds into generation leaves your server still generating tokens to a closed connection unless you detect the disconnect and cancel the request. Streaming inference is interactive infrastructure, and interactive infrastructure is harder to operate than fire-and-forget batch processing.
+
+## The Batch Advantage: Simplicity and Throughput
+
+Batch inference waits until the model completes the full response, then returns everything at once. The user makes a request, waits, and receives a complete answer. For non-interactive workloads — background processing, evaluation pipelines, document analysis, scheduled report generation — this is ideal. There is no human waiting on the other end, no need to optimize perceived latency, and no connection to maintain for 12 seconds.
+
+Batch inference is simpler to implement. Your server receives a request, generates a response, returns the result, and closes the connection. No streaming protocols, no connection management, no cancellation logic. If the request times out, it fails cleanly. If the server restarts mid-generation, the request fails and the client retries. Failure modes are straightforward. Recovery is automatic.
+
+Batch inference also allows throughput optimization. When you do not need to return the first token quickly, you can wait longer to form larger batches. A batch of eight requests runs nearly as fast as a single request on modern GPUs, because the compute is parallelized across the batch dimension. Larger batches mean higher throughput per GPU, which means lower cost per request. A system optimized for batch can process 400 requests per minute on the same hardware that handles 150 requests per minute in streaming mode, because batch can afford to wait 500 milliseconds to gather more requests before starting generation.
+
+The tradeoff is user experience. Batch works when no human is waiting. It fails when interactivity matters.
+
+## Continuous Batching: The Breakthrough That Changed Serving
+
+The traditional model serving pattern was static batching. The server waits until it collects N requests or a timeout expires, then processes the batch. All requests in the batch generate in lockstep — every request completes when the slowest request completes. If one request generates 800 tokens and seven requests generate 50 tokens, the seven short requests wait for the long one. GPU utilization is high during generation but zero while waiting to form the next batch. Throughput is constrained by batch formation time and the longest request in each batch.
+
+Continuous batching eliminates both constraints. Instead of waiting for all requests in a batch to complete before starting a new batch, the server removes completed requests from the batch and adds new requests dynamically. If a request finishes after 50 tokens, it is removed and replaced with a new request from the queue. The batch size fluctuates — it grows as new requests arrive and shrinks as requests complete. The GPU never waits. Utilization stays high. Throughput doubles or triples compared to static batching.
+
+vLLM pioneered continuous batching in open-source serving. The implementation relies on PagedAttention, which manages the key-value cache as paged blocks rather than contiguous memory. Traditional serving allocates a fixed-size KV cache per request at the start of generation. If a request generates 50 tokens but you allocated space for 1000 tokens, 95 percent of that memory is wasted. PagedAttention allocates memory in small blocks — typically 16 tokens per block — and allocates blocks as needed. Short requests use few blocks. Long requests use many blocks. Memory efficiency improves by 2x to 4x, which means you can fit more requests in the same GPU memory, which means higher throughput.
+
+Continuous batching is now the standard for high-throughput serving. TensorRT-LLM, TGI (Text Generation Inference), and vLLM all implement it. If your serving infrastructure does not support continuous batching, you are leaving 50 percent of your GPU capacity unused.
+
+## When Streaming is Required
+
+Streaming is not optional for interactive applications. Any interface where a human waits for a response must stream. Customer support chat, coding assistants, conversational search, voice assistants, real-time content generation — all require streaming. The moment the user sees progress, the system feels responsive. The moment they see a spinner for more than two seconds, the system feels broken.
+
+Streaming is also required when the response is long and the user needs to act on early parts before the full response completes. A coding assistant that generates a 200-line function should stream, because the developer starts reading and thinking about the first 20 lines while the rest generates. A legal contract assistant that generates a 3000-word draft should stream, because the lawyer begins reviewing the introduction while the body is still being written. The value is delivered incrementally, not all at once.
+
+Even when the response is short, streaming improves perceived latency. A 50-token response that takes 1.5 seconds to generate feels faster when streamed than when returned as a batch, because the user sees the first token at 300 milliseconds instead of seeing nothing until 1.5 seconds. The total time is the same. The experience is not.
+
+## When Batch is the Right Choice
+
+Batch inference is the right choice for background workloads where no human is waiting and throughput matters more than latency. Evaluation pipelines run thousands of requests through a model to measure accuracy, hallucination rate, safety, or task performance. These are offline jobs. A 10-second delay per request is irrelevant if the job runs overnight and processes 50,000 requests. Optimizing for throughput — maximizing requests per GPU per hour — minimizes cost.
+
+Document processing pipelines are batch workloads. A system that analyzes uploaded PDFs, extracts structured data, summarizes legal filings, or generates embeddings for search does not need streaming. The user uploads a file and expects results in seconds or minutes, but they do not watch tokens appear. Batch processing with large batch sizes maximizes throughput and minimizes infrastructure cost.
+
+Data pipelines that enrich records with model-generated fields are batch workloads. You have a database of customer support tickets and you want to add auto-generated category labels, sentiment scores, and priority predictions. You process 100,000 tickets overnight. Streaming is irrelevant. Batch inference with continuous batching at high batch sizes processes the workload 3x faster than streaming inference on the same hardware.
+
+Non-interactive APIs also favor batch. If your API is called by other services, not by end users, and the downstream service does not expose real-time feedback to a human, use batch. The calling service waits for the full response, processes it, and moves on. Streaming adds complexity without benefit.
+
+## Hybrid Patterns: Streaming to Users, Batching Internally
+
+Many production systems stream to the user but batch internally. The user-facing API accepts a request and opens a streaming connection. The backend queues the request and waits 50 to 100 milliseconds to see if more requests arrive. If they do, the backend forms a batch and processes all requests together. As tokens are generated, they are streamed back to each individual client. The user experiences streaming. The backend experiences batching. Throughput improves without sacrificing user experience.
+
+This pattern requires infrastructure that can demultiplex a batched generation back to individual streams. vLLM and TGI both support this natively. Your API server receives requests, assigns each request a stream ID, sends the batch to the inference server, and routes generated tokens back to the correct client stream. The user never knows their request was batched with others.
+
+Another hybrid pattern is streaming with timeout fallback. The system attempts to stream tokens as they are generated, but if the client connection drops or the generation stalls, the system switches to batch mode and returns the full response when generation completes. This prevents resource waste from generating tokens to closed connections while maintaining the streaming experience for clients that stay connected.
+
+## Infrastructure Implications: SSE, WebSocket, and Connection Management
+
+Streaming inference requires protocols designed for long-lived, server-to-client data flow. The two standard choices are Server-Sent Events (SSE) and WebSocket. SSE is simpler and works over standard HTTP. The client opens an HTTP connection, and the server sends a stream of events as plain text. Each token is an event. The connection stays open for the duration of generation, then closes. SSE is one-directional — server to client only — which is sufficient for most LLM streaming.
+
+WebSocket is bidirectional and more flexible. The client and server establish a WebSocket connection, and either side can send messages at any time. WebSocket is required for interactive applications where the user can interrupt generation, send follow-up requests before the previous response completes, or cancel mid-stream. Conversational agents with multi-turn context and interruption support need WebSocket.
+
+Both protocols require load balancer configuration. Most load balancers have connection timeouts — often 30 to 60 seconds by default. A model generation that takes 12 seconds will be killed if the timeout is 10 seconds. Your load balancer must be configured with a timeout longer than your maximum expected generation time. For production systems that generate long-form content, timeouts of 120 to 300 seconds are common. But longer timeouts mean connections stay open longer, which consumes load balancer resources. Monitor connection counts and tune timeouts to balance responsiveness with resource consumption.
+
+Connection pooling also changes. In batch mode, each request is short — a few hundred milliseconds to a few seconds. Connection pools can be small because connections are recycled quickly. In streaming mode, connections last 10 to 30 seconds or longer. Connection pools must be larger, or your API server will exhaust available connections and start queuing requests at the pool layer before they even reach the inference server. A system that handles 500 batch requests per second with a pool of 50 connections might need 500 to 1000 pooled connections to handle 500 streaming requests per second, because each streaming request holds a connection 10x longer.
+
+## Detecting the Wrong Choice
+
+You chose streaming when you needed batch if your infrastructure costs are 40 percent higher than expected, your load balancers show connection count exhaustion, and your workload is 90 percent non-interactive API calls. Streaming has overhead. If you are not delivering value to users through reduced perceived latency, you are paying for complexity with no return.
+
+You chose batch when you needed streaming if user feedback consistently mentions that the system feels slow, if your measured latency is acceptable but users still complain, or if competitors with similar model performance feel faster. Perceived latency is not measured by your monitoring. It is experienced by your users. If they see a spinner for five seconds before seeing output, they will call your system slow even if your p99 latency is four seconds. Streaming fixes perceptual problems that monitoring does not capture.
+
+You are underutilizing continuous batching if your GPU utilization is below 50 percent, your throughput per GPU is half what the model's benchmark claims, or your batch sizes average below four. Continuous batching increases utilization, increases throughput, and reduces cost. If your serving infrastructure does not support it, migrating to vLLM or TGI will cut your infrastructure cost by 40 to 60 percent.
+
+## The Cost of Getting It Wrong
+
+A fintech company built a document analysis API that processed uploaded contracts and returned structured data. They chose streaming because they assumed it was always better. Their clients were other services, not humans. No one watched the stream. Every request held a connection open for 15 to 20 seconds while the model processed a 4000-token document. Their load balancers hit connection limits at 300 concurrent requests. They scaled horizontally, adding more load balancers and API servers. Their infrastructure cost was 60 percent higher than a competitor using batch inference with continuous batching, and their throughput per GPU was 40 percent lower because they could not batch effectively while maintaining per-request streams. Six months later, they migrated to batch for all non-interactive endpoints. Throughput doubled. Cost dropped 45 percent. Users noticed no difference because no users were watching the stream.
+
+Streaming is powerful when users are watching. Streaming is waste when they are not. Batch is simple and efficient when throughput matters. Batch is frustrating when interactivity matters. The teams that know when to use which build systems that feel fast and cost less.
+
+---
+
+The next subchapter covers GPU resource allocation — fractional sharing, model batching, and memory management.

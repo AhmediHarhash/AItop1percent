@@ -1,0 +1,108 @@
+# 2.2 — Container Orchestration for AI: Docker, Kubernetes, and GPU Scheduling
+
+Kubernetes was built for stateless web services that run on CPU and scale horizontally. Large language models are stateful GPU workloads that don't scale horizontally. In late 2024, a fintech company deployed their LLM inference service to Kubernetes using standard horizontal pod autoscaling. Traffic spiked during market hours. Kubernetes scaled up from 4 pods to 20 pods based on CPU utilization. But their LLM ran on GPU, and CPU utilization was always low — Kubernetes was scaling based on the wrong signal. Meanwhile, GPU utilization hit 100 percent, response times climbed to 12 seconds, and requests started timing out. The autoscaler kept adding pods that couldn't get GPU assignments because all GPUs were already allocated. The cluster thrashed. User requests failed for 40 minutes until an engineer manually scaled down to the original 4 pods and implemented queue-based autoscaling. The lesson: standard Kubernetes patterns fail for AI workloads. You need GPU-aware orchestration, or you need a different orchestration layer entirely.
+
+Container orchestration for AI is not about running Docker containers and calling it a day. It's about managing GPU resources, handling stateful model weights, scheduling workloads that require specific GPU types, preventing memory fragmentation, and ensuring that scaling decisions are based on AI-specific metrics instead of CPU percentages. The tools exist — Docker for packaging, Kubernetes for orchestration, NVIDIA device plugins for GPU access — but using them correctly requires understanding what makes AI workloads fundamentally different from traditional web services.
+
+## Why Containerization Matters for AI
+
+Containerization solves three problems that kill AI deployments: environment reproducibility, dependency isolation, and scaling unit definition. Environment reproducibility means that a model that works on your laptop works in production. This sounds trivial, but in 2026, teams still ship models that break in production because CUDA versions don't match, because Python package versions differ, or because system libraries are missing. Containerization locks down the entire environment — operating system, CUDA toolkit, Python version, package dependencies, system libraries — so that "works on my machine" becomes "works everywhere."
+
+Dependency isolation means that two models with conflicting requirements can run on the same infrastructure without interfering with each other. Maybe Model A needs TensorFlow 2.14 and Model B needs TensorFlow 2.16. Maybe one model requires CUDA 12.1 and another requires CUDA 11.8. Without containers, you manage this with virtual environments, careful PATH configuration, and prayers. With containers, each model gets its own isolated environment. Conflicts become impossible.
+
+Scaling unit definition means that when you need to scale, Kubernetes knows what to scale. The container is the unit. Kubernetes doesn't need to know that your model requires 40GB of GPU memory, specific Python packages, and three system libraries. It just knows it needs to run more copies of this container. This abstraction is what makes autoscaling possible.
+
+The alternative to containerization is managing bare metal servers or virtual machines where models run directly on the host OS. This works at small scale — one or two models on dedicated hardware. It collapses at larger scale when you have ten models, five engineers, and infrastructure that needs to evolve every week. Containers are not optional for production AI systems in 2026. They're table stakes.
+
+## Docker for AI Workloads
+
+A Docker image for AI needs four layers: base OS with CUDA support, Python environment with ML frameworks, application code, and optionally model weights. The base image typically starts from NVIDIA's official CUDA images — cuda:12.1-base, cuda:12.1-runtime, or cuda:12.1-devel depending on whether you need the full development toolkit or just runtime libraries. These images are large — 4 to 6 GB before you add anything — because they include CUDA, cuDNN, NCCL, and other NVIDIA libraries.
+
+The Python layer installs PyTorch or TensorFlow, the serving framework you chose in the previous subchapter, and all dependencies. This is where image size explodes if you're not careful. A naive pip install of PyTorch, Transformers, vLLM, and common dependencies can add another 8 to 12 GB. Multi-stage builds help — you build in a large image with compilers and build tools, then copy only the runtime artifacts into a smaller final image. This can cut final image size by 40 percent.
+
+The application code layer is your serving API, health check endpoints, metric exporters, logging configuration, and model loading logic. This is usually the smallest layer — a few hundred megabytes at most. But it changes most frequently, so it should be the last layer in your Dockerfile to maximize Docker's layer caching.
+
+The model weights decision is the most consequential: do you bake weights into the Docker image, or do you mount them at runtime? Baking weights into the image means the image is fully self-contained. You push it to a registry, Kubernetes pulls it, and it runs. No external dependencies. The downside is that images become enormous — a 70B parameter model with 140GB of weights produces a 150GB Docker image that takes 20 minutes to pull on fast networks and longer on slow ones. If you update weights frequently, you're pushing 150GB images multiple times per day, which destroys build and deploy times.
+
+Mounting weights at runtime means the Docker image contains only the code and environment, not the weights. Weights live in object storage like S3 or GCS, or on a network file system like NFS or EFS. The container downloads or mounts weights when it starts. This keeps images small — 8 to 12 GB instead of 150 GB — and fast to deploy. The downside is cold start latency. Downloading 140GB from S3 takes 2 to 5 minutes depending on network speed. This delay happens every time a new pod starts, which happens during scaling, during deploys, during node failures. If your autoscaler spins up 10 new pods during a traffic spike, they all spend 3 minutes downloading weights before they can serve traffic. By the time they're ready, the traffic spike might be over.
+
+Most teams in 2026 use a hybrid approach: bake small models (under 20GB) into images, mount large models at runtime, and use caching layers to keep frequently-used weights on local NVMe or in memory. This balances deploy speed, image size, and cold start latency.
+
+## Kubernetes for AI Workloads
+
+Kubernetes manages containers. To manage GPU containers, Kubernetes needs to know that GPUs exist, how many are on each node, and how to allocate them to pods. This requires a device plugin — a Kubernetes extension that advertises GPU resources and handles allocation. NVIDIA provides the NVIDIA device plugin for their GPUs. AMD provides a similar plugin for their GPUs. You deploy the device plugin as a DaemonSet, it detects GPUs on each node, and it reports them to the Kubernetes API as allocatable resources.
+
+Once Kubernetes knows about GPUs, you request them in your pod spec using resource requests and limits. A pod that needs one GPU requests "nvidia.com/gpu: 1" in its resource requirements. Kubernetes schedules the pod only on nodes that have available GPUs. If all GPUs are allocated, the pod stays pending until a GPU becomes available. This prevents the disaster scenario from the opening story — pods spinning up without GPU access and failing to do useful work.
+
+GPU types matter. An H100 GPU is not interchangeable with an A100 or a T4. Some models require high memory GPUs. Some require tensor core support. Some require NVLink for multi-GPU communication. Kubernetes doesn't know about GPU types by default — it just sees "GPUs." You handle this with node labels and node affinity. Label nodes with their GPU type — gpu-type equals h100, gpu-type equals a100 — and configure pod affinity rules that require specific GPU types. This ensures that a pod requiring an H100 never lands on a node with T4 GPUs.
+
+Taints and tolerations prevent AI workloads from landing on non-GPU nodes and prevent non-AI workloads from landing on expensive GPU nodes. Taint GPU nodes with "gpu equals true colon NoSchedule" and add the matching toleration to AI pods. Now GPU nodes only run GPU workloads, and you don't waste a 3 dollar per hour GPU instance running a stateless web service that could run on a 50 cent CPU instance.
+
+## GPU-Aware Scheduling and Autoscaling
+
+Standard Kubernetes Horizontal Pod Autoscaler scales based on CPU or memory utilization. This fails for LLM workloads because CPU and memory utilization are low while GPU is the bottleneck. An LLM pod running at 95 percent GPU utilization might show 10 percent CPU utilization. HPA sees 10 percent CPU and decides not to scale. Users get slow responses or timeouts while HPA thinks everything is fine.
+
+GPU-aware autoscaling uses custom metrics. The most common metric is queue depth — how many requests are waiting for inference. If queue depth exceeds a threshold, scale up. If queue depth is near zero, scale down. This works because queue depth directly correlates with user-perceived latency. A request that waits in queue for 2 seconds before inference starts has already failed user expectations, even if inference itself is fast.
+
+Other useful metrics for autoscaling: time-to-first-token at the 95th or 99th percentile, GPU utilization averaged over 5 minutes, tokens per second normalized by model capacity. The right metric depends on your SLA. If your SLA is "95th percentile latency under 500 milliseconds," scale based on 95th percentile latency. If your SLA is "handle 10,000 requests per minute," scale based on request rate and throughput capacity.
+
+Implementing custom metrics requires the Kubernetes metrics server and a custom metrics adapter. Popular options include Prometheus Adapter which exposes Prometheus metrics as Kubernetes custom metrics, or KEDA Kubernetes Event-Driven Autoscaling which supports queue depth from message brokers, database queries, and HTTP endpoints. Configuration complexity is moderate — you define a ScaledObject that specifies the metric source, the target threshold, and the scaling bounds.
+
+GPU-aware autoscaling also requires GPU-aware cluster autoscaling. When HPA decides you need more pods, Kubernetes needs more GPU nodes. The standard Kubernetes Cluster Autoscaler can provision new nodes, but you need to configure it to provision GPU nodes specifically. Karpenter, an open-source autoscaler from AWS, does this more intelligently — it looks at pending pod requirements, sees that they need H100 GPUs, and provisions H100 nodes automatically. This works across cloud providers if you configure it correctly.
+
+## GPU Bin Packing and Multi-Tenancy
+
+A single GPU can run multiple small models simultaneously. A 70B model uses 80 percent of an H100's memory. The remaining 20 percent can run a smaller embedding model, a reranker, or a safety classifier. GPU bin packing — running multiple workloads on one GPU — increases utilization and reduces cost. But it requires careful orchestration to prevent interference.
+
+The simplest bin packing strategy is MIG, Multi-Instance GPU, available on NVIDIA A100 and H100 GPUs. MIG partitions a physical GPU into up to seven isolated instances, each with dedicated memory and compute. A pod requests a MIG instance instead of a full GPU. Kubernetes allocates it an isolated slice. The advantage is true isolation — one workload cannot interfere with another. The disadvantage is inflexibility — MIG instances come in fixed sizes, and you can't partition memory arbitrarily.
+
+Without MIG, multiple workloads share GPU memory and compute dynamically. This works if workloads cooperate — they use non-overlapping memory, they schedule compute efficiently, they don't thrash shared caches. It fails if workloads compete — one model doing large batch inference starves another model trying to serve low-latency requests. Most serving frameworks in 2026 don't handle this well. They assume they own the entire GPU. If you want to run multiple models on one GPU without MIG, you need a serving framework that supports multi-tenancy, or you need to run multiple serving processes with explicit memory limits and pray they don't interfere.
+
+Memory fragmentation is the silent killer of GPU bin packing. A model allocates 40GB at startup, runs for a while, then deallocates. Another model tries to allocate 45GB but fails because memory is fragmented into non-contiguous blocks. The GPU has 50GB free in total, but no single contiguous 45GB block. CUDA allocators try to mitigate this with pooling and coalescing, but fragmentation still happens under heavy load. The symptom is out-of-memory errors when GPU memory appears to be available. The fix is to restart pods periodically to defragment memory, or to avoid bin packing models with highly variable memory usage.
+
+## Node Pool Strategies for Cost and Reliability
+
+Most teams run separate Kubernetes node pools for different GPU types and workload priorities. A typical setup has three pools: on-demand H100 nodes for production workloads, spot H100 nodes for batch jobs and experimentation, and on-demand A100 nodes for less latency-sensitive workloads. Separate pools prevent interference — a batch job spinning up 50 pods doesn't disrupt production serving because they run on different nodes.
+
+Spot instances save 60 to 80 percent on GPU costs compared to on-demand, but they can be interrupted with 30 seconds notice. For stateless serving workloads, spot interruptions are manageable — Kubernetes reschedules the pod on another node, and the only impact is the latency of cold start. For stateful workloads like fine-tuning, spot interruptions kill hours of progress unless you checkpoint frequently. The strategy is to run production serving on a baseline of on-demand instances, use spot instances to absorb traffic spikes, and run batch workloads entirely on spot with aggressive checkpointing.
+
+Reserved instances lock in lower pricing in exchange for a one or three year commitment. If you have stable baseline load — you know you'll always need at least 20 H100 GPUs for the next year — reserved instances save 30 to 50 percent compared to on-demand with no interruption risk. The danger is over-committing. If your traffic grows slower than expected, or if you migrate to a more efficient model and need fewer GPUs, you're stuck paying for reserved capacity you don't use.
+
+Node pool sizing affects both cost and blast radius. Larger node pools — nodes with 8 GPUs instead of 1 — give better cost efficiency because you pay less overhead per GPU. But they increase blast radius when a node fails. If a single node hosts 8 model replicas and that node crashes, you lose 8 replicas at once. If those 8 replicas were 40 percent of your total capacity, your service is now severely degraded. Smaller nodes — 1 or 2 GPUs each — cost more per GPU but isolate failures better. The trade-off depends on your reliability requirements and budget.
+
+## The Pod Lifecycle and Health Checks
+
+An LLM pod goes through five stages: image pull, model weight download or mount, model load into GPU memory, warmup inference, ready to serve traffic. Each stage can fail. Kubernetes needs to detect failures and react appropriately — retry, reschedule, alert. This requires health checks: startup probes, liveness probes, and readiness probes.
+
+A startup probe runs repeatedly during startup and allows the pod extra time to become ready. LLM pods take 1 to 5 minutes to start — pulling images, downloading weights, loading models. A standard readiness probe with a 30 second timeout would mark the pod as failed before it finishes starting. The startup probe says "don't check readiness yet, give me 5 minutes." Once the startup probe succeeds, Kubernetes switches to the normal readiness probe.
+
+A liveness probe checks if the process is alive. If the liveness probe fails, Kubernetes kills the pod and restarts it. For LLM serving, the liveness probe typically hits a simple HTTP endpoint that returns 200 if the serving process is running. It doesn't check if the model is loaded or if inference works — just that the process hasn't crashed.
+
+A readiness probe checks if the pod is ready to serve traffic. If the readiness probe fails, Kubernetes removes the pod from the service load balancer, so it stops receiving requests. It doesn't kill the pod — just marks it as not ready. For LLM serving, the readiness probe usually runs a quick inference request with a known input and checks that the output is correct. This ensures the model is actually loaded and functional, not just that the process is running.
+
+The failure mode most teams miss is a pod that passes health checks but serves garbage. The model loads successfully, the serving process responds to health checks, but inference outputs are corrupted or nonsensical. This happens due to GPU memory errors, driver bugs, or bad model weights. Health checks can't catch this without sophisticated output validation, which is too expensive to run on every health check. The only reliable detection is through production monitoring — watching output quality metrics and alerting when they degrade.
+
+## Configuration Management and Secrets
+
+LLM serving pods need configuration: which model to load, which serving framework settings to use, which API keys to authenticate with, which observability endpoints to export metrics to. Kubernetes provides ConfigMaps for non-sensitive configuration and Secrets for sensitive data. Use them correctly or you leak API keys, model URLs, and database credentials into logs and error messages.
+
+A common mistake is baking configuration into the Docker image. This works until you need to change configuration without rebuilding the image. You want to switch from GPT-5 to GPT-5.1, or change the max batch size from 32 to 64, or update an API key. If configuration is baked into the image, you rebuild, re-push, and redeploy. If configuration lives in a ConfigMap, you update the ConfigMap and restart pods. The latter is faster and safer.
+
+Another mistake is storing API keys or model download credentials in ConfigMaps. ConfigMaps are not encrypted. They're visible to anyone with read access to the Kubernetes namespace. Secrets are base64-encoded and can be encrypted at rest if you configure encryption providers. Store everything sensitive in Secrets, reference them as environment variables in pod specs, and rotate them regularly.
+
+The most subtle mistake is logging configuration at startup. Your serving container logs "Starting with config: model equals s3 colon slash slash bucket slash model weights, api key equals sk hyphen proj hyphen..." and now your API key is in logs, in log aggregation systems, in alerting messages, and in postmortem documents. Sanitize logs. Never log secrets. Never log full configuration objects that might contain secrets.
+
+## The Deployment Sequence and Blue-Green Strategies
+
+Deploying a new model or a new version of your serving stack requires a rollout strategy. The naive approach is to delete old pods and create new ones. This causes downtime — a window where no pods are ready to serve traffic. The correct approach is rolling updates or blue-green deployments.
+
+Rolling updates replace pods gradually. Kubernetes creates one new pod, waits for it to become ready, then deletes one old pod. It repeats until all pods are replaced. This maintains capacity throughout the rollout — at any moment, most pods are running and serving traffic. The downside is that old and new versions run simultaneously during the rollout, which can cause inconsistent behavior if the new version changes API contracts or output formats.
+
+Blue-green deployments run two full environments simultaneously — blue is the current version, green is the new version. You deploy green, test it, then switch traffic from blue to green all at once. This ensures that users never see mixed versions. The downside is cost — you run double capacity during the deployment. For GPU workloads, this can mean running 40 H100s instead of 20, at 3 dollars per hour each, for the duration of the deployment. If testing takes 2 hours, the deployment costs 120 dollars in extra GPU time.
+
+Most teams use rolling updates for low-risk changes — dependency updates, configuration tweaks — and blue-green for high-risk changes — new model versions, major framework upgrades. The key is to keep rollout duration short. A rolling update that takes 30 minutes to replace 20 pods is too slow. If something goes wrong at minute 25, you've wasted 25 minutes and now you need to roll back. Optimize pod startup time, parallelize updates, and set aggressive readiness probe intervals so that rollouts complete in 5 minutes or less.
+
+## The Next Layer: Cold Start Optimization
+
+Container orchestration gets your models running on Kubernetes with GPU access, health checks, and autoscaling. But every new pod goes through a cold start — the seconds or minutes between Kubernetes scheduling the pod and the pod being ready to serve traffic. Cold starts kill user experience during scaling events and waste capacity when autoscalers overreact. The next subchapter covers how to optimize cold starts: keeping models warm, streaming weights, and predictive scaling.
+

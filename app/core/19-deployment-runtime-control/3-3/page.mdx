@@ -1,0 +1,104 @@
+# 3.3 — Load Balancing for Variable-Latency Workloads
+
+Most teams think about load balancing for LLM inference is simple: round-robin across replicas, maybe add a health check. They deploy, traffic increases, and suddenly one replica is maxed out while two others sit idle. The load balancer is doing exactly what it was configured to do. The configuration is wrong.
+
+Round-robin assumes all requests cost the same. LLM requests differ in cost by orders of magnitude. A load balancing strategy that ignores this distributes requests evenly but distributes load unevenly. The result is wasted capacity, unpredictable latency, and systems that underperform despite having headroom.
+
+## The Failure Mode of Round-Robin
+
+Round-robin load balancing sends request N to replica A, request N+1 to replica B, request N+2 to replica C, then loops back to replica A. Every replica receives the same number of requests. If all requests are equal, load is balanced. If requests vary, load is not balanced.
+
+Imagine three replicas and six requests arriving in sequence. Requests 1, 2, and 3 are short—200 milliseconds each. Requests 4, 5, and 6 are long—20 seconds each. Round-robin assigns: replica A gets requests 1 and 4. Replica B gets requests 2 and 5. Replica C gets requests 3 and 6.
+
+After 200 milliseconds, replica A finishes request 1 and begins request 4, which will take 20 seconds. After 200 milliseconds, replica B finishes request 2 and begins request 5, which will take 20 seconds. After 200 milliseconds, replica C finishes request 3 and begins request 6, which will take 20 seconds. All three replicas are now busy for the next 20 seconds.
+
+Now six more requests arrive—all short, 200 milliseconds each. Round-robin assigns two requests to each replica. But all three replicas are tied up with long requests. The short requests queue behind long requests and wait 20 seconds before processing. The system has zero available capacity for the next 20 seconds despite the fact that the new requests represent only 1.2 seconds of total work.
+
+If the load balancer had sent all three long requests to replica A and distributed the short requests across replicas B and C, replicas B and C would have remained available for subsequent short requests. The long requests would have queued on replica A, but short requests would have continued to process with low latency.
+
+Round-robin optimizes for request distribution. It does not optimize for latency, throughput, or user experience. It works for workloads where request cost variance is low. It fails for LLM workloads where request cost variance is high.
+
+## Least-Connections Load Balancing
+
+Least-connections is a step better than round-robin. Instead of distributing requests evenly, it routes each request to the replica with the fewest active connections. If replica A is processing 3 requests and replica B is processing 1 request, the next request goes to replica B.
+
+This balances active load, not request count. If the short requests finish quickly and the long requests stay active, least-connections naturally routes more short requests to the replicas that finish work faster. Over time, replicas handling short requests receive more requests, and replicas handling long requests receive fewer requests.
+
+Least-connections improves on round-robin because it reacts to the actual state of each replica. It does not assume all requests are equal. It observes which replicas are available and routes accordingly.
+
+The problem is that it does not account for request size. Least-connections sees that replica A has 1 active request and replica B has 2 active requests, so it routes the next request to replica A. But if replica A's active request is a 50-second long-context generation and replica B's two active requests are both 1-second short completions, routing to replica A was the wrong choice. Replica B will finish its work and become idle in 1 second. Replica A will not finish for 50 seconds.
+
+Least-connections is better than round-robin. It is not sufficient for LLM workloads.
+
+## Queue-Aware Load Balancing
+
+Queue-aware load balancing routes requests based on the queue depth at each replica. Every replica maintains an internal queue of pending requests. The load balancer queries each replica's queue depth and routes the next request to the replica with the shortest queue.
+
+This requires the serving layer to expose queue depth as a metric accessible to the load balancer. vLLM, TGI, and TensorRT-LLM all expose per-replica queue metrics. The load balancer—whether a reverse proxy like Envoy or a custom routing layer—queries these metrics and makes routing decisions based on current queue state.
+
+Queue-aware routing accounts for both active requests and pending requests. If replica A is processing 2 requests with 5 queued and replica B is processing 3 requests with 0 queued, the next request goes to replica B. Replica B's queue is shorter even though it has more active requests. The routing decision reflects the total pending work, not just the snapshot of active work.
+
+The trade-off is complexity. The load balancer must query queue depth from each replica before routing each request. This adds latency—typically 5-20 milliseconds per request. For latency-sensitive applications, this overhead matters. For most applications, the latency cost is worth the improved load distribution.
+
+Queue-aware routing also requires the serving layer to expose queue metrics in a format the load balancer can consume. This is infrastructure work. You need instrumentation, monitoring, and a load balancer that supports dynamic routing based on external metrics. The payoff is that the system uses capacity more efficiently and delivers more consistent latency.
+
+## Token-Aware Load Balancing
+
+Token-aware load balancing is the most sophisticated approach. Instead of routing based on request count or queue depth, it routes based on estimated token count. Each request's token cost is estimated, and the load balancer routes to the replica with the lowest estimated pending token load.
+
+Input token count is known at request time. The client sends a prompt, and the load balancer counts tokens before routing. Output token count is not known—it depends on the model's generation—but it can be estimated based on request type, historical data, or max token limits.
+
+For example, a classification request typically generates 1-10 tokens. A summarization request generates 100-500 tokens. A report generation request generates 1000-5000 tokens. If your application has distinct request types, you can estimate output tokens based on the request type. If request types are not labeled, you can estimate based on historical averages per user or per endpoint.
+
+The load balancer calculates total pending tokens for each replica: sum of input tokens for queued requests plus estimated output tokens for queued requests plus estimated remaining output tokens for active requests. It routes the next request to the replica with the lowest total pending tokens.
+
+This approach distributes work, not requests. A replica processing one long request has higher pending token count than a replica processing five short requests. The load balancer routes subsequent requests to the replica with lower token load, even though it has more active requests. Over time, token load balances across replicas, and each replica processes roughly the same number of tokens per second.
+
+Token-aware routing requires the most infrastructure. You need token counting at request time, token estimation for outputs, per-replica token tracking, and a routing layer that performs these calculations for every request. The latency overhead is higher than queue-aware routing—typically 10-30 milliseconds per request. The benefit is the best possible load distribution for variable-latency workloads.
+
+## Weighted Load Balancing for Heterogeneous Hardware
+
+If your deployment uses different GPU types for different replicas, requests should not be distributed evenly. A replica running on an A100 80GB can handle more concurrent requests and larger contexts than a replica running on an L4. Weighted load balancing assigns weights to each replica based on capacity, and the load balancer distributes requests proportionally.
+
+For example, if you have two replicas on A100s and two replicas on L4s, you might assign weights of 10 to A100 replicas and 3 to L4 replicas. The load balancer routes 10 requests to each A100 replica for every 3 requests it routes to each L4 replica. The higher-capacity replicas receive more traffic, and the system uses all available hardware efficiently.
+
+Weighted load balancing is orthogonal to routing strategy. You can combine weighted routing with least-connections, queue-aware, or token-aware routing. The weights adjust the baseline distribution. The routing strategy adjusts for real-time load.
+
+Heterogeneous hardware is common in production. You scale up during high traffic using whatever GPUs are available. You run batch workloads on cheaper GPUs during off-peak hours. You reserve high-capacity GPUs for latency-sensitive requests. Weighted load balancing ensures that the capacity differences are reflected in traffic distribution.
+
+## Connection Management and Streaming
+
+Many LLM inference requests use streaming—the model generates tokens one at a time and streams them to the client as they are produced. Streaming requires a persistent connection for the duration of the request, which can be seconds or even minutes.
+
+Load balancers must support long-lived connections and handle connection limits per replica. If a replica has a connection limit of 100 and all 100 connections are active, the load balancer must route new requests to other replicas. This is connection-aware routing, similar to least-connections but based on connection slots rather than active request count.
+
+Streaming also complicates graceful shutdowns. If a replica is marked for termination—because auto-scaling is scaling down—existing connections must be drained before the pod shuts down. The load balancer stops routing new requests to the replica, existing connections complete their requests, and the pod terminates only after all connections close. If a request takes 60 seconds to complete, the shutdown takes 60 seconds. This delays scale-down and costs money, but terminating active requests is worse—users see errors and retries flood the system.
+
+Connection draining requires coordination between the load balancer and the orchestration layer. Kubernetes supports connection draining via preStop hooks and terminationGracePeriodSeconds. The load balancer must stop routing to the replica when the preStop hook fires. The replica must stop accepting new requests but continue serving active requests. After the grace period expires, Kubernetes forcibly terminates the pod. The grace period must be longer than the longest expected request duration—typically 120 seconds for interactive requests, 600 seconds for batch requests.
+
+## Health Checking for LLM Replicas
+
+Load balancers remove unhealthy replicas from the pool. For LLM serving, health checks must go beyond "is the process running." They must check whether the model is loaded, whether the GPU is functional, and whether the replica can accept new requests.
+
+A basic health check is an HTTP endpoint that returns 200 if the model is loaded and ready, 503 otherwise. The serving layer implements this endpoint. The load balancer queries it every 5-10 seconds. If the endpoint returns 503 or times out, the replica is marked unhealthy and removed from rotation.
+
+A more sophisticated health check includes queue depth. If queue depth exceeds a threshold—say 50 requests—the replica returns 503 to signal that it is overloaded. The load balancer temporarily stops routing to that replica until queue depth drops. This prevents hot replicas from becoming hotter while other replicas remain underutilized.
+
+Health checks must balance responsiveness and stability. Checking too frequently creates load on the replicas. Checking too infrequently means unhealthy replicas stay in rotation longer. A 5-second interval is typical for liveness checks. A 10-second interval is typical for readiness checks that include queue depth or other load metrics.
+
+The load balancer must also handle slow health checks. If a replica is overloaded, the health check endpoint might time out. The load balancer must interpret timeouts as unhealthy and remove the replica. If the health check timeout is set too low, transient slowness causes false positives. If it is set too high, truly unhealthy replicas stay in rotation longer. A 2-second timeout is typical.
+
+## Choosing the Right Strategy
+
+Round-robin: only acceptable if all requests are short and uniform. Do not use for LLM workloads unless you have a very specific use case where request variance is artificially constrained.
+
+Least-connections: a reasonable default. Works out of the box with most load balancers. Handles variable latency better than round-robin. Not optimal but acceptable for many workloads.
+
+Queue-aware: the right choice for most production LLM deployments. Balances simplicity and effectiveness. Requires queue metrics from the serving layer and a load balancer that supports dynamic routing.
+
+Token-aware: the best choice for high-scale, high-variability workloads. Requires the most infrastructure. Worth the investment if latency consistency is critical and traffic patterns include extreme variance.
+
+Weighted: necessary if you run heterogeneous hardware. Combine with least-connections or queue-aware routing.
+
+The common mistake is defaulting to round-robin because it is simple. The simple choice is the wrong choice. LLM workloads are not uniform. Your load balancing strategy must reflect that. The effort to implement queue-aware or token-aware routing pays for itself in reduced latency variance, better capacity utilization, and fewer incidents caused by unbalanced load.
+

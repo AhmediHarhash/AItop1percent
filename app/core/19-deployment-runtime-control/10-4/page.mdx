@@ -1,0 +1,88 @@
+# 10.4 — Shadow Deployment: Run New Version Alongside, Compare Outputs
+
+What if you could test a new model on real production traffic without users ever seeing the outputs? That is shadow deployment. You run the new version in parallel with the production version, sending the same requests to both, but you only return the production version's outputs to users. The shadow version's outputs are recorded, analyzed, and compared to production. If the shadow outputs look good, you promote the shadow to production. If they look bad, you abort and fix the issues. Users never see the shadow's mistakes.
+
+Shadow deployment is the most conservative deployment pattern for changes where output quality is uncertain. It gives you complete confidence before committing. You observe the new version's behavior on real production traffic at full scale without risking user experience. The cost is literally double: you run two versions of the system simultaneously, which doubles compute costs. For high-value deployments where a mistake would be expensive, that cost is worth it.
+
+## The Shadow Pattern
+
+In a shadow deployment, every production request gets duplicated and sent to both the production system and the shadow system. The production system's response is returned to the user immediately. The shadow system's response is logged and stored for later analysis. The user never sees the shadow response. From the user's perspective, nothing has changed. The system behaves exactly as it did before the shadow deployment started.
+
+The duplication happens at the routing layer. An API gateway, load balancer, or service mesh intercepts incoming requests and forwards each request to both the production endpoint and the shadow endpoint. The production endpoint processes the request and returns a response. The shadow endpoint processes the same request and returns a response. The routing layer sends the production response back to the user and stores the shadow response in a database, log file, or analysis system.
+
+For AI systems, this means both the production model and the shadow model receive the same input. If a user asks "What is the capital of France," both models generate a response. The production model's response is shown to the user. The shadow model's response is logged. Later, you compare the two responses. If they are identical, the shadow model behaved the same as production. If they differ, you analyze why and decide whether the difference is acceptable.
+
+Shadow deployment works best for synchronous request-response workloads. The user sends a request, waits for a response, and receives the response. Asynchronous workloads are harder to shadow because the response is delivered later through a different channel. You can still shadow them, but you need to track request IDs across systems to match production responses with shadow responses.
+
+## Traffic Duplication Mechanisms
+
+The simplest way to duplicate traffic is at the application layer. Your application code receives a request, calls both the production inference service and the shadow inference service, waits for both responses, returns the production response to the user, and logs the shadow response. This works but adds latency. If the production model takes 500 milliseconds to respond and the shadow model takes 600 milliseconds, the user waits 600 milliseconds instead of 500 because the application waits for both.
+
+A better approach is to call the production service and the shadow service in parallel and return the production response as soon as it is ready without waiting for the shadow. This requires asynchronous request handling. The application sends the request to both services simultaneously, returns the production response as soon as it arrives, and logs the shadow response whenever it arrives. The user's latency is unaffected by the shadow.
+
+An even cleaner approach is to duplicate traffic at the infrastructure layer. A service mesh or API gateway duplicates each request and routes it to both production and shadow. The application code is unaware of the shadow. This separation is cleaner and avoids coupling application logic to deployment mechanics. The downside is that it requires infrastructure that supports traffic mirroring, which not all systems have.
+
+For AI systems, you need to consider how to handle non-deterministic outputs. If your model uses sampling with a temperature greater than zero, the same input can produce different outputs on different requests. If you send the same input to production and shadow, they might produce different outputs purely due to sampling randomness, not because the models behave differently. To get meaningful comparisons, you need to control randomness. One approach is to use the same random seed for both production and shadow. Another is to use deterministic inference with temperature set to zero. A third is to run the shadow on many requests and compare aggregate statistics rather than individual outputs.
+
+## Output Comparison and Analysis
+
+After collecting shadow outputs, you compare them to production outputs. The comparison depends on what you are testing. If you are deploying a new version of the same model with a bug fix, you expect most outputs to be identical and you focus on cases where outputs differ. If you are deploying a different model, you expect many outputs to differ and you focus on whether the differences represent improvements or regressions.
+
+The simplest comparison is exact match rate. What percentage of shadow outputs are identical to production outputs? If 95 percent of outputs match, the shadow model behaves similarly to production on most inputs. If only 60 percent match, the models diverge significantly. Exact match is a coarse signal. It tells you whether the models are similar but does not tell you whether the differences are good or bad.
+
+A more useful comparison is semantic similarity. You analyze whether shadow and production outputs convey the same meaning even if the wording differs. One model might respond "Paris is the capital of France" while the other responds "The capital of France is Paris." These outputs are semantically identical even though they differ lexically. You can measure semantic similarity using embedding models. Encode both outputs as vectors, compute cosine similarity, and threshold. If similarity is above 0.95, the outputs are effectively the same. If similarity is below 0.80, they differ meaningfully.
+
+For task-specific evaluations, you run your eval suite on both production and shadow outputs. If your system answers questions, you evaluate correctness. If it generates code, you evaluate whether the code runs. If it writes summaries, you evaluate whether key information is preserved. You compute pass rates for production and shadow across all eval criteria and compare. If shadow's pass rate is equal to or higher than production's, the shadow model is at least as good. If shadow's pass rate is lower, you investigate the failures.
+
+You also analyze specific categories of differences. What percentage of shadow outputs are longer than production outputs? What percentage have higher refusal rates? What percentage trigger policy violations? These categorical comparisons reveal specific behavioral changes. If the shadow model refuses 10 percent of requests that the production model answers, you decide whether that increased caution is desirable or whether it represents over-refusal.
+
+## Finding Regressions Before Users Do
+
+The primary value of shadow deployment is catching regressions before they affect users. If the shadow model produces a harmful output, you see it in the logs. You do not promote the shadow to production. You fix the issue and deploy a new shadow. The user never saw the harmful output because it was never returned to them.
+
+This is especially valuable for subtle regressions that are hard to detect in pre-production testing. Your eval suite might have 10,000 test cases, but production traffic includes millions of real user inputs with diversity your test cases do not cover. A model might pass all 10,000 eval cases and still fail on a class of production inputs that your evals missed. Shadow deployment exposes the model to that full diversity at production scale before you commit to it.
+
+Consider a scenario where you fine-tune a model to improve its performance on technical questions. The fine-tuning works well on your eval set. You deploy the model as a shadow. After a day, you analyze shadow outputs and discover that the model's performance on casual conversational inputs degraded. It is more formal and less engaging. Your eval set focused on technical questions and did not cover casual conversation, so you missed the regression. Shadow deployment caught it. You retrain the model with a more balanced dataset, deploy a new shadow, verify that both technical and casual performance are good, and then promote to production.
+
+## Shadow for Model Comparison
+
+Shadow deployment is also useful for comparing two models to decide which to promote. Suppose you are evaluating whether to switch from Claude Sonnet 4.5 to GPT-5-mini. Both models are production-ready, but you want to see which performs better on your specific use case and traffic. You run GPT-5-mini as a shadow alongside Claude Sonnet 4.5 in production. After collecting a week of outputs from both, you compare quality metrics, latency, cost, and user feedback. If GPT-5-mini outperforms Claude on your metrics, you promote it. If Claude performs better, you stick with Claude.
+
+This comparison is more reliable than synthetic testing because it uses real production traffic. Benchmark results and eval suite results tell you how models perform on average across many tasks. Shadow deployment tells you how they perform on your task with your users and your input distribution. The difference can be significant. A model that benchmarks well might perform poorly on your specific domain, and you would not discover that until you ran it on your production traffic.
+
+Shadow comparison requires discipline in defining success metrics before the test. If you wait until after collecting data to decide which model is better, you risk cherry-picking metrics that favor the model you already prefer. Before deploying the shadow, write down the metrics that matter: task success rate, refusal rate, latency at the 95th percentile, policy violation rate, output length. Define thresholds for each metric. After the shadow period, evaluate both models against those thresholds and make the decision based on the pre-defined criteria.
+
+## Cost Considerations
+
+Shadow deployment doubles your compute costs during the shadow period. If your production system uses 50 GPUs and costs 6,000 dollars per day, running a shadow on another 50 GPUs adds another 6,000 dollars per day. If you run the shadow for a week, that is 42,000 dollars of additional cost. For small systems, this is negligible. For large systems, it is a significant expense.
+
+The cost is justified when the risk of a bad deployment is high. If deploying a broken model would cost you more than 42,000 dollars in lost revenue, user trust, or compliance violations, spending 42,000 dollars to catch the problem before users see it is a good trade. If the risk is low, shadow deployment may be overkill. You could use canary deployment or even rolling deployment and save the cost.
+
+Some teams reduce shadow costs by shadowing only a sample of traffic. Instead of sending every request to the shadow, they send 10 percent of requests. This reduces compute costs by 90 percent but also reduces the sample size for comparison. If your production traffic is high volume, 10 percent sampling might still give you millions of shadow requests, which is enough to detect most issues. If your traffic is low volume, 10 percent sampling might leave you with too few samples to draw conclusions.
+
+Another cost is storage and analysis. Shadow outputs need to be stored for comparison. If each output is 500 tokens and you generate 10 million shadow outputs, that is 5 billion tokens of text to store. At a storage cost of 0.02 dollars per gigabyte and assuming 1 token equals roughly 4 bytes, that is 20 gigabytes, which costs about 0.40 dollars per month. Storage cost is usually negligible compared to compute cost, but it scales with traffic volume and shadow duration.
+
+Analyzing shadow outputs also requires compute. If you run eval suites on 10 million shadow outputs, that is 10 million eval runs. If each eval run costs 0.001 dollars, the total eval cost is 10,000 dollars. This is less than the cost of running the shadow but still significant. Some teams analyze only a sample of shadow outputs, running evals on 1 percent of outputs and using aggregate metrics for the rest. This reduces eval cost while still catching major issues.
+
+## Shadow Duration and Success Criteria
+
+How long should you run a shadow before promoting it to production? The answer depends on your traffic volume and the types of issues you want to detect. If your system handles 10 million requests per day and you run the shadow for a day, you collect 10 million shadow outputs. If your system handles 1,000 requests per day, you need to run the shadow for longer to accumulate enough data.
+
+A common heuristic is to run the shadow until you have enough samples to detect a 1 percent regression in your key metrics with statistical confidence. If your baseline error rate is 2 percent, you want to detect if the shadow's error rate is 3 percent. Statistical power calculations tell you how many samples you need. For typical confidence levels, you need thousands to tens of thousands of samples per metric. Low-volume systems might need weeks to accumulate that many samples.
+
+You also need to run the shadow long enough to encounter rare inputs. If a failure mode occurs once in every 100,000 requests, you need at least 100,000 shadow requests to have a reasonable chance of seeing it. If your traffic is 10,000 requests per day, that is ten days. If you only run the shadow for one day, you might miss the rare failure and promote a model that fails on those inputs.
+
+Success criteria for promoting the shadow should be defined before the shadow starts. Typical criteria include: shadow error rate is not statistically significantly higher than production, shadow latency is within acceptable bounds, shadow output quality metrics pass thresholds, no high-severity issues observed in manual review. If all criteria are met after the shadow duration, the shadow is promoted. If any criterion fails, the shadow is rejected and a new version is developed and tested.
+
+## Handling Non-Determinism
+
+AI models are often non-deterministic. The same input can produce different outputs on different runs due to sampling randomness. If you send the same request to production and shadow, they might produce different outputs even if they are the exact same model version. This makes comparison difficult. How do you know whether a difference is due to model behavior or due to sampling randomness?
+
+One solution is to use deterministic inference for shadow testing. Set temperature to zero or use greedy decoding. Both production and shadow will produce the same output for the same input if they are the same model version. Differences in output indicate genuine behavioral differences. The downside is that deterministic inference might not match your production inference configuration. If you use temperature 0.7 in production, testing with temperature 0 might miss issues that only appear with sampling enabled.
+
+Another solution is to run multiple shadow inferences per request and compare distributions. For each production request, you run the shadow model three times with different random seeds. If all three shadow outputs are similar to the production output, the models behave the same on average. If all three diverge, the models are different. This increases compute cost by 3x but gives you more confidence in the comparison.
+
+A third solution is to compare aggregate statistics instead of individual outputs. Instead of checking whether each shadow output matches the corresponding production output, you measure the distribution of outputs across thousands of requests. What is the average response length? What is the refusal rate? What is the distribution of sentiment scores? If the shadow's aggregate statistics match production's, the models are behaviorally similar even if individual outputs differ due to sampling.
+
+Shadow deployment provides the highest confidence of any deployment pattern because it tests the new version on real production traffic without risk to users. The cost is compute and complexity. For critical deployments where a mistake would be expensive, shadow is worth it. For routine deployments, faster patterns like canary or rolling are more practical. The next chapter covers dark launches, a related pattern where you deploy new infrastructure without activating it, allowing you to verify infrastructure stability before routing traffic.
+

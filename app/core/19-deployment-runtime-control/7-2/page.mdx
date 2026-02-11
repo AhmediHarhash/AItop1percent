@@ -1,0 +1,94 @@
+# 7.2 — Static vs Dynamic Feature Flags: Environment-Level vs Runtime-Evaluable
+
+Static flags tell you what is deployed. Dynamic flags tell you what is running. You need both. The distinction sounds subtle but determines what kind of control you actually have over your AI system in production. Static flags lock in behavior at deployment time. Every request in that deployment gets the same flag values. Dynamic flags evaluate at request time. Two requests in the same deployment can get different flag values based on context. This difference shapes how you use flags, how you implement them, and what problems they can solve.
+
+## Static Flags: Deployment-Time Decisions
+
+A static flag is set once when your application starts and does not change until you restart or redeploy. The flag value comes from an environment variable, a configuration file loaded at startup, or a build-time constant. Once the application is running, the flag value is frozen. Every request sees the same value. If you want to change the value, you must restart the application or deploy a new version with a different configuration.
+
+Static flags are useful for deployment-scoped decisions. You want to enable a feature in staging but not in production. You set a static flag that reads from an environment variable. Staging sets the variable to true, production sets it to false. The flag value never changes during the lifetime of a running process, which is exactly what you want — you do not want staging suddenly behaving like production in the middle of a test run.
+
+Another common use case is infrastructure configuration. You might have a flag that controls whether your system calls the OpenAI API or a self-hosted model endpoint. This decision does not change per request. It is an environment-level choice: development uses OpenAI, production uses the self-hosted endpoint. A static flag captures this perfectly. The value is set at deploy time and never changes until the next deploy.
+
+Static flags are fast. Reading an environment variable or checking an in-memory boolean costs almost nothing. There is no network call, no database lookup, no evaluation logic. The flag value is already in memory, loaded at startup. This makes static flags appropriate for high-frequency decisions that do not need per-request variance. If you check a flag on every request and the flag never needs to change without a deployment, make it static.
+
+The limitation is obvious: static flags cannot respond to runtime conditions. If a model starts timing out, you cannot flip a static flag to switch to a different model without restarting the application. If you want to gradually roll out a new prompt to ten percent of users, a static flag cannot do that — it is either on for everyone or off for everyone. Static flags give you environment-level control, not request-level control.
+
+## Environment-Level Flags: Same System, Different Behavior
+
+Most teams run multiple environments: local development, shared staging, and production. The same codebase runs in all three, but you want different behavior in each. Environment-level flags make this possible. You deploy the same code everywhere, but the flags tell each environment how to behave.
+
+A typical pattern: your AI assistant calls GPT-5 in production because you need the quality, but you call GPT-5-mini in development because you do not want to pay full API costs for every engineer's local testing. A static flag reads an environment variable that defaults to GPT-5-mini in development and is explicitly set to GPT-5 in production. Same code, different model, controlled by environment configuration.
+
+Another pattern: you enable verbose logging in staging but disable it in production. Logs help you debug issues in pre-production environments, but the volume and latency cost is too high for production traffic. A static flag controls logging verbosity. Staging sets it to true, production sets it to false. The application code checks the flag before emitting verbose logs. The behavior adapts to the environment without changing the code.
+
+Environment-level flags also handle feature readiness. You build a new multi-step agent workflow. It works in staging, but you are not ready to expose it to customers yet. A static flag gates the feature. The flag is enabled in staging and disabled in production. Internal testing proceeds in staging while production remains unaffected. When you are ready to launch, you update the production environment configuration to enable the flag and redeploy. The feature goes live.
+
+The key insight is that static flags let you deploy once and configure per environment. You do not maintain separate codebases or separate branches for different environments. You maintain separate flag configurations. This keeps your code unified while giving each environment the behavior it needs. The cost is that changing a flag requires a redeploy or application restart, which is acceptable for environment-level decisions that do not need to change frequently.
+
+## Dynamic Flags: Request-Time Evaluation
+
+A dynamic flag evaluates every time it is checked. The flag value is not cached at startup. Instead, the system evaluates targeting rules, checks user attributes, consults percentage rollout logic, and determines the flag value for this specific request. Two requests made one second apart can get different flag values if the targeting rules or rollout percentages change between them.
+
+Dynamic flags enable the runtime control that static flags cannot provide. You want to roll out a new prompt template to five percent of users. A dynamic flag checks the user ID, hashes it, and returns true if the hash falls in the bottom five percent of the hash space. Different users get different flag values even though they are hitting the same deployment. You want to enable a feature only for beta testers. A dynamic flag checks the user ID against a list of beta tester IDs. Beta testers see the flag as true, everyone else sees false.
+
+Dynamic flags are what people usually mean when they talk about feature flags as a control mechanism. The healthcare company from the previous subchapter used dynamic flags for their prompt rollout. They did not need to redeploy to change which prompt ran. They updated the flag configuration in their flag management system, and new requests immediately evaluated against the new configuration. The application code did not change. The deployment did not change. Only the flag evaluation result changed.
+
+This runtime control comes with a cost. Dynamic flags are slower than static flags. Evaluating a flag requires executing targeting logic, which might involve reading from a database, checking user attributes, or computing hash-based bucketing. A static flag is a boolean read from memory. A dynamic flag might be a function call that does nontrivial work. This matters when you check the flag on every request. A ten-millisecond flag evaluation cost adds ten milliseconds to every request latency.
+
+The other cost is complexity. Static flags are simple: read a value, use it. Dynamic flags require infrastructure: a flag management system, targeting rule storage, evaluation libraries, flag configuration APIs, monitoring for flag state. You need to think about flag evaluation failure modes. What happens if the flag service is down? Do you default to on or off? Do you cache previous flag values? How do you ensure consistent flag evaluation across distributed services? These are real operational concerns that static flags do not create.
+
+## When to Use Static vs Dynamic
+
+The decision comes down to who needs to change the flag and how quickly. If the flag controls deployment-scoped behavior and only needs to change when you deploy anyway, make it static. If the flag needs to change at runtime without a deployment, make it dynamic.
+
+Static flag examples: which model endpoint to call (development versus production), whether to enable debug logging, which database connection string to use, whether to use a feature that is only ready in some environments. These are configuration decisions that align with deployment boundaries. Changing them requires or accompanies a deployment, so there is no benefit to making them dynamic.
+
+Dynamic flag examples: percentage rollout of a new prompt template, enabling a feature for specific user IDs or tenant IDs, A/B testing two model configurations, emergency rollback of a problematic change. These are runtime decisions that need to change independently of code deployment. Making them static would require deploying every time you want to adjust the rollout percentage or change the test allocation, which defeats the purpose.
+
+Some flags start static and become dynamic. You build a new feature and gate it with a static environment variable: enabled in staging, disabled in production. You test it internally, and it works. Now you want to launch gradually to customers. You convert the static flag to a dynamic flag, deploy that change, and then use the dynamic flag to control rollout. The flag's role evolved from an environment gate to a runtime control, so its implementation evolved as well.
+
+Other flags start dynamic and become static. You use a dynamic flag to gradually roll out a new model selection strategy. After three months, one hundred percent of traffic uses the new strategy, and you have no intention of rolling back. The dynamic flag is now permanent. You convert it to a static flag or remove it entirely. This cleanup is important — dynamic flags have operational cost, and you should not pay that cost for decisions that no longer need runtime control.
+
+## Configuration Management for Static Flags
+
+Static flags need a place to live. The most common approach is environment variables. Your application reads environment variables at startup and uses them to set flag values. This works well for simple flags: true/false decisions, numeric parameters, string selections. Environment variables are standard, well-supported, and easy to manage through deployment tooling.
+
+For more complex static configuration, you might use configuration files. A JSON or YAML file contains flag definitions, and the application loads it at startup. This scales better than environment variables when you have dozens or hundreds of flags. The file can live in your repository, be deployed with your application, or be fetched from a configuration service at startup. The key property is that the file is read once and then not consulted again until the application restarts.
+
+Configuration-as-code is a popular pattern for static flags. The flag definitions live in version-controlled files alongside your application code. When you deploy a new version, you deploy the flag configuration with it. This gives you auditability: every flag change has a commit, a reviewer, and a deployment record. It also ensures consistency: the flags and the code that uses them are always in sync because they deploy together.
+
+The downside of configuration-as-code is that changing a flag requires a deployment. If you discover that a static flag is set incorrectly, you cannot just fix it — you have to commit the fix, go through code review, and deploy. This is acceptable for true static flags because they are meant to be deployment-scoped. But it is a sign that you might need a dynamic flag if you find yourself frequently needing to change a static flag outside of normal deployment cycles.
+
+## Dynamic Flag Evaluation: Per-Request Logic
+
+Dynamic flags require evaluation logic that runs on every flag check. The simplest form is a remote configuration service. Your application makes an API call to the flag service: "What is the value of flag X for user Y?" The service evaluates targeting rules and returns the result. Your application uses that result. This approach is simple but slow. Every flag evaluation is a network round trip. If you check ten flags per request, you have added ten network calls to your request path.
+
+To reduce latency, most dynamic flag systems use local evaluation with remote configuration. The application fetches flag targeting rules from a remote service at startup or periodically in the background. Then it evaluates flags locally using those cached rules. When a flag is checked, the application runs the targeting logic in-process — no network call required. The evaluation is fast because it is local. The configuration stays current because it is refreshed periodically from the remote service.
+
+The refresh interval matters. If you refresh every ten seconds, flag changes take up to ten seconds to propagate to all running application instances. If you refresh every ten minutes, flag changes take up to ten minutes. Faster refresh reduces lag but increases load on the flag configuration service. Most teams settle on refresh intervals between thirty seconds and five minutes depending on how quickly they need flag changes to propagate.
+
+Flag evaluation logic typically involves hashing user identifiers to achieve stable bucketing. You want the same user to get the same flag value across requests so their experience is consistent. You hash the user ID, take the modulo of the hash space, and compare it to the rollout percentage. If the user is in the bottom ten percent of the hash space and the rollout is at ten percent, they get the flag enabled. Everyone else gets it disabled. The hash ensures randomness across users while maintaining stability for each individual user.
+
+## Performance Considerations
+
+Static flags are free. Reading a boolean from memory costs nanoseconds. Checking a static flag ten thousand times per second has no measurable performance impact. You can check static flags as liberally as you want without worrying about the cost.
+
+Dynamic flags are not free. Even with local evaluation, a dynamic flag check is a function call that executes targeting logic. It might compute a hash, look up user attributes in a map, evaluate percentage logic, or check conditions. This costs microseconds to milliseconds depending on complexity. For a single flag check per request, the cost is negligible. For a hundred flag checks per request, the cost is measurable.
+
+The healthcare company discovered this when they first implemented dynamic flags. They checked a feature gate flag in twelve different places in their request handling code because different code paths needed to know whether the feature was enabled. Each check evaluated the same flag with the same user context. They were evaluating the flag twelve times per request even though the result was always the same. The redundant evaluation added three milliseconds to request latency.
+
+They fixed this by evaluating flags once at the start of request handling and caching the results in the request context. The first check evaluated the flag and stored the result. Subsequent checks read from the cache. This brought the evaluation cost down to a fraction of a millisecond per request. The lesson: dynamic flags are per-request evaluations, but you only need to evaluate each flag once per request if you cache intelligently.
+
+## The Hybrid Approach
+
+Most production systems use both static and dynamic flags. Static flags handle environment-level configuration: which external services to call, what logging level to use, which database to connect to. Dynamic flags handle runtime decisions: which users see which features, what percentage of traffic uses which model, how to route traffic during an A/B test.
+
+The two flag types live in different systems. Static flags come from environment variables or configuration files loaded at startup. Dynamic flags come from a feature flag management platform like LaunchDarkly, Split, Unleash, or a custom-built service. The application code knows about both. It checks static flags by reading environment variables or configuration objects. It checks dynamic flags by calling the flag evaluation library.
+
+This hybrid approach gives you the best of both worlds. You get the speed and simplicity of static flags for configuration that does not need runtime control. You get the flexibility and power of dynamic flags for decisions that need to change at runtime. You pay the operational cost of dynamic flag infrastructure only for the flags that actually need it.
+
+The key is knowing which type of flag you need when you introduce a new flag. Ask: does this decision need to change at runtime without a deployment? If yes, dynamic. If no, static. Do not make everything dynamic just because you can. Dynamic flags have a cost, and you should only pay it when you need the capability.
+
+Static and dynamic flags give you different types of control, but one of the most powerful dynamic flag patterns is percentage rollout — gradually exposing changes to increasing portions of traffic while monitoring for problems at each step.
+

@@ -1,0 +1,112 @@
+# 3.7 — Horizontal vs Vertical Scaling for AI Systems
+
+Traditional web services scale horizontally without thinking. Need more capacity? Add more instances. Load balancer distributes traffic. Each instance is independent. The architecture is simple and the cost is linear. LLM inference does not work this way.
+
+In November 2025, a legal tech company faced a scaling decision. Their contract analysis system was running at capacity on 8 A100 GPUs. Each GPU ran an independent instance of their model. Traffic was growing 25 percent per month. They had two choices: scale horizontally by adding more A100 GPUs, or scale vertically by upgrading to H100 GPUs. Horizontal scaling would cost 120,000 dollars for 4 additional A100s, maintaining their architecture. Vertical scaling would cost 280,000 dollars to replace all 8 A100s with 8 H100s, but each H100 delivered 2.5 times the throughput. They chose horizontal scaling because it was cheaper upfront. Three months later, they hit a wall. Their model size grew from 13 billion parameters to 70 billion parameters to improve quality. The model no longer fit on a single A100. They had to re-architect for multi-GPU inference using tensor parallelism, then replace all their A100s with H100s anyway. The horizontal-first decision cost them an extra 200,000 dollars and two months of engineering time. If they had chosen vertical scaling first, they would have had headroom for model growth.
+
+Horizontal and vertical scaling are not interchangeable strategies. They have different cost structures, different architectural complexity, and different failure modes. The right choice depends on your workload characteristics, your model size, and your growth trajectory.
+
+## Horizontal Scaling: Adding More Replicas
+
+Horizontal scaling means adding more independent instances of your model, each running on its own GPU or set of GPUs. A load balancer distributes incoming requests across instances. Each instance handles a subset of traffic. If you have 10 instances and one fails, the other 9 continue serving traffic. The architecture is simple, the failure domain is isolated, and the cost scales linearly.
+
+Horizontal scaling works best for models that fit comfortably on a single GPU. If your model is 7 billion parameters and fits in 14 GB of memory, you can run it on a single A100 with 40 GB of VRAM. Adding capacity means adding more A100s. Each A100 is an independent replica. You can add or remove replicas without changing architecture.
+
+The advantage of horizontal scaling is flexibility. You can scale incrementally. If you need 10 percent more capacity, add one more GPU. If traffic drops, remove a GPU. Auto-scaling is straightforward because each replica is independent. The cost is predictable: double your traffic, double your replicas, double your cost.
+
+The disadvantage is coordination overhead. Each replica maintains its own KV cache, its own memory state, and its own batch queue. A request that could be batched with other requests is only batched within its replica. If one replica has 8 requests in its queue and another has 2 requests, the load balancer does not rebalance dynamically. You get lower batch efficiency compared to a single large system.
+
+Horizontal scaling also has limits. If your model is too large to fit on one GPU, you cannot scale horizontally without first solving the vertical problem. If your model requires 80 GB of memory and a single A100 has 40 GB, you must split the model across GPUs using tensor parallelism or pipeline parallelism. Once you introduce multi-GPU inference, horizontal scaling becomes more complex.
+
+## Vertical Scaling: Larger GPUs with More Compute
+
+Vertical scaling means using larger, more powerful GPUs instead of more GPUs. Instead of 10 A100s, you use 5 H100s. Each H100 has more memory, more compute, and higher throughput. For the same total capacity, you use fewer instances, lower coordination overhead, and simpler architecture.
+
+Vertical scaling works best when your workload benefits from larger memory and faster compute on a single device. If your model fits on one GPU but is close to the memory limit, upgrading to a larger GPU gives you headroom for model growth. If your workload has large context windows—8,000 to 32,000 tokens—more memory per GPU allows larger KV caches, which allows larger batch sizes, which increases throughput.
+
+The advantage of vertical scaling is efficiency. A single H100 delivers 2 to 3 times the throughput of an A100 for many workloads, while costing 1.5 to 2 times as much. The cost per token is better. The batch efficiency is better because all requests are batched together on one device. The architecture is simpler because you have fewer instances to coordinate.
+
+The disadvantage is granularity. You cannot add 10 percent more capacity by adding 0.1 of an H100. You add a full H100 or nothing. If your traffic grows slowly, you over-provision for longer before filling the new capacity. If your budget is constrained, the upfront cost of larger GPUs is harder to justify than the incremental cost of smaller GPUs.
+
+Vertical scaling also has limits. The largest single GPU in 2026 is the H200 with 141 GB of memory. If your model requires more than that, you must split across GPUs. At that point, vertical scaling alone is no longer sufficient.
+
+## When to Scale Horizontally: Many Small Requests
+
+Horizontal scaling is the right default for most production systems when the model fits on a single GPU. If your workload is many small requests—typically under 2,000 tokens input and under 500 tokens output—horizontal scaling is simple and cost-effective.
+
+The key characteristic is request independence. Each request can be served by any replica without coordination. The load balancer distributes requests randomly or by least-connections. No state is shared across replicas. This makes horizontal scaling operationally simple. You can deploy new replicas, drain old replicas, and restart failed replicas without affecting other instances.
+
+Horizontal scaling also makes sense when high availability is critical. With 10 replicas, one replica failure reduces capacity by 10 percent. With 2 replicas, one failure reduces capacity by 50 percent. More replicas mean smaller blast radius per failure. For user-facing services with strict uptime SLAs, horizontal scaling with many replicas is safer than vertical scaling with few.
+
+Cost sensitivity also favors horizontal scaling. If you are optimizing for cost per token and can tolerate slightly lower batch efficiency, horizontal scaling on smaller GPUs is cheaper than vertical scaling on larger GPUs. The absolute cheapest GPU per hour is not the H100. It is the A10 or the T4 for small models. If your model fits on these, horizontal scaling delivers the lowest cost per token.
+
+## When to Scale Vertically: Large Context and Large Models
+
+Vertical scaling becomes necessary when your model does not fit on a single small GPU, or when your workload requires large context windows.
+
+If your model is 70 billion parameters, it requires approximately 140 GB of memory in FP16, or 70 GB in INT8 quantization. This does not fit on an A100. You must either use tensor parallelism to split across multiple A100s, or use a single H200 with 141 GB. The H200 option is simpler architecturally and faster because there is no inter-GPU communication overhead.
+
+If your workload requires large context windows—processing documents with 16,000 to 128,000 tokens—the KV cache grows proportionally. A 32,000-token context with a 13-billion-parameter model consumes approximately 60 GB of memory for KV cache alone. You need a GPU with 80 to 100 GB of total memory to handle this. Smaller GPUs cannot fit the KV cache, and splitting the KV cache across GPUs with tensor parallelism adds latency.
+
+Vertical scaling is also better when your request volume is low but each request is computationally expensive. If you serve 100 requests per minute with 10,000 tokens per request, you have low concurrency but high per-request cost. Running one or two large GPUs is simpler than running ten small GPUs with low utilization.
+
+The decision is also about growth trajectory. If your model size is likely to grow—from 7 billion to 13 billion to 70 billion parameters over the next year—vertical scaling gives you headroom. If you start with small GPUs, you will eventually hit the model size limit and have to re-architect. If you start with large GPUs, you have room to grow.
+
+## Tensor Parallelism: Splitting Models Across GPUs
+
+When your model is too large for one GPU, tensor parallelism splits the model across multiple GPUs. Each GPU holds a shard of the model weights. During inference, the GPUs communicate to exchange activations. The result is that the model acts as if it is on a single large GPU, but the memory is distributed.
+
+Tensor parallelism is implemented by frameworks like vLLM, Megatron-LLM, and DeepSpeed. The framework handles the communication. You specify the number of GPUs per model instance, and the framework shards the model automatically. For a 70-billion-parameter model, you might use 4 A100 GPUs with tensor parallelism, or 2 H100 GPUs, or 1 H200 GPU.
+
+The speedup from tensor parallelism is sub-linear. Splitting across 2 GPUs does not double throughput. It increases throughput by 1.6x to 1.8x because of communication overhead. Splitting across 4 GPUs increases throughput by 2.5x to 3x. Splitting across 8 GPUs increases throughput by 4x to 5x. The overhead grows with the number of GPUs. Beyond 8 GPUs, tensor parallelism becomes inefficient.
+
+Tensor parallelism also increases latency slightly. The GPUs must synchronize after each layer. For a model with 80 layers, synchronization happens 80 times per request. Each synchronization adds microseconds of latency. For a model generating 500 tokens, this adds 10 to 50 milliseconds of total latency. For latency-sensitive applications, this matters.
+
+The operational complexity of tensor parallelism is higher than single-GPU inference. If one GPU in a tensor-parallel group fails, the entire group fails. You cannot serve traffic from 3 out of 4 GPUs. The group is an atomic unit. This means your failure domain is larger. With horizontal scaling, one GPU failure affects one replica. With tensor parallelism, one GPU failure affects one group, which might be your only group if you only have one model instance.
+
+## Pipeline Parallelism: Layers Across GPUs for Throughput
+
+Pipeline parallelism splits the model by layers instead of by tensors. The first GPU holds the first 25 percent of layers, the second GPU holds the next 25 percent, and so on. A request flows through GPU 1, then GPU 2, then GPU 3, then GPU 4. Each GPU processes a different stage of the pipeline simultaneously.
+
+Pipeline parallelism increases throughput at the cost of latency. When GPU 1 finishes the first layer for request A, it starts the first layer for request B while GPU 2 processes the second layer for request A. The pipeline is full when all GPUs are busy. At steady state, you process multiple requests in parallel even though each request takes longer.
+
+The latency increase is significant. With 4-way pipeline parallelism, a single request passes through 4 GPUs sequentially. If each stage takes 2 seconds, total latency is 8 seconds instead of 2 seconds. This makes pipeline parallelism unsuitable for interactive applications. It is used for batch inference where throughput matters more than per-request latency.
+
+Pipeline parallelism is operationally complex. Balancing the pipeline requires careful tuning. If GPU 1 takes 1 second per stage and GPU 4 takes 3 seconds per stage, the pipeline stalls waiting for GPU 4. You must balance computation across stages, which depends on layer sizes and GPU capabilities. Most teams avoid pipeline parallelism unless they have batch workloads and very large models.
+
+## Hybrid Scaling: Vertical for Fit, Horizontal for Capacity
+
+The most common production pattern is hybrid scaling: vertical scaling to fit the model on the fewest GPUs possible, then horizontal scaling to add capacity.
+
+For a 13-billion-parameter model, you use 1 A100 per replica. For a 70-billion-parameter model, you use 2 H100s with tensor parallelism per replica. Each replica is a unit of capacity. Scaling horizontally means adding more replicas, each of which is 1 or 2 or 4 GPUs depending on model size.
+
+This approach combines the simplicity of horizontal scaling with the efficiency of vertical scaling. You minimize the number of GPUs per replica to reduce communication overhead. You maximize the number of replicas to increase availability and flexibility.
+
+The architecture is: load balancer distributes requests to replicas. Each replica is a tensor-parallel group if the model requires multi-GPU. The load balancer treats each replica as a single endpoint regardless of how many GPUs it uses. If you have 10 replicas and each replica is 2 H100 GPUs, you have 20 GPUs total, but the load balancer sees 10 endpoints.
+
+Failure handling is cleaner with hybrid scaling. If one replica fails, the load balancer removes it from rotation and distributes traffic to the remaining replicas. You lose 10 percent of capacity, not 100 percent. If one GPU within a replica fails, the entire replica fails, but only that replica, not the whole system.
+
+## Cost Analysis: Small GPUs vs Large GPUs
+
+Cost analysis must account for total throughput, not just cost per GPU. A single H100 costs 2.5 dollars per hour. A single A100 costs 1.5 dollars per hour. The H100 is more expensive. But if the H100 delivers 2.5x the throughput of the A100, the cost per token is the same.
+
+The break-even calculation is: cost per GPU divided by throughput per GPU equals cost per token. If an A100 costs 1.5 dollars per hour and processes 50,000 tokens per hour, the cost is 3 cents per 1,000 tokens. If an H100 costs 2.5 dollars per hour and processes 120,000 tokens per hour, the cost is 2.08 cents per 1,000 tokens. The H100 is cheaper per token despite being more expensive per GPU.
+
+The cost advantage of larger GPUs grows with workload complexity. For simple workloads with small context windows, the throughput difference between A100 and H100 is 2x. For complex workloads with large context windows, the throughput difference is 3x. The H100 has more memory bandwidth, which matters for memory-bound workloads.
+
+Small GPUs have one cost advantage: you can start smaller. If you only need 50 tokens per second of capacity, you can run 1 A100. If you chose an H100, you would over-provision by 2.5x and waste money until traffic grows. For early-stage products with uncertain demand, small GPUs reduce upfront cost. For mature products with high demand, large GPUs reduce per-token cost.
+
+The hidden cost is operational complexity. Managing 50 A100s requires more orchestration, more monitoring, and more failure handling than managing 20 H100s. The operational cost is not zero. If you can serve the same traffic with fewer GPUs, even if those GPUs are more expensive per unit, the total cost of ownership is often lower.
+
+## Practical Guidance: Start Small, Scale Vertical, Then Horizontal
+
+The default strategy for most teams is: start with the smallest GPU that fits your model comfortably. If your model is 7 billion parameters, start with 1 A100. This minimizes upfront cost and gives you time to understand your traffic patterns.
+
+Scale horizontally first. When you reach 80 percent utilization on your initial GPU, add a second GPU. When you reach 80 percent utilization across both, add a third. Horizontal scaling is operationally simple and gives you flexibility. You can scale up and down as traffic changes.
+
+Scale vertically when you hit horizontal scaling limits. The limits are: your model is too large for one small GPU, your context windows are too large for available memory, or your operational complexity from managing many small GPUs exceeds the cost of fewer large GPUs. At that point, migrate to larger GPUs. This might mean replacing 10 A100s with 4 H100s.
+
+The worst mistake is premature vertical scaling. If you start with H100s when your traffic can be served by A100s, you waste money for months waiting for traffic to grow. The second worst mistake is delayed vertical scaling. If your model grows to 70 billion parameters and you are still trying to run it on A100s with complex tensor parallelism, you are paying architectural complexity tax every day. The right time to scale vertically is when the model or workload no longer fits comfortably on your current GPU size.
+
+Horizontal and vertical scaling are not competing strategies. They are complementary. Use vertical scaling to minimize the number of GPUs per replica. Use horizontal scaling to add capacity. Together, they give you the efficiency of large GPUs and the flexibility of distributed systems. The teams that understand this balance spend less and operate more reliably than teams that pick one strategy and force it to solve all problems.
+

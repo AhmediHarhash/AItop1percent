@@ -1,0 +1,66 @@
+# 8.1 — Why Model Versioning Is Harder Than Code Versioning
+
+In October 2025, a financial services company deployed what they believed was the exact same fraud detection model they had validated in staging. The model had achieved 94 percent precision and 91 percent recall during the final validation run. In production, precision immediately dropped to 79 percent. False positives spiked. Customer support was flooded with complaints about legitimate transactions being blocked. The incident lasted six hours and affected 43,000 transactions before the team rolled back.
+
+The investigation revealed the problem: the production deployment had pulled a checkpoint from epoch 47 instead of the final checkpoint at epoch 52 that staging had used. The model artifacts were stored in S3 with timestamps as identifiers, but the deployment script defaulted to the most recently uploaded file, which happened to be an earlier checkpoint someone had re-uploaded for analysis. Nobody had realized that what was running in production was fundamentally different from what had been validated. The team had assumed that "model version 2.3" meant the same thing everywhere. It did not.
+
+This happens because model versioning is substantially harder than code versioning, and most teams learn this the hard way. Code versioning is a solved problem. A git commit hash points to an exact set of bytes. If two systems reference the same commit hash, they are running identical code. The artifact is small enough to store in version control. The build process is deterministic. The same source code produces the same binary every time. Model versioning has none of these properties.
+
+## The Artifact Size Problem
+
+The first barrier is size. A typical codebase might be tens of megabytes. A modern language model is tens of gigabytes. A 7-billion-parameter model in 16-bit precision is 14 gigabytes. A 70-billion-parameter model is 140 gigabytes. These artifacts cannot be stored in git. They cannot be quickly downloaded. They cannot be casually copied between environments. Storage costs matter. Transfer time matters. Every copy of the model consumes resources.
+
+This forces teams to use separate storage systems. Models go into S3, Azure Blob Storage, GCS, or specialized artifact stores. The version control system holds code, and a separate system holds models. Now you have two sources of truth. The training script at commit abc123 produced model version 2.3, but those two identifiers live in different systems. Linking them requires discipline and infrastructure that most teams do not build upfront. Without that link, you cannot reliably reconstruct what model corresponds to what code.
+
+The size problem also affects iteration speed. When a developer wants to test a model locally, they need to download 14 gigabytes. When a CI/CD pipeline wants to validate a model, it needs to download 14 gigabytes. When a production server starts up, it needs to download 14 gigabytes before it can serve the first request. Teams optimize this with caching, but cache invalidation becomes a versioning problem itself. If the cache holds model version 2.3 and you deploy version 2.4, how does the system know to invalidate the cache? If it does not, you serve stale model versions without realizing it.
+
+## The Training Non-Determinism Problem
+
+The second barrier is non-determinism. If you run the same training script twice with the same hyperparameters and the same data, you might not get the same model. Random seeds control initialization, data shuffling, and dropout. If those seeds are not fixed and recorded, every training run produces a different model. Even with fixed seeds, floating-point arithmetic is not perfectly deterministic across hardware. Training on one GPU architecture versus another can produce slightly different weight values due to rounding differences in floating-point operations.
+
+This means that the training code alone is not sufficient to reproduce a model. You need the code, the data, the hyperparameters, the random seeds, the hardware configuration, the framework version, and sometimes even the CUDA version. All of these inputs combine to determine the output model. If any one of them changes, the model changes. Most teams do not track all of these variables. They track some of them. The ones they forget are the ones that cause mysterious divergence later.
+
+Non-determinism also affects debugging. A model behaves unexpectedly in production. You want to reproduce the issue locally. You pull the training code, you pull the data, you run training again. The new model behaves differently. Was the original issue a bug in the training code? Or was it specific to the exact weight configuration that only existed in that one training run? You cannot answer this question without the exact artifact from the original run. This is why model versioning must version the artifact itself, not just the recipe for creating it.
+
+## The Dependency Chain Problem
+
+The third barrier is dependency depth. A model does not exist in isolation. It depends on a base model, which itself is versioned. It depends on training data, which changes over time. It depends on training code, which evolves. It depends on preprocessing logic, which might be versioned separately. It depends on tokenizer configurations, which affect how text is encoded. Any change in any layer of this stack produces a different model.
+
+Consider a fine-tuned model built on Llama 4 Scout. The team records that they used "Llama 4 Scout" as the base model. Six months later, Meta releases an updated version of Llama 4 Scout with improved safety tuning. The new version has the same name. If your model versioning system records "Llama 4 Scout" without the specific checkpoint hash, you cannot reproduce your model. If someone tries to fine-tune again using "Llama 4 Scout," they get a different result because the base model changed.
+
+The same problem applies to data. The training dataset is versioned, but the preprocessing pipeline might not be. A bug fix in the preprocessing code changes how data is transformed before training. The dataset version is the same, but the effective input to the model is different. The resulting model behaves differently. Without versioning both the dataset and the preprocessing code together, you cannot reproduce the model.
+
+The dependency chain extends to evaluation. You deploy model version 2.3 to production. It was evaluated against eval set version 1.4. Three months later, you train model version 2.4 and evaluate it against eval set version 1.6, which has been updated to include new edge cases. Model 2.4 scores lower than model 2.3 on the recorded metrics. Is model 2.4 actually worse? Or is the eval set now harder? You cannot answer this without tracking which eval set version was used for each model version. Most teams only realize they need this tracking after they have already lost the information.
+
+## The Checkpoint Proliferation Problem
+
+The fourth barrier is checkpoint proliferation. A single training run produces dozens of checkpoints. Training a model over 50 epochs means 50 potential checkpoints if you save every epoch. If you save every 1,000 steps and train for 100,000 steps, you have 100 checkpoints. Each checkpoint is 14 gigabytes. Now you are managing 1.4 terabytes of artifacts from a single training run. Which one is the model version you intend to deploy? Which ones are experiments? Which ones should be kept for analysis? Which ones can be deleted to save costs?
+
+Most teams save all checkpoints initially and then selectively delete them. This deletion is manual and error-prone. Someone deletes checkpoint 47 thinking it was superseded by checkpoint 52. Later, someone realizes that checkpoint 47 had unique properties that are worth revisiting. The artifact is gone. The weights cannot be recovered. The experiment cannot be reproduced.
+
+The checkpoints also have different quality profiles. Early checkpoints might have lower task accuracy but better generalization. Middle checkpoints might have the best trade-off between accuracy and calibration. The final checkpoint might have overfit slightly. Without systematic evaluation of every checkpoint, you do not know which one should be "the" model for version 2.3. Teams typically use the final checkpoint by default, but this is not always the best choice. If you have not evaluated intermediate checkpoints, you might miss better alternatives.
+
+## The Metadata Problem
+
+The fifth barrier is metadata completeness. A model artifact is just weights. The weights alone do not tell you what the model is for, what data it was trained on, what hyperparameters were used, what quality metrics it achieved, what known issues it has, or what environments it is safe to deploy in. All of that context is metadata. Without metadata, the model is a black box. You can load it and run inference, but you cannot make informed decisions about whether it is appropriate for a given use case.
+
+Most teams store metadata informally. The training script logs hyperparameters to a text file. Evaluation results go into a spreadsheet. Known issues are documented in Slack threads. The training data source is recorded in someone's notes. This distributed metadata is effectively unversioned. When you pull model version 2.3, you get the weights, but you do not get a machine-readable record of how it was created, what it is good at, or what it should not be used for.
+
+The metadata problem becomes critical during incidents. A model fails in production. The on-call engineer needs to understand what this model is, what it was trained on, and what evaluation it passed. If the metadata is scattered across systems and people, the incident response is delayed. If the metadata is incomplete, the engineer cannot make informed decisions about whether to roll back, fail over to a backup model, or adjust runtime parameters. Metadata must be versioned with the model artifact and must travel with it through every environment.
+
+## Why Traditional Version Control Does Not Work
+
+Version control systems like git are optimized for text files. They use line-by-line diffing to track changes. They compress stored data by storing deltas between versions. They support branching and merging by analyzing textual conflicts. None of this works for binary model files. A model is a binary blob. Changing one weight in a 7-billion-parameter model changes the entire file from git's perspective. There is no meaningful diff. There is no compression benefit from storing deltas. There is no way to merge two model versions.
+
+Git also has size limits. GitHub restricts individual files to 100 megabytes and recommends keeping repositories under 5 gigabytes. A single model exceeds these limits. Git Large File Storage (LFS) extends git to handle large files by storing pointers in the repository and the actual files in external storage. This solves the size problem but reintroduces the versioning problem. The external storage is not natively versioned by git. You are back to managing two systems.
+
+Even if you use git LFS, the workflow is awkward for models. Developers do not branch models the way they branch code. You do not create a feature branch for a model, make incremental changes to weights, and then merge those changes back. Model development is not incremental at the weight level. It is checkpoint-based. You train a model, evaluate it, and decide whether to promote that specific checkpoint. The version control model is linear, not branching. Git's branching and merging features, which are its core value for code, provide no value for models.
+
+## The Path Forward
+
+Model versioning is not impossible. It is just different from code versioning. It requires infrastructure designed specifically for large binary artifacts with complex metadata and dependency chains. It requires tracking not just the artifact but the entire lineage of how it was created. It requires tooling that makes it easy to answer questions like "what model is running in production right now" and "what training data was used for that model" and "can I reproduce this model from scratch."
+
+The teams that get this right build explicit versioning systems from the beginning. They do not treat model versioning as an afterthought. They do not assume that the same practices that work for code will work for models. They invest in artifact registries, metadata standards, and lineage tracking. They make it impossible to deploy a model without a version identifier. They make it easy to trace from a deployed model back to the exact training run, dataset version, and code commit that produced it. This is not trivial infrastructure, but it is the foundation that makes everything else possible.
+
+The next step is establishing what those version identifiers should look like and how they should communicate meaningful information about model changes to both humans and automated systems.
+

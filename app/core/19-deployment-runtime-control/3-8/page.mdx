@@ -1,0 +1,130 @@
+# 3.8 — Burst Handling: Traffic Spikes Without Service Degradation
+
+Your system will be tested by spikes. A piece of content goes viral and mentions your product. A marketing campaign launches and drives 10x normal traffic. A news event creates sudden demand for your service. The question is not whether spikes will happen. The question is whether your system survives them.
+
+In January 2026, a health information chatbot experienced a traffic spike when a celebrity mentioned it in an interview. Normal traffic was 800 requests per minute. Within six minutes, traffic hit 14,000 requests per minute. The system had been designed for steady-state load with 30 percent headroom. It had never been tested at 17x normal load. The first thing that failed was the load balancer connection pool. Incoming requests exceeded the maximum connections, and new requests were refused before reaching the inference layer. The second thing that failed was GPU memory. The sudden load caused all replicas to fill their batch queues simultaneously. Batch sizes exceeded memory limits, and replicas started crashing. Within 11 minutes, 7 of 10 replicas were down. The remaining 3 replicas could not handle the traffic and also crashed. The entire service was offline for 23 minutes. When the team rebuilt with burst handling, the same traffic pattern was absorbed without degradation. The system pre-scaled for predictable events, queued requests during unpredictable bursts, and shed low-priority traffic when queues filled. The next spike was handled without user complaints.
+
+Burst handling is not about preventing spikes. It is about controlling what happens when spikes arrive. The system either degrades gracefully under control, or it collapses catastrophically. There is no middle ground.
+
+## Sources of Traffic Spikes and Why They Are Predictable
+
+Not all spikes are surprises. Many spikes are predictable if you look for the patterns.
+
+Viral content creates unpredictable spikes. A user shares your product on social media, the post goes viral, and traffic increases 5x to 50x within minutes. You cannot predict when this will happen, but you can predict that it will happen eventually if your product is user-facing. Viral spikes are short-lived. Traffic peaks within 20 to 60 minutes and drops back to normal within hours. The challenge is that you have no warning.
+
+Marketing campaigns create predictable spikes. If your company launches a TV ad, a major email campaign, or a paid social media push, traffic will spike when the campaign goes live. These spikes are scheduled. You know the date and time. You can pre-scale. The failure mode is not lack of capacity. It is lack of coordination. Marketing schedules the campaign, but engineering is not informed, and the system is not scaled in advance.
+
+News events create semi-predictable spikes. If your product is a health information tool, traffic spikes during flu season or when a health scare is reported. If your product is a financial tool, traffic spikes during market volatility. You cannot predict the exact timing, but you can predict the conditions that drive spikes. Monitoring news and having a rapid-scale playbook reduces reaction time from hours to minutes.
+
+Batch job releases create internal spikes. If your system processes nightly batch jobs that submit thousands of requests simultaneously, those jobs create artificial spikes. The solution is to stagger batch job submissions or rate-limit batch traffic. Batch jobs are fully under your control. Allowing them to create spikes is a design error.
+
+Time-of-day patterns create daily spikes. Most user-facing systems have peak hours and off-peak hours. A B2B product peaks during business hours. A consumer product peaks in the evening. If your peak-to-average ratio is 4x, your system must handle 4x average load every day. This is predictable. Your baseline capacity should accommodate peak hourly load, not average daily load. Teams that provision for average load experience degradation every peak hour.
+
+## Why LLM Bursts Are Harder Than Traditional Service Bursts
+
+Traditional web services scale quickly. Need more capacity? Spin up more containers. The new containers are ready in 10 to 30 seconds. Kubernetes Horizontal Pod Autoscaler (HPA) detects load and scales automatically. The spike is absorbed.
+
+LLM inference does not scale this fast. Spinning up a new GPU instance takes 2 to 5 minutes depending on cloud provider. Loading the model into GPU memory takes another 1 to 3 minutes. By the time the new capacity is ready, the spike might be over, or your service might already be down. GPU cold starts are measured in minutes, not seconds. You cannot reactively scale for sub-10-minute bursts.
+
+Memory constraints are hard limits. A traditional service that runs out of CPU slows down. An LLM inference service that runs out of GPU memory crashes. There is no graceful degradation from out-of-memory. The replica dies. If the burst causes all replicas to exceed memory simultaneously, the entire service goes down. Memory is a hard wall.
+
+LLM workloads are stateful in a way that traditional services are not. Each request holds a KV cache in memory for the duration of generation. If a request takes 8 seconds to generate 500 tokens, that KV cache occupies GPU memory for 8 seconds. You cannot preempt it. You cannot swap it to disk. The GPU is committed until generation completes. During a burst, all replicas fill with in-progress requests, and new requests queue. If the queue depth is unlimited, the queue grows until memory is exhausted or timeouts cascade.
+
+## Burst Handling Strategies: Over-Provisioning for Predictability
+
+The simplest burst handling strategy is over-provisioning. Provision capacity for peak traffic, not average traffic. If your peak is 4x your average, provision 4x the GPUs you need for average load. During off-peak hours, the GPUs run at 25 percent utilization. During peak hours, the GPUs run at 100 percent utilization. No scaling is needed. The system always has capacity.
+
+Over-provisioning is expensive but operationally simple. If an A100 costs 1.5 dollars per hour and you run 20 A100s for 720 hours per month, your cost is 21,600 dollars per month. If you only need 20 A100s during 6 hours per day and only need 5 A100s the rest of the day, you waste 15 A100s for 18 hours per day, which is 16,200 dollars per month in wasted spend. The waste is 75 percent of your total cost.
+
+The advantage is that you never experience degradation. Your users always receive fast, high-quality responses. For high-margin businesses where user experience is critical, over-provisioning is worth the cost. For low-margin businesses, the waste is unacceptable, and you need a more sophisticated strategy.
+
+Over-provisioning makes sense for predictable bursts. If you know traffic spikes every weekday from 9am to 5pm, provision for that peak and accept low utilization overnight. If your traffic is unpredictable and spiky, over-provisioning for the worst-case spike is prohibitively expensive.
+
+## Request Queuing: Absorbing Bursts with Latency
+
+Request queuing allows the system to absorb bursts by increasing latency instead of rejecting requests. When traffic exceeds capacity, new requests enter a queue. The queue drains as capacity becomes available. Users wait longer, but they eventually receive responses.
+
+The queue must have a maximum depth. If the queue is unbounded, it grows indefinitely during sustained overload. Memory is exhausted, or timeout cascades occur as requests wait 60+ seconds and time out, only to be retried by users, making the problem worse. A typical maximum queue depth is 50 to 200 requests per replica. If the queue fills, new requests are rejected with HTTP 429.
+
+Queue depth should be tuned based on acceptable latency. If your target P95 latency is 3 seconds and your average request takes 2 seconds, a queue depth of 50 adds up to 100 seconds of queuing latency for the last request. This is too long. The user will assume failure and retry. A queue depth of 10 adds up to 20 seconds, which is still too long. A queue depth of 2 to 3 adds up to 6 seconds, which is acceptable. The rule is: maximum queue depth times average request latency should not exceed 10 to 15 seconds.
+
+Queuing works well for short bursts. If traffic spikes to 2x capacity for 3 minutes, the queue absorbs the excess traffic, latency increases to 6 seconds, then the spike ends and the queue drains. If traffic spikes to 5x capacity for 20 minutes, the queue fills immediately, requests are rejected, and queuing does not help. Queuing is a buffer, not a solution for sustained overload.
+
+The queue must be visible to users. If a request is queued for 8 seconds, the user should know. A status message that says "High demand, estimated wait 10 seconds" keeps users engaged. Silence for 8 seconds causes users to refresh, creating duplicate requests and making the burst worse. Transparency prevents retries.
+
+## Request Shedding: Rejecting Excess to Protect Existing Users
+
+Request shedding is the practice of rejecting new requests when capacity is exceeded, in order to protect the quality of service for in-flight requests. It sounds harsh, but it is often the best choice during sustained overload.
+
+The principle is: it is better to reject 30 percent of requests cleanly with HTTP 429 than to accept 100 percent of requests and deliver 40-second response times to everyone. The 70 percent who are served receive normal latency. The 30 percent who are rejected receive an immediate error and can retry later. If you accept everyone, all users receive degraded service, and some requests time out anyway after consuming resources.
+
+Request shedding must be priority-aware. Reject low-priority requests before high-priority requests. Free-tier users are rejected before paid users. Anonymous users are rejected before authenticated users. Retry attempts are rejected before first attempts. The implementation requires tagging every request with priority metadata at ingress. The gateway checks load and rejects requests below the priority threshold.
+
+The rejection response must be actionable. HTTP 429 with a Retry-After header tells the client to retry in 30 seconds. The client backs off and retries later. HTTP 503 without a Retry-After header creates ambiguity. The client does not know whether to retry immediately, retry later, or give up. Always include Retry-After.
+
+Shedding rate is a critical metric. If you are shedding 5 percent of requests, the burst is manageable. If you are shedding 40 percent of requests, you are severely under-provisioned. Shedding rate above 10 percent should trigger an alert. Shedding rate above 25 percent should page someone. The alert gives you time to add capacity before user impact becomes severe.
+
+## Quality Degradation: Smaller Models for Burst Traffic
+
+Quality degradation routes burst traffic to a smaller, faster model to increase effective capacity. If your primary model is GPT-5 and burst traffic exceeds capacity, route overflow traffic to GPT-5-mini. The smaller model is 2x faster and costs half as much, effectively quadrupling burst capacity.
+
+This strategy works when the quality gap between models is acceptable for a short time window. Users tolerate slightly worse responses during a known spike better than they tolerate 30-second latency or rejected requests. The degradation must be temporary. If burst traffic lasts 10 minutes, quality degradation is fine. If burst traffic lasts 6 hours, quality degradation is a long-term problem.
+
+The routing decision must be transparent. A message like "Due to high demand, responses may be shorter than usual" sets expectations. If you silently route to a worse model, users notice the quality drop and assume the product has degraded permanently.
+
+Implementation requires two model pools: a primary pool with the high-quality model, and a secondary pool with the fast model. The gateway checks load on the primary pool. If load exceeds 85 percent, new requests are routed to the secondary pool. When load drops below 70 percent, routing returns to normal. The hysteresis prevents oscillation.
+
+## Pre-Scaling for Predicted Bursts: Calendar and Event-Driven Scaling
+
+For predictable bursts, the best strategy is pre-scaling. Scale up capacity before the burst arrives, then scale down after the burst ends.
+
+Calendar-based scaling is appropriate for time-of-day patterns. If traffic spikes every weekday from 9am to 5pm, scale up at 8:45am and scale down at 5:15pm. The scaling happens automatically via cron job or Kubernetes CronJob. You pay for extra capacity only during the 8-hour peak window, not all day. This reduces cost by 60 percent compared to provisioning for peak 24/7.
+
+Event-driven scaling is appropriate for known events. If your marketing team schedules a campaign launch, create a scaling event: add 10 replicas at 2pm on Tuesday, remove them at 6pm. The scaling is manual but scheduled. Engineering and marketing coordinate in advance. The capacity is ready before traffic arrives.
+
+The challenge with pre-scaling is prediction accuracy. If you pre-scale for 3x traffic and the burst is 8x traffic, you still experience degradation. If you pre-scale for 8x traffic and the burst is 3x traffic, you waste money. The solution is to combine pre-scaling with reactive strategies. Pre-scale for expected load, use queuing or quality degradation for unexpected excess.
+
+Pre-scaling requires a manual API or runbook. The on-call engineer should be able to add 20 GPUs in under 2 minutes via a script or command. If adding capacity requires filing a ticket and waiting for approval, it is too slow. Burst response is measured in minutes, not hours.
+
+## Burst Budget: Defining Acceptable Degradation
+
+Every system should have a documented burst budget: the maximum degradation you accept during burst traffic. The budget defines your trade-offs in advance, so decisions are not made under pressure during an incident.
+
+Maximum queue depth defines how much latency increase you tolerate. A maximum queue depth of 5 requests per replica means you accept P95 latency increasing from 2 seconds to 12 seconds. A maximum queue depth of 50 requests means you accept P95 latency increasing to 100 seconds. The first is acceptable for most users. The second causes retries and cascading failures.
+
+Maximum latency increase defines when to switch strategies. If your normal P95 is 2 seconds and your acceptable maximum is 8 seconds, once P95 hits 8 seconds, you stop queuing and start shedding or degrading quality. The latency threshold is a circuit breaker. Once crossed, you shift to a more aggressive strategy.
+
+Maximum quality degradation defines which models you will route to. You might accept routing to a model that is 20 percent faster and 10 percent lower quality, but not routing to a model that is 50 percent faster and 40 percent lower quality. The quality threshold depends on your product. A creative writing tool cannot tolerate significant quality degradation. A customer support chatbot can.
+
+Maximum shedding rate defines when to escalate. If you are rejecting 15 percent of requests, the situation is under control. If you are rejecting 50 percent, the situation is critical. Shedding above 30 percent should page the infrastructure lead and start the emergency capacity procurement process.
+
+The burst budget is reviewed quarterly and updated as the product evolves. What was acceptable degradation in year one might be unacceptable in year three as user expectations increase.
+
+## Recovery from Bursts: Queue Draining and Gradual Scale-Down
+
+When the burst ends, the system must return to normal carefully. The instinct is to scale down immediately to save cost. The danger is that the queue is still full, and scaling down too fast causes a second outage.
+
+Queue draining is the first step. Let the queue process all in-flight requests before scaling down. If you have 500 requests in the queue and you scale down from 20 replicas to 5 replicas while the queue is full, the remaining 5 replicas are instantly overloaded and might crash. Wait until the queue depth drops to near zero, then scale down.
+
+Gradual scale-down prevents oscillation. If traffic drops from 10,000 requests per minute to 3,000 requests per minute, do not scale from 20 replicas to 5 replicas in one step. Scale to 15 replicas, wait 5 minutes, scale to 10 replicas, wait 5 minutes, scale to 5 replicas. Gradual scaling gives you time to detect if the burst is truly over or if traffic is about to spike again.
+
+Quality restoration must be verified. If you degraded to a smaller model during the burst, switching back to the primary model increases load per request. Verify that the primary model pool can handle current traffic before routing everything back. Route 20 percent of traffic to the primary pool, check latency, route 50 percent, check again, route 100 percent.
+
+Post-burst review is mandatory. Every burst that caused degradation should trigger a post-incident review. What was the traffic pattern? What was the root cause of the burst? What degraded first? What worked well? What should change? The review produces action items: increase capacity, improve monitoring, update the burst budget, or change the architecture.
+
+## Observability During Bursts: Real-Time Dashboards and Alerts
+
+During a burst, the on-call engineer needs real-time visibility into what is happening. Dashboards that update every 5 minutes are too slow. Dashboards must update every 10 to 30 seconds.
+
+The traffic dashboard shows requests per minute, broken down by status code. You need to see successful requests, queued requests, rejected requests, and timed-out requests in real time. If requests per minute spikes from 800 to 12,000, you know a burst is happening. If successful requests stay at 800 and rejected requests climb to 11,200, you know the system is shedding load.
+
+The latency dashboard shows P50, P95, and P99 latency in real time. If P95 latency increases from 2 seconds to 9 seconds, you know queues are filling. If P99 latency hits 30 seconds, you know requests are timing out. The latency trend tells you whether the situation is improving or degrading.
+
+The utilization dashboard shows GPU utilization, memory usage, and queue depth per replica. If utilization spikes from 60 percent to 98 percent across all replicas, you are at capacity. If memory usage approaches the limit, you are at risk of out-of-memory crashes. If queue depth exceeds 10 per replica, you are queuing aggressively and latency is increasing.
+
+Alerts must fire at the right thresholds. An alert that fires when utilization exceeds 90 percent gives you 5 to 10 minutes to respond before hitting 100 percent. An alert that fires when utilization exceeds 98 percent gives you 30 seconds. The former is actionable. The latter is noise. Alerts should fire early enough to act, but not so early that you page someone for normal traffic variance.
+
+Shedding rate is the most important burst metric. If shedding rate exceeds 10 percent, create a warning alert. If shedding rate exceeds 25 percent, page the on-call engineer. If shedding rate exceeds 50 percent, page the infrastructure lead and the VP of Engineering. Shedding at 50 percent means half your users cannot use the product. This is a severity-1 incident.
+
+Burst handling is not about preventing spikes. It is about surviving them. The system that survives a 10x spike without degradation is over-provisioned and wasting money. The system that survives a 10x spike with controlled degradation is well-designed. The system that collapses during a 3x spike is under-designed. The goal is not perfect availability. The goal is predictable, controlled degradation that protects the user experience and gives you time to respond.
+

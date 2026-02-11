@@ -1,0 +1,104 @@
+# 4.6 — Burst Handling and Token Bucket Algorithms
+
+Users do not send traffic evenly. They send nothing for an hour, then send 50 requests in 10 seconds, then go quiet again. If your rate limiter rejects burst traffic, you frustrate legitimate users who just happen to work in bursts. If your rate limiter allows unlimited bursts, a single user can saturate your infrastructure in seconds. The solution is token bucket algorithms, which allow controlled bursting up to a capacity limit while enforcing long-term rate limits. They let users consume resources faster than the sustained rate for short periods, then throttle them back to the sustained rate once the burst capacity is exhausted.
+
+Token bucket is the industry-standard algorithm for this problem. It is used in network traffic shaping, API rate limiting, and cloud resource quotas. Every major API platform uses some variant of token bucket. Understanding it deeply is not optional for production AI systems.
+
+## The Burst Problem
+
+Human usage patterns are bursty. A developer runs a batch evaluation job that sends 200 requests in 30 seconds. A user opens your application and triggers five parallel requests immediately. A scheduled task fires at the top of the hour and sends a spike of load. These bursts are not abuse. They are normal usage.
+
+A naive rate limiter might enforce a strict per-second limit: 10 requests per second. If a user sends 11 requests in one second, the 11th is rejected, even if the user sent nothing in the previous 59 seconds. This is frustrating and wasteful. The user has capacity available, but the rate limiter prevents them from using it because the requests arrived in the wrong temporal distribution.
+
+The opposite extreme is no burst control. Allow users to send unlimited requests as long as they average 10 requests per second over some long window. This enables an attack: send 1,000 requests in the first second, exhaust the backend, then stay quiet for the next 99 seconds. The average rate is 10 per second, but you caused a denial-of-service spike. Burst capacity must be limited.
+
+The token bucket algorithm solves this by decoupling short-term burst capacity from long-term sustained rate. The user has a bucket that holds tokens. Tokens are added to the bucket at a fixed rate. Each request consumes tokens. If the bucket has enough tokens, the request proceeds. If not, the request is delayed or rejected. The bucket size determines maximum burst. The refill rate determines sustained throughput.
+
+## Token Bucket Mechanics
+
+Imagine a physical bucket that holds tokens. The bucket has a maximum capacity, say 100 tokens. Tokens are added to the bucket at a rate of 10 tokens per second. When a request arrives, it consumes 1 token. If the bucket has at least 1 token, the request proceeds and the token is removed. If the bucket is empty, the request is rejected or queued.
+
+If the user sends no requests for 10 seconds, the bucket fills to capacity: 100 tokens. Now the user can send a burst of 100 requests instantly. All 100 requests succeed because the bucket had enough tokens. After the burst, the bucket is empty. The user is now limited to the refill rate: 10 requests per second. If the user sends 15 requests per second, only 10 succeed and 5 are rejected. The user stays in this rate-limited state until their request rate drops below the refill rate, allowing the bucket to accumulate tokens again.
+
+This model allows legitimate bursts while preventing sustained overuse. A user who sends 100 requests once per hour is never rate limited. A user who sends 100 requests per minute is rate limited most of the time. The algorithm distinguishes between bursty-but-reasonable usage and sustained-high-usage abuse.
+
+## Token Bucket Parameters
+
+Three parameters control token bucket behavior: bucket capacity, refill rate, and token cost per request. Bucket capacity determines maximum burst size. Refill rate determines sustained throughput. Token cost determines request granularity.
+
+Bucket capacity is the maximum number of tokens the bucket can hold. A bucket with capacity 100,000 allows a burst of up to 100,000 tokens before rate limiting kicks in. Larger buckets allow larger bursts. Smaller buckets enforce tighter burst control. For AI inference, bucket capacity is typically set based on token count rather than request count, because requests vary wildly in cost. A 10,000-token capacity allows one large request or many small requests.
+
+Refill rate is the rate at which tokens are added back to the bucket. A refill rate of 10,000 tokens per minute means the user can sustain 10,000 tokens per minute indefinitely. This is the long-term rate limit. Users who consume tokens faster than the refill rate will eventually exhaust their bucket and be throttled. Users who consume tokens slower than the refill rate will accumulate tokens up to capacity.
+
+Token cost per request is the number of tokens consumed by a single request. For simple rate limiting, each request costs 1 token. For token-based rate limiting, each request costs the number of input plus output tokens. For cost-based rate limiting, each request costs a dollar amount converted to token equivalents. Variable token costs allow you to rate limit based on actual resource consumption rather than request count.
+
+A typical configuration for a free-tier user might be: bucket capacity 100,000 tokens, refill rate 10,000 tokens per minute, cost per request is actual token count. This user can burst up to 100,000 tokens immediately, then sustain 10,000 tokens per minute. If the user sends a 50,000-token request, they consume half their burst capacity and can send another 50,000 tokens before rate limiting. If they then sustain 15,000 tokens per minute, they are consuming faster than refill rate, so their bucket drains at 5,000 tokens per minute until empty, at which point they are hard rate limited to 10,000 tokens per minute.
+
+## Leaky Bucket Alternative
+
+The leaky bucket algorithm is a close relative. Imagine a bucket with a hole in the bottom that leaks tokens at a fixed rate. Incoming requests add tokens to the bucket. If the bucket overflows, requests are rejected. The leak rate determines the sustained rate limit. The bucket capacity determines the burst tolerance.
+
+The key difference from token bucket is that leaky bucket smooths traffic. Bursts are not served immediately. They are queued and served at the leak rate. Token bucket allows bursts to proceed instantly as long as capacity exists. Leaky bucket forces all traffic to conform to the leak rate, even if capacity is available.
+
+When should you use leaky bucket instead of token bucket? When you need strict traffic shaping. Token bucket optimizes for user experience: serve bursts immediately if possible. Leaky bucket optimizes for backend stability: never allow bursts to reach the backend. If your backend cannot handle bursts at all, leaky bucket is appropriate. If your backend can handle bursts but you want to limit their size, token bucket is better.
+
+Most production API systems use token bucket because users prefer immediate burst responses over queued smooth delivery. The exception is systems where bursts cause cascading failures. If a burst of 1,000 requests in one second crashes your database, leaky bucket prevents the burst from ever reaching the database by queueing requests and releasing them at a safe rate.
+
+## Sliding Window Algorithms
+
+A third approach is sliding window rate limiting. Instead of maintaining a token bucket, maintain a count of requests in the last N seconds. If a new request would exceed the limit, reject it. This is conceptually simpler than token bucket and provides more predictable behavior for users.
+
+For example, a limit of 100 requests per minute is enforced by counting the number of requests in the last 60 seconds. If the count is 99 and a new request arrives, it is allowed and the count becomes 100. If the count is 100, the new request is rejected with a message indicating when the oldest request will age out of the window. The user knows exactly when they can retry.
+
+Sliding window is easier to reason about than token bucket. The user can calculate their exact remaining quota by looking at their recent request history. Token bucket requires understanding token accumulation and consumption, which is less intuitive. Sliding window also provides tighter rate enforcement: you cannot burst beyond the limit even if you saved up tokens.
+
+The downside of sliding window is memory usage. You must store the timestamp of every request in the window, which can be expensive for high-rate users. Token bucket requires only two numbers: current token count and last refill timestamp. Sliding window requires a list of timestamps. For high-volume users, this list can grow to thousands of entries.
+
+A hybrid approach is sliding window counters, which divide the window into fixed buckets and count requests per bucket. A 60-second window with 6 buckets of 10 seconds each requires storing only 6 counters. This reduces memory usage while approximating sliding window behavior. The trade-off is less precision: a user who sends 100 requests in the last 2 seconds of one bucket and the first 2 seconds of the next bucket is not rate limited because the requests span two buckets.
+
+## Implementation Considerations
+
+Token bucket must be implemented with atomic operations. Multiple requests from the same user can arrive concurrently. If token consumption is not atomic, two requests can both see sufficient tokens, both consume tokens, and the bucket can go negative. This is a race condition that enables users to bypass rate limits.
+
+The atomic operation required is check-and-decrement: read current token count, verify sufficient tokens exist, decrement token count, all in one atomic transaction. Redis provides this with Lua scripts or with the INCRBY command used carefully. Relational databases provide this with SELECT FOR UPDATE or optimistic locking. In-memory rate limiters provide this with mutexes or lock-free atomics.
+
+Distributed rate limiting requires shared state. If you have 10 gateway instances, they must all decrement the same token bucket. If each gateway maintains its own local bucket, the user has 10 times the rate limit. Shared state is typically stored in Redis, which provides atomic operations, high throughput, and expiration semantics. Each user's bucket state is a Redis key with a TTL that resets the bucket periodically.
+
+Local caching improves performance at the cost of slight inaccuracy. Each gateway maintains a local cache of token counts and only synchronizes with Redis periodically. This reduces Redis load by 10-100x but allows users to slightly exceed rate limits during the synchronization interval. The trade-off is acceptable for most use cases: a 1% rate limit overage is better than 10-millisecond latency added to every request.
+
+## Multi-Level Token Buckets
+
+Real systems use multiple token buckets at different timescales. A user might have a per-minute bucket for burst control, a per-hour bucket for sustained usage, and a per-day bucket for quota enforcement. All three buckets must have sufficient tokens for a request to proceed. This provides fine-grained control over both short-term and long-term usage.
+
+The per-minute bucket prevents second-to-second bursts. Capacity: 100,000 tokens. Refill rate: 10,000 tokens per minute. This allows a burst of 100,000 tokens but limits sustained rate to 10,000 per minute.
+
+The per-hour bucket prevents hour-to-hour bursts. Capacity: 500,000 tokens. Refill rate: 500,000 tokens per hour. This allows up to 500,000 tokens in an hour but prevents sustained usage above that rate.
+
+The per-day bucket enforces quota. Capacity: 10,000,000 tokens. Refill rate: 10,000,000 tokens per day. This is the hard limit. A user who exhausts their daily quota cannot proceed until the next day.
+
+Each layer is checked independently. A request that would pass the per-minute bucket but fail the per-hour bucket is rejected. A request that would pass both but fail the per-day bucket is rejected. This multi-level enforcement prevents gaming: a user cannot send 10 million tokens in one hour by sending 166,000 tokens per minute, because the per-hour bucket caps them at 500,000.
+
+## Bucket Configuration Tuning
+
+Setting bucket parameters is an art. Buckets that are too small frustrate legitimate users. Buckets that are too large enable abuse. The right balance is learned through observation and iteration.
+
+Start with generous buckets. You can always tighten limits, but loosening limits after users have adapted to tight limits causes confusion. Monitor actual usage patterns. What does the P50, P90, and P99 user's burst size look like? Set the bucket capacity at the P95 burst size. This ensures 95% of users are never rate limited on bursts, while the top 5% of bursty users hit limits.
+
+Monitor rate limit rejection rates. If 10% of requests are rejected due to rate limits, your limits are too tight. If 0.01% of requests are rejected, your limits are too loose and not preventing abuse. A healthy system rejects 0.1-1% of requests, mostly from abusive or misconfigured clients.
+
+Adjust refill rates based on infrastructure capacity and cost targets. If your infrastructure can handle 1 million tokens per minute and you have 100 free-tier users, you might set refill rate to 10,000 tokens per minute per user, allowing 100 users to max out your capacity simultaneously. If you have 10,000 free-tier users, you might set refill rate to 100 tokens per minute, betting that not all users will max out simultaneously.
+
+Bucket tuning is also a monetization tool. The gap between free-tier bucket capacity and paid-tier bucket capacity is the upgrade incentive. If free tier has 100,000 token capacity and paid tier has 10 million token capacity, users who need to send large batch jobs will upgrade. If the gap is too small, upgrade incentive disappears. If the gap is too large, free tier is useless and users cannot evaluate the product.
+
+## The Operational Reality
+
+Token bucket algorithms are standard infrastructure for production API systems. They are not negotiable. Without them, you either frustrate legitimate users with overly strict rate limits or enable abusive users with overly permissive limits. Token bucket gives you both: accommodate legitimate bursts and enforce long-term quotas.
+
+The implementation complexity is moderate. Token bucket logic itself is 50 lines of code. The hard part is distributed state management, atomic operations, and cache synchronization. Most teams use an off-the-shelf rate limiting library or service rather than building from scratch. Redis-based rate limiting is well-trodden ground with mature libraries in every language.
+
+The monitoring requirement is critical. You must track bucket fill levels, rate limit rejection rates, and user burst patterns. If users are constantly hitting rate limits, your buckets are too small. If users never hit rate limits, your buckets are too large or your platform is not being used. The ideal state is that a small percentage of users occasionally hit rate limits during unusual bursts.
+
+What happens when you skip token buckets and use fixed per-second rate limits? Your users send 100 requests in one second, 99 of them are rejected, your error logs fill with rate limit rejections, users complain about flaky API, support tickets flood in, and you eventually implement token bucket anyway. Or you set per-second limits so high that no one hits them, and then a single abusive user sends 10,000 requests per second and crashes your backend. Token bucket is not optional. It is how you balance user experience with infrastructure protection.
+
+The next problem is handling streaming responses. Token bucket works for request-response, but when the model is generating tokens continuously over seconds or minutes, you need real-time monitoring and the ability to stop generation mid-stream when limits are hit. That requires streaming-specific rate limiting patterns.
+

@@ -1,0 +1,108 @@
+# 3.2 — Auto-Scaling Strategies for LLM Inference
+
+Standard Kubernetes Horizontal Pod Autoscaler configurations will not save you. They will fail silently, scale at the wrong times, and leave your GPU pods idle while requests queue. This is not a configuration problem. This is a fundamental mismatch between what HPA measures and what LLM workloads need.
+
+The infrastructure exists to scale LLMs correctly. It requires custom metrics, external adapters, and policies designed for token-level workloads. The teams that implement these strategies scale smoothly from 100 requests per minute to 100,000 requests per minute without manual intervention. The teams that rely on default HPA configurations never make it past the first traffic spike.
+
+## Why Standard HPA Fails for LLM Workloads
+
+The default Kubernetes HPA watches three metrics: CPU utilization, memory utilization, and request rate. None of these metrics reflect the actual constraints of LLM inference.
+
+CPU utilization for an LLM serving pod is typically 10-20% even under full load. The CPU's job is to handle HTTP requests and move data between CPU memory and GPU memory. The actual inference computation happens on the GPU. A pod running at maximum GPU capacity shows minimal CPU usage. An HPA rule that scales when CPU exceeds 70% will never trigger. The system queues requests indefinitely, users see timeouts, and the auto-scaler reports that everything is fine because CPU usage is low.
+
+Memory utilization is static. Loading a Claude Opus 4.5 model into GPU memory consumes a fixed amount of memory determined by model size and precision. That memory is allocated at pod startup and does not change based on request load. Whether the pod is processing zero requests or one hundred requests, memory utilization is the same. Scaling based on memory tells you when the model is loaded. It tells you nothing about capacity utilization.
+
+Request rate HPA scales based on requests per second. This is better than CPU or memory, but it still assumes all requests are equal. If your traffic shifts from short classification requests to long summarization requests, the request rate might drop by 50% while token load increases by 300%. The auto-scaler sees declining request rate and scales down. Latency explodes. Users abandon sessions. The metric you optimized for moved in the wrong direction relative to actual load.
+
+The failure is not the HPA mechanism. The failure is the metrics. Standard metrics were designed for CPU-bound, stateless HTTP services. LLMs are GPU-bound, stateful token generators. You need different metrics.
+
+## Custom Metrics for LLM Auto-Scaling
+
+The metrics that reflect LLM capacity are queue depth, time to first token, tokens in queue, and GPU utilization. These are not available in standard Kubernetes metrics. You must expose them from your serving layer and configure HPA to use them.
+
+**Queue depth** is the number of requests waiting for an available slot in the inference batch. If queue depth is consistently above zero, you need more capacity. If it grows over time, you are falling behind demand. If it shrinks to zero, you have excess capacity. Queue depth is the most direct measure of whether supply matches demand.
+
+Most serving frameworks—vLLM, TGI, TensorRT-LLM—expose queue depth as a metric. You need to surface it to Prometheus and configure HPA to scale based on it. A typical rule: scale up if queue depth exceeds 10 requests per replica. Scale down if queue depth is zero for five consecutive minutes.
+
+**Time to first token (TTFT)** measures user-perceived latency. This is the time from when a request arrives to when the first token is generated. TTFT above 2 seconds feels sluggish to users. TTFT above 5 seconds feels broken. If TTFT is creeping upward, you are approaching capacity limits. If it spikes, you have exceeded capacity.
+
+TTFT is harder to use as a scaling metric because it lags behind the problem. By the time TTFT degrades, users are already experiencing poor performance. It works better as an alert trigger than a scaling trigger. Scale based on queue depth. Alert based on TTFT.
+
+**Tokens in queue** is a more sophisticated metric than queue depth. Instead of counting requests, estimate the total tokens waiting to be processed. A queue with ten requests might represent 1,000 tokens or 100,000 tokens. Tokens in queue reflects actual work, not just request count.
+
+Calculating tokens in queue requires knowing input token count for each queued request and estimating output token count. Input tokens are known at request time. Output tokens require estimation based on request type, user behavior, or max token limits. The estimate does not need to be perfect. An approximate token count is far better than ignoring token variance entirely.
+
+**GPU utilization** measures how much of the GPU's compute capacity is being used. This metric is available from nvidia-smi or DCGM (Data Center GPU Manager). High GPU utilization means the system is working at capacity. Low GPU utilization means there is headroom.
+
+GPU utilization is a trailing metric. It tells you what happened, not what is about to happen. It is useful for setting scale-down thresholds. If GPU utilization is below 40% for ten minutes, you can safely remove a replica. But it is less useful for scaling up because by the time GPU utilization is maxed out, queue depth has already grown and latency has already degraded.
+
+The best auto-scaling strategies combine multiple metrics. Scale up based on queue depth. Scale down based on GPU utilization and queue depth. Alert based on TTFT.
+
+## Implementing Custom HPA with Prometheus
+
+Kubernetes HPA supports custom metrics via the External Metrics API. You expose metrics from your serving layer to Prometheus, deploy a Prometheus Adapter that surfaces those metrics to Kubernetes, and configure HPA to use them.
+
+The serving layer must export queue depth and other relevant metrics in Prometheus format. vLLM, for example, exposes a `/metrics` endpoint with per-replica queue depth, active requests, and token throughput. Prometheus scrapes this endpoint every 15 seconds. The metrics are stored in Prometheus and available for querying.
+
+The Prometheus Adapter translates Prometheus queries into Kubernetes External Metrics. You configure the adapter with a query like `avg(vllm_queue_depth)` and map it to a Kubernetes metric called `queue_depth`. HPA can now scale based on `queue_depth` as if it were a built-in metric like CPU.
+
+The HPA configuration specifies the target value for each metric. For example: maintain average queue depth below 5 requests per replica. When queue depth exceeds 5, HPA adds replicas. When it drops below 5, HPA removes replicas. The scaling is gradual—Kubernetes does not double capacity instantly. It adds replicas based on the formula: desired replicas equals current replicas times current metric value divided by target metric value.
+
+This approach requires operational maturity. You must run Prometheus. You must deploy and configure the Prometheus Adapter. You must ensure metrics are reliably scraped and available. For teams already running Prometheus for observability, this is a natural extension. For teams without Prometheus, it is a significant infrastructure lift.
+
+## KEDA for Event-Driven Auto-Scaling
+
+KEDA—Kubernetes Event-Driven Autoscaling—is an alternative to custom HPA that simplifies scaling based on external metrics. KEDA supports queue-based scaling, custom metrics, and scale-to-zero behavior out of the box.
+
+KEDA works by deploying a controller that watches external metrics and adjusts Kubernetes Deployments or StatefulSets accordingly. You define a ScaledObject that specifies the metric to watch and the scaling thresholds. KEDA handles the rest.
+
+For LLM inference, the most useful KEDA scaler is the Prometheus scaler. You configure it to watch a Prometheus metric—like `vllm_queue_depth`—and scale when that metric exceeds a threshold. The configuration is simpler than custom HPA because KEDA handles the External Metrics API plumbing for you.
+
+KEDA also supports scale-to-zero, which HPA does not. If queue depth is zero for a specified period, KEDA scales the deployment to zero replicas. When a request arrives, KEDA scales back up. This is useful for batch workloads or low-traffic environments where running idle GPU pods wastes money. For high-traffic production deployments, scale-to-zero introduces cold start latency and is usually disabled.
+
+KEDA's advantage is simplicity. The disadvantage is that it is one more component in your stack. For teams already using KEDA for event-driven workloads, adding LLM scaling is trivial. For teams without KEDA, the decision is whether the operational overhead is worth the simplified configuration.
+
+## Scaling Thresholds and Hysteresis
+
+Auto-scaling policies must define when to scale up and when to scale down. The thresholds are not symmetric. You scale up aggressively to avoid latency spikes. You scale down conservatively to avoid thrashing.
+
+A typical scale-up policy: add replicas when average queue depth exceeds 10 requests per replica for two consecutive minutes. The two-minute window prevents scaling on transient spikes. The threshold of 10 requests balances responsiveness with stability. Lower thresholds scale more aggressively but increase cost. Higher thresholds reduce cost but allow longer queue times.
+
+A typical scale-down policy: remove replicas when average queue depth is below 2 requests per replica for ten consecutive minutes and GPU utilization is below 40%. The longer window and additional GPU condition prevent premature scale-down. Scaling down is riskier than scaling up because removing capacity during a latent traffic increase causes immediate latency problems.
+
+**Hysteresis**—the delay between scaling actions—prevents flapping. If traffic oscillates around a threshold, the system could scale up and down repeatedly. Each scaling action takes minutes. Pods start, load models, become ready, then get terminated. This burns money and destabilizes the system. Hysteresis adds a cooldown period. After scaling up, wait five minutes before allowing another scale-up. After scaling down, wait ten minutes before allowing another scale-down.
+
+The thresholds depend on your latency requirements and cost tolerance. A real-time customer support chatbot might scale up at queue depth of 5 to keep TTFT under 1 second. A batch document analysis pipeline might scale up at queue depth of 50 because latency is less critical.
+
+## Predictive Scaling for Known Traffic Patterns
+
+Reactive auto-scaling responds to load after it appears. Predictive scaling adds capacity before load arrives. This eliminates the delay between traffic increase and capacity increase.
+
+Predictive scaling works when traffic follows patterns. If your application sees a spike every weekday at 9am, you can pre-scale at 8:50am. If traffic doubles every Monday, you can increase minimum replicas on Monday mornings.
+
+The simplest form is calendar-based scaling. Kubernetes CronJobs adjust HPA min/max replicas on a schedule. On weekdays from 8am to 6pm, set minimum replicas to 10. On nights and weekends, set minimum replicas to 2. This reduces cost during low-traffic periods without risking latency during high-traffic periods.
+
+More sophisticated predictive scaling uses historical data to forecast demand. Machine learning models analyze past traffic and predict future load. When predicted load exceeds capacity, the system pre-scales. This is complex and requires significant investment in traffic modeling. Few teams do it. For most workloads, calendar-based scaling captures 80% of the benefit with 5% of the complexity.
+
+## Cold Start Considerations
+
+Scaling up an LLM serving pod is not instant. The pod must start, download the model from object storage or pull it from a cached volume, load the model into GPU memory, and become ready. This process takes 3-10 minutes depending on model size and infrastructure.
+
+During cold start, requests queue. If traffic spikes and triggers scale-up, users experience degraded latency for the entire cold start window. By the time new capacity is ready, the traffic spike might be over.
+
+The mitigation is to maintain a minimum number of replicas. Instead of scaling to zero during low traffic, scale to a floor that handles baseline load. If your baseline is 50 requests per minute and each replica handles 20 requests per minute, maintain a minimum of 3 replicas. This costs money—running idle GPU pods is expensive—but eliminates cold start latency.
+
+An alternative is warm pools. Keep a small number of replicas running with models pre-loaded but not actively serving traffic. When scale-up triggers, route traffic to the warm pool immediately while new replicas start. This reduces cold start latency from minutes to seconds. The trade-off is operational complexity—managing separate warm and active pools—and cost, since warm pools consume resources without serving load.
+
+## Scaling Limits and Cost Caps
+
+Auto-scaling without limits is a financial risk. A traffic spike or a DDoS attack could scale your deployment to hundreds of replicas, costing thousands of dollars per hour.
+
+Set a maximum replica count in your HPA configuration. This is your cost cap. If scaling hits the maximum, new requests queue or are rejected, but your bill does not explode. The maximum should be high enough to handle realistic traffic spikes but low enough to prevent runaway costs.
+
+In April 2025, an e-commerce company's LLM-powered search feature was hit by bot traffic. The auto-scaler added replicas until it hit the cloud provider's GPU quota. The bill for that day was $47,000. The maximum replica count was set to 200. If it had been set to 50, the bill would have been $12,000 and the legitimate user traffic would have experienced the same performance—the excess capacity was serving bots, not users.
+
+You also need rate limits on scaling frequency. Do not allow the system to add more than 10 replicas per minute. Rapid scaling destabilizes the load balancer and triggers cloud provider rate limits. Gradual scaling is safer.
+
+The combination—maximum replicas, scaling rate limits, and hysteresis—prevents auto-scaling from becoming a financial or operational disaster. The cost is that capacity is bounded. If traffic exceeds your maximum replicas, performance degrades. That is the correct trade-off. Degraded performance during an extraordinary event is better than an extraordinary bill.
+

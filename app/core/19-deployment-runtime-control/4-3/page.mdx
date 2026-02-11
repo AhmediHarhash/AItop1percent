@@ -1,0 +1,89 @@
+# 4.3 — Token Metering as Infrastructure: Real-Time Budget Enforcement
+
+Token metering is not a feature you add to your API. It is foundational infrastructure that every other component depends on. Your gateway depends on it to decide whether to admit a request. Your routing layer depends on it to choose between expensive and cheap models. Your billing system depends on it to generate invoices. Your observability stack depends on it to track usage patterns. Your finance team depends on it to forecast costs. If token metering is wrong, inaccurate, slow, or unavailable, everything downstream breaks. You cannot treat it as an afterthought.
+
+Token metering has four requirements that are individually hard and collectively brutal. First, it must be real-time. You need the token count during the request, not after. You must decide whether to admit the request before you send it to the model. If you wait until after, you have already consumed resources and incurred cost. Second, it must be accurate. The token count you use for quota enforcement must match the token count you use for billing. If these diverge, users will notice and lose trust. Third, it must be highly available. If token metering goes down, you cannot admit requests. Your API is effectively offline. Fourth, it must be fast. Every request pays the latency cost of checking quotas. If token metering adds 200 milliseconds to every request, your user experience degrades.
+
+These four requirements conflict. Real-time and accurate conflict because the output token count is unknown until generation completes. Highly available and accurate conflict because distributed systems trade consistency for availability. Fast and accurate conflict because validation takes time. You cannot fully satisfy all four. You must choose which trade-offs to accept.
+
+## Architecture Patterns: Centralized, Distributed, or Hybrid
+
+The simplest architecture is a **centralized counter**. You run a single Redis instance. Every request checks its quota against this Redis instance. You increment the counter atomically. You set a TTL so the counter resets automatically. This architecture is simple to implement, simple to reason about, and simple to debug. It is also a single point of failure and a bottleneck. If Redis goes down, your API goes down. If request volume exceeds what a single Redis instance can handle, your API slows to a crawl. In 2026, a single Redis instance can handle roughly 100,000 operations per second. If every request requires two Redis operations (check quota, increment counter), you can support 50,000 requests per second. For many systems, this is sufficient. For high-scale systems, it is not.
+
+A **distributed counter** architecture scales horizontally but sacrifices strong consistency. You run multiple Redis instances or a distributed data store like Cassandra. Each request hashes to a specific instance based on user ID. You increment counters locally. This architecture removes the single point of failure and scales to millions of requests per second. But now you have eventual consistency. A user with 10,000 tokens remaining sends two requests simultaneously to two different nodes. Both nodes see 10,000 tokens remaining. Both admit the request. The user consumes 12,000 tokens. They are over quota, but the system allowed it. Distributed counters work well when occasional small overages are acceptable. They work poorly when strict enforcement is required.
+
+A **hybrid architecture** combines local estimation with periodic synchronization. Each API node maintains a local counter for each user. The node checks the local counter for every request, which is fast. Every ten seconds, the node synchronizes its local counts with the central store. If the central store reports that a user is near their limit, the node begins rejecting requests. This architecture is fast, scales well, and provides eventual consistency with bounds. The overage is limited to ten seconds of usage. For most systems, this is acceptable. The complexity is higher. You must handle local counter expiration, synchronization failures, and clock skew.
+
+Most production systems in 2026 use the hybrid architecture for token metering. The latency requirement is too strict for centralized counters at scale. The accuracy requirement is too strict for fully distributed counters. Hybrid wins by sacrificing perfect accuracy for good-enough accuracy with much better latency.
+
+## Implementation with Redis: Atomic Operations
+
+Redis is the most common choice for quota counters because it provides atomic operations, TTL support, and high performance. The basic operation is simple. You store a key for each user and each time window. For user ID 12345 and per-minute quota, the key is quota:12345:minute:1736697600 (Unix timestamp rounded to the minute). The value is the number of tokens consumed in that minute. Before admitting a request, you run two commands: GET the current count, check if adding the new request would exceed the limit. If not, INCR the counter by the token count of the request. If the key does not exist, you also set a TTL of 60 seconds so it expires automatically.
+
+This approach has a race condition. Between GET and INCR, another request might increment the counter. You might read 9,000 tokens consumed, decide that a 1,500-token request is within the 10,000 token limit, and INCR the counter. But another request incremented it to 9,800 between your GET and your INCR. You just brought the total to 11,300. You allowed a request that should have been rejected.
+
+The fix is to use Lua scripts for atomic check-and-increment. Redis guarantees that a Lua script executes atomically. You write a script that reads the current count, checks the limit, and increments only if the new count would be within the limit. The script returns success or failure. If success, the request is admitted. If failure, the request is rejected. The race condition is eliminated.
+
+A typical Lua script for token quota enforcement:
+
+The script accepts three arguments: the quota limit, the token cost of the current request, and the TTL for the key. It returns 1 if the request is admitted, 0 if rejected. This script runs atomically on the Redis server. No other command can interleave with it. The check-and-increment operation is safe.
+
+Most teams wrap this in a reusable function that handles multiple time windows. You call check_and_increment for the per-minute quota, the per-hour quota, and the per-day quota. All three must succeed for the request to be admitted. If any fails, you reject the request and return the most restrictive limit in the error message.
+
+## High-Availability Considerations: When Metering Fails
+
+Redis is highly available if you configure it correctly. Redis Sentinel provides automatic failover. Redis Cluster provides sharding and replication. But failures still happen. The network partitions. The Redis nodes run out of memory. A configuration error breaks replication. When Redis is unavailable, your token metering system must decide what to do.
+
+There are two failure modes: **conservative** and **permissive**. Conservative mode rejects all requests when metering is unavailable. This protects your budget and your infrastructure. You will not have a runaway cost event because token metering went down. But your API is effectively offline. Users cannot make requests. Revenue stops. Permissive mode allows all requests when metering is unavailable. This keeps your API online. Users can continue working. But you have no cost control. If metering is down for an hour and users send heavy requests, your costs spike. When metering comes back online, you discover that users exceeded their quotas. You cannot charge them retroactively if your terms of service promised quota enforcement.
+
+Most systems use conservative mode for free tiers and permissive mode for paid tiers. Free tier users have no financial relationship with you. If you allow them to exceed their quotas, you lose money and gain nothing. Conservative mode is correct. Paid tier users are paying customers. If your infrastructure failure blocks their requests, they lose trust. Permissive mode is correct as long as you track the unmetered usage and reconcile it later.
+
+A more sophisticated approach is **degraded mode**. When metering is unavailable, you fall back to request-based rate limiting with aggressive limits. You allow 10 requests per minute per user. This keeps the API usable for small-scale operations while preventing runaway usage. When metering recovers, you resume token-based limits. Degraded mode is harder to implement because you need two parallel rate limiting systems. But it balances availability and cost control better than either conservative or permissive mode alone.
+
+## Real-Time Enforcement: Reservations and Reconciliation
+
+Real-time enforcement requires making a quota decision before you know the final cost. The input token count is known. The output token count is not. You must decide whether to admit the request with incomplete information.
+
+The reservation strategy solves this by reserving the maximum possible output tokens. The user specifies max_tokens equals 2000. You reserve 2000 output tokens from their quota. You generate the response. The model generates 1,200 tokens. You refund 800 tokens. The user's quota reflects actual usage after generation completes.
+
+Reservation is simple and safe, but it penalizes users who set max_tokens high as a safety buffer. If the user sets max_tokens to 4000 but the model typically generates 1000 tokens, they pay the quota cost of 4000 tokens per request even though actual usage is 1000. This feels unfair. Users start setting max_tokens as low as possible. Responses get cut off mid-sentence. User experience degrades.
+
+The reconciliation strategy avoids this by estimating output tokens based on historical data. You track the ratio of actual output tokens to max_tokens for each user. If a user's historical ratio is 0.6, you estimate their next request will generate 0.6 times max_tokens. You reserve that amount. You generate the response. You reconcile the actual count. If the estimate was low, you charge the difference. If the estimate was high, you refund the difference. The user's quota reflects actual usage most of the time.
+
+Reconciliation is user-friendly but introduces overage risk. If the user's request generates more tokens than estimated and they do not have enough quota to cover the difference, you must choose between cutting off the response mid-generation or allowing the overage. Cutting off the response is poor UX. Allowing the overage is poor cost control. The best approach is to track overages separately and apply them to the next quota period. The user exceeded their quota by 500 tokens. You allow it this time. Next period, their effective quota is reduced by 500 tokens. They pay back the overage over time.
+
+## Budget Hierarchies: Organization, Team, User
+
+In multi-tenant systems, quotas often have hierarchies. An organization has a total quota. Teams within the organization have sub-quotas. Users within teams have individual quotas. A request consumes quota at all three levels. You must check all three before admitting the request.
+
+The simplest implementation is to check each level independently. You check the user's quota. You check the team's quota. You check the organization's quota. All three must pass. This works but is inefficient. Every request requires three quota checks. In a distributed system with thousands of users, this triples the load on your metering infrastructure.
+
+A more efficient approach is to use a tree structure. Each organization has a total quota. The sum of team quotas within the organization cannot exceed the organization quota. The sum of user quotas within a team cannot exceed the team quota. When a user makes a request, you check only the user quota. The user quota is already constrained by the team and organization quotas. You need only one check per request.
+
+The downside is that quota allocation becomes rigid. If a team has a 50 million token quota and one user consumes 30 million tokens, other users in the team are constrained even if the organization has 500 million tokens remaining. To allow flexibility, you implement **quota borrowing**. A user can borrow from their team's unallocated quota. A team can borrow from the organization's unallocated quota. Borrowing is allowed up to a maximum percentage. A user can borrow up to 150% of their base quota if the team has capacity. This adds complexity but significantly improves user experience.
+
+## Metering Accuracy: Tokenizer Alignment
+
+The token count you use for quota enforcement must match the token count the model uses. If they diverge, users notice immediately. Your system says they used 10,000 tokens. The model provider's bill says they used 12,000 tokens. Users complain. You investigate. You discover your tokenizer is different from the model's tokenizer. The counts do not match. You look incompetent.
+
+Every model family uses a different tokenizer. GPT models use tiktoken with different encodings for different model versions. Claude models use a proprietary tokenizer available via API. Llama models use SentencePiece. Gemini models use a custom tokenizer. You must use the correct tokenizer for each model. You cannot use a generic tokenizer and assume it is close enough. It is not close enough. The differences compound over millions of requests.
+
+Tokenizer alignment is especially hard when you route requests to multiple models. A user sends a request. You count tokens with the GPT-5 tokenizer and deduct from their quota. Then you route the request to Claude Opus 4.5 because GPT-5 is at capacity. Claude's tokenizer counts differently. The actual token consumption does not match the quota deduction. You must either count tokens twice (once for quota enforcement, once for billing) or standardize on one tokenizer for quotas and accept that billing reconciliation will show discrepancies.
+
+Most systems standardize on one tokenizer for quota enforcement and treat it as an approximation. They use the GPT-5 tokenizer for all requests because it is fast and widely understood. They reconcile billing monthly. If actual usage is consistently 5% higher than quota usage, they adjust quota limits downward to compensate. This is not perfect, but it is pragmatic. The alternative is maintaining parallel tokenizers for every model you support, which is an operational nightmare.
+
+## Metering Observability: Dashboards and Alerts
+
+Token metering generates vast amounts of data. Every request logs a token count. Every quota check logs a decision. You must turn this data into actionable insight or it is useless.
+
+The most important dashboard is **usage by customer**. You show total tokens consumed per customer per day for the last 30 days. You show the trend: increasing, decreasing, or stable. You show the ratio of actual usage to quota: are they using 20% of their quota or 95%? You show per-customer cost: how much did each customer cost you this month? You sort by cost descending. The top ten customers account for 60% of your total costs. You know where your money is going.
+
+The second dashboard is **quota burn rate**. For each customer, you calculate their current usage rate in tokens per hour. You project forward: at this rate, when will they hit their daily quota? If they will hit it in the next two hours, you surface an alert. The customer can upgrade proactively rather than hitting a hard limit mid-workflow.
+
+The third dashboard is **quota efficiency**. You measure how much of each customer's quota they actually use. If a customer has a 100 million token monthly quota and uses 8 million, their efficiency is 8%. They are paying for capacity they do not need. You reach out and offer to downgrade them to a cheaper tier. This seems counterintuitive — you are reducing revenue. But it builds trust. The customer appreciates that you are optimizing for their benefit. They stay longer. They refer others. Long-term value exceeds short-term revenue loss.
+
+The fourth dashboard is **metering system health**. You track Redis latency, Redis availability, tokenizer performance, and quota check duration. You alert when Redis latency exceeds 10 milliseconds. You alert when quota check duration exceeds 50 milliseconds. You alert when more than 0.1% of requests fail quota checks due to metering unavailability. These alerts catch infrastructure problems before they become user-visible outages.
+
+Token metering is infrastructure. It must be fast, accurate, available, and observable. It is not glamorous. It is not differentiating. But it is foundational. Every LLM-powered product in production in 2026 has solved this problem. The ones that solved it well have predictable costs and happy users. The ones that solved it poorly have surprise bills and confused customers. The quality of your token metering infrastructure is directly visible in your P&L.
+
+In the next subchapter, we examine per-tenant quota allocation strategies: how to decide what quotas to assign to each customer, how to enforce those quotas fairly, how to handle quota exhaustion gracefully, and how to design quota systems that grow with your customers.

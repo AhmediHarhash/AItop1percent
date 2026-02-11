@@ -1,0 +1,84 @@
+# 3.1 — Why LLM Scaling Is Different: Variable Latency and Token Economics
+
+In October 2025, a legal tech platform migrated their contract analysis service from a traditional microservice to an LLM-powered solution. They configured auto-scaling based on request rate, following the same pattern they used for their REST APIs. When traffic spiked during a client deadline, the system behaved inexplicably. CPU usage stayed below 30%. Request rate never exceeded their scaling threshold. But response times ballooned to twenty seconds, then sixty, then timeouts. Users abandoned sessions. The engineering team watched in confusion as their well-tuned auto-scaling rules did nothing while the system melted down under load that should have been trivial.
+
+The problem was not their scaling strategy. The problem was that LLM inference breaks every assumption that traditional scaling is built on.
+
+## The Fixed-Cost Assumption
+
+Traditional web services operate under a fundamental assumption: each request consumes roughly the same amount of resources. A request to retrieve a user profile hits the database, serializes some JSON, and returns. That request costs approximately the same CPU cycles and memory whether the profile belongs to a new user or a ten-year veteran. The variance is small—maybe 2x in the worst case.
+
+Auto-scaling strategies are built on this assumption. Scale up when CPU usage exceeds 70%. Scale down when it drops below 30%. Add replicas when request rate exceeds 1000 per second. Remove replicas when it falls below 500. These rules work because the underlying unit—the request—has predictable cost.
+
+LLM inference shatters this assumption. A request is no longer a unit of work. It is a container that can hold anywhere from ten tokens to a hundred thousand tokens. The work required to process that request varies not by 2x, but by 10,000x.
+
+## Variable Latency in Practice
+
+Consider three requests hitting the same LLM endpoint within one second. The first request asks the model to classify a customer email into one of five categories. Input: 80 tokens. Output: 1 token. Total processing time: 180 milliseconds. The second request asks the model to summarize a legal contract. Input: 4,500 tokens. Output: 200 tokens. Total processing time: 3.2 seconds. The third request asks the model to generate a detailed report from a long context window. Input: 32,000 tokens. Output: 2,000 tokens. Total processing time: 48 seconds.
+
+Same endpoint. Same model. Same infrastructure. Three requests that differ in cost by a factor of 266. The traditional web service equivalent would be like one HTTP request taking 20 milliseconds, another taking 5 seconds, and a third taking 90 seconds—all hitting the same endpoint, all considered equal by the load balancer.
+
+This is not an edge case. This is normal LLM traffic. Every production deployment sees this distribution. The implications cascade through every layer of the infrastructure stack.
+
+## Token Economics Replace Request Economics
+
+In traditional systems, cost scales with request count. Double the requests, double the cost. Buy capacity based on requests per second. Optimize for throughput measured in QPS—queries per second.
+
+In LLM systems, cost scales with token count. Two requests can have the same input length but wildly different output lengths. A user asks for a one-sentence summary versus a ten-paragraph analysis. Same input. 100x difference in output tokens. 100x difference in cost.
+
+The cost model is not request-based. It is token-based. One request that generates 50,000 tokens costs the same as 500 requests that generate 100 tokens each. Your infrastructure sees one request. Your GPU processes the equivalent of 500 requests. Your auto-scaling rules see low request volume and decide capacity is fine. Your users see timeouts.
+
+This inversion breaks capacity planning. You cannot estimate load based on request rate. You must estimate load based on token throughput. The problem is that token throughput is only known after the request completes. Input tokens are knowable at request time. Output tokens are not. The model generates them one at a time, and you do not know when it will stop until it emits an end token or hits a length limit.
+
+You are scaling a system where the cost of the work is unknown until the work is finished.
+
+## Why Traditional Auto-Scaling Fails
+
+CPU-based auto-scaling is the most common pattern in cloud deployments. When CPU usage exceeds a threshold, add replicas. When it drops, remove replicas. This works for CPU-bound workloads. LLM inference is not CPU-bound. It is GPU-bound.
+
+The CPU in an LLM serving pod does almost nothing. It receives requests, deserializes JSON, and passes tensors to the GPU. CPU usage hovers around 15-20% even under heavy load. An auto-scaling rule that waits for CPU to hit 70% will never trigger. The system will queue requests indefinitely while the CPU idles and the GPU maxes out.
+
+Memory-based auto-scaling is equally useless. Memory usage for LLM inference is determined by model size, not request load. A GPT-5 model loaded into GPU memory consumes the same memory whether it is processing zero requests or one hundred requests. Memory usage is a static function of the model, not a dynamic function of the load. Scaling based on memory tells you nothing about capacity.
+
+Request rate auto-scaling is better but still broken. Scale up when request rate exceeds 1000 per second. This rule assumes all requests are equal. They are not. 1000 short requests might consume 50,000 tokens total. 100 long requests might consume 5,000,000 tokens total. The second scenario requires 100x more capacity despite being one-tenth the request rate.
+
+The auto-scaling rule optimizes for the wrong metric. It scales on a proxy—request count—that no longer correlates with the underlying resource consumption.
+
+## The Queue Problem and Head-of-Line Blocking
+
+LLM serving layers use queues to manage concurrency. A replica can process N requests simultaneously, where N is determined by GPU memory and batch size. Requests beyond N wait in a queue. When a slot opens, the next request in the queue begins processing.
+
+The problem is that all requests in the queue are not equal. One request might take 200 milliseconds. Another might take 60 seconds. If the 60-second request enters the queue first, every request behind it waits 60 seconds before even starting. This is head-of-line blocking.
+
+Traditional web services do not experience this problem at this scale because request variance is small. A slow database query might take 500 milliseconds instead of 50 milliseconds—a 10x difference. Annoying, but not catastrophic. An LLM request might take 50 seconds instead of 500 milliseconds—a 100x difference. Catastrophic.
+
+The queue becomes a serialization point where one user's expensive request punishes every other user. The system has capacity—other replicas are idle or processing short requests—but the queue structure prevents that capacity from being used efficiently.
+
+This is not a bug in the serving layer. This is a fundamental characteristic of variable-latency workloads. The solution is not better queuing. The solution is better routing and load balancing that accounts for request cost before queuing.
+
+## The New Metrics That Matter
+
+If CPU, memory, and request rate do not reflect LLM load, what does? The metrics that matter are the ones that directly measure user experience and GPU utilization.
+
+**Queue depth** is the number of requests waiting to be processed. If queue depth is growing, you need more capacity. If it is shrinking, you have excess capacity. Queue depth is a leading indicator—it predicts future latency problems before users experience them.
+
+**Time to first token (TTFT)** is the time from request arrival to the first token being generated. This is the user-perceived latency. A user waiting for a response does not care about total generation time as much as they care about when the response starts appearing. TTFT above 2 seconds feels sluggish. TTFT above 5 seconds feels broken. This metric tells you whether users are experiencing acceptable performance.
+
+**Tokens per second throughput** measures actual work being done. This is the GPU-level metric that reflects capacity utilization. If throughput is below expected maximums, the system is underutilized. If throughput is at maximum, the system is saturated.
+
+**GPU memory utilization** measures how much of the available GPU memory is being used for inference. High utilization means you are approaching the limit of concurrent requests. Low utilization means you have headroom to accept more load.
+
+These metrics replace CPU, memory, and request rate. They measure the dimensions that matter for LLM inference. Auto-scaling rules built on these metrics reflect actual capacity constraints and actual user experience.
+
+## The Fundamental Shift: Scale on Work, Not on Requests
+
+The core insight is this: requests are not units of work. Tokens are units of work. Auto-scaling must measure and respond to token-level load, not request-level load.
+
+This requires instrumentation that traditional HTTP services do not need. You need visibility into queue depth per replica. You need token counts per request. You need GPU utilization metrics exposed from the serving layer. You need custom Prometheus metrics and custom Kubernetes Horizontal Pod Autoscaler configurations that reference those metrics.
+
+The infrastructure becomes more complex. The trade-off is that the system scales in response to actual load rather than proxy metrics that stopped being meaningful the moment you switched from stateless HTTP handlers to token-generating language models.
+
+Scaling LLM inference is not a variation on traditional scaling. It is a different problem that requires different metrics, different strategies, and different mental models. The teams that treat it as a traditional scaling problem spend months fighting inexplicable capacity issues. The teams that recognize the difference design for variable latency and token economics from the start.
+
+Your auto-scaling rules are either built for LLMs or built for HTTP services. There is no middle ground. The legal tech platform eventually rewrote their scaling logic around queue depth and TTFT. The next traffic spike scaled smoothly. The lesson cost them three months and one major client. You can learn it faster.
+

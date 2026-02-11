@@ -1,0 +1,109 @@
+# 2.1 — The Model Serving Landscape in 2026: vLLM, TGI, Triton, TensorRT-LLM
+
+The serving framework you choose in the first hour determines your performance ceiling for the next two years. In early 2025, a Series B enterprise software company spent six weeks building a custom serving layer on top of bare PyTorch. They handled 500 requests per day without issue. When a major customer signed on and traffic jumped to 50,000 requests per day, their infrastructure collapsed. Response times went from 800 milliseconds to 45 seconds. Their custom batcher couldn't handle concurrent requests efficiently. Their memory management caused out-of-memory crashes every few hours. They spent three months migrating to vLLM, rewrote significant portions of their deployment pipeline, and delayed two product launches. The performance problems were solvable — they just picked the wrong foundation.
+
+The serving framework is not a detail you optimize later. It is the foundation that everything else builds on. Your choice determines how many requests you can handle per GPU, how low your latency can go, how much memory you waste, and how complex your operations become. In 2026, the landscape has consolidated around five serious options: vLLM, Text Generation Inference, TensorRT-LLM, Triton Inference Server, and Ray Serve. Each solves different problems. Each makes different trade-offs. Your job is to pick the one that matches your constraints — and to pick it before you build anything on top of it.
+
+## The vLLM Standard
+
+vLLM became the default serving framework for large language models because it solved the problem that killed everyone else's throughput: memory fragmentation. Traditional serving systems allocate a fixed block of GPU memory for each request. If a request only uses half its allocated memory, the rest sits idle. If a request needs slightly more memory than allocated, the system crashes. vLLM introduced PagedAttention, which manages GPU memory the way operating systems manage RAM — in small, reusable pages. A request uses exactly the memory it needs. When it finishes, those pages become immediately available for other requests. The result is 24 times higher throughput than naive PyTorch serving, with no quality loss.
+
+The second breakthrough is continuous batching. Older systems wait until a batch fills up before processing it. If your batch size is 32 and only 28 requests arrive, the system waits for 4 more before starting inference. vLLM starts inference as soon as any request arrives and dynamically adds new requests to the batch as they come in. This cuts average latency by 40 to 60 percent under real traffic patterns. It also handles variable-length inputs and outputs efficiently — a 50-token input and a 500-token input can coexist in the same batch without wasting computation.
+
+vLLM supports the models that matter in 2026: GPT-5, Claude Opus 4.5, Llama 4, Gemini 3, Mistral Large 3, DeepSeek V3. It handles tensor parallelism out of the box, so you can split a 70-billion-parameter model across four GPUs without writing custom sharding logic. It integrates with OpenAI-compatible APIs, so your client code doesn't need to change when you swap models. It exposes metrics for latency, throughput, and queue depth that plug into Prometheus and Grafana without custom exporters.
+
+The trade-off is that vLLM is optimized for throughput, not lowest-possible latency. If you need sub-100-millisecond time-to-first-token and you're running on NVIDIA H100s, TensorRT-LLM will beat vLLM by 30 to 50 milliseconds. If you need to run five different models in a complex ensemble with custom pre- and post-processing, Triton will give you more control. But for most teams, most of the time, vLLM is the right answer. It handles the hardest problems — memory management, batching, parallelism — so you can focus on the problems that are specific to your product.
+
+## Text Generation Inference for the Hugging Face Ecosystem
+
+Text Generation Inference is Hugging Face's production serving framework. If your models live on Hugging Face Hub, if your evaluation pipeline uses Hugging Face Transformers, if your team already knows the Hugging Face ecosystem — TGI is the path of least resistance. It supports the same continuous batching and PagedAttention techniques as vLLM. It integrates natively with Hugging Face's tokenizers, model hub, and deployment infrastructure. It handles safetensors weight loading, trust-remote-code execution, and Hugging Face authentication without extra configuration.
+
+The advantage is ecosystem fit. You push a model to Hugging Face Hub with an Inference Endpoints configuration, and TGI serves it automatically. You don't write Dockerfiles, you don't configure Kubernetes manifests, you don't debug CUDA version mismatches. The entire flow from fine-tuning to production serving stays inside one ecosystem. For teams that already work this way, TGI removes three layers of integration complexity.
+
+The disadvantage is that TGI is optimized for Hugging Face's infrastructure and assumptions. If you want to run on GCP with custom TPU configurations, TGI won't help. If you need to serve a model that isn't on Hugging Face Hub or that uses a custom architecture not supported by Transformers, you're back to writing custom code. If you need extreme performance tuning — kernel-level optimization, custom quantization schemes, hand-tuned memory pools — TGI's abstractions get in the way.
+
+TGI works when your architecture is standard, your models are on Hugging Face, and your team values integration simplicity over maximum control. It doesn't work when you need the absolute highest performance, when you're running custom model architectures, or when your deployment infrastructure is deeply customized.
+
+## TensorRT-LLM for Maximum NVIDIA Performance
+
+TensorRT-LLM is NVIDIA's optimized inference stack. It compiles models into highly optimized CUDA kernels that run faster than any other framework on NVIDIA hardware. On H100 GPUs, TensorRT-LLM delivers 20 to 40 percent higher throughput than vLLM and 30 to 50 milliseconds lower latency. It uses fused kernels, INT8 and FP8 quantization, and custom attention implementations that squeeze every cycle out of the GPU. If you're running entirely on NVIDIA infrastructure and performance is your bottleneck, TensorRT-LLM is the fastest option.
+
+The cost is complexity. TensorRT-LLM requires model conversion. You can't just point it at a Hugging Face checkpoint and start serving. You need to convert your model weights into TensorRT format, which can take hours for large models. You need to specify quantization schemes, optimization profiles, and kernel configurations upfront. Once compiled, the model is locked to specific batch sizes, sequence lengths, and hardware. If you want to change any of those, you recompile. This makes experimentation slower and deployment more brittle.
+
+TensorRT-LLM also ties you to NVIDIA hardware. If you want to run on AMD GPUs, Google TPUs, or AWS Trainium, TensorRT-LLM doesn't help. If you want the flexibility to switch cloud providers or use spot instances across different GPU types, TensorRT-LLM makes that harder. The performance gains are real, but they come with vendor lock-in and operational overhead.
+
+Use TensorRT-LLM when you meet three conditions: you're running on NVIDIA H100 or newer hardware, you have stable models that don't change weekly, and you need the absolute lowest latency or highest throughput. Don't use it when you're still experimenting with model architectures, when you need multi-cloud flexibility, or when your ops team doesn't have deep CUDA expertise.
+
+## Triton Inference Server for Multi-Model Ensembles
+
+Triton Inference Server is NVIDIA's production-grade serving platform that predates the LLM era. It was built for computer vision and structured prediction models, which means it handles things that LLM-specific frameworks don't: serving multiple models in a single request, running custom preprocessing and postprocessing, orchestrating complex pipelines where one model's output feeds into another. In 2026, Triton is used for hybrid AI systems — applications that combine language models with embedding models, with rerankers, with safety classifiers, with structured extractors.
+
+Triton's strength is orchestration. You define a pipeline as a directed acyclic graph. Request comes in, hits a safety classifier, gets embedded by a sentence transformer, retrieves context from a vector database, passes to an LLM, extracts structured output through a JSON parser, and returns a validated response. Triton handles scheduling, batching, queueing, and monitoring across all those steps. It exposes metrics at each stage. It handles failures gracefully. It supports dynamic batching for each component independently.
+
+The trade-off is that Triton is more complex to configure than vLLM or TGI. You write model configuration files that specify input and output tensors, backend frameworks, versioning policies, and batching parameters. You manage model repositories where Triton loads models from. You configure ensemble pipelines that define how models connect. This flexibility is necessary when your system is complex — but it's overkill when all you need is to serve one LLM with standard request-response flow.
+
+Triton works when your product involves multi-step pipelines with multiple models. It doesn't work when you just need to serve a single LLM fast and reliably. Most teams in 2026 start with vLLM and only migrate to Triton when they need the orchestration capabilities that vLLM doesn't provide.
+
+## Ray Serve for Custom Pipelines and Research-to-Production
+
+Ray Serve is a general-purpose serving framework built on top of Ray, the distributed computing framework. It's designed for teams that need custom logic, complex pipelines, and fine-grained control over how requests are routed, batched, and processed. Ray Serve is common in research organizations and in companies that treat AI infrastructure as a core competency. It's rare in companies that just want to ship a product.
+
+Ray Serve lets you write serving logic in Python with full control over batching, queueing, autoscaling, and request routing. You can implement custom batching policies — maybe you batch by input length, or by user priority, or by time-of-day. You can write multi-stage pipelines where different stages run on different hardware — embeddings on CPU, LLM inference on GPU, postprocessing back on CPU. You can integrate with Ray's distributed data processing, so your serving layer can trigger retraining jobs, update vector databases, or run online learning loops.
+
+The cost is that you're responsible for everything. Ray Serve doesn't give you PagedAttention or continuous batching out of the box. You implement those yourself or you live without them. It doesn't give you OpenAI-compatible APIs unless you build them. It doesn't give you optimized CUDA kernels unless you integrate TensorRT or vLLM as a backend. Ray Serve is a platform for building serving infrastructure, not a turnkey serving solution.
+
+Use Ray Serve when your team has ML infrastructure engineers, when your architecture is research-driven and changes frequently, or when you need capabilities that no existing framework provides. Don't use it when you just need to serve a standard LLM and you want proven, optimized, community-supported infrastructure.
+
+## The Performance Comparison
+
+Performance comparisons shift every quarter as frameworks improve, but the 2026 landscape looks like this. For a Llama 4 Maverick 70B model on eight NVIDIA H100 GPUs with 2048-token context and 512-token generation:
+
+vLLM delivers 45 tokens per second per request at batch size 32, with time-to-first-token averaging 180 milliseconds at the 50th percentile and 320 milliseconds at the 99th percentile. Memory efficiency is excellent — vLLM can fit 48 concurrent requests in GPU memory where naive PyTorch fits 12. Throughput scales linearly with batch size up to around 64, then flattens due to memory bandwidth limits.
+
+TensorRT-LLM delivers 58 tokens per second per request at the same batch size, with time-to-first-token averaging 140 milliseconds at the 50th percentile and 260 milliseconds at the 99th percentile. The 30 percent throughput gain and 40 millisecond latency reduction are consistent across workloads. But TensorRT-LLM's memory management is less flexible — it pre-allocates fixed memory pools, so you fit fewer concurrent requests if request sizes vary.
+
+Text Generation Inference performs comparably to vLLM — within 5 percent on throughput and latency benchmarks. The real difference is operational: TGI integrates better with Hugging Face tooling, vLLM integrates better with custom infrastructure. Pick based on your ecosystem, not on performance.
+
+Triton and Ray Serve don't have apples-to-apples comparisons because they're frameworks for building serving infrastructure, not optimized LLM servers. Teams using Triton typically integrate vLLM or TensorRT-LLM as backends and use Triton for orchestration. Teams using Ray Serve either integrate those frameworks or implement custom batching that performs worse but meets their specific needs.
+
+## The Operational Complexity Comparison
+
+Operational complexity determines how fast your team moves, how often things break, and how much infrastructure expertise you need. vLLM is the simplest to operate. You run a Docker container, point it at a model checkpoint, configure the number of GPUs, and it works. Logs are clear, metrics are standard, failure modes are well-documented. A mid-level engineer can deploy vLLM in production and debug it when things break.
+
+TGI is similarly simple if you stay inside the Hugging Face ecosystem. But the moment you need something custom — a model not on Hugging Face Hub, a modified tokenizer, a non-standard generation config — complexity spikes. You're editing Python code inside a framework built for Hugging Face's assumptions, not yours.
+
+TensorRT-LLM requires expert-level CUDA and NVIDIA stack knowledge. Model conversion can fail in opaque ways. Debugging performance regressions requires profiling with Nsight, interpreting kernel traces, and understanding GPU memory hierarchies. Your ops team needs people who have done this before. If you're a 10-person startup, you probably don't have that person. If you're a 500-person AI company, you probably do.
+
+Triton requires learning Triton's configuration language, managing model repositories, debugging ensemble pipelines, and understanding Triton's backend abstraction. It's more complex than vLLM but less complex than TensorRT-LLM. Most teams can learn it in a few weeks if they have strong infrastructure engineers.
+
+Ray Serve has the steepest learning curve because you're building infrastructure, not configuring it. But if you have the team for it, Ray Serve gives you the most control. You own your entire stack. You understand every line. When something breaks at 3am, you can fix it because you built it.
+
+## Migration Paths Between Frameworks
+
+You will change frameworks. Every team does. You start with the simplest thing, you hit a scaling limit or a performance wall, and you migrate to something more powerful. The migration is always harder than you expect. Plan for it.
+
+Migrating from vLLM to TensorRT-LLM is a one-way door. You gain performance but lose flexibility. If you migrate and then realize TensorRT-LLM doesn't support a feature you need, migrating back is just as painful as the original move. Test TensorRT-LLM thoroughly with a replica of production traffic before committing.
+
+Migrating from TGI to vLLM is straightforward if your models are standard. Export weights from Hugging Face, point vLLM at them, test that outputs match, then switch traffic. The hard part is replicating TGI-specific features — custom generation configs, trust-remote-code execution, Hugging Face-specific authentication. Budget a week for edge cases.
+
+Migrating to Triton or Ray Serve is always a large project. You're not swapping one serving framework for another — you're redesigning your architecture. Plan for a month of eng time, even if your system is simple.
+
+The best migration strategy is to run both frameworks in parallel during the transition. Route 5 percent of traffic to the new framework, compare outputs and latency against the old framework, gradually shift traffic as confidence builds. This doubles your infrastructure cost temporarily, but it prevents the disaster scenario where you fully migrate and then discover the new framework has a regression that breaks 2 percent of requests in a subtle way.
+
+## When to Use Each Framework
+
+Use vLLM when you need high throughput, good memory efficiency, and standard LLM serving with minimal operational complexity. This covers 70 percent of production LLM deployments in 2026.
+
+Use TGI when your entire stack is Hugging Face — models, training, evaluation, deployment — and you value integration simplicity over maximum performance.
+
+Use TensorRT-LLM when you're running on NVIDIA H100 or newer GPUs, your models are stable and won't change frequently, and you need the absolute lowest latency or highest throughput. This is worth it for high-scale, latency-sensitive products where 30 milliseconds matters.
+
+Use Triton when you have multi-model pipelines, when you need to orchestrate complex inference graphs, or when you're serving a mix of LLMs and traditional ML models.
+
+Use Ray Serve when your team has infrastructure depth, when your architecture is research-driven and changes weekly, or when you need capabilities that no turnkey framework provides.
+
+The wrong choice costs months. A startup that picks TensorRT-LLM when they should have picked vLLM burns engineering time on complexity that doesn't deliver value. A company that picks vLLM when they should have picked TensorRT-LLM loses customers because their latency is 50 milliseconds slower than competitors. The decision matters. Make it based on your actual constraints, not on what sounds most impressive.
+
+---
+
+The serving framework is your foundation. Get it right, and everything else — batching, autoscaling, monitoring, cost optimization — becomes easier. Get it wrong, and you spend months fighting infrastructure instead of building product. The next subchapter covers container orchestration: how to run these serving frameworks on Kubernetes, how to schedule GPU workloads, and how to avoid the mistakes that cause production outages at 2am.

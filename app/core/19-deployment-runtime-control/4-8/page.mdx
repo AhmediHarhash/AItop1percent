@@ -1,0 +1,124 @@
+# 4.8 — Hard Token Caps for Agents: Preventing Runaway Loops
+
+In November 2025, a research platform running autonomous agents allowed users to deploy custom agents with no session-level limits. One user deployed an agent to "research the history of philosophy." The agent decided to read every philosopher mentioned in every article. Each article mentioned more philosophers. The agent entered an infinite loop, making 14,000 tool calls and consuming 6.2 million tokens over 18 hours before an engineer noticed and manually killed the process. The cost: $18,400 on a single user request. The user's account was free-tier with a nominal daily limit of 10,000 tokens, but the limit was enforced per-request, not per-session. The agent spawned new requests continuously. By the time quota enforcement activated, the damage was done.
+
+The platform implemented hard session-level caps the next day: maximum 500,000 tokens per agent session, maximum 100 tool calls, maximum 30 minutes elapsed time. When a user next tried to deploy the same philosophy research agent, it hit the tool call limit after exhausting Wikipedia's summary articles and returned a partial result. The user received a clear message: "Agent stopped: exceeded maximum 100 tool calls per session. Consider narrowing your task scope." Cost: $47. The lesson: agents without hard caps are financial time bombs.
+
+## The Agent Loop Problem
+
+Agents are designed to iterate until task completion. Unlike single-generation models that produce one response and stop, agents loop: assess the situation, decide on an action, execute the action, observe the result, repeat. The loop terminates when the agent decides the task is complete or when it encounters an error. But what if the agent never decides the task is complete? What if it enters a loop where every action reveals new information that triggers another action?
+
+This is not hypothetical. Agents enter infinite loops for many reasons. The task is genuinely unbounded: "research everything about X." The agent misunderstands termination criteria: it thinks it needs more information when it already has enough. The agent has a logic bug: it repeats the same action expecting different results. The agent's world model is wrong: it thinks it is making progress when it is spinning in place. The environment is adversarial: every action generates new tasks, like a hydra growing two heads for each one cut off.
+
+Human users would recognize the loop and stop. Agents do not. They execute their loop faithfully until something external stops them. That something must be hard infrastructure limits, not soft suggestions.
+
+## Why Soft Limits Fail for Agents
+
+A soft limit is a suggestion. "You have used 90% of your quota. Consider stopping soon." The agent receives this message and decides how to respond. A well-designed agent might acknowledge the message and begin wrapping up. A poorly-designed agent might ignore the message entirely because task completion is its only programmed goal. A malicious agent might actively work around the limit.
+
+Soft limits assume the agent is cooperative and rational. Most agents are neither. They are optimizers pursuing a goal. If the goal is "research all philosophers" and the soft limit is "you have used a lot of tokens," the agent faces no forcing function to stop. The goal is not complete, so it continues. The soft limit is just information, not enforcement.
+
+Soft limits also fail because agents do not have perfect self-awareness. An agent might not understand that it is looping. It believes each tool call is bringing it closer to task completion. A message saying "you have made 50 tool calls" is just a statistic, not a reason to stop. The agent needs an external perspective to recognize that 50 tool calls is excessive for the task. That external perspective is the orchestration layer.
+
+The only reliable limit is a hard cap: a limit that cannot be bypassed or negotiated. When the cap is reached, the agent stops, whether it wants to or not. This is not a suggestion. This is infrastructure-level enforcement.
+
+## Hard Cap Dimensions
+
+Hard caps must cover multiple resource dimensions: total tokens consumed, number of tool calls executed, elapsed time, and iteration count. Capping only one dimension leaves others unbounded.
+
+A total token cap limits cumulative token consumption across all generations in a session. If the cap is 500,000 tokens, the agent can generate as many responses as it wants until the total reaches 500,000, then it stops. This prevents cost overruns but does not prevent time overruns or tool call overruns. An agent could make 10,000 tool calls in 1 hour while staying under 500,000 tokens if each call is small.
+
+A tool call cap limits the number of external actions. If the cap is 100 tool calls, the agent stops after its 100th tool call regardless of token consumption. This prevents agents from hammering external APIs or databases. It also forces agents to be efficient: if you only have 100 actions, you must choose them carefully.
+
+An elapsed time cap limits wall-clock duration. If the cap is 30 minutes, the agent stops 30 minutes after the session started, regardless of progress. This prevents agents from tying up orchestration resources indefinitely. It also provides predictable latency for users: they know that no agent task will take longer than 30 minutes.
+
+An iteration cap limits the number of reasoning loops. If the cap is 50 iterations, the agent stops after 50 decide-act-observe cycles. This is similar to a tool call cap but applies even if some iterations do not call tools. It prevents logical loops where the agent is thinking in circles without taking action.
+
+All four caps should be enforced simultaneously. The session terminates when any cap is reached. An agent that hits the token cap after 20 minutes and 30 tool calls stops due to token cap. An agent that hits the tool call cap after 15 minutes and 400,000 tokens stops due to tool call cap. The first cap reached is the termination condition.
+
+## Implementing Hard Caps
+
+Hard caps are enforced at the orchestration layer, not within the agent. The agent is code running inside a sandbox. The sandbox monitors resource usage and terminates the agent when a cap is exceeded. The agent cannot bypass this because it does not control the sandbox.
+
+The orchestration layer maintains counters for each session: tokens_consumed, tool_calls_made, iterations_completed, and session_start_time. Every time the agent generates a response, tokens_consumed increments by the input and output token count. Every time the agent calls a tool, tool_calls_made increments. Every time the agent completes a reasoning loop, iterations_completed increments. Elapsed time is calculated as current_time minus session_start_time.
+
+Before each agent action, the orchestration layer checks all counters against caps. If any counter exceeds its cap, the session is terminated immediately. The agent does not get one more action. The termination is hard and instant. The partial results are returned to the user with a message explaining which cap was reached.
+
+Caps must be configured per session, not per user. A user might have a daily quota of 10 million tokens, but each agent session is capped at 500,000 tokens. This prevents a single runaway session from consuming the user's entire daily quota. The user can run 20 agent sessions at 500,000 tokens each, but no single session can exhaust their quota.
+
+Caps should be tunable based on task complexity. A simple "summarize this document" task might have a cap of 50,000 tokens and 10 tool calls. A complex "research and write a report" task might have a cap of 1 million tokens and 200 tool calls. The user or the platform specifies caps appropriate to the task. Default caps are conservative to prevent abuse.
+
+## Cap Configuration
+
+Default caps protect against runaway loops while allowing most legitimate tasks to complete. A reasonable default configuration for a general-purpose agent platform in 2026:
+
+Maximum tokens per session: 500,000. This allows for extensive reasoning and multiple document generations while preventing unchecked cost growth. At GPT-5 pricing of roughly $3 per million input tokens and $15 per million output tokens, 500,000 tokens costs approximately $5-10 depending on input/output mix. This is a meaningful cost but not catastrophic.
+
+Maximum tool calls per session: 100. Most agent tasks require fewer than 20 tool calls. Allowing 100 provides headroom for complex tasks while preventing API hammering. An agent making 100 tool calls is either working on a genuinely complex task or stuck in a loop. Manual review is appropriate at that threshold.
+
+Maximum elapsed time: 30 minutes. Most agent tasks complete in under 5 minutes. Allowing 30 minutes accommodates slow tool responses and complex reasoning while preventing indefinite resource tying. Users do not want to wait longer than 30 minutes for a result anyway.
+
+Maximum iterations: 50. An iteration is one decide-act-observe loop. Most tasks complete in 5-15 iterations. Allowing 50 provides generous headroom. An agent that iterates 50 times is likely confused or stuck.
+
+These caps can be overridden per task or per user tier. Free-tier users might have tighter caps: 100,000 tokens, 20 tool calls, 10 minutes, 20 iterations. Enterprise users might have looser caps: 2 million tokens, 500 tool calls, 2 hours, 200 iterations. The caps scale with trust and payment.
+
+## What Happens at Cap
+
+When a cap is reached, the orchestration layer stops the agent immediately. The current action is not completed. If the agent was mid-generation, generation is cancelled. If the agent was mid-tool-call, the tool call is aborted. The session state is frozen.
+
+The termination should be graceful where possible. If the agent was generating a response and hits the token cap, allow the current sentence to finish if it will only add 10-20 tokens. If the agent was executing a tool call and hits the tool call cap, allow the current call to complete so the agent has its result. But if allowing completion would significantly exceed the cap, hard-stop immediately.
+
+The user receives partial results and an explanation. The explanation includes which cap was reached, the cap value, and the actual usage: "Agent stopped: exceeded maximum 100 tool calls. Your agent made 100 tool calls in 18 minutes and consumed 420,000 tokens. Consider simplifying your task or breaking it into smaller sub-tasks."
+
+The partial results should be usable where possible. If the agent was building a research report and completed 8 out of 10 sections before hitting the cap, return the 8 completed sections. The user can decide whether that is sufficient or whether to rerun with higher caps. Do not discard partial work.
+
+## User Experience at Cap
+
+Hitting a cap is not necessarily a failure. It is feedback that the task was more complex than expected or that the agent was inefficient. The user needs clear information to decide what to do next.
+
+The termination message should explain what happened in plain language, not technical jargon. "Your agent was stopped because it used more than 500,000 tokens" is clearer than "Token quota exceeded." The user may not know what a token is. Translate to user-meaningful units where possible: "Your agent generated approximately 375,000 words of reasoning and output."
+
+The message should offer actionable options. If the agent hit the token cap but completed 80% of the task, offer to resume with extended caps. If the agent hit the tool call cap and appears to be looping, suggest simplifying the task. If the agent hit the time cap, suggest breaking the task into smaller sub-tasks that can be run sequentially.
+
+Some caps indicate likely problems. Hitting the tool call cap or iteration cap strongly suggests the agent is looping or confused. The message should reflect this: "Your agent made 100 tool calls without completing the task. This often indicates the task is too broad or the agent is stuck in a loop. Try rephrasing your task more specifically."
+
+Other caps indicate legitimate complex tasks. Hitting the token cap on a "research and write a comprehensive report" task is expected. The message should be supportive: "Your agent used all 500,000 tokens allocated to this session. Upgrade to Enterprise for higher limits, or split your task into smaller research questions."
+
+## Monitoring and Alerting
+
+The platform must track cap hit rates and patterns. If 30% of agent sessions hit token caps, the default caps might be too low. If 0.1% hit caps, the caps are not doing much and might be too generous. If 10% hit tool call caps, many agents are looping, which indicates either task design problems or agent logic problems.
+
+Cap hit patterns reveal agent behavior. An agent that consistently hits the tool call cap but uses only 50,000 tokens is making many small tool calls, possibly stuck in a loop. An agent that consistently hits the token cap but makes only 10 tool calls is generating huge responses, possibly overexplaining. These patterns inform cap tuning and agent debugging.
+
+Alerting should trigger on individual runaway sessions and on aggregate cap hit rates. If a single session consumes 90% of its token cap in the first 5 minutes, alert the platform team. The agent is on track to hit the cap, and manual review might be warranted. If cap hit rate spikes from 2% to 15% across all sessions, something changed, possibly a bad agent deployment or a task design pattern that causes loops.
+
+Per-user cap hit tracking identifies problematic users. A user whose agents consistently hit caps might be deploying poorly-designed agents, asking for overly broad tasks, or intentionally probing limits. Support or platform intervention can help: offer agent design guidance, task scoping assistance, or enforce stricter caps if abuse is suspected.
+
+## Setting Appropriate Caps
+
+Caps that are too low frustrate users whose legitimate tasks cannot complete. Caps that are too high fail to prevent cost overruns. The right balance is learned through observation.
+
+Start conservative. You can always raise caps, but lowering caps after users have adapted to higher caps feels like a service degradation. Launch with caps that allow most tasks to complete but catch clear outliers. Monitor completion rates. If 95% of sessions complete without hitting caps, your caps are well-tuned. If only 60% complete, your caps are too tight.
+
+Tune separately by task type. A code generation agent should have different caps than a research agent. Code generation is usually bounded: write a function, write a class. Research is unbounded: research a topic can spiral forever. Code generation might have caps of 100,000 tokens and 20 tool calls. Research might have caps of 1 million tokens and 100 tool calls.
+
+Tune separately by user tier. Free-tier users should have tight caps to prevent abuse and to create upgrade incentive. Pro-tier users should have comfortable caps that allow real work. Enterprise users should have caps high enough that they rarely notice them. The cap ladder is a monetization tool: if free users constantly hit caps and paid users never hit caps, upgrade incentive is strong.
+
+Caps should be visible before task execution. The user should know the limits before starting. Display caps in the UI: "This task has a limit of 500,000 tokens, 100 tool calls, and 30 minutes." The user can make informed decisions about task scope. Invisible caps that trigger without warning frustrate users.
+
+## The Operational Reality
+
+Hard caps for agents are not optional. Without them, agents are financial and operational risks. A single poorly-designed agent or malicious user can cost thousands of dollars and tie up infrastructure for hours. With hard caps, blast radius is limited. The worst-case cost is the cap value, not unbounded.
+
+The implementation is straightforward. Orchestration layers track resource usage and enforce limits. This is standard infrastructure, not novel research. The hard part is setting the right cap values, which requires understanding task complexity distributions and cost tolerance.
+
+The business impact is significant. Hard caps enable agent platforms to offer free tiers without catastrophic cost risk. They enable predictable pricing: "up to 500,000 tokens per session" is a tangible limit users can understand and plan around. They enable experimentation: users can deploy agents knowing that even a badly broken agent cannot bankrupt them.
+
+What happens without hard caps? Users deploy agents that run forever, costing hundreds or thousands of dollars per session. Support is overwhelmed with cost disputes. The platform either absorbs the cost, destroying unit economics, or bills users for runaway costs, destroying trust. Free tiers are shut down because one bad agent can cost more than a year of revenue from that user. Agent features are limited to enterprise customers with negotiated cost protections.
+
+Or you implement hard caps from day one. Sessions terminate predictably. Costs are bounded. Users understand limits. You can offer agents widely, not just to enterprise customers. Runaway loops are impossible. The platform is financially sustainable.
+
+Hard caps do not solve every cost problem. Agents can still be expensive even within caps. But they transform uncontrollable cost risk into manageable, predictable cost. They make agent platforms viable businesses rather than financial gambles.
+
+The next challenge is cost-aware rejection: refusing requests before they start when they would violate cost policies. Hard caps stop runaway sessions after they start. Cost-aware rejection stops expensive sessions before they begin. Both are necessary layers of defense.
+

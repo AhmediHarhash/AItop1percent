@@ -1,0 +1,97 @@
+# 3.10 — Multi-Region Architecture: Active-Active and Active-Passive Patterns
+
+A financial services company ran their AI-powered fraud detection system in AWS us-east-1. Single region, solid infrastructure, good uptime. On December 7th, 2024, us-east-1 had a multi-hour outage affecting compute services. Their fraud detection went offline. Transactions piled up in a queue. When the region recovered, they had forty-seven thousand transactions to process retroactively. Three of them were actual fraud. Two had already cleared. The cost of that single-region decision was one hundred sixty thousand dollars in fraudulent charges and a regulatory filing. Multi-region is not optional for systems where downtime has a dollar cost.
+
+## Why Single-Region Is a Risk You Cannot Take
+
+Regional outages happen. AWS, Google Cloud, and Azure all have multi-hour regional incidents every year. In 2024, us-east-1 had three significant outages. In 2025, eu-west-1 had two. In early 2026, asia-southeast-1 had a capacity crunch that caused partial unavailability for GPU workloads for six hours. If your system depends on a single region, it will go down multiple times per year through no fault of your own.
+
+Regulatory requirements increasingly mandate geographic distribution. The EU AI Act requires certain high-risk AI systems to maintain availability and resilience. Data residency rules under GDPR and China's data sovereignty laws require that certain user data never leaves specific geographic boundaries. A US-only deployment cannot serve EU users if their data must stay in the EU. A single-region deployment cannot meet availability requirements if that region is the single point of failure.
+
+Latency matters for global users. A user in Tokyo accessing a model hosted in us-east-1 experiences two hundred to three hundred milliseconds of network latency before the model even starts processing. For low-latency use cases like voice assistants or real-time translation, that baseline latency is unacceptable. Multi-region deployments with geographic routing reduce latency by serving users from the nearest region.
+
+Capacity distribution reduces risk of GPU unavailability. If you need fifty H100 GPUs and you request them all in one region, you are at the mercy of that region's capacity. If that region is sold out, you wait. If you distribute the request across three regions, you are more likely to get capacity in at least one of them. Multi-region is also a capacity hedging strategy.
+
+## Active-Passive: Simpler, Slower Recovery
+
+Active-passive is the simpler multi-region pattern. One region serves all traffic. The other region is a warm standby. If the primary region fails, you fail over to the standby. The standby region runs the same model, has the same configuration, but serves no production traffic during normal operation.
+
+Warm standby means the infrastructure is running but idle. Your model is loaded into GPU memory. Your serving infrastructure is healthy and passing health checks. Your load balancer knows the standby exists but does not route traffic to it. If the primary region goes down, you update the load balancer or DNS to point to the standby. Within seconds to minutes, traffic shifts. The standby becomes the new primary.
+
+Active-passive is simpler because only one region handles production traffic at a time. You do not need to synchronize state across regions. You do not need to worry about split-brain scenarios. You do not need sophisticated traffic routing. Your monitoring and alerting focus on one region. Your cost is lower because the standby can run at reduced capacity — enough to handle failover, but not enough to handle normal traffic plus standby margin.
+
+The tradeoff is recovery time. Failover takes minutes. DNS changes propagate slowly. Clients cache DNS responses. Even with low TTL values, full traffic cutover can take five to fifteen minutes. During that window, the primary is down and the standby is not yet serving all traffic. You have partial unavailability. For workloads where fifteen minutes of downtime is acceptable, active-passive is fine. For workloads where fifteen minutes costs six figures, it is not.
+
+Cold standby is even simpler but even slower. The standby region has infrastructure provisioned but not running. If the primary fails, you boot the standby infrastructure, load the model, run health checks, then cut over traffic. This takes thirty minutes to two hours depending on model size and infrastructure complexity. Cold standby is only appropriate for non-critical workloads where cost savings justify the recovery time.
+
+## Active-Active: Complex, Instant Recovery
+
+Active-active means all regions serve traffic simultaneously. A user in California is routed to us-west-2. A user in Germany is routed to eu-central-1. A user in Singapore is routed to ap-southeast-1. If one region fails, traffic from that region is instantly rerouted to the nearest healthy region. There is no failover delay because every region is already handling production traffic.
+
+Active-active requires sophisticated traffic routing. You need a global load balancer that performs health checks on all regions and routes based on latency, health, and capacity. You need GeoDNS or Anycast to direct users to the nearest region. You need consistent configuration across all regions so that a user who gets routed to a different region mid-session does not experience different behavior.
+
+Active-active eliminates failover delay but doubles or triples cost. If you run in three regions and each region must handle its own traffic plus absorb traffic from the other two regions in a failure scenario, each region needs to be provisioned at one hundred fifty percent of normal load. If you want N plus two redundancy, each region needs even more capacity. You are paying for capacity that sits idle most of the time, waiting for a failure that might happen twice a year.
+
+Active-active is the right choice for workloads where any downtime is unacceptable. Real-time fraud detection. Voice assistants. Live translation. Medical diagnostic support. Any use case where seconds of unavailability cause user harm or revenue loss. The cost of running three regions is high, but the cost of an outage is higher.
+
+## GPU Availability Challenges Across Regions
+
+GPU availability is not uniform across regions. In early 2026, H100 GPUs were readily available in us-east-1, constrained in eu-west-1, and nearly impossible to get in ap-south-1. If your multi-region strategy assumes you can provision identical GPU capacity in every region, you will be disappointed.
+
+Different regions often offer different GPU types. You might get H100s in one region, A100s in another, and L40S in a third. Your serving infrastructure must handle heterogeneous GPU types. Your performance characteristics will differ across regions. Users in the region with slower GPUs will experience higher latency. This creates inconsistent user experience unless you normalize by over-provisioning the slower regions.
+
+Reserved capacity contracts are region-specific. If you have a commitment for fifty H100 GPUs in us-west-2, that does not guarantee you fifty H100s in eu-central-1. You negotiate separately with each region. For multi-region active-active, you need reserved capacity in every region you deploy to. This multiplies your commitment cost and your negotiation complexity.
+
+The practical approach is to design for heterogeneity. Build your serving layer to support multiple GPU types. Benchmark each GPU type for your model. Provision capacity in each region based on what is actually available, not based on an idealized plan. Accept that some regions will have different latency profiles. Monitor per-region performance separately and alert when any region degrades below acceptable thresholds.
+
+## Deploying Models Across Regions
+
+Model deployment in multi-region must be coordinated. You cannot have us-east-1 running model version 2.3 while eu-west-1 runs version 2.1. Users do not know which region they are hitting. If behavior differs by region, you will get bug reports that are impossible to reproduce because the reporter was in a different region than your test.
+
+The safest deployment strategy is synchronous multi-region rollout. Deploy to all regions simultaneously. Wait for health checks to pass in all regions. Only then shift traffic. If any region fails health checks, roll back all regions. This ensures consistency but makes deployments slower and riskier. A single region's infrastructure problem blocks deployment everywhere.
+
+The faster deployment strategy is region-by-region rollout with version pinning. Deploy to us-west-2 first. Monitor for one hour. If stable, deploy to eu-central-1. Monitor for one hour. If stable, deploy to ap-southeast-1. During rollout, different regions run different versions. Your load balancer includes version information in headers or logs so you can correlate behavior with version. This is faster and lower risk but requires more sophisticated observability.
+
+Some teams run region-specific canaries. Deploy the new version to ten percent of replicas in each region. Route ten percent of traffic to the canary. Monitor error rates and latency. If canary is healthy in all regions, promote to one hundred percent. If canary fails in any region, roll back that region only. This combines speed with safety but requires infrastructure that supports per-region traffic splitting.
+
+## Synchronizing State Across Regions
+
+Stateless inference is the easiest case. If every request is independent and carries all necessary context, multi-region is trivial. The request hits the nearest region. That region processes it. The response goes back. No state to synchronize. Most batch inference and API-based inference workloads are stateless. Multi-region for stateless workloads is purely an infrastructure problem.
+
+Session state complicates multi-region. If a user has a conversation that spans multiple requests, the session history must be available in every region. You cannot rely on sticky sessions to keep the user in one region because that region might fail. The session state must be replicated across regions. This requires a distributed session store like DynamoDB Global Tables, Cosmos DB with multi-region writes, or Redis with active-active replication.
+
+Configuration synchronization is critical. Your rate limits, feature flags, model routing rules, and prompt templates must be identical across regions. A configuration change in one region must propagate to all regions within seconds. Use a globally replicated configuration service. Validate that configuration is consistent across regions before applying changes. If configuration diverges, user experience becomes unpredictable.
+
+Some teams accept eventual consistency for non-critical state. Usage quotas, analytics, and audit logs can tolerate a few seconds of replication lag. Critical state like session history and rate limit counters must be strongly consistent or at least conflict-free. Use CRDTs or last-write-wins with timestamps if strong consistency is too expensive.
+
+## Traffic Routing Strategies
+
+GeoDNS routes users based on their geographic location. When a user queries your DNS, the DNS server returns the IP address of the closest region. The user's client connects to that region. GeoDNS is simple and cheap. The downside is that DNS is cached aggressively. If a region fails, DNS updates can take minutes to propagate. Users in that region will keep trying the failed region until their DNS cache expires.
+
+Anycast routes users to the nearest healthy endpoint automatically. You advertise the same IP address from multiple regions. Internet routing protocols direct traffic to the topologically nearest region. If a region fails, routing protocols reconverge and traffic flows to the next nearest region within seconds. Anycast is more complex to set up but provides faster failover than GeoDNS. Cloudflare and AWS Global Accelerator both use Anycast.
+
+Global load balancers perform application-layer routing. The load balancer runs health checks against all regions. It routes each request based on latency, health, capacity, and custom rules. If a region is unhealthy, the load balancer stops routing traffic there immediately. Global load balancers provide the most control but add latency and cost. Every request passes through the load balancer before reaching your service.
+
+The best strategy depends on your scale and budget. For early-stage systems, GeoDNS with manual failover is sufficient. For mid-stage systems, a global load balancer provides automatic failover without complex networking. For large-scale systems, Anycast provides the lowest latency and fastest failover.
+
+## Manual vs Automatic Failover
+
+Automatic failover sounds ideal but can cause problems. A transient issue in one region triggers failover. Traffic shifts to other regions. Those regions become overloaded. They start failing health checks. Traffic shifts again. You end up in a flapping state where traffic bounces between regions and nothing is stable. Automatic failover works only if you have enough capacity in every region to absorb another region's traffic.
+
+Manual failover gives you control but requires humans in the loop. When a region fails, an on-call engineer reviews the situation, confirms the failure is real and not transient, then triggers failover. This adds minutes to recovery time but prevents false positives. For systems where fifteen minutes of degraded performance is better than an hour of flapping, manual failover is safer.
+
+Some teams use automatic failover with human confirmation. The system detects failure, pages an engineer, and waits sixty seconds. If the engineer does not cancel, failover proceeds automatically. This combines fast response with human oversight. The engineer can cancel if they see the failure is transient or if they know failover will make things worse.
+
+The right answer depends on your team's operational maturity and your system's failure modes. If your regions fail cleanly and your capacity is sufficient, automatic failover works. If your regions fail in complex ways and capacity is tight, manual failover is safer.
+
+## The Cost Reality of Multi-Region
+
+Multi-region doubles or triples your infrastructure cost. If you run active-active in three regions, you pay for three sets of GPUs, three sets of supporting infrastructure, and three sets of data transfer. A single-region deployment costing fifty thousand dollars per month becomes one hundred fifty thousand per month for active-active in three regions.
+
+Cross-region data transfer is expensive. Transferring data between AWS regions costs one to two cents per gigabyte. If your model serves large responses or your logging is verbose, cross-region replication can cost thousands per month. Minimize cross-region data movement. Replicate only critical state. Log locally and aggregate asynchronously.
+
+The ROI calculation is straightforward. Estimate the cost of an outage. If a one-hour outage costs one hundred thousand dollars in lost revenue or penalties, and outages happen twice per year, your annual outage cost is two hundred thousand dollars. If multi-region costs an extra one hundred thousand per year, it pays for itself. If outages cost ten thousand dollars, multi-region is not justified.
+
+Most enterprise AI systems justify multi-region. The ones that do not are internal tools, batch processing workloads, or early-stage products where availability is not yet a customer requirement. Once you have SLAs, once you have enterprise customers, once you have regulatory obligations, multi-region becomes mandatory.
+
+Geographic distribution is the foundation. The next layer is intelligent routing that respects data residency while optimizing for latency and capacity.

@@ -1,0 +1,117 @@
+# 1.2 — The Five Deployment Layers: Models, Prompts, Tools, Routing, Config
+
+AI systems are not monoliths. They are compositions of five independent layers, each with its own change frequency, risk profile, and rollback requirements. Most teams deploy all five layers together because their architecture treats them as a single unit. This coupling makes every deployment slow, risky, and expensive. The teams that scale from hundreds to millions of requests decouple these layers. They version each layer independently. They deploy each layer at its natural cadence. They roll back each layer without touching the others.
+
+The five layers are: model artifacts, prompt templates, tool definitions, routing rules, and runtime configuration. Understanding what lives in each layer, how each layer changes, and why each layer needs independent control is the foundation of mature AI deployment.
+
+## Layer One: Model Artifacts
+
+The model layer contains everything required to execute inference: model weights, tokenizer files, adapter weights for fine-tuned models, quantized variants, and any model-specific configuration like temperature defaults or stop sequences. This is the heaviest layer. A GPT-5 model can be 200 gigabytes. A fine-tuned Llama 4 Maverick with LoRA adapters might be 30 gigabytes of base weights plus 500 megabytes of adapter weights.
+
+Model changes are infrequent. You upgrade from GPT-5 to GPT-5.1. You deploy a newly fine-tuned version. You switch from a full-precision model to a quantized variant to reduce latency. These changes happen weekly or monthly, not daily. The reason: model changes are expensive to validate. A new model version can alter behavior across every input. You need extensive eval coverage before deploying. The risk is high. The change frequency is low.
+
+Model artifacts are also environment-specific. A model optimized for A100 GPUs will not run efficiently on H100s. A model quantized to INT8 requires inference engines that support INT8. A model served via vLLM needs different configuration than the same model served via TensorRT-LLM. The artifact you deploy is not just the weights. It is the weights plus the serving stack configuration.
+
+Most teams version models as immutable artifacts. You build a model, assign it a version identifier like v2.7.3, store it in a model registry, and deploy that version to production. You never modify v2.7.3 in place. If you need changes, you build v2.7.4. This immutability makes rollback simple: switch the routing layer back to v2.7.2, and production is running the previous model within seconds.
+
+The failure mode: coupling model updates with prompt or config changes. A team wants to deploy a new fine-tuned model and also update the system prompt to better leverage the new model's capabilities. They bundle both changes into a single deployment. Production quality drops. Is the problem the model, the prompt, or the interaction between them? Without independent versioning, you cannot isolate the root cause. You roll back both changes, losing any gains from the model update, and spend days debugging.
+
+## Layer Two: Prompt Templates
+
+The prompt layer contains system prompts, user prompt templates, few-shot examples, and any instructions or context that get prepended or appended to user inputs. Prompts are natural language. They do not compile. They do not have types. They are interpreted by the model at inference time. This makes them powerful and dangerous.
+
+Prompt changes are frequent. You discover that adding "respond in bullet points" improves user satisfaction. You refine the few-shot examples to better demonstrate edge case handling. You adjust tone to match brand guidelines. These changes happen daily or multiple times per day. The reason: prompts are the primary interface for tuning model behavior without retraining. Small prompt changes can yield measurable quality improvements. The iteration cycle is fast.
+
+Prompts are also user-facing in a way that models are not. A user never sees the model weights. A user always sees the output shaped by your prompts. If your prompt instructs the model to be formal and the user expects casual, the mismatch is immediate. Prompt changes directly impact user experience. This makes them high-iteration, high-risk.
+
+Most teams initially store prompts as string literals in code. The system prompt is a variable in a Python file. Updating it requires a code change, a commit, a build, a deploy. This coupling makes prompt iteration slow. A better architecture treats prompts as data. Prompts live in a database or configuration store. The application fetches the current prompt at runtime. Changing a prompt is a configuration update, not a code deployment. This enables instant prompt updates without service restarts.
+
+Versioning prompts is critical. You deploy a new prompt. Quality drops. You need to roll back to the previous prompt immediately. If prompts are versioned, rollback is a configuration change. If prompts are hardcoded in the application binary, rollback requires redeploying the previous application version, which takes minutes and risks breaking other recent changes.
+
+The failure mode: treating prompts as static. A team hardcodes prompts, deploys them, and assumes they will remain unchanged for months. Then a new use case emerges that requires prompt adjustments. The team realizes they cannot update prompts without a full deployment cycle. They hack around it by adding conditional logic: if user type equals X, use prompt A, else use prompt B. The codebase fills with prompt conditionals. Maintainability collapses. The team eventually refactors to externalized prompt management, but only after months of pain.
+
+## Layer Three: Tool Definitions
+
+The tool layer contains function schemas, API integration configs, tool permissions, and any external services the model can invoke. For agentic systems, this layer defines what actions the model can take: search a database, call an API, send an email, update a record. For non-agentic systems, this layer might be empty or limited to retrieval tools.
+
+Tool changes are moderate frequency. You add a new API endpoint. You deprecate an old integration. You adjust a function schema to accept additional parameters. These changes happen weekly or bi-weekly. The reason: tools expand the model's capabilities, but adding tools requires integration work, testing, and security review. You do not add tools impulsively.
+
+Tool definitions are schema-based. The model receives a JSON schema describing available functions, parameters, types, and descriptions. Changing a tool definition changes what the model believes is possible. If you add a parameter to a function schema, the model might start passing that parameter. If you remove a function, the model can no longer call it. These changes alter agentic behavior.
+
+Most teams version tools similarly to APIs. Each tool has a version. The schema includes version information. The application routes tool calls to the appropriate handler based on version. This allows gradual migration: deploy tool v2, run v1 and v2 in parallel, shift traffic from v1 to v2, retire v1. Without versioning, tool changes are all-or-nothing.
+
+The security implications are high. A tool gives the model access to an external system. If the tool schema is wrong, the model might invoke the tool incorrectly, causing data corruption or unauthorized access. If the tool permissions are wrong, the model might perform actions the user is not authorized for. Tool changes require careful review.
+
+The failure mode: coupling tool changes with model changes. A team fine-tunes a model to better utilize a new tool. They deploy the model and the tool simultaneously. The tool has a bug. Production requests fail. Is the problem the model calling the tool incorrectly, or the tool implementation failing? Without independent deployment, you cannot test each layer in isolation. You roll back both, losing the model improvement, and spend time debugging the tool when the model was fine.
+
+## Layer Four: Routing Rules
+
+The routing layer contains model selection logic, fallback chains, traffic splitting for A/B tests, and any rules that determine which model and configuration serve a given request. This layer answers: for this user, this request type, this feature flag state, which model and prompt should we use?
+
+Routing changes are very frequent. You launch an A/B test: 10% of users get the new model, 90% get the old. You implement a fallback: if the primary model times out, route to a faster backup model. You add conditional logic: enterprise users get GPT-5, free users get GPT-5-mini. These changes happen multiple times per day. The reason: routing is how you manage risk and cost. You constantly adjust traffic distribution based on quality, latency, and budget.
+
+Routing rules are control plane logic. They do not execute inference. They decide where inference happens. This makes them lightweight and fast to change. A routing rule is typically a configuration entry: if feature flag X is enabled and user tier equals premium, use model Y with prompt Z. Updating a routing rule is updating a configuration value, not deploying code.
+
+Most mature teams implement routing in a dedicated service or library that reads configuration from a centralized store like etcd, Consul, or a feature flag service. The routing layer is stateless. It evaluates rules per request based on request attributes and current configuration. This makes it horizontally scalable and fault-tolerant.
+
+The power of independent routing: you can deploy a new model to production without sending it any traffic. The model is loaded and ready. Routing rules keep all traffic on the old model. You then gradually shift traffic: 1%, 5%, 10%, 50%, 100%. At each step, you measure quality. If quality drops, you adjust routing back to 0% without unloading the model. The model deployment and the traffic shift are separate operations.
+
+The failure mode: hardcoding routing logic in application code. A team writes if-else chains to select models. Changing routing logic requires code changes, tests, builds, deploys. The team wants to run an A/B test but realizes they cannot adjust traffic splits without redeploying. They add feature flags, but now routing logic is scattered across feature flag checks in multiple files. When an incident occurs, no one can quickly determine which model is serving which traffic. The team eventually centralizes routing, but only after outages caused by routing logic bugs.
+
+## Layer Five: Runtime Configuration
+
+The configuration layer contains rate limits, timeout values, retry policies, cost budgets, feature flags, and any operational parameters that control how the system behaves at runtime. This layer is the most frequently changed and the least risky.
+
+Configuration changes are constant. You increase the timeout from 10 seconds to 15 seconds because P95 latency spiked. You lower the rate limit for a specific API key because a user is abusing the system. You enable a feature flag for a new beta feature. You set a daily cost budget to prevent runaway spending. These changes happen hourly or more. The reason: configuration is how you respond to operational issues in real-time. You do not wait for a deployment cycle. You change a value and the system adapts immediately.
+
+Configuration is environment-specific. Staging has higher timeouts because it runs on slower hardware. Production has stricter rate limits because it serves real users. Development has feature flags enabled for all in-progress features. You cannot use the same configuration across environments.
+
+Most teams externalize configuration using environment variables, config files, or dynamic configuration services. The application reads configuration at startup or continuously polls for updates. Changing configuration does not require code changes. For values that must update without restarts, teams use hot-reloading: the application watches the config source and applies changes immediately.
+
+The risk profile is different from other layers. A bad prompt can degrade quality across all users. A bad configuration value usually affects one operational parameter. You set a timeout too low, and requests fail faster than they should. You notice within minutes, adjust the value, and the issue resolves. The blast radius is smaller. The feedback loop is faster.
+
+The failure mode: hardcoding configuration in code. A team sets timeouts, rate limits, and budgets as constants in the codebase. A production incident requires increasing a timeout. The team has to merge a code change, wait for CI, deploy. By the time the change is live, the incident has escalated. The team adds environment variables for critical values, but many configuration parameters remain hardcoded. Over time, the codebase becomes a mix of externalized and hardcoded config, and no one remembers which is which.
+
+## Why Each Layer Needs Independent Versioning
+
+Every layer changes at a different frequency. Models change monthly. Prompts change daily. Tools change weekly. Routing changes hourly. Config changes constantly. If you couple all five layers into a single versioned artifact, you force every change through the slowest deployment cycle.
+
+A team wants to adjust a timeout value. With coupled layers, this requires: modify the config file in the monorepo, commit, wait for CI to build and test the entire application (15 minutes), deploy the new version to staging, verify nothing broke, deploy to production. Total time: 45 minutes. With independent config management, this takes: update the config value in the config store, the application hot-reloads it within seconds. Total time: 30 seconds.
+
+The time difference is 90x. At scale, this difference determines whether you can respond to incidents in real-time or watch them escalate while you wait for deployments to complete.
+
+Independent versioning also enables independent rollback. A deployment changes three layers: a new model, a new prompt, and updated routing rules. Quality degrades. Which layer caused the regression? With independent versioning, you can roll back each layer individually and measure the impact. Roll back the routing rules: quality still bad. Roll back the prompt: quality improves. Root cause identified: the prompt. The model and routing changes were fine. You keep those, revert only the prompt, and production recovers.
+
+Without independent versioning, you have to roll back all three layers together, losing any gains from the model or routing improvements. You then redeploy layers individually to isolate the problem, which takes hours. During those hours, production runs on the fully reverted version, and users experience whatever issues existed before the deployment.
+
+## Change Frequencies in Practice
+
+The actual cadence varies by team and use case, but the relative frequencies are consistent across mature AI systems:
+
+**Runtime config changes:** Multiple per day or per hour. Teams adjust timeouts, rate limits, budgets, and feature flags continuously in response to operational conditions. These changes are low-risk and fast to validate.
+
+**Routing rule changes:** Multiple per day. Teams launch A/B tests, adjust traffic splits, implement fallback logic, and enable or disable models based on cost or quality. These changes require monitoring but no code deployment.
+
+**Prompt changes:** Daily or multiple per week. Teams iterate on prompts to improve quality, adjust tone, fix edge cases, or respond to user feedback. These changes require quality evaluation but no infrastructure work.
+
+**Tool changes:** Weekly or bi-weekly. Teams add new integrations, update function schemas, or deprecate old tools. These changes require integration testing and security review.
+
+**Model changes:** Weekly to monthly. Teams upgrade to new model versions, deploy fine-tuned models, or switch to quantized variants. These changes require extensive eval coverage and gradual rollout.
+
+The frequency difference is two orders of magnitude from config to models. A system that couples all layers forces the fastest-changing layer (config) to move at the speed of the slowest-changing layer (models). This is not a theoretical inefficiency. It is the difference between responding to incidents in seconds versus hours.
+
+## The Decoupling Architecture
+
+Decoupling the five layers requires architectural choices. Models are stored in a model registry and loaded by inference workers. Prompts are stored in a database or config service and fetched at request time. Tools are defined in a schema registry and validated at startup. Routing rules live in a control plane service that evaluates them per request. Runtime config is externalized to environment variables or a dynamic config service.
+
+The data plane handles inference. It receives a request, consults the routing layer to determine which model and prompt to use, fetches the prompt from the prompt store, loads the model from the model registry (or uses a cached instance), executes inference, and returns the response. The data plane is stateless. It does not store configuration. It reads configuration from the control plane.
+
+The control plane manages state. It stores model versions, prompt versions, tool schemas, routing rules, and runtime config. It exposes APIs for updating configuration. It tracks which versions are active, which are deprecated, and which are in A/B tests. The control plane is low-throughput. It handles configuration updates and routing decisions, not inference requests.
+
+This separation enables hot-reloading. The data plane watches the control plane for configuration changes. When a prompt is updated, the data plane fetches the new prompt on the next request. When routing rules change, the data plane applies the new rules immediately. When a model version is marked inactive, the data plane stops routing traffic to it. No restarts required.
+
+The teams that scale AI to millions of requests all converge on some variant of this architecture. The implementation details differ: some use Kubernetes ConfigMaps for prompts, others use a custom database. Some use feature flag services for routing, others build a dedicated routing service. But the principle is universal: decouple the layers, version them independently, deploy them at their natural cadence, and enable instant rollback per layer.
+
+The alternative is coupling. Coupling makes every deployment slow, risky, and expensive. It forces you to batch changes. It makes A/B testing difficult. It makes rollback coarse-grained. It turns every prompt tweak into a full deployment cycle. At small scale, this is painful. At large scale, it is impossible. The five-layer model is not a nice-to-have. It is the foundation of AI deployment that scales.
+
+The next question is how to structure the system to enable this decoupling. That requires understanding the control plane and data plane architecture.

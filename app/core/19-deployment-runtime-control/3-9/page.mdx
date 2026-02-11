@@ -1,0 +1,87 @@
+# 3.9 — Queue Depth Monitoring and Backpressure Patterns
+
+Most teams discover their scaling problems when users start complaining about timeouts. By then, the system is already failing. Queue depth tells you the same story three minutes earlier, when you can still do something about it. A team running a content moderation service watched their queue depth climb from 12 to 47 requests over ninety seconds in October 2025. They scaled up immediately. Three minutes later, a traffic spike hit that would have taken them down. Queue depth is the earliest warning system you have. If you are not monitoring it, you are flying blind.
+
+## The Queue Depth Signal
+
+Queue depth is the number of requests waiting for processing at any given moment. It sits between your load balancer and your model serving infrastructure. Requests arrive, enter the queue, wait their turn, get processed, and exit. The depth of that queue at any instant tells you whether your system is keeping up with demand or falling behind.
+
+Zero queue depth means you are over-provisioned or have no traffic. If your queue is consistently empty, you have more serving capacity than you need. That costs money but causes no harm to users. Low stable queue depth means you are right-sized. A queue that hovers between three and fifteen requests indicates healthy capacity. You have enough margin to absorb small spikes without degrading latency, but you are not wasting resources. Growing queue depth means demand is exceeding capacity. If your queue was at eight requests five minutes ago and is now at thirty-two, you are falling behind. Users are waiting longer for responses. At some threshold, the oldest requests will time out. Queue depth at limit means you are about to start shedding requests. Most systems configure a maximum queue depth to prevent unbounded memory growth. When you hit that limit, new requests must be rejected immediately.
+
+The absolute number matters less than the trend. A queue of fifty requests is fine if you process fifty requests per second. A queue of ten requests is alarming if you process two requests per second. What you watch for is acceleration. Queue depth that doubles every thirty seconds is a cascading failure in progress.
+
+## What Queue Depth Reveals About System Health
+
+Queue depth correlates directly with user experience. When queue depth is stable, latency is predictable. When queue depth grows, latency grows with it. A request that enters an empty queue gets processed immediately. A request that enters a queue with forty items ahead of it waits for all forty to finish first. If each request takes two seconds to process and you serve requests serially, that incoming request waits eighty seconds. Users do not wait eighty seconds. They retry, which adds more requests to the queue, which makes the problem worse.
+
+Queue depth also reveals capacity mismatches. If your queue depth spikes every day at 10am and again at 2pm, you have a traffic pattern your auto-scaler is not handling well. If your queue depth grows steadily over hours, you have a slow capacity leak — perhaps a memory issue causing replica restarts, or a dependency getting slower. If your queue depth explodes instantly from five to three hundred, you have a traffic spike that exceeds your scale-up speed.
+
+You monitor queue depth per replica and in aggregate. Per-replica queue depth shows whether load is balanced evenly. If one replica has a queue of sixty and another has a queue of four, your load balancer is not distributing traffic correctly. Aggregate queue depth shows total system load. Even if per-replica depth is balanced, aggregate depth can reveal that you need more total capacity.
+
+If you support priority tiers, monitor queue depth by priority separately. High-priority requests should have near-zero queue depth. Low-priority requests can tolerate higher queue depth. If high-priority queue depth climbs, you have a critical capacity problem. If only low-priority queue depth climbs, you can shed those requests without affecting paid users.
+
+## Monitoring Queue Depth in Practice
+
+The simplest metric is current queue depth. Export it every five seconds. Graph it as a time series. Set an alert threshold based on your capacity. If your system can process ten requests per second and your P95 latency target is five seconds, you never want more than fifty requests in the queue. Alert at thirty to give yourself margin.
+
+Rate of change is more valuable than absolute depth. A queue that went from ten to forty in thirty seconds is accelerating. A queue that has been at forty for ten minutes is stable. Calculate the five-minute moving average and compare current depth to that average. If current depth exceeds the moving average by fifty percent, you are in a growth phase. If it exceeds by two hundred percent, you are in a spike.
+
+Queue wait time is the practical metric users care about. Measure how long each request sits in the queue before processing starts. If queue wait time exceeds one second, users perceive slowness. If it exceeds five seconds, users retry or abandon. Export P50, P95, and P99 queue wait time. Alert when P95 exceeds your latency budget.
+
+Track queue evictions separately. An eviction happens when a request is rejected because the queue is full. This is a hard failure from the user perspective. The request never got processed. The client received an immediate error. If you evict even one request per minute, you have a capacity crisis. Zero evictions is the only acceptable steady state.
+
+## What Backpressure Means
+
+Backpressure is the mechanism by which a downstream system signals upstream to slow down. Without backpressure, a slow downstream system accepts every request, queues them all, and eventually collapses under load. With backpressure, the downstream system starts rejecting requests before collapse, forcing upstream systems to retry later or reduce send rate.
+
+Explicit backpressure is a clear signal. Your API returns HTTP 429 Too Many Requests with a Retry-After header. The client knows to wait before retrying. The request was not processed, but the client has guidance on what to do next. Explicit backpressure is clean, measurable, and debuggable.
+
+Implicit backpressure happens when responses get so slow that clients time out. If your normal response time is two hundred milliseconds and suddenly responses take twelve seconds, most clients will time out after five or ten seconds. From the client's perspective, the request failed. From your perspective, you are still processing it. This creates waste. You spend GPU cycles on requests whose answers will never be received. Implicit backpressure is what happens when you do not implement explicit backpressure.
+
+Queue-based backpressure triggers rejection when the queue reaches a threshold. Before the queue is completely full, you start rejecting new requests. If your maximum queue depth is one hundred, you might start rejecting at eighty. The last twenty slots are a buffer for in-flight requests that are already committed. This prevents the queue from ever reaching hard limits and triggering emergency shedding.
+
+## Implementing Backpressure Correctly
+
+Set queue depth thresholds based on your latency budget. If your P95 latency target is three seconds and your average processing time is one second, you can tolerate a queue of roughly three items per replica before you start violating latency targets. Set a soft threshold at three and a hard threshold at five. Between three and five, start probabilistic rejection. Above five, reject everything.
+
+Gradual rejection is more effective than binary rejection. At queue depth of three, reject zero percent of requests. At queue depth of four, reject fifty percent. At queue depth of five, reject one hundred percent. This creates a smooth backpressure curve rather than a cliff. Clients that retry immediately have a chance of getting through. Clients that wait a few hundred milliseconds are very likely to get through.
+
+Priority-based rejection sheds low-priority work first. If you have free and paid tiers, reject free-tier requests before paid-tier requests. If you have batch and interactive workloads, reject batch before interactive. Configure multiple queue depth thresholds. At depth twenty, reject batch. At depth forty, reject free. At depth sixty, reject everything except critical. This ensures your most valuable traffic survives capacity crunches.
+
+Client retry guidance is critical. When you return 429, include a Retry-After header with a realistic value. If your queue clears in ten seconds on average, set Retry-After to fifteen seconds. If you set it to one second, clients retry too fast and make the problem worse. If you set it to five minutes, clients give up. Fifteen to thirty seconds is usually right for inference workloads.
+
+## Backpressure at Every Layer
+
+Your load balancer enforces connection limits. If you allow ten thousand concurrent connections but your backend can only handle one thousand, the load balancer queues the other nine thousand. This is the first backpressure layer. When connection limits are reached, new connections are refused immediately. The client gets a connection error, not a timeout. This is better than accepting the connection and then making it wait minutes for a response.
+
+Your service layer enforces queue limits. After the load balancer accepts the connection and routes the request, your application code checks the queue. If the queue is above threshold, the service returns 429 before adding the request to the queue. This is the second backpressure layer. The request made it through the network but was rejected at the application boundary.
+
+Your model serving layer enforces batch size limits. If you batch requests for GPU efficiency, your batch queue has a maximum size. If inference requests arrive faster than the GPU processes batches, the batch queue fills. Once full, new requests are rejected. This is the third backpressure layer. The request made it through the service but was rejected at the model boundary.
+
+All three layers must coordinate. If your load balancer allows ten thousand connections but your service queue is capped at one hundred, nine thousand nine hundred connections will wait in load balancer limbo. They will time out after sixty seconds, having consumed connection slots for no reason. Set your connection limit slightly above your queue limit to allow for transient bursts, but not ten times higher.
+
+## How Backpressure Prevents Cascading Failures
+
+Without backpressure, a small capacity problem becomes a total outage. Your inference service starts slowing down. Queue depth grows. Latency increases. Clients time out and retry. Retries add more load. Queue depth grows faster. More timeouts, more retries. Within minutes, your queue depth is in the thousands and every request is failing. The system is spending all its time processing doomed requests. New requests cannot get through. You are in a death spiral.
+
+With backpressure, the same scenario plays out differently. Your inference service starts slowing down. Queue depth grows. At queue depth thirty, you start rejecting ten percent of requests. At queue depth forty, you reject thirty percent. At queue depth fifty, you reject sixty percent. Rejected clients back off. Queue depth stabilizes at fifty. The requests that do get through complete successfully. Your success rate drops to forty percent, but forty percent is better than zero percent. You have controlled degradation instead of total failure.
+
+Circuit breakers extend backpressure to dependent services. If your RAG retrieval service is overloaded, your inference service should stop calling it rather than adding to its queue. When retrieval response time exceeds two seconds or error rate exceeds ten percent, open the circuit. Serve inference requests without retrieval context until the circuit closes. This prevents your load from making another team's problem worse.
+
+## Designing a Queue Depth Dashboard
+
+Your primary graph is queue depth over time. Show current depth, five-minute moving average, and threshold lines. Use color: green below soft threshold, yellow between soft and hard threshold, red above hard threshold. This graph alone shows whether your system is healthy. If the line is green and flat, everything is fine. If the line is yellow and climbing, something is wrong.
+
+Correlate queue depth with latency. Plot both on the same timeline. You will see latency follow queue depth with a short lag. This confirms your capacity model. If queue depth climbs but latency does not, you have unexpected headroom. If latency climbs but queue depth does not, you have a processing problem, not a capacity problem.
+
+Show rejection rate by reason. Break down rejections into categories: queue full, rate limited, priority shed, circuit breaker. This tells you why requests are being rejected. If rejections are all "queue full," you need more capacity. If rejections are all "rate limited," you have a noisy neighbor or abuse problem. If rejections are "priority shed," your free tier is absorbing load that would otherwise take down paid users.
+
+Log backpressure events with context. Every time you transition from accepting all traffic to rejecting some traffic, log the queue depth, the load level, the rejection rate, and the time. During an incident, you can replay the timeline and see exactly when backpressure kicked in and whether it was effective. If backpressure started too late, lower your thresholds. If it started too early, raise them.
+
+## The Practical Reality of Queue Management
+
+Queue depth monitoring is not optional for production AI systems. It is the difference between graceful degradation and total collapse. A properly configured queue with backpressure allows you to survive traffic spikes, slow dependencies, and capacity constraints without dropping every request. An unconfigured queue becomes a buffer that makes failures slower and more painful without preventing them.
+
+The teams that scale AI systems successfully are the ones who treat queue depth as the primary scaling signal. They alert on queue depth before they alert on latency. They tune backpressure thresholds based on traffic patterns. They test backpressure under load to make sure it actually works. They do not wait for users to complain. They watch the queue, and they react before the problem becomes visible externally. That is what production readiness looks like.
+
+The next question is geographic distribution. A single-region deployment, no matter how well tuned, is still a single point of failure. Multi-region architecture changes the scaling model entirely.

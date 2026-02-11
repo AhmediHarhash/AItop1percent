@@ -1,0 +1,78 @@
+# 10.3 — Rolling Deployment: Update Servers One at a Time
+
+Fifty servers running the old version, deployment begins, servers update one by one while traffic continues flowing. Server 1 restarts with the new version, health checks pass, it rejoins the load balancer pool. Server 2 updates. Server 3 updates. Traffic routes to whichever servers are available, which means users hitting the system during deployment see a mix of old and new versions. The deployment proceeds until all fifty servers run the new version. If an issue appears midway, at server 23, you have twenty-three servers on the new version and twenty-seven on the old, and you must decide whether to continue forward or roll back the twenty-three that already updated.
+
+Rolling deployment is the most common deployment pattern for stateless services at scale. It requires no additional infrastructure beyond what you already run. It works with any number of servers. It naturally limits blast radius because only a fraction of servers are updating at any given time. But it has two significant downsides: rollback is slow, and users experience version inconsistency during the rollout.
+
+## The Rolling Update Sequence
+
+In a rolling deployment, you update instances incrementally while the rest continue serving traffic. The typical sequence is: remove an instance from the load balancer, deploy the new version to that instance, verify it is healthy, add it back to the load balancer, repeat for the next instance. The load balancer ensures that traffic only goes to instances that are currently in the pool, so users never hit an instance that is mid-deployment.
+
+The order in which instances update can be random or deterministic. Random order is simpler. The deployment system picks an instance, updates it, picks another, updates it, and so on until all instances are updated. Deterministic order is more predictable. You might update instances in a specific availability zone first, or instances with specific labels, or instances in a specific order defined in configuration. Deterministic order is useful when you need to control which instances update first for testing or risk management reasons.
+
+Some teams update one instance at a time. Others update multiple instances in parallel. Updating one at a time is safest. If an issue appears, only one instance is affected. You catch the problem before it spreads to more instances. Updating multiple instances in parallel is faster. If you have 100 instances and update one at a time with 60 seconds per instance, the deployment takes 100 minutes. If you update five at a time, it takes 20 minutes. The trade-off is blast radius. If five instances deploy simultaneously and all five have the same bug, five instances fail before you detect the problem.
+
+The parallelism you choose depends on your tolerance for risk and your tolerance for slow deployments. High-risk changes get serial updates. Low-risk changes get parallel updates. Some systems adjust parallelism dynamically. Start by updating one instance, verify it works, then increase parallelism to five, then ten as confidence grows. This adaptive approach balances speed and safety.
+
+## Health Checks and Readiness
+
+After deploying the new version to an instance, you must verify that the instance is healthy before adding it back to the load balancer. The verification is typically a health check endpoint that the instance exposes. The deployment system or the load balancer calls the endpoint. If the endpoint returns a success response, the instance is considered healthy. If it returns an error or times out, the instance is unhealthy and the deployment system retries or aborts.
+
+For AI systems, health checks need to verify more than just that the service is running. The health check should confirm that the model is loaded into memory, that the inference runtime is initialized, that dependencies like vector databases and caches are reachable, and ideally that the model can produce a valid response to a test input. A naive health check that only verifies the web server is running will pass even if the model failed to load or if inference is throwing exceptions.
+
+A robust health check for an AI service might work like this: the deployment system deploys the new version to an instance and waits for the instance to signal readiness. The instance loads the model, initializes the inference runtime, runs a test inference on a known input, verifies the output is expected, and then marks itself as ready. The load balancer begins routing traffic to the instance only after it signals readiness. If the instance never signals readiness, the deployment system marks it as failed and does not add it back to the pool.
+
+This readiness check can take time. Loading a 70 billion parameter model into GPU memory might take 90 seconds. Warming up caches and pre-compiling inference kernels might take another 30 seconds. Running a test inference might take 5 seconds. The total readiness time is over two minutes. During that two minutes, the instance is not serving traffic, which means your effective capacity is reduced by one instance. If you update five instances in parallel, your capacity is reduced by five instances during readiness. You must ensure that your remaining instances can handle the load.
+
+## Rollback in Mid-Deployment
+
+The primary weakness of rolling deployment is what happens when you detect a problem midway through. Suppose you are updating 50 servers, you have updated 20, and you discover that the new version has a critical bug. You now have 20 servers running the broken version and 30 servers still on the old version. You must roll back the 20 updated servers to the old version, which means deploying the old version to those 20 servers, which takes time.
+
+The rollback process is the same as the forward deployment process: remove an instance from the load balancer, deploy the old version, verify health, add it back. If each instance takes 60 seconds to roll back and you do one at a time, rolling back 20 instances takes 20 minutes. During those 20 minutes, 40 percent of your traffic is hitting the broken version. Users are experiencing failures. The longer the rollback takes, the more users are affected.
+
+You can speed up rollback by increasing parallelism, but that introduces the same trade-off as increasing parallelism during forward deployment: you reduce capacity temporarily. If you roll back five instances in parallel, you lose five instances of capacity during rollback. If your system is already under load because the broken version is causing errors and retries, losing additional capacity might make the situation worse.
+
+Some teams keep the old version's binaries on each instance to enable fast rollback. After deploying the new version, they do not delete the old version. If rollback is needed, they restart the service pointing to the old binaries instead of the new ones. This avoids downloading and deploying the old version over the network, which saves time. The downside is that it uses disk space and only works if the old version's dependencies are still present on the instance. If the new version upgraded a system library or a model file, you cannot simply point back to the old binaries.
+
+Another approach is to keep old instances running until the new instances are verified. This is a hybrid between rolling deployment and blue-green. You deploy the new version to a new set of instances, verify they work, and then drain the old instances. If the new instances fail, you abort the deployment and keep the old instances running. This avoids the mid-rollback state but requires double capacity during deployment, which is the same cost as blue-green.
+
+## Session Affinity and Statefulness
+
+Rolling deployment assumes that requests are stateless or that the system can tolerate routing a user's requests to different instances. If your AI application maintains no state between requests, rolling deployment works cleanly. Each request can go to any instance, old or new, and the user gets a correct response.
+
+If your application maintains session state, rolling deployment becomes complicated. Suppose a user starts a conversation with the old version on instance 10. Their session state is stored in memory on instance 10. Mid-conversation, instance 10 updates to the new version and restarts. The session state is lost. The user's next request routes to a different instance, which does not have their session state. The conversation breaks.
+
+You can solve this with external session storage. Instead of storing session state in memory on each instance, you store it in a shared database or cache like Redis. When instance 10 restarts, the session state persists in Redis. The user's next request goes to instance 15, which loads the session state from Redis and continues the conversation. This adds complexity and latency but makes rolling deployment safe for stateful applications.
+
+Another solution is session affinity, also called sticky sessions. The load balancer routes all requests from a specific user to the same instance for the duration of their session. If instance 10 is handling a user's session, the load balancer does not route that user to instance 15. When instance 10 updates, the load balancer drains existing sessions by stopping new sessions from being assigned to instance 10 while allowing in-flight sessions to complete. Once all sessions on instance 10 complete, the instance updates. This works but slows down deployments. If sessions are long-lived, you might wait minutes or hours for an instance to drain.
+
+For AI systems where conversations or reasoning tasks can take minutes, session draining is often necessary. You cannot interrupt a user's thirty-second LLM response mid-stream to deploy a new version. The deployment must wait for the response to complete. This means your rolling deployment timeline depends on your application's usage patterns. If users rarely have long sessions, deployments are fast. If many users have long sessions, deployments are slow.
+
+## Rolling Deployment Tooling
+
+Most orchestration platforms support rolling deployments natively. Kubernetes rolling updates are the standard example. You define a new version of your deployment, Kubernetes gradually replaces old pods with new pods, and the service continues running throughout. You configure how many pods can be unavailable at once and how many extra pods can exist during the rollout. Kubernetes handles health checks, readiness gates, and rollback if too many pods fail.
+
+Cloud provider deployment tools also support rolling updates. AWS Elastic Beanstalk, Google App Engine, and Azure App Service all have rolling deployment options. You specify the new version, configure rollout parameters like batch size and health check thresholds, and the platform executes the rollout. These tools work well for standard web applications. They require customization for AI applications because the default health checks do not verify model-specific readiness.
+
+For more control, some teams build custom rolling deployment scripts. A script iterates through the list of instances, calls the cloud provider API to deploy the new version to each instance, waits for health checks to pass, and moves to the next instance. Custom scripts allow precise control over rollout order, parallelism, and health verification, but they require more engineering effort to build and maintain.
+
+Regardless of tooling, rolling deployment requires that your application can tolerate running multiple versions simultaneously. If version A and version B both write to the same database, their writes must be compatible. If they both read from the same cache, the cached data format must be compatible. This is the same backward-compatibility requirement as blue-green deployment, but it is more critical in rolling deployment because the mixed-version state lasts longer.
+
+## Deployment Speed vs Risk
+
+The speed of a rolling deployment depends on how aggressively you parallelize and how long you wait for health checks. Updating one instance at a time with thorough health checks is slow but safe. Updating twenty instances at a time with minimal health checks is fast but risky. The right balance depends on the change you are deploying.
+
+For a low-risk change like a configuration tweak, fast rollout makes sense. Deploy to ten instances at a time, use a basic health check, complete the deployment in five minutes. If something goes wrong, the impact is limited and you can roll back quickly. For a high-risk change like a new model version, slow rollout makes sense. Deploy to one instance at a time, use comprehensive health and correctness checks, take an hour to complete the deployment. If something goes wrong, you catch it early and roll back before many users are affected.
+
+Some teams encode this trade-off in their deployment tooling. They tag deployments as high-risk or low-risk, and the tooling adjusts rollout speed accordingly. High-risk deployments use low parallelism and long soak times. Low-risk deployments use high parallelism and short soak times. This requires discipline in tagging deployments correctly. If a high-risk deployment is incorrectly tagged as low-risk, it rolls out fast and fails widely.
+
+Another approach is to monitor metrics during rollout and adjust speed dynamically. Start with low parallelism, deploy to five instances, monitor error rates and latencies. If metrics look good, increase parallelism to ten instances. If metrics degrade, decrease parallelism or pause the deployment. This adaptive approach optimizes for speed when safe and slows down when risk is detected.
+
+## When Rolling Deployment Fits
+
+Rolling deployment is the default choice for stateless services with many instances where you need continuous availability during deployment and where you can tolerate temporary version inconsistency. It scales well. Deploying to 10 instances takes roughly the same amount of time per instance as deploying to 1,000 instances. It requires no additional infrastructure. It integrates well with standard orchestration platforms.
+
+Rolling deployment is less appropriate for stateful services, for services with long-running requests that cannot be interrupted, for services where version inconsistency is unacceptable, and for services with few instances where losing one instance during deployment significantly impacts capacity. It is also less appropriate for deployments where you want to test the new version extensively before exposing it to users. Rolling deployment exposes the new version as soon as the first instance updates. If that instance has a critical bug, users hit it immediately.
+
+For AI systems, rolling deployment works well when you are deploying changes that are unlikely to affect user-visible behavior or when you trust your pre-production testing. It works less well when you are deploying a new model version where you want to observe behavior on production traffic before committing fully. In that case, shadow deployment offers a way to run the new version alongside production without exposing outputs to users.
+

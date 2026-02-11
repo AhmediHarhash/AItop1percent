@@ -1,0 +1,109 @@
+# 1.3 — Control Plane vs Data Plane: The Architecture That Scales
+
+The architecture that separates configuration from execution is not unique to AI. It is how distributed systems scale. The control plane manages state: what versions are active, what rules apply, what configuration is current. The data plane executes work: it handles requests, applies the rules, uses the configuration, and returns results. In AI systems, the control plane stores prompts, routing logic, and deployment state. The data plane loads models, executes inference, and serves responses. This separation is what allows a system to update configuration without restarting services, shift traffic without redeploying models, and roll back changes in milliseconds instead of minutes.
+
+Most teams start with a monolith where control and data are entangled. Configuration lives in environment variables or config files bundled with the application. Updating configuration means redeploying the application. As scale increases, this becomes untenable. The teams that successfully scale to millions of requests all make the same architectural leap: they separate control from execution. Understanding why this separation matters and how to implement it is foundational to production AI deployment.
+
+## What the Control Plane Does
+
+The control plane is the source of truth for configuration and state. It answers questions: Which model version is active? What prompt should this user receive? What routing rules apply to this request? What is the current rate limit for this API key? What is the timeout threshold? What feature flags are enabled?
+
+The control plane does not execute inference. It does not handle user requests. It stores metadata, serves configuration, and tracks deployment state. It is a low-throughput, high-consistency system. Configuration updates are infrequent relative to inference requests. A system handling 10,000 inference requests per second might update configuration 10 times per hour. The control plane is optimized for consistency and durability, not throughput.
+
+In practice, the control plane is often a combination of services and data stores. A relational database stores prompt templates and model metadata. A key-value store like etcd or Consul stores routing rules and runtime configuration. A feature flag service stores flags for A/B tests and beta features. An API layer sits in front of these stores, providing interfaces for querying and updating configuration.
+
+The critical property: the control plane is the single source of truth. If the data plane and control plane disagree about which model version is active, the control plane is correct. The data plane eventually converges to match the control plane. This eventual consistency model allows the data plane to cache configuration for performance while still staying synchronized with the authoritative state.
+
+A team in mid-2025 ran a high-scale chatbot serving 50,000 requests per minute. Their control plane stored prompts in PostgreSQL, routing rules in Consul, and feature flags in LaunchDarkly. The data plane queried Consul on every request to determine routing but cached prompts for 60 seconds to reduce database load. When a prompt was updated, the data plane picked up the change within 60 seconds. When routing rules changed, the data plane applied them immediately. This hybrid approach balanced consistency with performance.
+
+## What the Data Plane Does
+
+The data plane handles inference. It receives incoming requests, consults the control plane to determine configuration, loads the appropriate model, executes inference, and returns results. It is a high-throughput, stateless system. Every replica is identical. Any replica can handle any request. If a replica crashes, traffic shifts to other replicas without data loss.
+
+The data plane is optimized for latency and throughput. It caches models in memory to avoid loading them on every request. It caches frequently accessed configuration to avoid querying the control plane on every request. It uses asynchronous I/O and batching to maximize GPU utilization. It horizontally scales by adding more replicas.
+
+The data plane does not store authoritative state. It reads state from the control plane, caches it for performance, and periodically refreshes to stay synchronized. If the data plane cache is stale, it serves slightly outdated configuration until the next refresh. For most configuration, this staleness is acceptable. A prompt that updates every few days can safely be cached for 60 seconds. A routing rule that changes hourly can be refreshed every 10 seconds.
+
+For configuration that requires stronger consistency, the data plane queries the control plane on every request. Rate limiting is an example. If you cache rate limit state in the data plane, a user can exceed their rate limit by hitting multiple replicas before the cache updates. For strict rate limiting, the data plane queries a centralized rate limiter on every request. The latency cost is 1-2 milliseconds. The consistency gain is exact enforcement.
+
+A financial services platform in late 2025 used vLLM for inference serving. Their data plane consisted of 40 Kubernetes pods, each running a vLLM instance with a GPT-5-mini model loaded. The pods were stateless. On startup, each pod fetched the current prompt from the control plane API, cached it in memory, and refreshed every 30 seconds. When a request arrived, the pod used the cached prompt, executed inference, and returned the result. Median latency: 280 milliseconds. Prompt update propagation time: up to 30 seconds across all pods. This was acceptable because prompt updates were infrequent and non-critical.
+
+## Why Separation Matters: Hot-Reload Without Downtime
+
+The primary benefit of separating control and data planes is hot-reloading: updating configuration without restarting services. Traditional monolithic deployments bundle configuration with code. Updating configuration requires rebuilding and redeploying the application. Redeployment causes downtime or requires complex rolling update strategies.
+
+With separated planes, configuration updates are independent of application deployment. You update a prompt in the control plane. The data plane detects the change and fetches the new prompt. The application continues running. No restart. No downtime. No deployment pipeline. The update takes seconds instead of minutes.
+
+This is not theoretical. A customer support platform needed to update a system prompt 40 times in one week to iterate on tone and accuracy. With a monolithic architecture, each update would require a full deployment cycle: commit, CI, staging, production. Assuming 20 minutes per deployment, that is 800 minutes of deployment overhead. With a separated control plane, each update took 15 seconds: update the prompt in the database, data plane refreshes on next cache expiration. Total overhead: 10 minutes for all 40 updates combined.
+
+The time difference is 80x. The risk difference is even larger. Every deployment carries risk of introducing bugs, breaking integrations, or causing downtime. 40 deployments is 40 opportunities for failure. 40 configuration updates through the control plane is 40 low-risk changes that do not touch application code.
+
+Hot-reload also enables instant rollback. A prompt update degrades quality. You revert the prompt in the control plane. The data plane picks up the revert within seconds. No application deployment. No rolling restart. The rollback is a configuration change, not a deployment operation. This reduces rollback time from minutes to seconds, which directly reduces the blast radius of bad changes.
+
+## Consistency Requirements: Eventual vs Strong
+
+Not all configuration requires the same consistency guarantees. Prompts can tolerate eventual consistency. If it takes 30 seconds for a new prompt to propagate to all data plane replicas, the impact is minimal. Some users get the new prompt, some get the old. Both work. The transition is gradual and safe.
+
+Routing rules often require stronger consistency. If you deploy a new model and update routing to send 10% of traffic to it, you want exactly 10%, not "eventually 10%." If the data plane cache is stale, some replicas might still route 0% to the new model while others route 10%. The aggregate distribution becomes unpredictable. For routing, teams typically refresh configuration every few seconds or use a push model where the control plane notifies the data plane immediately when rules change.
+
+Rate limiting requires strong consistency. If a user has a limit of 100 requests per minute and the data plane caches rate limit counters, the user can send 100 requests to each replica, bypassing the limit entirely. For rate limiting, teams either query a centralized rate limiter on every request or use distributed counters with synchronization protocols. The latency cost is acceptable because rate limiting is a single operation per request.
+
+Feature flags fall somewhere in between. A feature flag that enables a beta feature can tolerate eventual consistency. A feature flag that disables a broken feature (a kill switch) requires strong consistency. When you flip a kill switch, you want the feature disabled immediately across all replicas, not gradually over 30 seconds. For kill switches, teams use push-based updates or very short cache TTLs (1-5 seconds).
+
+The architecture must support different consistency models for different configuration types. A common pattern: use a cache with configurable TTL. Prompts: 60-second TTL. Routing rules: 10-second TTL. Kill switches: 1-second TTL. Rate limits: no cache, always query. This gives you flexibility to balance performance and consistency per configuration type.
+
+## Scale Properties: Control Plane Is Low-Throughput, Data Plane Is High-Throughput
+
+The control plane handles configuration updates and queries. Configuration updates are rare: tens or hundreds per day. Configuration queries from the data plane happen more frequently but are still orders of magnitude lower than inference requests. If the data plane caches configuration with a 30-second TTL, each replica queries the control plane twice per minute. With 40 replicas, that is 80 queries per minute. If the system handles 50,000 inference requests per minute, the control plane sees 80 queries while the data plane sees 50,000. The control plane load is 0.16% of the data plane load.
+
+This asymmetry allows the control plane to prioritize consistency and durability over throughput. You can use a traditional relational database for prompts. You can use a consensus-based key-value store like etcd for routing rules. These systems are not optimized for high throughput, but they excel at consistency and fault tolerance. The control plane does not need to scale to millions of requests per second. It needs to scale to thousands of configuration queries per minute and provide strong durability guarantees.
+
+The data plane, by contrast, must scale to handle inference load. It is optimized for throughput and latency. It uses GPU acceleration, batching, caching, and parallelism to maximize requests per second. It is horizontally scalable: add more replicas, handle more load. It is stateless: any replica can fail without data loss because state lives in the control plane.
+
+This separation of concerns simplifies scaling. Scaling the data plane is an infrastructure problem: add more GPU nodes, deploy more replicas, configure load balancing. Scaling the control plane is rarely necessary because its load is proportional to the number of data plane replicas and configuration update frequency, not inference request volume.
+
+A team scaling from 100 to 10 million requests per day increased their data plane from 5 replicas to 200 replicas. Their control plane remained a single PostgreSQL instance and a three-node etcd cluster. The control plane load increased from 10 queries per minute to 400 queries per minute (200 replicas times 2 queries per minute). PostgreSQL handled this load with no optimization. The team never had to scale the control plane. They only scaled the data plane.
+
+## Implementation Patterns: etcd, Consul, and Config Services
+
+Most mature AI platforms use one of several proven patterns for the control plane:
+
+**Relational database for structured configuration.** Prompts, model metadata, tool schemas, and other structured configuration live in PostgreSQL, MySQL, or a similar relational database. The data plane queries via a REST API. The database provides strong consistency, transactions, and rich query capabilities. The downside: higher query latency (10-50ms) compared to key-value stores. The solution: aggressive caching in the data plane.
+
+**Key-value store for high-frequency configuration.** Routing rules, feature flags, and runtime config live in etcd, Consul, or Redis. These systems provide low-latency reads (1-5ms), watch APIs for real-time updates, and strong consistency guarantees. The data plane watches keys and updates its cache immediately when values change. This enables near-instant propagation of routing changes.
+
+**Feature flag service for A/B tests.** Teams use dedicated feature flag platforms like LaunchDarkly, Split, or Unleash for managing A/B tests, gradual rollouts, and kill switches. These services provide SDKs that integrate with the data plane, handle targeting rules, and track experiment assignments. The benefit: built-in analytics, easy configuration UI, and battle-tested reliability.
+
+**Hybrid approach.** Most teams use a combination. Prompts in PostgreSQL, routing rules in Consul, feature flags in LaunchDarkly, and runtime config in environment variables or Kubernetes ConfigMaps. The control plane is not a single service. It is a collection of systems, each optimized for a specific type of configuration.
+
+The key architectural principle: the data plane treats all these systems as sources of truth. It queries them, caches the results, and refreshes periodically. The data plane does not make decisions about which model or prompt to use. It asks the control plane, receives an answer, and executes the answer. This keeps decision logic centralized and makes the data plane simple and scalable.
+
+## Instant Rollback: Flip a Version, Data Plane Follows
+
+The most powerful capability enabled by control/data separation is instant rollback. A deployment changes the active model version from v3 to v4 by updating a single value in the control plane: active_model_version = v4. The data plane queries this value, sees v4, and starts routing traffic to model v4. Quality degrades. You revert the value in the control plane: active_model_version = v3. The data plane refreshes its cache, sees v3, and starts routing traffic back to model v3.
+
+The rollback operation is updating a single value in a database or key-value store. It takes milliseconds. The propagation time to the data plane depends on cache TTL. If the data plane refreshes every 10 seconds, rollback completes across all replicas within 10 seconds. No redeployment. No pod restarts. No manual intervention beyond changing a value.
+
+This is not hypothetical. A healthcare AI platform in early 2026 deployed a new fine-tuned model. Within 90 seconds, their automated eval pipeline detected a quality regression in a specific medical specialty. An on-call engineer was paged. The engineer looked at the dashboard, confirmed the regression, and clicked a rollback button in the control plane UI. The button updated the active model version in Consul. Within 5 seconds, all data plane replicas had picked up the change and reverted to the previous model. Total time from detection to full rollback: 45 seconds. Zero users filed support tickets because the regression was caught and reverted before it caused widespread impact.
+
+The alternative: coupling model version with application deployment. Rollback requires redeploying the previous application version. If the deployment pipeline takes 10 minutes, rollback takes 10 minutes. During those 10 minutes, production continues serving the degraded model. At 1,000 requests per minute, that is 10,000 affected requests. The cost in user trust and potential revenue loss is significant.
+
+Instant rollback is not optional. It is the difference between a 1-minute incident and a 10-minute incident. At scale, that difference is millions of dollars.
+
+## Real Architecture Example: A Production System at 8 Million Requests Per Day
+
+In late 2025, a legal tech company built an AI contract review system serving 8 million requests per day. Their architecture:
+
+**Control plane:** PostgreSQL database stored prompts, model metadata, and tool schemas. Consul stored routing rules and runtime configuration. LaunchDarkly managed feature flags for A/B tests. An internal API service provided a unified interface for querying and updating configuration. The API enforced validation, logged changes, and provided audit trails.
+
+**Data plane:** 120 Kubernetes pods ran vLLM instances. Each pod had a GPT-5 model loaded in memory. On startup, each pod queried the control plane API for the current prompt, routing rules, and feature flags. The pod cached prompts for 30 seconds, routing rules for 10 seconds, and feature flags for 5 seconds. The pod watched Consul for routing rule changes and updated its cache immediately on changes.
+
+**Deployment workflow:** To deploy a new prompt, an engineer updated the prompt in the PostgreSQL database via the control plane API. The API validated the prompt, stored it with a new version number, and marked it as active. Within 30 seconds, all 120 data plane pods refreshed their caches and started using the new prompt. To deploy a new model, an engineer uploaded the model to their model registry, updated the model metadata in PostgreSQL, and updated the routing rules in Consul to point to the new model version. Within 10 seconds, all pods started routing traffic to the new model.
+
+**Rollback workflow:** If a prompt or model change caused issues, an engineer updated the active version in the control plane to point to the previous version. The data plane automatically reverted within seconds. No manual pod restarts. No redeployment.
+
+This architecture enabled the team to iterate rapidly. They deployed prompt changes 5-10 times per day. They ran continuous A/B tests, adjusting traffic splits hourly based on quality metrics. They responded to incidents by adjusting timeouts, rate limits, or kill switches in seconds. The architecture scaled from 100,000 requests per day to 8 million requests per day without major changes. They added more data plane pods. The control plane scaled effortlessly because its load was proportional to the number of pods, not the number of inference requests.
+
+The control plane and data plane separation is not a complex architectural pattern. It is the straightforward application of distributed systems principles to AI deployment. State lives in a dedicated control layer. Execution happens in a stateless data layer. This separation enables hot-reload, instant rollback, independent scaling, and rapid iteration. It is the foundation of every production AI system that operates at scale. The teams that skip this separation pay for it in slow deployments, complex rollbacks, and operational fragility. The teams that adopt it gain speed, reliability, and the ability to respond to production issues in seconds instead of minutes.
+
+The next question is: what can go wrong during deployment, and how fast does it happen? Understanding deployment risk is critical to building the right safety mechanisms.

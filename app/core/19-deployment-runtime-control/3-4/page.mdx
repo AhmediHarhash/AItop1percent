@@ -1,0 +1,126 @@
+# 3.4 — Request Queuing and Priority Scheduling
+
+When demand exceeds capacity, you have two choices: reject requests or queue them. Rejection is fast, predictable, and hostile to users. Queuing is slower, variable, and necessary. The question is not whether to queue. The question is how to queue in a way that serves the right requests at the right time without starving anyone or creating unbounded latency.
+
+Priority scheduling decides who gets served when capacity is scarce. Without it, you treat a paying customer's urgent request the same as a free-tier user's exploratory prompt. You process a 50,000-token request that will take 60 seconds before a 100-token request that will take 200 milliseconds. You give every user equal access to a resource that is fundamentally unequal in cost and value.
+
+Priority queuing is not optional for production LLM systems. It is how you survive traffic spikes, allocate scarce capacity to high-value workloads, and prevent one user from monopolizing the system.
+
+## Why Queuing Is Necessary
+
+Traffic is bursty. Even with auto-scaling, there is a delay between detecting increased load and adding capacity. During that window—3 to 10 minutes for LLM serving—incoming requests exceed available capacity. You must either queue them or reject them.
+
+Rejection is the right choice for some workloads. An API with a strict SLA might prefer to return HTTP 503 and let the client retry rather than queue requests and risk timeout. But most user-facing applications cannot reject requests. A chatbot that tells users "too busy, try again later" is a broken chatbot. A content generation tool that returns errors during peak hours loses users.
+
+Queuing smooths demand. Requests arrive in bursts. Processing capacity is steady. The queue absorbs the burst and releases requests to workers at a sustainable rate. The cost is latency—queued requests wait before processing—but the benefit is that requests eventually succeed rather than failing outright.
+
+The alternative to queuing is massive overprovisioning. Run enough capacity to handle 10x peak load so that bursts never exceed capacity. This works. It also costs 10x as much. For most workloads, queuing plus moderate overprovisioning is the correct trade-off.
+
+## Queue Architectures: Per-Replica vs Centralized
+
+The simplest queue architecture is per-replica queuing. Each serving replica maintains its own queue. When a request arrives at a replica, it enters that replica's queue. The replica processes requests from its queue in order. Load balancing determines which replica receives each request, and thus which queue each request enters.
+
+Per-replica queues are simple. They require no coordination between replicas. They scale horizontally—adding replicas adds queue capacity. The downside is that load balancing determines queue balance. If the load balancer routes unevenly—say, one replica gets twice as many long requests as another—queue depths become unbalanced. One replica has a 20-request queue while another has a 2-request queue. The system has capacity, but it is not being used efficiently.
+
+Centralized queuing puts all requests into a single queue, and replicas pull from that queue when they finish processing a request. This balances load perfectly—no replica is idle while requests wait in another replica's queue. The downside is that the centralized queue is a single point of failure and a potential bottleneck. It must handle traffic from all replicas and all incoming requests. At scale, this requires a robust, high-throughput queue implementation—Redis, RabbitMQ, Kafka, or a cloud-managed queue like AWS SQS.
+
+Distributed queuing is a middle ground. Requests enter a distributed queue system—multiple queue servers, each handling a partition of the traffic. Replicas pull from any partition. Load is balanced across queue servers and across replicas. This architecture is complex but scales to very high traffic. Most teams do not need it unless they are operating at tens of thousands of requests per second.
+
+For most production deployments, per-replica queuing with queue-aware load balancing is sufficient. The load balancer routes requests to the replica with the shortest queue. Load stays balanced. Queues stay shallow. The system is simple and scales well.
+
+## Queue Depth Management and Backpressure
+
+Unbounded queues are dangerous. If requests arrive faster than the system can process them, the queue grows indefinitely. Latency increases linearly with queue depth. A request that arrives when queue depth is 100 waits for 100 requests to finish before processing begins. If each request takes 5 seconds, the wait time is 500 seconds—over 8 minutes. No user waits 8 minutes. They retry or abandon the session. The retry adds another request to the queue. The queue grows faster.
+
+Bounded queues prevent this failure mode. Set a maximum queue size—say, 50 requests per replica. When the queue is full, new requests are rejected with HTTP 503. The client sees an error immediately rather than timing out after minutes in a queue.
+
+Rejecting requests is better than queueing them forever. The user sees an error and retries or gives up. The system does not spend resources processing requests that the user has already abandoned. Latency stays bounded. The failure is explicit rather than silent.
+
+The queue size limit should be based on acceptable latency. If each request takes 5 seconds on average and you want maximum queue wait time of 60 seconds, set the queue limit to 12 requests. When queue depth exceeds 12, reject new requests. This keeps latency predictable.
+
+Backpressure signals propagate queue state upstream. When a replica's queue is full, it signals to the load balancer: do not route more requests here. The load balancer tries other replicas. If all replicas have full queues, the load balancer itself rejects new requests. This prevents cascading failures where requests pile up at every layer of the stack.
+
+Implementing backpressure requires coordination between layers. The serving layer must expose queue depth. The load balancer must check queue depth before routing. The application layer must handle 503 errors and retry with backoff. Each layer must respect the layer below it.
+
+## Priority Scheduling: Not All Requests Are Equal
+
+Without priority scheduling, queues are first-in, first-out (FIFO). The first request to arrive is the first request processed. This is fair in the sense that everyone waits in order. It is not fair in the sense that a request that will consume 60 seconds of GPU time is treated the same as a request that will consume 200 milliseconds.
+
+Priority scheduling assigns each request a priority level. High-priority requests are processed before low-priority requests. Within a priority level, requests are processed in FIFO order. This ensures that high-value requests—like a paying customer's urgent query—are processed ahead of low-value requests—like a free-tier user's exploratory prompt.
+
+Priority is determined by request characteristics. Common priority dimensions include user tier, request type, estimated cost, and request urgency.
+
+**User tier**: Paid users get higher priority than free users. Enterprise customers get higher priority than individual subscribers. This aligns system behavior with business value. The users who pay the most get the best service.
+
+**Request type**: Real-time interactive requests get higher priority than batch jobs. A chatbot query gets priority over a bulk document summarization job. The chatbot user is waiting for a response. The batch job can tolerate minutes of delay.
+
+**Estimated cost**: Short requests get higher priority than long requests. A request estimated to consume 500 tokens gets priority over a request estimated to consume 50,000 tokens. This reduces average latency for the majority of users. Short requests finish quickly and free capacity for the next request. Long requests wait longer, but they were going to take a long time anyway.
+
+**Request urgency**: Some applications let users specify urgency. A support agent handling an escalated ticket marks their request as urgent. A content creator working on a deadline marks their generation job as high priority. This gives users control over their own experience within the limits of their account tier.
+
+## Implementing Priority Queues
+
+The simplest implementation is multiple FIFO queues, one per priority level. High-priority requests enter the high-priority queue. Low-priority requests enter the low-priority queue. The replica pulls from the high-priority queue first. Only when the high-priority queue is empty does it pull from the low-priority queue.
+
+This works but creates starvation. If high-priority requests arrive faster than the system can process them, low-priority requests never get processed. The low-priority queue grows indefinitely. Free-tier users see infinite latency. This is not acceptable for most applications.
+
+**Weighted fair queuing** solves starvation by giving each priority level a weight. High-priority gets weight 10, low-priority gets weight 1. The replica processes 10 high-priority requests for every 1 low-priority request. High-priority users get better service, but low-priority users eventually get processed.
+
+The weights can be dynamic. If the low-priority queue depth exceeds a threshold, increase its weight temporarily to drain the backlog. If the high-priority queue is empty, process low-priority requests at full speed. This balances priority with fairness.
+
+**Strict priority with starvation prevention** is a middle ground. Process high-priority requests first, but set a maximum wait time for low-priority requests. If a low-priority request has been queued for more than 2 minutes, escalate it to high priority. This guarantees that no request waits forever regardless of priority level.
+
+## Request Classification and Priority Assignment
+
+Priority must be assigned at request time. This requires classifying each request based on the available attributes: user, request type, token count, and any user-specified urgency flags.
+
+User tier is the easiest to classify. The authentication layer knows the user's subscription level. A middleware layer reads the subscription level and assigns priority accordingly. Enterprise users get priority 1. Paid users get priority 2. Free users get priority 3.
+
+Request type classification requires either explicit labeling or heuristics. If your API has separate endpoints for chat, completion, and embedding, the endpoint determines priority. If all requests hit the same endpoint, you must classify based on request content. Short requests with max tokens less than 500 are likely interactive. Long requests with max tokens greater than 10,000 are likely batch. Classify accordingly.
+
+Token count is known for input tokens and estimated for output tokens. If estimated total tokens exceed a threshold—say 20,000—assign lower priority. This prioritizes short requests over long requests.
+
+User-specified urgency requires adding a priority field to the API. Users can mark requests as high, normal, or low priority. This gives users control but requires enforcement. A free-tier user should not be able to mark all their requests as high priority and bypass the queue. Limit high-priority requests by account tier—enterprise users get unlimited high-priority, paid users get 100 per day, free users get none.
+
+## Timeout Strategies and Latency Bounds
+
+Queuing introduces latency. A request that would have taken 2 seconds to process takes 12 seconds if it waits in a 10-request queue. Timeouts prevent indefinite waits and resource waste.
+
+**Queue timeout** is the maximum time a request can wait in the queue before being rejected. If a request has been queued for 60 seconds and has not started processing, reject it with HTTP 408 Request Timeout. The user can retry if they are still waiting. The system does not waste resources processing a request the user has already abandoned.
+
+**Execution timeout** is the maximum time a request can spend in processing. If a request has been generating tokens for 120 seconds and has not finished, terminate it. Return whatever has been generated so far, or return an error. This prevents runaway requests from tying up capacity forever.
+
+**Total timeout** is the end-to-end maximum time from request arrival to response completion. This includes queue time and processing time. If total time exceeds 180 seconds, terminate the request. This is the user-facing SLA. Users who configure a 3-minute timeout on the client side should not see requests hang for 5 minutes on the server side.
+
+The timeouts must be coordinated. Queue timeout must be less than total timeout minus expected processing time. Otherwise, requests time out in processing after surviving the queue. Execution timeout must be less than total timeout minus expected queue time. Otherwise, requests that waited in the queue time out immediately when processing starts.
+
+Typical values for an interactive workload: queue timeout 30 seconds, execution timeout 90 seconds, total timeout 120 seconds. For a batch workload: queue timeout 5 minutes, execution timeout 15 minutes, total timeout 20 minutes. The values depend on your latency requirements and user expectations.
+
+## Fairness and Per-User Limits
+
+Priority scheduling favors high-priority users. This is correct. But without limits, a single high-priority user can monopolize the system and starve other high-priority users.
+
+**Per-user concurrency limits** cap the number of requests a single user can have in flight at one time. If a user already has 5 active requests, their 6th request is queued or rejected regardless of priority. This prevents one user from saturating the system.
+
+The limit depends on account tier. Enterprise users might have a concurrency limit of 50. Paid users might have a limit of 10. Free users might have a limit of 2. This aligns capacity allocation with business value.
+
+**Per-user queue limits** cap the number of requests a single user can have queued. If a user already has 10 queued requests, their 11th request is rejected. This prevents one user from filling the queue.
+
+These limits are enforced at the request ingress layer—before the request enters the queue. The ingress layer tracks active and queued request counts per user. When a new request arrives, it checks the user's current counts. If the counts exceed limits, the request is rejected with HTTP 429 Too Many Requests.
+
+## Observability for Queuing Systems
+
+You need visibility into queue depth, wait time, timeout rate, and priority distribution. Without observability, you cannot tune queue limits, priority weights, or timeout thresholds.
+
+**Queue depth by priority** shows how many requests are waiting at each priority level. If high-priority queue depth is consistently above 10, you need more capacity. If low-priority queue depth is consistently above 100, low-priority users are experiencing poor service. Scale up or adjust priority weights.
+
+**Wait time distribution** shows how long requests spend in the queue before processing starts. P50 wait time is the median. P99 wait time is the 99th percentile—the worst experience that 1% of users see. If P99 wait time exceeds your timeout threshold, 1% of requests time out before processing. Reduce queue limits or scale up.
+
+**Timeout rate by priority** shows what percentage of requests time out at each priority level. If high-priority timeout rate is above 0.1%, high-priority users are experiencing failures. Scale up or increase timeout thresholds. If low-priority timeout rate is above 5%, low-priority users are being starved. Adjust priority weights or scale up.
+
+**Priority distribution** shows what percentage of requests fall into each priority level. If 90% of requests are high-priority, your priority classification is too lenient. If 10% of requests are high-priority, your priority classification might be too strict. The distribution should reflect the true distribution of high-value and low-value requests in your application.
+
+These metrics inform capacity planning, priority tuning, and incident response. During an incident, queue depth spikes. Wait time spikes. Timeout rate spikes. The observability system alerts you before users report problems. You scale up, drain the queue, and restore service.
+
+Queuing is not a failure mode. It is a resource management strategy. The failure is not having a strategy—letting requests pile up unbounded, treating all requests equally regardless of value, and discovering that the system collapsed because one user submitted 10,000 long requests at once. Priority scheduling and observability turn queuing from a risk into a tool.
+

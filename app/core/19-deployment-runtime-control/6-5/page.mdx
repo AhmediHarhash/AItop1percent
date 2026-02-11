@@ -1,0 +1,98 @@
+# 6.5 — Cache Key Design: What Makes Two Requests 'The Same'
+
+When are two requests the same? The answer determines whether your cache helps or hurts.
+
+In early 2025, a customer support platform cached model responses to reduce costs. The cache key included only the user's question text. Within two weeks, they discovered customers in different support tiers were receiving responses meant for other tiers. A premium customer asked about refund policy and received the cached response meant for basic-tier customers, which cited a stricter policy. The customer escalated. The support team investigated and found the cache had served incorrect tier-specific information to hundreds of customers. The incident cost the company $180,000 in goodwill credits and emergency cache rebuilds. The root cause was simple: the cache key didn't include tier information, so the system treated all refund policy questions as identical regardless of who asked them.
+
+Cache key design is the foundation of caching correctness. Include too little in the key and you serve wrong responses. Include too much and you never hit the cache, wasting infrastructure on a system that provides no value. The cache key must capture everything that affects the response while excluding everything that doesn't. This balance determines whether caching accelerates your system or becomes a source of silent failures.
+
+## The Components That Define Request Identity
+
+The cache key must include every input that materially affects the model's output. Start with the obvious: the query text itself. Two users asking "what is the refund policy" should get the same response if everything else about their context is identical. The query text is the primary discriminator, but it is never sufficient alone.
+
+Model identity matters. A request to GPT-5-mini and a request to Claude Opus 4.5 with the same query produce different responses. They cannot share cache entries. The cache key must include the model identifier, and it must be specific enough to distinguish between model versions. If you upgrade from GPT-5-mini to GPT-5.1-mini, cached responses from the old model should not serve requests to the new one. Use fully qualified model names in your cache keys: "gpt-5-mini-2025-11-14" rather than "gpt-5-mini."
+
+Generation parameters affect output. Temperature, top-p, max tokens, frequency penalty, presence penalty — these all influence what the model returns. A request with temperature 0.7 produces different output than the same request with temperature 0.2. If your application uses different parameters for different scenarios, those parameters must be in the cache key. However, not all parameters matter equally. Max tokens affects only response length, not content quality or correctness for most use cases. If you're caching the first 200 tokens of every response anyway, variations in max tokens beyond 200 might not warrant separate cache entries. Parameter sensitivity requires domain judgment.
+
+The system prompt is part of request identity. If you serve customer support queries with one system prompt and sales queries with another, those cannot share cache entries even if the user query is identical. The system prompt shapes the model's behavior, its tone, its constraints, and the information it prioritizes. A change to the system prompt invalidates all cached responses generated under the old prompt. This means the cache key must include either the full system prompt text or a hash of it. Full text makes keys large. Hashing makes them compact but requires you to track which hash corresponds to which prompt version for debugging.
+
+Conversation context changes everything for multi-turn applications. In a chatbot, the question "what did you just say" has no meaning without the previous messages. The same query text produces different responses depending on what came before. The cache key must somehow include conversation history. But how? Including the full text of all previous messages makes keys massive and reduces cache hit rates to near zero — every conversation is unique. The solution is context hashing. Take the conversation history, hash it into a fixed-size identifier, and include that hash in the cache key. This allows requests with identical histories to hit the cache while keeping key size manageable.
+
+## Normalization Strategies That Increase Hit Rates
+
+Two queries that mean the same thing should produce the same cache key. This requires normalization — transforming queries into a canonical form before hashing. The goal is to collapse trivial variations while preserving meaningful differences.
+
+Whitespace normalization is the simplest and most universally applicable. Trim leading and trailing spaces. Collapse multiple spaces into one. Treat tabs and newlines as spaces. The query "what is the refund policy" and "what is the refund policy  " with trailing spaces should produce the same cache key. This normalization never loses meaning and often increases hit rates by five to ten percent just by catching accidental formatting differences.
+
+Case normalization depends on your domain. For many support and information retrieval systems, "What is the refund policy" and "what is the refund policy" should be treated as identical. Lowercase both before hashing. But in domains where case carries meaning — code generation, legal text analysis, brand name sensitivity — case normalization breaks correctness. A query about "Python" the programming language and "python" the snake are different requests. Apply case normalization only when case truly doesn't matter in your domain.
+
+Punctuation handling is more nuanced. In most natural language queries, "what is the refund policy" and "what is the refund policy?" are functionally identical. Stripping terminal punctuation collapses these variations. But mid-sentence punctuation often carries meaning. "Let's eat Grandma" and "Let's eat, Grandma" are different requests with different answers, even if your application is morbid enough to cache both. A safe approach: strip terminal punctuation, preserve internal punctuation. This increases hit rates without losing semantic distinctions.
+
+Spelling correction is a tempting normalization strategy. If users frequently misspell "refund" as "refun," correcting it before caching means both spellings hit the same cache entry. This works when your application already performs spelling correction as part of query processing. If you don't correct spelling for the model, don't correct it for the cache — the model's response to a misspelling might differ from its response to the correct spelling, and serving the wrong cached response introduces errors. Normalization must match your actual processing pipeline.
+
+## Context Hashing for Multi-Turn Systems
+
+Conversation history is high-cardinality data. Every conversation is different. Naive inclusion of full conversation history in the cache key makes caching useless — you'll never hit the cache because no two conversations are identical. Context hashing solves this by representing conversation state as a fixed-size fingerprint.
+
+The simplest approach is to hash the concatenation of all previous messages. Take the conversation history, join it into a single string, apply a cryptographic hash function like SHA-256, and include the resulting hash in the cache key. This gives you a unique identifier for each distinct conversation state. If two users happen to have identical conversation histories — unlikely but possible for early turns in scripted interactions — they'll hit the same cache entries.
+
+Structured hashing provides better debuggability. Instead of hashing the raw message text, hash a structured representation: message count, total character count, hash of each message. This allows you to reconstruct what the conversation looked like from the cache key without storing the full history. When debugging cache misses, you can see that conversation A had five messages totaling 800 characters while conversation B had four messages totaling 650 characters, explaining why they didn't share cache entries.
+
+Sliding window hashing improves hit rates for long conversations. If your application only includes the last five messages in the model context, only those five messages should affect the cache key. Hash the most recent window, not the entire conversation history. This increases cache hits because users who reach the same five-message sequence will share cache entries even if their earlier conversation history differed. The cache key reflects what the model actually sees, not the full conversational past.
+
+Semantic hashing is an advanced technique where you embed the conversation history into a vector space and hash the vector. This allows conversations that are semantically similar but textually different to share cache entries. Two users who both complained about a delayed shipment using different words might hit the same cached response if their embedded conversation states are close enough. This requires infrastructure for embedding and threshold-tuning but can dramatically increase hit rates in domains with high query variety but low intent variety.
+
+## User-Specific Versus Shared Caches
+
+Some applications serve personalized responses that cannot be shared across users. Others serve generic information that's identical for everyone. The cache key design must reflect this distinction.
+
+User-specific caches include user identity in the cache key. Every user gets their own cache namespace. This is necessary when responses depend on user attributes: account tier, subscription status, geographic location, language preference, purchase history, permissions. A question about "my recent orders" produces different responses for different users. The cache key must include user ID or a hash of the user's identity. This limits cache hit rates — each user must warm their own cache — but preserves correctness.
+
+Shared caches omit user identity when responses are truly identical across users. If a thousand users ask "what is the return policy" and they all have the same account tier, they should all hit the same cache entry. The first request computes the response and caches it. The next 999 requests hit the cache. This produces enormous cost savings and latency improvements. But it requires confidence that the response truly doesn't vary by user. The risk is subtle personalization. If your prompt includes a greeting with the username placeholder or if the model is supposed to adapt tone based on user history, shared caching breaks personalization. Design your application so personalization and cacheable content are separated. Generate the cacheable core response once, then personalize the wrapper separately.
+
+Hybrid approaches use tiered caching. The base response is shared across all users. User-specific annotations or personalizations are cached separately and composed at serving time. A product recommendation system might cache the core product information in a shared cache, then cache user-specific relevance scoring in a user-specific cache. This maximizes reuse of expensive computations while preserving personalization where it matters.
+
+## Parameter Sensitivity Analysis
+
+Not all parameters affect output equally. Some changes produce meaningfully different responses. Others produce variations so subtle they're not worth separate cache entries. Parameter sensitivity analysis determines which parameters belong in the cache key.
+
+Temperature has high sensitivity at the extremes. Temperature 0.0 produces deterministic output. Temperature 1.0 or higher produces highly variable output. The difference between temperature 0.0 and 0.3 is significant — one is deterministic, the other is not. The difference between temperature 0.7 and 0.8 is often negligible in practice. If your application uses temperature 0.7 for ninety percent of requests and 0.8 for ten percent, you face a choice: include temperature in the cache key and maintain separate caches for minor parameter variations, or round temperature to the nearest 0.2 and treat 0.7 and 0.8 as equivalent. The second approach increases hit rates at the cost of minor output variation.
+
+Max tokens rarely needs cache key inclusion if you're caching based on early response content. If you cache the first 500 tokens of every response, the fact that one request specified max tokens 600 and another specified max tokens 800 doesn't matter — you're serving the same cached prefix. If you're caching full responses and your application uses widely varying token limits, max tokens should be in the key. Otherwise, omit it.
+
+Top-p and frequency penalty have moderate sensitivity. They affect output diversity and repetition but often not correctness or factual content. If your eval suite shows that responses generated with top-p 0.9 versus top-p 0.95 are functionally equivalent for your use case, you can treat them as identical for caching purposes. If your application is creative writing where subtle variation matters, include these parameters in the key.
+
+The decision is empirical. Generate 100 responses with parameter set A. Generate 100 responses with parameter set B, identical except for one parameter. Run both sets through your eval suite. If quality metrics are indistinguishable, the parameter doesn't need to be in the cache key. If metrics differ significantly, include it. This analysis should be repeated whenever you change your eval criteria or your model.
+
+## Collision Risk Detection and Mitigation
+
+A cache collision occurs when two meaningfully different requests produce the same cache key, causing the system to serve a cached response that's wrong for the second request. Collisions are silent failures — the system doesn't know it made a mistake. Detection requires active monitoring.
+
+Log every cache hit with the full request details. When you serve a cached response, log the cache key, the original request that populated the cache, and the current request that hit it. Periodically sample these logs and verify that cached responses remain appropriate for the requests that hit them. If you find cases where the cached response is wrong for the current request despite identical cache keys, you have a collision. The fix is to add more information to the cache key to distinguish these cases.
+
+Monitor user feedback for patterns correlated with cache hits. If complaints about incorrect or irrelevant responses spike during high-traffic periods when cache hit rates are highest, collisions might be causing incorrect responses. Drill into specific complaints and trace whether the problematic response was served from cache. If you find multiple users complaining about the same wrong response, check whether they all hit the same cache entry.
+
+Implement cache key version prefixes. When you change cache key design, increment a version number that's part of every cache key. This ensures that cache entries from the old key design don't serve requests under the new key design, even if the keys happen to collide due to hashing. Version prefixes make cache key evolution safe. When you discover you need to add a new component to keys, you increment the version, which effectively invalidates all old cache entries and starts fresh.
+
+## Testing Cache Key Correctness
+
+Cache key design is not intuitive. The only way to know if your design is correct is to test it against real request diversity. This requires a testing framework that validates the interchangeability assumption: if two requests produce the same cache key, the cached response for one request must be an acceptable response for the other request.
+
+Generate a large corpus of test requests that span the variation you expect in production: different query phrasings, different conversation states, different user attributes, different parameter settings. For each pair of requests in this corpus, compute their cache keys. If the keys match, generate responses for both requests and compare them using your eval suite. The responses should be either identical or functionally equivalent. If they're not — if one request gets a correct response and the other gets an incorrect response despite identical cache keys — your cache key design is insufficient.
+
+Test edge cases explicitly. Two users with different account tiers asking the same question should produce different cache keys if responses differ by tier. Two users with the same tier asking the same question should produce the same cache key. Two conversations with different history but the same recent context window should produce the same cache key if you're using sliding window hashing. Two requests with trivial formatting differences should produce the same cache key after normalization. Write test cases that assert these properties.
+
+Shadow mode testing is the safest way to validate a new cache key design. Deploy the new cache alongside the old one. Serve all requests from the old cache as usual. For every request, compute what the new cache key would be and log it. After a week of traffic, analyze the logs. How do hit rates compare? Are there cases where the new key would have caused collisions? Are there cases where the new key would have missed opportunities for sharing? This analysis gives you confidence before switching traffic to the new cache design.
+
+## The Cache Key Evolution Problem
+
+Your cache key requirements will change. You'll discover you need to include a parameter you previously omitted. You'll add new features that introduce new context. You'll find collision patterns in production. Evolving cache key design without breaking production is an operational challenge.
+
+The simplest approach is to version your cache keys and invalidate all entries when the version changes. This is safe but expensive — you lose all cached data and must rebuild the cache from scratch. For a system serving millions of requests per hour, this means a temporary spike in inference costs and latency while the cache warms up again. It's acceptable if you do it rarely, but it doesn't scale to frequent iteration.
+
+Dual-key migration is gentler. Deploy code that computes both the old cache key and the new cache key for every request. Write to both cache entries. Read from the new cache first; if it misses, fall back to the old cache and promote the response to the new cache. Over time, the new cache warms up. Once the new cache hit rate matches the old cache hit rate, you stop writing to the old cache and eventually delete it. This approach allows you to change cache key design without a cold start.
+
+Feature flags for cache key components allow gradual rollout. When adding a new component to the cache key, put it behind a feature flag. Initially, the flag is off — the component isn't included. Turn the flag on for one percent of traffic and monitor. If hit rates drop as expected but correctness improves, roll out to ten percent, then fifty percent, then one hundred percent. This staged rollout catches problems before they affect all users.
+
+The next question is how long those cache entries should remain valid — cache invalidation determines whether cached responses stay correct as your system evolves.
+

@@ -1,0 +1,108 @@
+# 2.4 — Model Quantization for Serving: INT8, FP8, GPTQ, AWQ in Production
+
+Most teams run models in the same precision they were trained in — FP32 or BF16 — because it's the safe default. They accept that a 70-billion-parameter model requires 140 GB of memory, that they can fit one model per H100 GPU, and that inference costs 3 dollars per million tokens. Then a competitor launches with half the latency and half the cost, and the team investigates how. The answer is quantization. The competitor runs the same model in INT8, fits it in 35 GB instead of 140 GB, runs four models per GPU instead of one, and delivers 2.5 times the throughput. The team scrambles to implement quantization, discovers that their eval suite doesn't measure the quality dimensions that quantization degrades, deploys quantized models to production, and watches their support tickets triple as users complain about subtle quality regressions that evals didn't catch. The lesson: quantization is not free performance. It is a precision-for-efficiency trade that requires careful measurement, selective application, and production validation.
+
+Quantization reduces the number of bits used to represent model weights and activations. Full precision uses 32 bits per number. Half precision uses 16 bits. INT8 uses 8 bits. INT4 uses 4 bits. Fewer bits mean smaller memory footprint, faster computation, and higher throughput. The cost is reduced numerical precision. Values are rounded, gradients are coarser, and the model's ability to represent subtle distinctions degrades. For some tasks and some models, this degradation is invisible. For others, it breaks critical capabilities.
+
+## Why Quantize for Serving
+
+Quantization delivers three benefits: smaller memory footprint, faster inference, and lower cost. A 70B model in BF16 requires 140 GB of memory — 2 bytes per parameter, 70 billion parameters. In INT8, the same model requires 70 GB — 1 byte per parameter. In INT4, it requires 35 GB. Smaller memory footprint means you fit larger models on the same GPU or run more models per GPU. If you were running one 70B model per H100 and you quantize to INT8, you can run two 70B models per H100. Throughput doubles. Cost per token halves.
+
+Faster inference comes from reduced memory bandwidth. GPU compute is fast. Memory bandwidth is the bottleneck. Loading 140 GB of weights from GPU memory takes longer than the actual matrix multiplications. Quantizing to INT8 cuts memory bandwidth requirements by half. The GPU spends less time waiting for memory and more time computing. Inference speed increases by 30 to 60 percent depending on model architecture and batch size.
+
+Lower cost is the direct result of higher throughput. If one H100 GPU costs 3 dollars per hour and serves 1 million tokens per hour at BF16, your cost is 3 dollars per million tokens. If quantization increases throughput to 2.5 million tokens per hour, your cost drops to 1.20 dollars per million tokens. At scale — 10 billion tokens per month — this is the difference between 30,000 dollars and 12,000 dollars. The savings justify significant engineering effort.
+
+## Quantization Formats and Precision Levels
+
+FP16 and BF16 are half-precision floating-point formats that use 16 bits instead of 32. FP16 is the IEEE standard. BF16, bfloat16, is a variant used by modern GPUs that trades precision for range. BF16 can represent the same range of numbers as FP32 but with less precision. FP16 has higher precision but smaller range. For LLM inference, BF16 is preferred because the range matters more than the precision. FP16 vs BF16 vs FP32 is rarely a meaningful performance decision in 2026 — most models are trained in BF16 and served in BF16 by default.
+
+INT8 uses 8-bit integers instead of floating-point. This is a 2 times reduction from BF16. INT8 quantization requires mapping the range of floating-point values to the range of integers — typically minus 127 to 127. This mapping is determined by calibration. You run a representative set of inputs through the model, observe the range of activation values, and choose a scale factor that maps that range to INT8. Done well, INT8 quantization loses less than 1 percent of task performance for most models. Done poorly, it destroys the model.
+
+FP8 is a newer format supported by NVIDIA H100, H200, and Blackwell GPUs. FP8 provides better numerical properties than INT8 — it's still a floating-point format, so it handles outliers and dynamic range better. On H100, FP8 inference can be faster than INT8 because H100 has specialized tensor cores for FP8 arithmetic. But FP8 support is hardware-dependent. If you're running on older GPUs like A100, FP8 is not available.
+
+INT4 is aggressive quantization. A 70B model in INT4 requires only 35 GB. You can fit four 70B models on one H100. Throughput quadruples. But INT4 loses significant precision. For complex reasoning tasks, math, code generation, or nuanced language understanding, INT4 often degrades quality noticeably. INT4 works for retrieval, classification, and simple generation tasks where precision is less critical. It rarely works for frontier reasoning tasks.
+
+## Quantization Methods: PTQ, GPTQ, AWQ, SmoothQuant
+
+Post-training quantization, PTQ, is the simplest approach. You take a trained model, run a calibration dataset through it to observe activation ranges, compute scale factors, and quantize weights and activations. PTQ requires no retraining and takes minutes to hours. The quality loss depends on the model and the calibration dataset. For some models, PTQ to INT8 is lossless. For others, it loses 2 to 5 percent of task performance.
+
+GPTQ is a weight-only quantization method that optimizes quantization layer by layer. For each layer, GPTQ solves an optimization problem to find the quantized weights that minimize the difference from the original weights. GPTQ quantization takes longer than naive PTQ — hours instead of minutes — but produces better results. On most LLMs, GPTQ to INT4 loses less quality than naive PTQ to INT4. GPTQ is widely used in 2026 for serving large models at INT4 precision.
+
+AWQ, activation-aware weight quantization, improves on GPTQ by considering how often each weight is used during inference. Weights that are used frequently or have high impact on activations are quantized less aggressively. Weights that are rarely used or have low impact are quantized more aggressively. This requires running a calibration dataset to measure activation magnitudes, but the result is better quality preservation than GPTQ at the same bit width. AWQ is the state-of-the-art weight quantization method in early 2026.
+
+SmoothQuant targets activation quantization, not weight quantization. Activations have outliers — occasional very large values that are hard to quantize. SmoothQuant smooths these outliers by shifting magnitude from activations to weights. This makes both activations and weights easier to quantize. SmoothQuant is most useful when you're quantizing both weights and activations to INT8 and you're seeing quality degradation from activation outliers.
+
+## Quality Impact Measurement
+
+Quantization changes the model. The question is: how much? Most teams measure quality impact using perplexity and task-specific evals. Perplexity measures how surprised the model is by a held-out text corpus. Lower perplexity is better. If a model has perplexity 8.5 at BF16 and perplexity 8.7 at INT8, the degradation is small. If perplexity jumps to 12.0, the degradation is large. Perplexity is a general quality indicator, but it doesn't tell you which specific capabilities degrade.
+
+Task-specific evals measure performance on the tasks you care about. If your model does customer support, measure support quality metrics — resolution rate, user satisfaction, escalation rate. If your model does code generation, measure code correctness, compilation rate, and test pass rate. Run these evals on the original model and the quantized model. If scores drop by less than 2 percent, quantization is probably safe. If scores drop by more than 5 percent, quantization is risky. If scores drop by more than 10 percent, quantization is unacceptable.
+
+The evals you run before quantization determine what regressions you catch. If you only measure factual accuracy and quantization degrades instruction-following or tone, you won't catch it until users complain. If you only measure overall task success and quantization degrades a rare but critical edge case, you won't catch it until that edge case appears in production. The eval suite must cover all quality dimensions that users care about. If your eval suite is incomplete, quantization exposes that incompleteness.
+
+## Where Quality Loss Appears
+
+Quantization does not degrade all capabilities equally. It degrades specific capabilities in predictable ways. Rare tokens are the first casualty. Models represent rare words, technical terms, and non-English text with embeddings that occupy a narrow range in activation space. Quantization rounds those embeddings, making them less distinguishable. The model confuses rare tokens, generates wrong technical terms, or loses ability to handle non-English text.
+
+Complex reasoning is the second casualty. Multi-step reasoning requires the model to maintain intermediate state across layers. Quantization adds noise to that state. After 10 or 20 reasoning steps, accumulated noise degrades the model's ability to reach the correct conclusion. You see this as increased failure rates on math problems, logic puzzles, or multi-hop question answering.
+
+Long-context understanding is the third casualty. Models attending to a 100,000-token context are computing attention scores with very small differences between relevant and irrelevant tokens. Quantization reduces the precision of those scores. The model starts attending to the wrong parts of the context. You see this as decreased retrieval accuracy in long documents or failure to follow complex multi-turn conversations.
+
+Edge cases and tail distributions are the fourth casualty. The model is trained on a broad distribution. Most inputs are near the center of that distribution. Quantization is calibrated on typical inputs. Atypical inputs — unusual phrasing, uncommon domains, adversarially constructed prompts — fall outside the calibration range. The model's behavior on these inputs degrades more than its behavior on typical inputs. You don't see this in standard benchmarks. You see this in production when 1 percent of requests behave strangely.
+
+## Production Validation Before Deployment
+
+Never deploy quantized models based on offline evals alone. Offline evals miss things. They miss the long tail of edge cases. They miss the specific ways your users interact with the model. They miss the subtle quality regressions that users notice but benchmarks don't measure. Production validation is mandatory.
+
+The standard approach is A/B testing. Deploy the quantized model to a small percentage of traffic — 5 percent — while the original model serves the remaining 95 percent. Measure user-facing metrics: task success rate, user satisfaction scores, escalation rate, session length, thumbs-up vs thumbs-down feedback. Compare metrics between the two groups. If metrics are statistically indistinguishable, quantization is safe. If metrics degrade, quantization is risky.
+
+The duration of A/B testing matters. A one-day test might miss issues that only appear with certain types of requests or certain user behaviors. A one-week test is better. A one-month test is safest. But longer tests delay the cost savings from quantization. The trade-off depends on risk tolerance. High-stakes applications — healthcare, legal, financial advice — need longer tests. Low-stakes applications — casual chatbots, content generation — can use shorter tests.
+
+The metrics you track during A/B testing determine what regressions you catch. Track the same metrics you use for overall product quality. Track the metrics that correlate with revenue, user retention, and support costs. If the quantized model increases support tickets by 10 percent, the cost savings from quantization are offset by increased support costs. If the quantized model decreases user retention by 5 percent, the cost savings are offset by lost revenue. The business impact of quantization is not just infrastructure cost. It is the total impact on all metrics that matter.
+
+## Selective Quantization by Task and Model Component
+
+Not all tasks tolerate quantization equally. Classification, retrieval, and summarization tolerate INT8 quantization well. These tasks have clear right answers, limited output space, and tolerance for small errors. Math, code generation, and complex reasoning tolerate quantization poorly. These tasks require precision, and small errors compound across steps.
+
+The strategy is selective quantization: quantize models for tolerant tasks, keep full precision for sensitive tasks. If your product uses one model for retrieval and one model for reasoning, quantize the retrieval model to INT8 or INT4, keep the reasoning model at BF16. The retrieval model delivers most of the throughput and cost savings. The reasoning model maintains quality where it matters most.
+
+Selective quantization also applies within a single model. Quantize most layers to INT8, keep a few critical layers at BF16. The critical layers are typically the first few layers — embeddings and initial transformers — and the last few layers — output projection and language modeling head. These layers have the most impact on model quality. Quantizing them aggressively degrades quality noticeably. Quantizing the middle layers has less impact. This mixed-precision approach delivers 70 to 80 percent of the throughput gains of full quantization with much less quality loss.
+
+## Hardware Compatibility and Tensor Core Utilization
+
+Quantization performance depends on hardware. INT8 inference is fast on NVIDIA GPUs with INT8 tensor cores — A100, H100, H200, Blackwell. On older GPUs like V100, INT8 inference might not be faster than BF16 because the GPU doesn't have specialized INT8 hardware. Check your GPU's capabilities before choosing a quantization format.
+
+FP8 is only fast on H100 and newer. On A100, FP8 is emulated and slower than BF16. On V100, FP8 is not supported at all. If you're running on A100, use INT8 or BF16. If you're running on H100, FP8 is worth testing — it often delivers the best balance of quality and performance.
+
+Tensor core utilization determines how much of the theoretical speedup you actually achieve. Tensor cores are specialized hardware units that accelerate matrix multiplication. They work best with specific matrix sizes and data layouts. If your model's layer dimensions don't align with tensor core requirements, you lose performance. This is a deep optimization problem. Most teams use serving frameworks like vLLM or TensorRT-LLM that handle tensor core optimization automatically. If you're writing custom CUDA kernels, you need to understand tensor core programming.
+
+## Quantization in Multi-Model Pipelines
+
+Quantizing one model in a pipeline can degrade end-to-end quality even if that model's individual performance looks fine. If your pipeline has a retrieval model, a reranking model, and a generation model, quantizing the retrieval model might reduce retrieval recall by 2 percent. That 2 percent reduction means the generation model receives slightly worse context. The generation model's output quality drops by 5 percent even though the generation model itself is unchanged. The eval that measures only retrieval performance misses this. The eval that measures end-to-end quality catches it.
+
+The mitigation is end-to-end evaluation. Measure the final output quality of the entire pipeline, not just the output quality of each individual component. If quantizing the retrieval model degrades end-to-end quality by more than the acceptable threshold, don't quantize it — even if the retrieval model's standalone metrics are fine.
+
+This also applies to cascading errors. The retrieval model retrieves slightly wrong documents. The reranking model reranks based on those wrong documents, producing a different ranking than it would with correct documents. The generation model generates based on the reranked documents, producing output that reflects the compounded errors of retrieval and reranking. The final output is noticeably worse even though each component's error is small. Quantization amplifies this because it adds noise at every stage.
+
+## Rollback Strategy and Graceful Degradation
+
+Deploying quantized models is a one-way door until you build a rollback strategy. If you quantize, deploy to 100 percent of traffic, and then discover a quality regression, you need to roll back to the original model immediately. If rolling back requires rebuilding containers, re-deploying, and waiting for cold starts, your rollback takes 20 minutes. That's 20 minutes of degraded quality and unhappy users.
+
+The robust strategy is to run both models simultaneously during the initial deployment. Route 95 percent of traffic to the quantized model, 5 percent to the original model. If the quantized model fails, flip the routing to 0 percent quantized, 100 percent original. The flip takes seconds instead of minutes. You pay double infrastructure cost temporarily, but you derisk the deployment.
+
+Graceful degradation is another strategy. If the quantized model produces low-confidence outputs, fall back to the full-precision model for those requests. Confidence can be measured as token probability, output length, or a separate classifier that predicts whether the output is correct. This ensures that the most difficult requests — the ones where quantization is most likely to fail — are handled by the full-precision model. The easy requests — where quantization works fine — are handled by the quantized model. You get most of the cost savings with less quality risk.
+
+## When Not to Quantize
+
+Quantization is not always worth it. Don't quantize when the quality risk exceeds the cost savings. Don't quantize safety-critical applications — medical diagnosis, autonomous vehicles, legal advice — unless you have exhaustive validation that proves quantization does not increase risk. The potential harm from a wrong answer is larger than any cost savings.
+
+Don't quantize when your eval suite is incomplete. If you don't have evals that cover all quality dimensions users care about, quantization will expose that gap. You'll deploy a quantized model that passes all your evals and fails in production on dimensions you didn't measure. Fix your eval suite first, then quantize.
+
+Don't quantize when your infrastructure is already underutilized. If your GPUs are running at 30 percent utilization, quantization doesn't help. You're not bottlenecked on throughput or cost. You're bottlenecked on something else — traffic, product-market fit, go-to-market. Quantization delivers value when you're at or near capacity and you need to serve more traffic without adding more GPUs. If you're not there yet, quantization is premature optimization.
+
+Don't quantize just because competitors do. Competitors might have different quality tolerances, different user expectations, or different cost structures. What works for them might not work for you. Quantize based on your own measurements, your own trade-offs, and your own validation. Never copy a competitor's technical decision without understanding the context that makes it right for them and potentially wrong for you.
+
+## The Handoff to Batch and Streaming Inference
+
+Quantization optimizes how the model represents weights and activations. But once a request reaches the model, how it's processed — batched with other requests or streamed token by token — determines latency and throughput. Batch inference maximizes throughput by processing many requests together. Streaming inference minimizes time-to-first-token by returning tokens as they're generated. The next subchapter covers how to choose between batching and streaming, how to implement each correctly, and how to avoid the trade-offs that kill either latency or throughput.
+

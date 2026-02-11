@@ -1,0 +1,108 @@
+# 4.7 — Streaming Cutoffs and Mid-Generation Cancellation
+
+The model has generated 47,000 tokens over 90 seconds. The user's quota is 50,000 tokens per hour and they had 48,000 tokens remaining when the request started. You reserved 5,000 tokens pessimistically, assuming a normal response. But the model is writing an essay and shows no signs of stopping. You need to cut it off now, before the user exhausts their quota or before the response becomes unmanageably long. But the model is mid-sentence. How do you stop generation cleanly, bill accurately, and communicate what happened to the user?
+
+This is the streaming rate limit problem. Traditional rate limiting works on discrete requests: check quota, allow or deny, done. Streaming inference generates tokens continuously over seconds or minutes, and you do not know the final token count until generation completes. You must monitor and enforce limits in real time, during generation, not after.
+
+## The Streaming Challenge
+
+Streaming responses are the standard interface for AI inference in 2026. Users expect to see tokens appear progressively rather than waiting for a complete response. Streaming improves perceived latency, enables better UX, and allows users to interrupt generation early if the response goes off track. But streaming complicates rate limiting because resource consumption is unknown at request time.
+
+When a non-streaming request arrives, you can estimate token cost and reserve quota before routing to inference. If quota is insufficient, you reject the request immediately. The user never waits. When a streaming request arrives, you estimate token cost and reserve quota, but the estimate might be wildly wrong. A user who asks for a one-sentence summary might get a 10,000-word essay if the prompt is ambiguous. You reserved 100 tokens, but the model generated 5,000.
+
+You cannot reject the request after it has started streaming. The user has already received the first tokens. They are watching the response appear. If you suddenly cut the connection, they see a truncated response with no explanation. This is a terrible user experience. You must detect the overrun in real time and stop generation cleanly.
+
+Output length is also unpredictable. The user might specify a max_tokens limit, but they might not. If they do not, the model can generate until it hits a stop sequence, which might never happen. A model asked to "write a comprehensive guide to machine learning" could generate 100,000 tokens without hitting a natural stop. You must enforce output limits even when the user does not specify them.
+
+## Mid-Generation Monitoring
+
+Real-time token counting is required. As the model generates tokens, your orchestration layer must count them. Every token generated increments a counter associated with that request. This counter is checked against the user's quota and against the reserved token budget. When the counter approaches a limit, action must be taken.
+
+The monitoring loop runs on every token or every N tokens. Checking every single token adds overhead but provides precise cutoff. Checking every 100 tokens reduces overhead but allows up to 100 tokens of overrun. The right granularity depends on cost and user experience trade-offs. For free-tier users with tight quotas, check every token. For enterprise users with large quotas, check every 100 or 1000 tokens.
+
+The monitoring logic compares the current token count against three thresholds: user quota remaining, reserved token budget, and system-imposed output limit. If any threshold is exceeded, generation must stop. The urgency differs by threshold: exceeding reserved budget is a billing issue, exceeding quota is a contract violation, exceeding system output limit is a safety issue.
+
+Monitoring must account for both input and output tokens. The user's quota applies to total tokens, not just output. A request with 10,000 input tokens and a 50,000 token quota has only 40,000 tokens available for output. If you only monitor output tokens, you underestimate consumption. The correct approach is to debit input tokens immediately when the request starts, then monitor output tokens during generation.
+
+## Mid-Generation Cancellation
+
+Stopping generation cleanly requires coordination between orchestration and inference. The orchestration layer detects that a limit has been reached and sends a cancellation signal to the inference process. The inference process stops generation at the next token boundary, returns the partial response, and marks the request as truncated.
+
+There are two cancellation modes: graceful and hard. Graceful cancellation allows the model to finish the current sentence or thought before stopping. This produces a partial response that is at least coherent, even if incomplete. Hard cancellation stops immediately at the current token, which might leave the response mid-word. Graceful is better for user experience. Hard is better for strict quota enforcement.
+
+Graceful cancellation is implemented by setting a stop-soon flag rather than stopping immediately. The inference process checks the flag every token. When it sees the flag, it generates until the next sentence boundary, then stops. The sentence boundary is detected by looking for period-space or question-mark-space or exclamation-mark-space. This adds a small overrun, typically 10-30 tokens, but produces much more readable truncated responses.
+
+Hard cancellation is implemented by killing the inference process or closing the connection. This stops generation instantly with no overrun. The partial response is returned as-is, potentially mid-sentence. This is appropriate when quota is exhausted or when the user explicitly cancels, but not for routine output limits where coherence matters.
+
+The truncation must be communicated clearly. The response includes metadata indicating that it was truncated and why: "Output truncated: quota limit reached" or "Output truncated: exceeded max_tokens parameter" or "Output truncated: user requested cancellation." The user's application can display this message or handle it programmatically. Without clear truncation signaling, the user might assume the response is complete and act on incomplete information.
+
+## User Experience Considerations
+
+A truncated response is confusing. The user asked a question and received a partial answer. They do not know if the answer is complete or cut off. They do not know why it was cut off. They do not know what to do next. Clear communication is essential.
+
+The response should indicate truncation in two places: in the metadata and in the final text. Metadata is machine-readable: a "finish_reason" field set to "length" or "quota_exceeded" or "cancelled". The final text is human-readable: the last token in the stream is followed by a message like "Response truncated due to quota limit. You have 1,200 tokens remaining today. Upgrade to Pro for unlimited usage."
+
+The truncation message should explain the reason and offer options. If the truncation was due to quota limit, tell the user their remaining quota and when it resets. If the truncation was due to max_tokens limit, tell the user they can resubmit with a higher limit. If the truncation was due to user cancellation, confirm the cancellation. Do not leave the user guessing.
+
+Partial responses should still be useful. If the user asked for a 10-point list and you truncated after 7 points, those 7 points are still valuable. If the user asked for a summary and you truncated mid-paragraph, the first two paragraphs might still be useful. Do not discard partial responses. Return them with clear truncation signaling. The user can decide whether to use the partial result, resubmit with higher limits, or upgrade.
+
+Some use cases are more tolerant of truncation than others. Creative writing can be resumed from a partial response. Structured output like JSON or code cannot. If you truncate a JSON response mid-object, the result is unparseable. For structured output, you must either reserve enough tokens to guarantee completion or refuse to start generation if quota is insufficient.
+
+## The max_tokens Parameter
+
+The max_tokens parameter allows users to specify an output limit. If the user sets max_tokens to 500, the model stops generating after 500 tokens regardless of whether the response is complete. This is a user-imposed cutoff, not a system-imposed cutoff, but the implementation is identical.
+
+The system must enforce the minimum of user-specified max_tokens and system-imposed max_tokens. If the user requests 10,000 tokens but your system limit is 4,096 tokens, the effective limit is 4,096. If the user requests 100 tokens and your system allows 4,096, the effective limit is 100. Both limits are checked during generation.
+
+The max_tokens parameter is also used for quota reservation. If the user specifies max_tokens 500, you reserve 500 tokens from their quota. If they specify no limit, you must reserve a pessimistic estimate, often 2,000-4,000 tokens. When generation completes, you measure actual consumption and refund over-reserved tokens. This ensures accurate billing while preventing quota exhaustion mid-generation.
+
+Some users set max_tokens absurdly high: 100,000 or 1,000,000 tokens. This is usually a mistake, but you must handle it. If you allow the request, they might consume their entire quota in one request. The solution is to cap the effective max_tokens at a system-defined reasonable maximum, typically 8,000-16,000 tokens, even if the user requested more. The user is informed of the capped limit in the response.
+
+## Output Token Reservation
+
+Quota must be reserved before generation starts. You cannot allow generation to proceed and then discover mid-stream that the user has insufficient quota. By then they have consumed compute resources and received partial output. Retroactive rejection is not acceptable.
+
+The reservation size is the estimated output token count. If the user specifies max_tokens, that is the reservation size. If they do not, you estimate based on historical averages or a conservative default. A typical default reservation is 2,000 tokens, which covers most requests. If the user's quota is insufficient to cover the reservation, the request is rejected before generation starts.
+
+When generation completes, you measure actual tokens generated and adjust the reservation. If generation produced 1,200 tokens and you reserved 2,000, you refund 800 tokens to the user's quota. If generation produced 2,400 tokens and you reserved 2,000, you debit an additional 400 tokens. This true-up step ensures billing accuracy.
+
+Reservation failures must be communicated clearly. If a user has 500 tokens remaining in their quota and you require a 2,000 token reservation, the request is rejected with a message: "Insufficient quota. You have 500 tokens remaining, but this request requires at least 2,000 tokens reserved. Your quota resets in 3 hours." The user knows exactly why the request failed and what to do about it.
+
+Reservation overruns trigger cancellation. If generation reaches the reserved token count, the system checks whether more quota is available. If yes, it reserves additional quota and continues. If no, it cancels generation and returns the partial response. This prevents quota overdraft while allowing generation to exceed initial reservation if quota permits.
+
+## Billing Accuracy
+
+You must bill for actual tokens generated, not reserved tokens. Charging for reservation would overcharge users who generate short responses. Charging for actual tokens requires accurate counting and quota true-up.
+
+Token counting must include both input and output. The user consumed compute for both. The input tokens are debited when the request starts. The output tokens are debited as they are generated or at the end of the stream. Total cost is the sum of input and output tokens.
+
+Token counting must be accurate even if generation fails mid-stream. If the user's connection drops after 1,000 tokens are generated, you bill for 1,000 tokens plus input. If the server crashes after 500 tokens, you bill for 500 tokens plus input. Partial generation still consumes resources and must be billed.
+
+Billing records include the full token breakdown: input tokens, output tokens, total tokens, reservation amount, actual amount, and any refunds. This transparency is critical for user trust. If a user sees a charge for 3,000 tokens and cannot understand how the charge was calculated, they dispute it. If they see input 500, output 2,500, total 3,000, reservation 4,000, refund 1,000, final 3,000, they understand the calculation.
+
+## Edge Cases
+
+Connection drops during streaming create ambiguity. The user's client disconnected, but you do not know why. Did the user cancel intentionally? Did their network fail? Did they close the tab by accident? You must decide whether to stop generation or continue in case the user reconnects.
+
+The industry-standard approach is to stop generation after a short timeout. If the connection drops, continue generating for 5-10 seconds in case of transient network issues. If the connection is not restored, stop generation and bill for tokens generated up to that point. This balances resource efficiency with tolerance for brief network failures.
+
+Client timeouts mid-stream are similar. The client set a timeout of 30 seconds, but generation is taking 45 seconds. The client closes the connection, but generation continues on the server. You should detect the closed connection and stop generation. Continuing to generate after the client has disconnected wastes resources.
+
+Model errors mid-stream must be handled gracefully. If the inference process crashes after generating 1,500 tokens, return the 1,500 tokens to the user with an error message explaining that generation failed. Do not silently discard the partial response. The user can decide whether to retry.
+
+Streaming cutoffs also interact with retries. If generation was cut off due to quota limit, retrying will immediately fail for the same reason. The user must wait for quota reset or upgrade. If generation was cut off due to a model error, retrying might succeed. The cutoff reason determines whether retry is appropriate.
+
+## The Operational Reality
+
+Streaming cutoffs are essential infrastructure for quota enforcement. Without them, you have no way to stop a runaway generation that is consuming the user's entire quota. With them, you can enforce limits in real time, bill accurately, and provide clear feedback.
+
+The implementation complexity is moderate. You need real-time token counting, threshold monitoring, cancellation signaling, and billing true-up. These are standard components in any production streaming inference system. Most orchestration frameworks provide them out of the box.
+
+The monitoring and alerting must track cutoff rates. If 10% of requests are truncated due to output limits, your limits are too tight or your users are asking for longer outputs than you anticipated. If 0.01% of requests are truncated, your limits are not doing anything. A healthy system truncates 0.5-2% of requests, mostly from users who do not specify max_tokens or who request very long outputs.
+
+What happens when you skip mid-generation monitoring? Users exhaust their quotas in a single request. You cannot bill accurately because you do not know when to stop counting. Runaway generations consume compute for minutes or hours. Your costs explode. Users receive absurdly long responses that crash their applications. You implement mid-generation monitoring in an emergency late-night deployment after spending $40,000 on a single user's runaway request.
+
+Or you implement it correctly from day one. Monitor during generation, enforce limits in real time, communicate truncation clearly, and bill accurately. Your users understand their quota consumption. Your costs are predictable. Your infrastructure is protected.
+
+The next challenge is agents. Agents can loop indefinitely, calling tools and generating responses in a cycle that never terminates. Streaming cutoffs handle single-generation limits, but agents need session-wide limits that span dozens or hundreds of generation calls. That requires hard caps enforced at the orchestration layer.
+

@@ -1,0 +1,111 @@
+# 2.8 — Multi-Model Serving: Running Multiple Models on Shared Infrastructure
+
+Your production system does not run one model. It runs six. A large model for complex reasoning. A small model for simple queries. A summarization model. A classification model. A code generation model. A fallback model when the primary is overloaded. Each model lives on dedicated infrastructure because that is simpler. Six models, six sets of GPUs, six deployment pipelines, six monitoring dashboards. Your infrastructure cost is 90,000 dollars per month. Three of those models are idle 80 percent of the time. You are paying for simplicity. The question is whether the simplicity is worth 40,000 dollars per month.
+
+Multi-model serving runs multiple models on shared infrastructure. One set of GPUs. One deployment pipeline. One monitoring system. The infrastructure dynamically loads models based on traffic, evicts cold models to make room for hot models, and routes requests to the appropriate model. Utilization increases. Cost drops. Operational complexity increases slightly. The teams that implement multi-model serving cut infrastructure costs by 40 to 60 percent without degrading user experience. The teams that do not implement it pay for dedicated infrastructure that sits idle most of the time.
+
+## Why Multi-Model: The Reality of Production AI Systems
+
+A real production system is not a single model serving a single endpoint. It is a model portfolio. Different models serve different tasks because no single model is optimal for everything. You use a 70B parameter model for long-form writing and complex reasoning. You use a 7B model for simple classification and FAQ responses. You use a specialized summarization model for document processing. You use a fast small model as a router to decide which large model to invoke. You use a fallback model when the primary model is overloaded or unavailable.
+
+A/B testing and gradual rollouts require running multiple versions of the same model simultaneously. You deploy a new fine-tuned version and route 10 percent of traffic to it while 90 percent stays on the old version. If the new version performs well, you shift to 50/50, then 100 percent. During the rollout, both versions are live. If you dedicate separate infrastructure to each version, your infrastructure cost doubles during every rollout.
+
+Fallback chains are another multi-model pattern. Your primary model is GPT-5.2, which costs 60 dollars per million tokens. Your fallback is GPT-5-mini, which costs 5 dollars per million tokens. If the primary model is overloaded or rate-limited, requests fail over to the fallback. If you run the fallback on dedicated infrastructure but use it only 5 percent of the time, you pay for 95 percent idle capacity. If you share infrastructure between primary and fallback, the GPU serves primary requests most of the time and fallback requests when needed. Utilization increases. Cost drops.
+
+Cost tiering is a third reason. You offer three service tiers: premium, standard, and basic. Premium uses Opus 4.5. Standard uses Sonnet 4.5. Basic uses Haiku 4.5. Each tier has different traffic patterns. Premium has low volume, high value. Basic has high volume, low value. Dedicating infrastructure to each tier over-provisions for premium and under-provisions for basic. Sharing infrastructure across tiers smooths utilization and reduces total GPU count.
+
+The question is not whether you need multiple models. The question is whether you run them on shared infrastructure or dedicated infrastructure. Shared infrastructure is more efficient. Dedicated infrastructure is simpler. Efficiency wins when cost matters and you have the expertise to implement sharing.
+
+## Sharing Patterns: Dedicated Pods, Shared Pods, Model Multiplexing
+
+The simplest multi-model pattern is **dedicated pods per model**. Each model runs in its own Kubernetes pod with dedicated GPU allocation. Model A runs on GPU 1. Model B runs on GPU 2. Model C runs on GPU 3. No sharing. No interference. Simple to deploy, simple to monitor, simple to scale. But also expensive. If Model B receives 10 requests per hour and Model A receives 1,000 requests per hour, GPU 2 is idle 95 percent of the time while GPU 1 is saturated. Total cost: three GPUs. Effective utilization: 40 percent.
+
+**Shared pods with multiple models** load all models into the same process and share GPU compute. Model A, B, and C all load into one pod. Requests arrive and are routed internally to the appropriate model. The GPU processes requests for whichever model is active. Utilization increases because the GPU is never waiting for one specific model to receive traffic — it serves whichever model has requests queued. Total cost: one or two GPUs instead of three. Effective utilization: 70 percent.
+
+But shared pods introduce interference. If Model A and Model B both receive traffic simultaneously, they compete for GPU memory and compute. If Model A uses 40 GB of GPU memory and Model B uses 35 GB, they do not fit on an 80 GB GPU unless you unload one to load the other. If Model A has strict latency requirements and Model B has relaxed requirements, Model B can degrade Model A's latency when both are active. Shared pods work best when models are small relative to GPU memory and traffic to each model is bursty and non-overlapping.
+
+**Model multiplexing** loads and unloads models dynamically based on demand. The serving infrastructure holds a cache of recently used models in GPU memory. When a request arrives for Model A, the system checks if Model A is loaded. If yes, process the request. If no, unload the least recently used model and load Model A. This allows the system to serve many models — potentially dozens — on a single GPU by treating GPU memory as a cache and swapping models as needed.
+
+Multiplexing works when traffic to each model is infrequent and burstiness is high. A system that serves 20 different models but each model only receives a few requests per minute can multiplex all 20 models on two or three GPUs. The cold-start cost — loading a model from disk into GPU memory — is 2 to 10 seconds depending on model size. This is acceptable for batch workloads or low-traffic APIs but not for interactive user-facing applications. If your user waits 8 seconds for a model to load before generation starts, the system feels broken.
+
+Multiplexing is a cost optimization for systems with many models and low per-model traffic. It is not a latency optimization. If your models are hot and traffic is continuous, keep models loaded in memory and use shared pods or dedicated pods.
+
+## Model Multiplexing: Load on Demand, Evict on Pressure
+
+Model multiplexing treats GPU memory as a fixed-size cache. The cache holds N models, where N depends on model size and available memory. A GPU with 80 GB of memory can hold five 13B models, or two 70B models, or ten 7B models. When a request arrives for a model not in the cache, the system must evict a model to make room.
+
+The eviction policy is typically **least recently used (LRU)**. The model that has gone the longest without serving a request is evicted first. LRU works well when traffic has temporal locality — if a model was used recently, it is likely to be used again soon. A model that has not received traffic in 10 minutes is evicted to make room for a model receiving traffic now. If traffic patterns are random and unpredictable, LRU degrades to frequent thrashing — constantly loading and unloading models with high cache miss rates.
+
+Preloading improves cache hit rates. If you know Model A receives traffic every weekday from 9 AM to 5 PM and Model B receives traffic every night from 10 PM to 6 AM, preload Model A at 8:55 AM and Model B at 9:55 PM. Scheduled preloading eliminates cold starts for predictable traffic patterns. Preloading based on traffic prediction — using historical patterns or user-specific models — works for personalized model serving where each user has a preferred model and you can predict which users will be active in the next few minutes.
+
+The load time is the latency penalty for a cache miss. Loading a 13B model from NVMe storage into GPU memory takes 3 to 6 seconds. Loading a 70B model takes 8 to 15 seconds. This is sequential disk read time plus GPU memory transfer time. You can reduce load time by storing models on faster storage — NVMe SSDs are 3x faster than SATA SSDs — or by keeping models in CPU memory and transferring to GPU on demand, which is faster than disk read but consumes large amounts of CPU memory.
+
+Model multiplexing is the right pattern when you have many models, low per-model traffic, and tolerance for occasional cold-start latency. It is the wrong pattern when you have a few hot models with continuous traffic and strict latency requirements.
+
+## Resource Isolation: Memory Guarantees and Priority Queuing
+
+The hardest problem in multi-model serving is resource isolation. How do you prevent one model from starving others? If Model A receives a traffic spike and allocates all available GPU memory, Model B cannot process requests until Model A's traffic subsides. If Model C has high-priority requests and Model D has low-priority requests, how do you ensure Model C gets preferential access to compute when both models have queued requests?
+
+**Memory guarantees** reserve a minimum amount of GPU memory per model. Model A is guaranteed 20 GB. Model B is guaranteed 15 GB. Model C is guaranteed 10 GB. If Model A tries to allocate more than 20 GB, the allocation fails or the request is queued until memory becomes available. Memory guarantees prevent one model from consuming all memory and causing OOM errors for other models. But memory guarantees also reduce flexibility. If Model A is idle and Model B is busy, Model B cannot use Model A's reserved 20 GB even though it is unused.
+
+**Priority queuing** assigns priorities to models or request types. High-priority requests are processed before low-priority requests. If both Model A and Model B have queued requests and Model A is marked high-priority, Model A's requests are processed first. Priority queuing is useful for tiered service levels. Premium customers get high-priority routing. Free users get low-priority routing. During traffic spikes, premium customers maintain acceptable latency while free users experience degraded latency.
+
+Most serving frameworks do not implement memory guarantees or priority queuing natively. You must build it at the application layer. Track memory usage per model. Reject requests that would exceed a model's memory limit. Implement a priority queue that pops high-priority requests before low-priority requests. This adds complexity. The alternative is accepting that resource contention happens and handling it with retries and fallbacks.
+
+A simpler approach is to avoid tight sharing. Do not pack models so tightly that one traffic spike causes failures for other models. Leave 20 percent headroom in GPU memory. Monitor per-model traffic and move hot models to dedicated GPUs when contention becomes a problem. Shared infrastructure is a cost optimization, not a goal. If sharing degrades reliability, dedicate.
+
+## Routing to Models: Selection, Load Balancing, and Cost Optimization
+
+Requests must be routed to the correct model. The routing decision happens at the API layer. A request arrives with metadata indicating which model to invoke: a model name in the API path, a model ID in request headers, or a task type that maps to a model. The API server looks up which pod or replica hosts that model and forwards the request.
+
+For models running on shared infrastructure, routing is internal to the pod. The pod loads multiple models. The API server routes the request to the pod, and the pod routes internally to the appropriate model. For models running on dedicated infrastructure, routing happens at the load balancer or service mesh. Each model has a dedicated service endpoint. The API server routes to the service endpoint, and Kubernetes routes to a healthy pod.
+
+**Load-based routing** distributes requests across replicas based on current load. If Model A is deployed on three replicas and Replica 1 is serving 10 requests, Replica 2 is serving 15 requests, and Replica 3 is serving 5 requests, route the next request to Replica 3. Load-based routing balances utilization across replicas and reduces tail latency by avoiding overloaded replicas.
+
+**Cost-based routing** selects the cheapest model that meets quality requirements. Your system has three models: a large expensive model, a medium-cost model, and a small cheap model. You classify incoming requests by complexity. Simple requests route to the cheap model. Complex requests route to the expensive model. Cost-based routing can reduce inference cost by 50 percent or more if classification accuracy is high. The challenge is classification. How do you determine request complexity before processing the request? Use a fast router model, use heuristics based on request length or keywords, or let the cheap model attempt the request and escalate to the expensive model if confidence is low.
+
+**Quality-based routing** ensures requests are served by models that meet quality thresholds. If Model A has a known hallucination problem on financial queries, route financial queries to Model B. If Model C degrades on long-context requests, route long-context requests to Model D. Quality-based routing requires per-model quality monitoring and routing rules based on request characteristics. It is operationally complex but necessary when model quality varies significantly across tasks.
+
+## Versioning with Multi-Model: Simultaneous Versions and Traffic Splitting
+
+Every model deployment is a version. Version 1.0 is your baseline. Version 1.1 is a fine-tuned model. Version 1.2 is a different fine-tuning run. Running multiple versions simultaneously allows gradual rollouts and A/B testing. But each version consumes infrastructure. If you dedicate separate GPUs to each version, your infrastructure cost multiplies with every version you run. Multi-model serving allows running multiple versions on shared infrastructure.
+
+Deploy Version 1.0 and Version 1.1 to the same pod. Route 90 percent of traffic to Version 1.0 and 10 percent to Version 1.1. Monitor quality metrics for both versions. If Version 1.1 performs as well as or better than Version 1.0, shift to 50/50, then 90/10 in favor of Version 1.1, then 100 percent Version 1.1. During the rollout, both versions share GPU resources. Utilization increases. Cost stays flat.
+
+Version rollback is simpler with multi-model serving. If Version 1.1 degrades quality, shift all traffic back to Version 1.0 instantly. Version 1.0 is still loaded and ready. No redeployment required. Rollback latency is milliseconds — the time to update a routing configuration. Contrast this with dedicated infrastructure: rolling back requires scaling down Version 1.1 pods and scaling up Version 1.0 pods, which takes minutes and risks availability gaps during the transition.
+
+The tradeoff is that running multiple versions increases memory usage. Two versions of a 13B model require 52 GB of GPU memory. If your GPU has 80 GB, this leaves 28 GB for KV cache and activations. If traffic to both versions is high, you may hit memory limits. Monitor memory usage during rollouts and scale infrastructure if needed. But in most cases, running two versions on shared infrastructure is still cheaper than dedicating separate infrastructure to each version.
+
+## Operational Complexity: Monitoring, Alerting, Capacity Planning
+
+Multi-model serving requires per-model monitoring. You cannot treat the system as a black box. You must monitor request rate, latency, error rate, and quality metrics per model. A spike in Model B's latency might be invisible in aggregate metrics if Model A's traffic dominates. Per-model dashboards surface problems early.
+
+Alerting must be per-model. If Model C's error rate exceeds 1 percent, alert. If Model D's p99 latency exceeds 2 seconds, alert. Aggregate alerts trigger when multiple models degrade simultaneously but miss isolated model-specific issues. Per-model alerts catch problems that affect only one model.
+
+Capacity planning becomes multi-dimensional. You must plan for peak traffic across all models, not just peak traffic for one model. If Model A peaks during business hours and Model B peaks overnight, total capacity must support the peak across both. If Model A and Model B both peak at the same time, you need capacity for concurrent peak traffic. If peaks are offset, you can share capacity.
+
+Track per-model traffic patterns over time. Identify which models are hot (high traffic, continuous requests) and which are cold (low traffic, sporadic requests). Move hot models to dedicated infrastructure for better isolation and predictability. Keep cold models on shared infrastructure for cost efficiency. The goal is not to share everything. The goal is to share when sharing increases efficiency without degrading reliability.
+
+## When Dedicated is Better: High-Volume, Latency-Sensitive, Isolation-Required
+
+Dedicated infrastructure is the right choice for high-volume models. If Model A handles 70 percent of your total traffic, dedicating GPUs to Model A simplifies operations and improves reliability. Shared infrastructure makes sense when traffic is distributed across many models. It does not make sense when one model dominates.
+
+Latency-sensitive models also favor dedicated infrastructure. If Model B must respond in under 200 milliseconds p99 and any latency degradation violates SLAs, isolate Model B on dedicated GPUs. Shared infrastructure introduces interference and unpredictability. Dedicated infrastructure provides consistent performance.
+
+Isolation requirements driven by compliance, security, or customer contracts also force dedicated infrastructure. If a customer pays for dedicated model hosting as part of their contract, you cannot share their model with other customers. If regulatory requirements mandate physical or logical isolation, you cannot share GPUs. Dedicated infrastructure is non-negotiable when isolation is a requirement, not an optimization.
+
+The rule: Share when sharing reduces cost without increasing risk. Dedicate when isolation, performance, or reliability is more valuable than cost savings. Multi-model serving is a tool, not a mandate. Use it where it fits.
+
+## The Efficiency Calculation: Cost vs Complexity
+
+A SaaS platform ran six models: two large models for premium customers, three medium models for standard customers, and one small model for free users. Each model ran on dedicated GPUs. Total GPU count: 18. Monthly cost: 54,000 dollars. Average utilization: 35 percent.
+
+They migrated to multi-model serving. The two large models stayed on dedicated GPUs because they handled 60 percent of traffic. The three medium models and one small model moved to shared infrastructure. GPU count for shared models dropped from 12 to 5. Total GPU count: 11. Monthly cost: 33,000 dollars. Average utilization: 62 percent. Savings: 21,000 dollars per month.
+
+Engineering investment: four weeks to implement routing, cache management, and per-model monitoring. Operational complexity increased moderately. But the ROI was clear. The team saved 21,000 dollars per month for an upfront cost equivalent to one month of savings. After one month, the investment paid for itself. Every month after that was pure savings.
+
+Multi-model serving is not appropriate for every system. Small systems with one or two models gain little. Large systems with diverse model portfolios gain significantly. The teams that calculate the ROI and implement sharing when it makes sense cut infrastructure costs without sacrificing quality. The teams that default to dedicated infrastructure because it is simpler pay the difference every month.
+
+---
+
+The next subchapter covers self-hosted versus managed serving — the build-versus-buy decision for model infrastructure.

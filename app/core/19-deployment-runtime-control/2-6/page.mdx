@@ -1,0 +1,91 @@
+# 2.6 — GPU Resource Allocation: Fractional Sharing, Model Batching, Memory Management
+
+Most production AI infrastructure runs at 30 percent GPU utilization. Your cloud bill shows 20 A100 GPUs running 24/7. Your monitoring shows those GPUs idle 70 percent of the time. You are paying for 20 GPUs and getting the effective capacity of six. The problem is not your workload. The problem is your allocation strategy. GPUs are expensive, and the default allocation pattern — one model per GPU, full memory reserved, exclusive access — is designed for research convenience, not production efficiency.
+
+The teams that reduce infrastructure cost by 50 percent or more do not buy cheaper GPUs. They share GPUs intelligently. They batch workloads. They manage memory dynamically. They measure utilization and right-size instances. The difference between 30 percent utilization and 75 percent utilization is the difference between profitability and burning cash on idle compute.
+
+## The Utilization Problem: Reserved But Unused
+
+GPU memory is allocated at request time and held until the request completes. A model that requires 24 GB of memory to load will reserve 24 GB even if inference only uses 18 GB. A request that generates 50 tokens allocates a KV cache sized for 2048 tokens, then uses 2 percent of it. The memory is reserved but not used. The GPU sits idle between requests, waiting for the next batch to form. Utilization averages 20 to 40 percent in most deployments because allocation is static, traffic is bursty, and inference is fast relative to idle time.
+
+This is waste at industrial scale. An A100 80GB costs approximately 3 to 4 dollars per hour on major clouds. At 30 percent utilization, you are paying 3 dollars per hour for 0.90 dollars of effective compute. Multiply that across 50 GPUs running continuously and you are spending 10,000 dollars per month on idle capacity. The CFO asks why your AI infrastructure costs 150,000 dollars per month. The answer is that you are paying for 50 GPUs but using 15.
+
+The fix is not to accept 30 percent utilization as inevitable. The fix is to share, batch, and manage dynamically.
+
+## Fractional GPU Sharing: Running Multiple Workloads on One GPU
+
+A single A100 80GB GPU can run four 20B-parameter models simultaneously, or two 70B-parameter models, or one 70B model plus several smaller models. But the default Kubernetes GPU allocation gives each pod exclusive access to an entire GPU. You deploy a 7B model that uses 14 GB of memory, and Kubernetes allocates an 80 GB GPU. The remaining 66 GB sits unused. You deploy eight such models and consume eight GPUs. With fractional sharing, those eight models fit on two GPUs.
+
+Fractional GPU sharing allows multiple pods to use the same GPU. NVIDIA provides several mechanisms for this. **Multi-Instance GPU (MIG)** physically partitions an A100 or H100 into up to seven isolated instances, each with dedicated memory and compute. A single A100 80GB can be split into seven 10GB instances, or three 20GB instances, or other configurations. Each MIG instance appears to Kubernetes as a separate GPU. You schedule pods to MIG instances, and they run with hardware-level isolation. MIG is ideal for multi-tenant environments where workload isolation matters, or for running many small models on shared infrastructure.
+
+**Time-slicing** allows multiple pods to share a GPU by taking turns. The NVIDIA device plugin for Kubernetes supports time-slicing configuration. You configure a GPU to support four replicas, and Kubernetes schedules up to four pods on that GPU. Each pod believes it has exclusive access, but the GPU switches between workloads at the millisecond level. Time-slicing works when workloads do not saturate the GPU. Four models that each use 20 percent of GPU compute can time-slice on one GPU and each maintain acceptable latency. Four models that each want 80 percent compute will starve each other. Time-slicing is memory-sharing without isolation — all pods see the same memory space, which means careful monitoring is required to prevent OOM errors.
+
+**Multi-Process Service (MPS)** allows multiple processes to submit work to the same GPU concurrently. MPS is designed for workloads where each process submits small batches and the GPU would otherwise be underutilized. MPS improves utilization but does not provide memory isolation. It is most useful for inference workloads with high request rates and small batch sizes, where multiple models can keep the GPU busy without interfering with each other.
+
+**Virtual GPU (vGPU)** is NVIDIA's enterprise solution for GPU sharing. It allows a single physical GPU to be virtualized into multiple vGPU instances, each with dedicated memory and compute guarantees. vGPU is common in virtualized environments like VMware, but less common in Kubernetes-native deployments. For cloud-native AI serving, MIG and time-slicing are the standard approaches.
+
+## Memory Management: Static, Dynamic, and PagedAttention
+
+Traditional serving allocates memory statically. You load a model, allocate a fixed-size KV cache per request slot, and reserve that memory until the server restarts. A model that supports eight concurrent requests with a 2048-token context allocates 8 times 2048 tokens of KV cache at startup. If your average request generates 80 tokens, you allocated for 2048 and used 80. You wasted 96 percent of the memory. Multiply that across dozens of requests and you have massive over-provisioning.
+
+Dynamic memory allocation solves this by allocating memory as needed. When a request starts, allocate a small KV cache. As the request generates tokens, grow the cache. When the request completes, free the memory. This is how PagedAttention works in vLLM. Instead of allocating a contiguous block of memory for the entire KV cache, PagedAttention allocates memory in small blocks — typically 16 tokens per block. A request that generates 80 tokens uses five blocks. A request that generates 800 tokens uses 50 blocks. Short requests use little memory. Long requests use more. Memory efficiency improves by 2x to 4x compared to static allocation.
+
+PagedAttention also enables memory sharing across requests. If two requests share the same prompt prefix, they can share the KV cache for that prefix. This is useful for batch inference with a common system prompt, or for conversational systems where the first several turns are identical across users. The shared prefix is cached once, and each request only allocates memory for its unique suffix. Memory savings can be 50 percent or more for workloads with high prompt overlap.
+
+Dynamic memory management is harder to operate than static allocation. You must monitor memory fragmentation, track allocation failures, and handle out-of-memory errors gracefully. But the cost savings are large enough that every high-throughput serving system should use dynamic allocation. If you are using static allocation, you are over-provisioning by 50 to 75 percent.
+
+## Model Batching Strategies: Maximizing Throughput Per GPU
+
+A GPU processes a batch of requests almost as fast as it processes a single request. A 70B model generating 100 tokens for one request takes 3.2 seconds. Generating 100 tokens for eight requests in a batch takes 3.8 seconds. You process eight requests in the time it used to take to process one. Throughput increases 8x. Cost per request drops by 87 percent. Batching is the highest-leverage optimization in model serving.
+
+Continuous batching allows the server to form batches dynamically. Requests arrive at unpredictable times. Instead of waiting for a fixed batch size or a timeout, the server starts generating as soon as at least one request is available. As new requests arrive, they are added to the current batch. As requests complete, they are removed. The batch size fluctuates — it grows when traffic is high and shrinks when traffic is low. The GPU never waits. Utilization stays high.
+
+The key parameters are **batch formation timeout** and **maximum batch size**. Batch formation timeout controls how long the server waits for additional requests before starting generation. A timeout of 50 milliseconds means the server waits up to 50 milliseconds to gather more requests. If no requests arrive, it starts generating with the current batch. If requests arrive, it adds them to the batch and starts generating. A longer timeout allows larger batches but increases latency. A shorter timeout reduces latency but results in smaller batches. Typical values are 10 to 100 milliseconds, depending on traffic patterns and latency requirements.
+
+Maximum batch size limits how many requests can be processed concurrently. A larger maximum allows higher throughput but requires more GPU memory for KV caches. A 70B model with a maximum batch size of 16 and a 2048-token context might need 40 to 50 GB of KV cache memory. The same model with a maximum batch size of 32 might need 80 GB, which exceeds the capacity of a single A100 80GB GPU. The correct maximum batch size is the largest value that fits in GPU memory while leaving room for model weights and intermediate activations. Measure memory usage under load and tune the maximum batch size to avoid OOM errors while maximizing throughput.
+
+Dynamic batch sizing adjusts the maximum batch size based on current memory usage. If memory usage is low, increase the maximum to allow more concurrency. If memory usage is high, reduce the maximum to prevent OOM errors. vLLM implements this with a memory scheduler that tracks available memory and adjusts batch size dynamically. This allows the system to handle traffic spikes without manual tuning, and to maximize throughput during normal traffic.
+
+## Multi-Model Per GPU: When It Works, When It Breaks
+
+Running multiple models on a single GPU is efficient when the models are small relative to GPU memory and the workloads do not interfere. Three 7B models that each use 14 GB of memory fit comfortably on an 80 GB GPU with room for KV caches and intermediate activations. If traffic to each model is independent and latency requirements are not strict, running all three models on one GPU cuts infrastructure cost by 66 percent.
+
+But multi-model per GPU introduces interference. Each model competes for GPU compute and memory. If all three models receive traffic simultaneously, they batch separately and compete for compute. Latency increases. If one model receives a burst of traffic, it can saturate GPU memory and cause OOM errors for the other models. If one model has strict latency requirements and another has relaxed requirements, the strict model will miss SLAs when the relaxed model is generating.
+
+The correct use case for multi-model per GPU is when models are small, traffic is predictable, latency requirements are relaxed, and you are optimizing for cost over performance. A batch processing system that runs six different 7B models for different data enrichment tasks can pack all six on two GPUs and process requests overnight. An interactive chat system that runs three models with sub-second latency requirements should not pack models — isolation and predictability matter more than cost.
+
+Memory isolation is the hardest problem. Most serving frameworks do not provide memory limits per model. If three models are loaded on one GPU and one model receives a traffic spike, it can allocate all available memory and cause the other models to fail. You can work around this with Kubernetes resource limits at the pod level, but that requires running each model in a separate pod and using time-slicing or MPS to share the GPU. This reintroduces operational complexity and reduces the simplicity of multi-model serving.
+
+The rule: Multi-model per GPU is a cost optimization for batch workloads. For interactive, latency-sensitive workloads, prefer dedicated GPUs per model.
+
+## Right-Sizing GPU Instances: Match Memory to Model
+
+An 80 GB GPU costs roughly twice as much as a 40 GB GPU. A 40 GB GPU costs roughly twice as much as a 24 GB GPU. If your model fits in 24 GB, running it on an 80 GB GPU is paying 4x the cost for capacity you do not use. Right-sizing GPU instances means choosing the smallest GPU that fits your model, your expected batch size, and your KV cache requirements.
+
+The calculation is straightforward. A 70B parameter model in 16-bit precision uses approximately 140 GB of memory just for weights. It requires two 80 GB GPUs with tensor parallelism. A 70B model quantized to 4-bit uses approximately 35 GB for weights. It fits on a single 40 GB A100 with 5 GB remaining for KV cache and activations. If you do not need 16-bit precision, quantizing and downsizing from two 80 GB GPUs to one 40 GB GPU cuts cost by 75 percent.
+
+A 13B model in 16-bit uses approximately 26 GB. It fits on a single 40 GB GPU with 14 GB for KV cache. If you expect low traffic and can run with a maximum batch size of four, it might fit on a 24 GB GPU. If you expect high traffic and need a maximum batch size of 16, you need the 40 GB GPU. Measure actual memory usage under realistic load, add 20 percent headroom for traffic spikes, and choose the smallest GPU that meets that requirement.
+
+The cost comparison is significant. Running ten 13B models on ten 40 GB GPUs costs approximately 20,000 dollars per month. Running those same models on ten 80 GB GPUs costs approximately 40,000 dollars per month. You pay double for capacity you do not use. The teams that right-size instances save 30 to 50 percent on infrastructure cost.
+
+## Monitoring GPU Utilization: What to Measure
+
+GPU utilization is not a single number. It is a set of metrics that together describe how effectively you are using the hardware. **GPU utilization percent** measures how much time the GPU spends executing kernels versus idle. A utilization of 50 percent means the GPU is computing 50 percent of the time and idle 50 percent of the time. This is the first metric to check when diagnosing underutilization.
+
+**Memory utilization** measures how much GPU memory is allocated versus available. A 40 GB GPU with 32 GB allocated shows 80 percent memory utilization. High memory utilization is necessary but not sufficient for efficiency — you can have 100 percent memory allocated and 30 percent compute utilization if your memory is reserved but not actively used for computation.
+
+**Tensor core utilization** measures how much time the tensor cores — the specialized units for matrix multiplication — are active. For LLM inference, tensor core utilization is the most important metric because most compute happens in matrix multiplications. A GPU with 70 percent overall utilization but 90 percent tensor core utilization is well-optimized. A GPU with 70 percent overall utilization but 30 percent tensor core utilization is bottlenecked somewhere else — likely memory bandwidth or batching inefficiency.
+
+**Power consumption** is a secondary indicator of utilization. A GPU under load draws near its thermal design power (TDP). An A100 has a TDP of 400 watts. If your A100 is drawing 120 watts, it is mostly idle. Power consumption correlates with compute utilization. Monitoring power gives you a real-time signal of whether the GPU is working or waiting.
+
+Collect these metrics at one-minute granularity and track them over time. If your GPU utilization averages below 50 percent, you are over-provisioned or under-batching. If your tensor core utilization is below 60 percent, your batching strategy is inefficient. If your memory utilization is above 90 percent, you are at risk of OOM errors and should reduce maximum batch size or scale horizontally.
+
+## What Happens When You Get Allocation Wrong
+
+A healthcare AI company deployed a 70B model for clinical note summarization on dedicated 80 GB A100 GPUs, one model per GPU. They ran 30 GPUs. Their average GPU utilization was 22 percent. Their traffic was bursty — high during business hours, near-zero overnight and on weekends. They paid for 30 GPUs running 24/7 and used the equivalent of seven. Their monthly infrastructure cost was 120,000 dollars. They could have achieved the same throughput with 10 GPUs using continuous batching, fractional sharing during low-traffic periods, and dynamic batch sizing. The actual compute cost should have been 40,000 dollars per month. They wasted 80,000 dollars per month because they allocated GPUs like research infrastructure, not production infrastructure.
+
+Allocation mistakes scale linearly with GPU count. Every underutilized GPU costs 2,000 to 3,000 dollars per month. Fifty underutilized GPUs cost 100,000 to 150,000 dollars per month in waste. The teams that fix allocation cut infrastructure costs in half without changing models, without reducing quality, without degrading user experience. They measure, batch, share, and right-size. Allocation is not an infrastructure detail. Allocation is a cost driver, and cost drives profitability.
+
+---
+
+The next subchapter covers stateless versus stateful serving — architecture tradeoffs and scaling patterns.

@@ -1,0 +1,102 @@
+# 4.2 — Request-Based vs Token-Based Rate Limits: The Critical Difference
+
+Most systems implement request limits. Smart systems implement token limits. The best systems implement both. This is not redundancy. This is defense in depth. Each limit protects against a different failure mode. Request limits prevent request flooding. Token limits prevent resource exhaustion. You need both because the attacks your system faces will exploit whichever dimension you leave unprotected.
+
+Request-based limits are simple to implement. You increment a counter on each request. You check the counter before admitting the request. If the counter exceeds the limit, you reject the request. If the limit resets every minute, you set a TTL on the counter for 60 seconds. The logic fits in ten lines of code. Every engineer who has built an API has implemented this. The mental model is immediate.
+
+Request-based limits are easy to explain to users. "You can make 100 requests per hour." The user understands this. They know what a request is. They can count to 100. They can look at a clock. There is no technical complexity. Customer support does not get confused. Product marketing does not stumble over the explanation.
+
+Request-based limits prevent request flooding. A malicious user cannot send 10,000 requests per second to overwhelm your load balancer. A buggy client cannot get stuck in a loop sending infinite requests. A misconfigured integration cannot accidentally DDoS your API. The request limit catches these problems before they propagate.
+
+But request-based limits do not reflect resource use. A user sending 100 tiny requests consumes far fewer resources than a user sending 10 massive requests. The request limit treats them the same. This is acceptable for traditional APIs where request cost is uniform. It is unacceptable for LLMs where request cost varies by four orders of magnitude.
+
+## Token-Based Limits: Reflecting Resource Reality
+
+Token-based limits are complex to implement. You must count tokens before the request starts. You must count tokens as the response generates. You must handle the case where output token count is unknown until generation completes. You must decide whether to reserve capacity for estimated output or allow overrun and reconcile later. You must ensure the tokenizer you use for counting matches the tokenizer the model uses. The logic requires careful state management and error handling.
+
+Token-based limits are harder to explain to users. "You can use 10 million tokens per month." The user asks, "How many tokens is that?" You explain that it depends on the length of their input and output. They ask, "How do I know how many tokens my input is?" You explain that a token is roughly four characters, or three-quarters of a word, but it varies by language and content. They are now confused. Customer support fields questions daily. Product marketing struggles to create clear pricing pages.
+
+Token-based limits reflect actual resource consumption. A user who sends massive context windows consumes their quota proportionally. A user who sends short queries conserves their quota. The system is fair. Heavy users pay more. Light users pay less. The relationship between usage and cost is honest and predictable.
+
+Token-based limits enable capacity planning. You know your GPU can process 50,000 tokens per second. You allocate 5,000 tokens per second per customer. You can support 10 customers at full load. When you hit 8 customers, you add capacity. The math is straightforward.
+
+Token-based limits prevent resource exhaustion. A user cannot send a single 200,000-token request and consume resources meant for 200 users. The token limit catches this. Even if the user is within their request limit, they cannot exceed their token limit. Your infrastructure is protected.
+
+## Why You Need Both: Complementary Protection
+
+In May 2025, a healthcare AI platform implemented token-based rate limiting. They allowed 5 million tokens per user per day. They did not implement request-based rate limiting. A researcher building an integration made a mistake in their retry logic. When the API returned an error, the client retried immediately in a loop. The client sent 18,000 requests in 90 seconds. Each request was small: 200 tokens. Total token consumption: 3.6 million tokens, well under the daily limit. But the request volume overwhelmed the platform's load balancer. The load balancer could handle 500 requests per second. The researcher's client sent 200 requests per second from a single IP. Multiplied across 30 users with the same buggy client, the load balancer hit 6,000 requests per second. It fell over. The token limit did its job. The lack of a request limit caused an outage.
+
+In August 2025, a different platform implemented request-based rate limiting but not token-based. They allowed 1,000 requests per user per hour. A customer found that they could send 128,000-token context windows. They built a service that sent 999 requests per hour, each with maximum context. The platform was using GPT-5 at $10 per million input tokens. Each request cost $1.28. The customer sent 999 requests per hour, 24 hours per day. Daily cost: $30,643. Monthly cost: $919,000. The customer was on a $99 per month plan. The platform's margin was negative $918,901 per month on this one customer. The request limit did its job. The lack of a token limit caused financial catastrophe.
+
+Request limits protect against rapid-fire abuse. Token limits protect against resource exhaustion. You implement request limits with a short reset period: per minute or per second. This catches buggy clients, retry loops, and malicious flooding. You implement token limits with a longer reset period: per hour or per day. This catches heavy usage, massive context windows, and cost overruns. The two limits operate on different timescales and protect against different threats.
+
+A production system in 2026 typically enforces three layers of limits. First, request-based rate limiting at one second granularity: no more than 10 requests per second per user. This prevents burst flooding. Second, request-based rate limiting at one hour granularity: no more than 1,000 requests per hour per user. This prevents sustained high request volume. Third, token-based rate limiting at one day granularity: no more than 10 million tokens per day per user. This prevents resource exhaustion and cost overruns.
+
+## Token Counting Mechanisms: The Input Side
+
+Counting input tokens is straightforward. Before you route the request to the model, you tokenize the input using the same tokenizer the model uses. GPT models use the tiktoken library. Claude models use their own tokenizer available via API. Llama models use the SentencePiece tokenizer. Gemini models use a custom tokenizer. You must match the tokenizer to the model, or your counts will be wrong.
+
+You count the tokens in the system prompt, the user prompt, any context documents, and any conversation history. You sum these counts. This is the input token count. You check this count against the user's remaining token quota. If the input token count exceeds the remaining quota, you reject the request immediately. The user receives an error explaining that they have insufficient quota. They have not consumed any quota yet because you rejected the request before sending it to the model.
+
+This is critical for user experience. If you send the request to the model and then discover the user is over quota, they have already consumed tokens. The model has processed the input. You must charge them. But the request failed. The user is frustrated. They paid for nothing. Pre-request validation prevents this.
+
+Pre-request validation also prevents a more subtle problem: the model generates a partial response, then hits the token limit mid-generation. The user receives half an answer. The response is useless. They consumed tokens for an incomplete output. This feels like the system cheated them. Pre-request validation checks that the user has enough quota for the expected input and output before starting generation.
+
+## Token Counting Mechanisms: The Output Side
+
+Counting output tokens is harder because the output token count is unknown until generation completes. The model generates tokens one at a time. You do not know in advance how many tokens it will generate. The user specifies a max_tokens parameter, which caps the output. But the model might stop early because it finished the response or hit a stop sequence.
+
+There are three strategies for handling output token quotas. The first strategy is **reservation**. Before starting generation, you reserve the maximum possible output tokens from the user's quota. If the user specifies max_tokens equals 2000, you reserve 2000 tokens. You generate the response. When generation completes, you count the actual output tokens. If the model generated 1,200 tokens, you refund 800 tokens to the user's quota. This approach is safe but user-unfriendly. If the user has 1,500 tokens remaining and requests max_tokens equals 2000, you reject the request even though the model might only generate 1,200 tokens. The user is penalized for the maximum, not the actual.
+
+The second strategy is **estimation**. You estimate the output token count based on historical data. If users typically generate responses that are 60% of max_tokens, you reserve 60% of max_tokens from their quota. You generate the response. When generation completes, you reconcile the actual count. If the estimate was low, you charge the difference. If the estimate was high, you refund the difference. This approach is user-friendly but risky. If your estimate is systematically low, users will exceed their quotas. If a user has 1,000 tokens remaining and requests max_tokens equals 2000, you estimate 1,200 tokens, allow the request, and the model generates 1,800 tokens. The user is now 800 tokens over quota. You must decide whether to complete the generation or cut it off mid-response.
+
+The third strategy is **streaming reconciliation**. You count output tokens as they are generated. You check the quota after every token or every 100 tokens. If the user exceeds their quota mid-generation, you stop generation immediately. This approach is fair and accurate but complex. It requires real-time quota checking during generation. It interrupts the model mid-response, which users find jarring. Most systems avoid this approach because the user experience is poor.
+
+Most production systems use reservation for strict quota enforcement and estimation for flexible quota enforcement. Strict enforcement is used for free tiers and when approaching hard budget limits. Flexible enforcement is used for paid tiers where a small overage is acceptable and will be charged.
+
+## Pre-Request Validation: Failing Fast
+
+The best place to enforce token limits is before the request reaches the model. You validate the input token count. You reserve or estimate the output token count. You check both against the user's quota. If either check fails, you reject the request with a clear error message.
+
+The error message must include three pieces of information. First, the user's current quota status: "You have used 9.2 million of your 10 million token daily quota." Second, the token cost of the rejected request: "This request requires 1.5 million tokens." Third, the time until quota reset or instructions to upgrade: "Your quota resets in 4 hours, or upgrade to Pro for 50 million tokens per day."
+
+Users who understand their quota status can make informed decisions. They can shorten their input, reduce max_tokens, wait for quota reset, or upgrade. Users who receive only "rate limit exceeded" are frustrated and confused. The system feels arbitrary. Transparency in quota enforcement turns a rejection into an education moment.
+
+Pre-request validation also allows you to offer alternatives. If the user's request is denied due to quota exhaustion, you can suggest routing to a cheaper model. "This request requires 1.5 million tokens, which exceeds your remaining quota. Would you like to route this to GPT-5-mini instead? Estimated cost: 300,000 tokens." The user can choose to use a cheaper model and stay within quota, or wait and use the premium model later. This degrades gracefully rather than failing hard.
+
+## Limit Granularities: Time Windows Matter
+
+Token limits operate on time windows. You allow N tokens per window. The window resets at regular intervals. The choice of window size determines how users experience the limit and how you enforce it.
+
+**Per-minute limits** control burst usage. A user can send a massive request, but they cannot send fifty massive requests in quick succession. Per-minute limits are typically small: 100,000 tokens per minute for free tier, 1 million tokens per minute for paid tier. These limits prevent a single user from overwhelming your system in a short period.
+
+**Per-hour limits** control sustained usage. A user can send heavy requests consistently, but not at a rate that exhausts your capacity. Per-hour limits are larger: 5 million tokens per hour for free tier, 50 million tokens per hour for paid tier. These limits shape daily usage patterns and prevent runaway cost.
+
+**Per-day limits** control budget. A user can have a heavy hour or two, but their total daily consumption is capped. Per-day limits align with billing cycles and budget planning. Free tier: 10 million tokens per day. Paid tier: 100 million tokens per day. Enterprise tier: custom.
+
+**Per-month limits** align with subscription billing. Users on a monthly plan have a monthly quota. This is the most intuitive for users because it matches their payment cycle. But per-month limits alone do not prevent bursts. A user can consume their entire monthly quota in the first three days and then be blocked for the rest of the month. This is poor user experience. Most systems combine per-month limits with per-day or per-hour limits to smooth usage.
+
+The most common pattern is to enforce three granularities: per-minute for burst control, per-day for daily budget, per-month for billing alignment. Each limit serves a different purpose. Each catches a different usage pattern.
+
+## User Communication: Making Quotas Visible
+
+Users cannot manage what they cannot see. If you enforce token quotas but do not show users their current usage, they will hit limits unexpectedly and feel the system is broken. Quota visibility is not optional.
+
+Every API response should include headers showing quota status. A standard pattern:
+
+- X-Token-Limit-Minute: the per-minute limit
+- X-Token-Remaining-Minute: tokens remaining in the current minute
+- X-Token-Limit-Day: the per-day limit
+- X-Token-Remaining-Day: tokens remaining today
+- X-Token-Reset-Minute: Unix timestamp when the per-minute quota resets
+- X-Token-Reset-Day: Unix timestamp when the per-day quota resets
+
+A user checking these headers after each request can see their quota depleting in real time. They can adjust their usage accordingly. They are never surprised by a rate limit error.
+
+Your API should provide an endpoint to query quota status without consuming quota. A GET request to /quota returns the user's current limits, current usage, and time to reset for each granularity. Users can check this before starting a large batch job to confirm they have sufficient quota. Users can monitor this during a batch job to pace their requests.
+
+Your dashboard should visualize quota usage over time. A graph showing token consumption per hour for the last seven days. A projection showing when the user will hit their daily limit if they continue at the current rate. An alert when the user reaches 80% of any quota. These tools turn quota management from a mystery into a workflow.
+
+The difference between a system with invisible quotas and a system with visible quotas is the difference between a user who feels punished and a user who feels in control. Quota enforcement is necessary. Quota transparency makes it acceptable.
+
+In the next subchapter, we examine the infrastructure required to meter token usage in real time: how to count tokens accurately, how to update quota counters atomically, how to handle distributed systems where quota state must be consistent across multiple nodes, and how to remain available when the quota service itself fails.
