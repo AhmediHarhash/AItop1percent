@@ -1,0 +1,117 @@
+# 5.10 — Multi-Environment Testing Strategies
+
+Testing must happen in multiple environments because no single environment captures all failure modes. Development environments are fast and convenient but lack production data and production scale. Staging environments approximate production but are never perfectly matched. Production environments have real constraints and real consequences but cannot be used for destructive testing. Each environment reveals different classes of problems, and a complete testing strategy uses all three deliberately.
+
+The failure mode that multi-environment testing prevents is the "works in dev, breaks in prod" regression. A developer tests a prompt change locally against synthetic data. It looks good. They push to staging. It still looks good. They deploy to production. Within an hour, users report incorrect responses. Investigation reveals that production traffic includes edge cases absent from dev and staging datasets, and the prompt change fails on those cases. The regression was not detectable in the earlier environments because the test data did not cover production diversity.
+
+## Development Environment Testing
+
+Development testing happens on the developer's machine or in a dedicated dev cloud environment. The goals are speed, convenience, and fast feedback. A developer should be able to test a change in seconds or minutes, not hours. This requires compromises: smaller datasets, faster models, lower coverage. These compromises are acceptable because development testing is not the final gate—it is the first filter.
+
+The typical development eval setup: a curated dataset of fifty to two hundred test cases that cover the most common scenarios and the most common failure modes. This dataset is small enough to run in under five minutes but large enough to catch obvious regressions. It includes high-signal cases: prompts that have broken before, edge cases that are known to be difficult, and representative samples of production traffic. It does not include exhaustive coverage—that would be too slow—but it includes enough coverage to give developers confidence before pushing code.
+
+Development testing often uses cheaper models or smaller model variants. If production uses GPT-5.2 or Claude Opus 4.5, development might test with GPT-5-mini or Claude Sonnet 4.5. This reduces cost and latency but introduces a risk: behavior differences between models. A prompt that works perfectly with the smaller model might fail with the larger one, or vice versa. Most teams accept this risk because the speed benefit outweighs the coverage loss, and later stages of testing use production models.
+
+Development testing should be deterministic. Set temperature to zero, disable sampling, use fixed seeds. A test that passes now should pass again if nothing changed. Non-deterministic tests make debugging impossible—you cannot tell whether a failure is a real regression or random variance. Determinism is less important in staging and production, where you want to test realistic sampling behavior, but in development it is critical.
+
+The limit of development testing is environment parity. A developer's machine does not have production data, production traffic patterns, production rate limits, or production infrastructure. Tests that depend on any of these will behave differently in production. Most teams accept this and treat development testing as a smoke test, not a final validation.
+
+## Staging Environment Testing
+
+Staging is where you test with production-like infrastructure, production-like data, and production-like models. The goal is to catch everything that development testing missed without risking production failures. Staging should be as close to production as possible while still being safe to break.
+
+The typical staging eval setup: a larger dataset than development, often thousands of test cases. Longer test runs, often fifteen to thirty minutes. Production models, production retrieval indices, production databases—but isolated from real users. Staging is where you test integration: does the new prompt work with the current retrieval system, the current data pipeline, the current monitoring stack? Development testing assumes these integrations work. Staging validates that assumption.
+
+Staging is where you test scale. Load testing, concurrency testing, rate limit testing—none of these are practical in development. In staging, you can spin up a hundred concurrent requests and see what breaks. You can test what happens when the retrieval service is slow or the database connection is dropped. You can test failure recovery: if the model API times out, does your system retry gracefully or cascade into a broader failure?
+
+The challenge is that staging never perfectly matches production. Production data evolves. Production traffic patterns shift. Production infrastructure has quirks that staging infrastructure lacks. A common failure mode: staging and production use the same model API but hit different endpoints with different performance characteristics. A prompt that responds in two hundred milliseconds in staging takes eight hundred milliseconds in production. Users experience the delay. Staging did not.
+
+The mitigation is continuous environment drift monitoring. Track key metrics in both staging and production: model latency, retrieval accuracy, error rates. When staging and production diverge—latency increases, accuracy drops, error rates spike—investigate. Either something changed in production that staging did not capture, or something changed in staging that production does not yet reflect. Both are problems. Most teams have weekly or biweekly staging-production reconciliation reviews where they compare metrics and resolve discrepancies.
+
+## Production Shadow Testing
+
+Shadow testing runs new code against production traffic without serving responses to users. The production system continues using the old code to generate responses. In parallel, the new code processes the same requests and generates its own responses. You compare the two and flag differences. If the new code produces different outputs, you investigate before deploying. If it produces identical outputs, you have higher confidence that the change is safe.
+
+Shadow testing catches problems that staging cannot. Staging uses synthetic or sampled traffic. Shadow testing uses real traffic with real diversity, real edge cases, real user behavior. If your production traffic includes requests in eighteen languages, shadow testing validates all eighteen. If your production traffic includes users who paste enormous documents, shadow testing validates that case. Staging might miss it. Shadow testing will not.
+
+The challenge is volume. Production traffic is large. Running every request through both old and new code doubles compute cost and doubles load on your infrastructure. Most teams shadow a percentage of traffic—five to twenty percent—rather than all traffic. This reduces cost but introduces sampling risk: the requests you shadow might not include the edge case that breaks.
+
+The second challenge is latency. Shadow testing adds latency to production requests because the system must wait for both old and new code to finish before it can compare outputs. If the new code is slower, users experience that delay even though they never see the new code's output. Most teams handle this by running shadow tests asynchronously: serve the old code's response immediately, run the new code in the background, and compare later. This eliminates user-facing latency but means you cannot block deployment based on shadow results—you can only flag problems after deployment.
+
+The third challenge is output comparison. For deterministic systems, comparison is exact: old output must match new output byte-for-byte. For non-deterministic systems—when temperature is greater than zero or sampling is enabled—comparison requires semantic equivalence, not exact match. Many teams use LLM-as-a-judge to evaluate whether two outputs are semantically equivalent even if they differ in phrasing. This works but adds cost and latency.
+
+Shadow testing is most valuable for high-risk changes: new models, rewritten prompts, refactored retrieval logic. For low-risk changes—cosmetic phrasing adjustments, logging improvements—shadow testing is often skipped because the cost outweighs the benefit.
+
+## Canary Testing in CI
+
+Canary testing deploys new code to a small fraction of production traffic and monitors for regressions before full rollout. Unlike shadow testing, canary testing serves real responses to real users—but only to a small, controlled subset. If the canary shows no problems, you expand to more traffic. If it shows regressions, you roll back before most users are affected.
+
+Canary testing in the context of CI and regression gates means running canary deployments as part of the release process, not after. Before code is marked as fully released, it must pass a canary gate: deploy to five percent of traffic, monitor for one hour, validate that key metrics do not degrade. If they do not, the release proceeds. If they do, the release is blocked and the developer investigates.
+
+The advantage of canary testing over staging is real user feedback. Staging uses test datasets. Canaries use actual production traffic. Staging might miss a prompt that performs poorly for a specific user segment. A canary will catch it because users in that segment are part of the canary traffic.
+
+The challenge is determining what counts as a regression in canary traffic. Some metrics are noisy. If your baseline accuracy is ninety-two percent and the canary shows ninety-one percent, is that a real regression or statistical noise? Most teams use confidence intervals: if the canary metric is statistically significantly worse than baseline with ninety-five percent confidence, it is a regression. Otherwise, it is noise.
+
+The second challenge is blast radius. Even a five percent canary affects thousands or millions of requests, depending on your scale. If the canary introduces a critical failure—PII leakage, incorrect financial data, unsafe responses—thousands of users are exposed before you detect the problem. Most teams mitigate this with layered canaries: start with one percent for thirty minutes, then five percent for an hour, then twenty percent for two hours, then full rollout. Each stage acts as a gate. A problem at one percent affects far fewer users than a problem at five percent.
+
+Canary testing requires strong rollback mechanisms. If a canary fails, you must be able to revert to the previous version instantly. Many teams implement this with feature flags: the new code is deployed everywhere, but a flag controls whether it is active. Flipping the flag back rolls back the change without redeploying.
+
+## Environment-Specific Configurations
+
+Different environments require different configurations. Development uses mock APIs and local databases. Staging uses real APIs but non-production endpoints. Production uses production endpoints with real rate limits and real authentication. If your evaluation pipeline does not account for these differences, tests that pass in development will fail in staging or production due to configuration mismatches.
+
+The principle: environment-specific behavior should be explicit, not implicit. Do not hard-code API endpoints in test files. Do not embed database connection strings in code. Use environment variables or configuration files that declare which environment is active and what settings apply. This makes it clear what changes between environments and reduces the risk of deploying development configuration to production.
+
+A common anti-pattern: using production API keys in staging. This seems safe—you are not serving traffic to users—but it creates two problems. First, staging tests consume production API quota, which can trigger rate limits that affect real users. Second, staging logs and metrics pollute production observability, making it harder to detect real production issues. Most teams solve this by maintaining separate API accounts for each environment, with separate keys, separate quotas, and separate billing.
+
+The second anti-pattern: assuming staging data matches production data. Many teams copy a snapshot of production data into staging periodically—weekly or monthly—but between snapshots, production data evolves and staging data stagnates. Tests pass in staging because the data is outdated and does not include recent edge cases. Tests fail in production because real data includes those cases. The mitigation: refresh staging data frequently, ideally daily, or use production data directly with PII redaction.
+
+## Data Isolation Between Environments
+
+Development, staging, and production must have strict data isolation. Development data should never include real user data. Staging data can include anonymized or synthetic data that resembles production, but it must not include PII or sensitive content. Production data is real and must be protected from accidental exposure in lower environments.
+
+Data leakage between environments is a common failure mode. A developer copies a production dataset into their local environment to debug a prompt issue. That dataset includes PII. The developer's machine is not encrypted. The dataset is now exposed. Or: a staging database accidentally points to the production database backend due to a configuration error. Staging tests write test data into the production database, corrupting real user records.
+
+The mitigation is infrastructure-level isolation. Development environments should have no network access to production databases or APIs. Staging environments should use entirely separate database instances, even if they contain similar data. Access controls should enforce that production credentials cannot be used in lower environments. Most teams implement this with role-based access: developers have read access to anonymized staging data but no access to production data. Only production deployment pipelines have production write access.
+
+The second mitigation is synthetic data generation for development and staging. Instead of copying production data, generate realistic synthetic data that covers the same scenarios. This eliminates PII exposure risk entirely. Many teams use LLM-generated synthetic data for this purpose: prompt a model to generate examples of user queries, documents, or conversations that resemble production traffic but contain no real user information. This data is safe to use in development and staging without privacy concerns.
+
+## Cost Differences Across Environments
+
+Each environment has different cost profiles. Development testing is cheap because it uses small datasets and fast models. Staging is more expensive because it uses production models and larger datasets. Production shadow testing and canary testing are expensive because they run on real traffic at scale. A comprehensive multi-environment testing strategy can easily cost ten to fifty times more than development testing alone.
+
+The trade-off: more testing catches more regressions but increases cost. Less testing is cheaper but riskier. Most teams optimize by running expensive tests selectively. Development tests run on every commit. Staging tests run on every pull request. Production shadow tests run only on release candidates—code that has already passed development and staging gates. This funnels cost toward the changes most likely to ship, rather than spending equally on every experimental branch.
+
+Cost optimization also applies to test coverage. Not every test case needs to run in every environment. High-signal tests that catch frequent regressions run everywhere. Low-signal tests that rarely fail can run only in staging or only in production canaries. This reduces the total number of API calls and compute hours without significantly reducing coverage.
+
+The second optimization is tiered model usage. Development tests use the cheapest models that provide useful signal. Staging tests use mid-tier models. Production shadow tests use the exact production model. This balances cost against accuracy: development is fast and cheap, staging is accurate enough to catch most regressions, production is definitive.
+
+## Promotion Gates
+
+A promotion gate is a decision point where code moves from one environment to the next. Code that passes development gates is promoted to staging. Code that passes staging gates is promoted to production canaries. Code that passes canary gates is promoted to full production rollout. Each gate has explicit pass criteria. If criteria are not met, promotion is blocked.
+
+Development gate criteria are usually minimal: no critical test failures, no syntax errors, no obvious regressions on the small development test set. The bar is low because the goal is speed, not perfection. Developers should be able to iterate quickly without waiting for exhaustive validation.
+
+Staging gate criteria are stricter: no test failures on the full test suite, no performance regressions compared to baseline, no new errors or exceptions in logs. Staging is where you validate that the change is production-ready. If it fails staging gates, it does not deploy, no exceptions.
+
+Production canary gate criteria are strictest: no statistically significant degradation in key metrics compared to baseline, no increase in error rates, no user complaints or support tickets related to the change. Canary gates are the final safety check. If a canary fails, you roll back immediately and investigate.
+
+The principle: gates should be automated, not manual. A human should not need to review test results and decide whether to promote. The system should apply objective criteria and make the decision automatically. This eliminates judgment calls, reduces cycle time, and ensures consistency. Manual promotion is appropriate for major releases or high-risk changes, but for routine commits, automation is essential.
+
+## The Environment Matrix
+
+The environment matrix is a table that maps test types to environments. Each row is a test type: unit tests, integration tests, regression tests, load tests, security tests. Each column is an environment: development, staging, production canary, production full rollout. Each cell indicates whether that test runs in that environment, and if so, with what frequency and coverage.
+
+A typical matrix:
+- Unit tests: run in development on every commit, in staging on every pull request. Not in production.
+- Integration tests: run in development on every commit with mocked dependencies, in staging on every pull request with real dependencies. Not in production.
+- Regression tests: run in development on every commit with small dataset, in staging on every pull request with full dataset, in production canaries with sampled real traffic.
+- Load tests: run in staging nightly, in production canaries at limited scale. Not in development.
+- Security tests: run in staging on every pull request, in production canaries on release candidates. Not in development due to potential destructiveness.
+
+The matrix makes trade-offs explicit. It answers questions like "why are we not running load tests in development?" and "why are we running regression tests in production?" These decisions should be intentional, not accidental.
+
+The matrix also reveals gaps. If a test type does not run in any environment, is it because it is not needed, or because it was overlooked? If a test type runs only in production, is that acceptable risk, or should it run earlier? Reviewing the matrix quarterly helps teams catch coverage gaps and cost inefficiencies.
+
+Multi-environment testing is not a luxury. It is the difference between deploying changes confidently and deploying changes nervously with fingers hovering over the rollback button. The next step is using those testing signals to enforce quality gates and manage cost—so that the only changes that reach users are the ones that deserve to.
+

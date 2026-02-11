@@ -1,0 +1,74 @@
+# 5.5 — Test Runner Infrastructure
+
+What does it take to run 500 LLM evaluations reliably? Not just once, manually, when you remember to check before merging — but automatically, on every pull request, with results you can trust enough to block a deployment. The answer involves more infrastructure than most teams expect. A test runner for traditional software validates deterministic functions against static assertions. A test runner for AI systems orchestrates asynchronous API calls to multiple providers, manages rate limits across shared quota pools, handles partial failures gracefully, tracks per-test costs in real time, and surfaces results in a format that both humans and CI gates can interpret. The difference between a test suite that teams trust and a test suite that teams ignore often comes down to whether the runner infrastructure was built for AI from the start.
+
+## The Orchestration Layer
+
+The test runner sits between your CI system and your LLM providers. When a pull request triggers your test suite, the runner receives a manifest of tests to execute — regression cases, safety checks, performance benchmarks, cost validations. For each test, the runner must retrieve the appropriate prompt template, fetch any required context, select the correct model configuration, make the API call, wait for the response, parse the output, apply scoring logic, record the result, and aggregate everything into a final pass-fail determination. In traditional testing, this orchestration is trivial. In AI testing, every step can fail in ways that have nothing to do with code quality.
+
+A fintech company in early 2025 learned this when their test suite started failing intermittently. The code was fine. The models were fine. The problem was that their runner retried failed API calls immediately, which triggered rate limiting, which caused cascading failures across unrelated tests. They had no visibility into which tests were waiting, which were executing, and which were consuming retry attempts. Pull requests sat blocked for hours while engineers manually re-triggered CI runs. The fix required rebuilding the runner with explicit state tracking for every test execution — pending, in-flight, completed, retrying, failed — and exposing that state in real time so engineers could distinguish infrastructure failures from legitimate regressions.
+
+The orchestration layer must treat LLM API calls as unreliable by default. A test that calls GPT-5.1 might fail because OpenAI's API is experiencing elevated error rates. A test that calls Claude Opus 4.5 might time out because Anthropic is throttling requests. A test that calls your internal model might fail because your inference cluster is under load. None of these failures mean your code regressed. The runner's job is to distinguish signal from noise — retrying transient failures, surfacing persistent failures, and never blocking a deployment because of infrastructure instability outside your control.
+
+## API Key and Secrets Management
+
+Your test runner needs credentials for every LLM provider you evaluate against. OpenAI keys, Anthropic keys, Google Cloud credentials for Gemini, AWS credentials for Bedrock, internal API tokens for self-hosted models. These secrets cannot live in your repository. They cannot live in your CI configuration files. They must be injected at runtime from a secrets manager — AWS Secrets Manager, Google Secret Manager, HashiCorp Vault, or your CI platform's native secret storage.
+
+The naive approach is to give every test runner instance access to every secret. This works until an engineer accidentally logs a prompt that includes an API response containing an embedded key, or until a compromised dependency in your test suite exfiltrates credentials during a CI run. The correct approach is to scope secrets by environment and by test suite. Your production secret for OpenAI should never be accessible to feature branch CI runs. Your development keys should have rate limits and spend caps. Your test suite should explicitly declare which providers it needs, and the runner should only inject those credentials.
+
+A healthcare AI startup in mid-2025 discovered that their CI runners had been using production API keys for six months. Every feature branch test was consuming production quota. Every failed test retry was charged to the production budget. Worse, production logs contained test prompts that included synthetic patient data the team had created for regression testing. The exposure risk was real. The fix required segregating secrets by environment, implementing secret rotation for all production keys, and adding audit logging to track which CI runs accessed which credentials. The principle is simple: treat your test infrastructure as untrusted by default, and grant the minimum necessary access.
+
+## Retry Logic and Rate Limit Handling
+
+LLM API calls fail. Rate limits trigger. Timeouts occur. The test runner must handle all of these without manual intervention. The standard approach is exponential backoff with jitter — when a test fails with a retryable error code, wait an increasing amount of time before retrying, and add randomness to prevent thundering herd effects when multiple tests retry simultaneously.
+
+But AI testing has a wrinkle that traditional testing does not. Rate limits are shared across your entire organization. If another team is running a batch inference job that consumes 90 percent of your OpenAI quota, your test suite will hit rate limits even though your CI run is small. The runner cannot simply retry every failure — it needs to detect rate limit responses, back off more aggressively, and surface the issue to engineers so they understand the delay is not caused by their code.
+
+The implementation detail that matters: the runner must parse provider-specific error responses and extract rate limit signals. OpenAI returns a 429 status code with headers indicating when quota resets. Anthropic returns rate limit details in the response body. Google Cloud uses a different format. Your runner needs provider-specific logic to interpret these responses and adjust retry behavior accordingly. A generic retry strategy that treats all 429s the same will either retry too aggressively and waste quota, or back off too conservatively and block CI runs unnecessarily.
+
+A media company in late 2025 built a runner that tracked rate limit resets across providers and paused test execution when limits were reached. Instead of failing tests and requiring manual retriggers, the runner would wait until quota reset, then resume. CI runs took longer, but they completed reliably. The cost of waiting 60 seconds for quota to reset was far lower than the cost of blocking deployments and requiring engineers to babysit CI.
+
+## Timeout Handling for Long-Running Calls
+
+Traditional unit tests execute in milliseconds. AI tests execute in seconds or tens of seconds. A single call to GPT-5.1 with a complex prompt and a 4000-token response can take 20 seconds. A batch of 50 regression tests can take 15 minutes. Your test runner must enforce timeouts at multiple levels to prevent a single slow test from blocking an entire CI run.
+
+The first timeout is per-test. If a single LLM call takes longer than 60 seconds, the runner should fail that test and move on. The specific threshold depends on your use case — voice applications might set a 5-second timeout, long-form generation systems might allow 2 minutes — but the principle is universal. A test that hangs should not hold up the entire suite.
+
+The second timeout is per-suite. If the full regression suite is expected to complete in 10 minutes and it is still running after 20 minutes, something is wrong. The runner should surface a suite-level timeout, fail the CI run, and log diagnostic information so engineers can identify which tests are slow or stuck.
+
+The third timeout is per-provider. If all tests against OpenAI are timing out, the problem is likely not your code — it is either an API outage or a configuration issue. The runner should detect provider-level timeout patterns and surface them separately from test-level failures. A single failed test is a regression. All tests against one provider failing simultaneously is an infrastructure issue.
+
+A logistics company in early 2026 implemented per-provider timeout tracking and discovered that their internal model API was timing out 30 percent of the time during CI runs. The model itself was fast, but their API gateway had a connection pool exhaustion issue that only manifested under CI load. The runner's diagnostic logging pointed directly to the problem. Without it, engineers would have assumed the test suite was flaky and started ignoring failures.
+
+## Result Formatting and Standardization
+
+Your test runner produces results that multiple systems consume. Engineers read results in CI logs. Your release gate parses results to decide whether to block deployment. Your metrics system ingests results to track regression trends over time. Your alerting system monitors results to detect silent degradations. All of these consumers need a consistent format.
+
+The standard approach is to output structured JSON with a fixed schema. Each test result includes the test name, the status (pass, fail, error), the model and provider, the execution time, the cost, the input prompt, the output response, the expected behavior, the actual behavior, and any diagnostic messages. This format is verbose, but it is parseable by both humans and machines. Engineers can grep logs for failed tests. Scripts can parse JSON to extract metrics. Dashboards can aggregate results across thousands of CI runs.
+
+The mistake teams make is treating result formatting as an afterthought. They log results in ad-hoc formats, mix structured and unstructured output, or write results to multiple locations without a single source of truth. When a test fails, engineers cannot tell whether it was a true regression or a transient API error. When a release gate evaluates results, it cannot distinguish between a failed test and a test that never ran. The fix is to standardize result formatting from day one, and treat result schema changes with the same rigor you apply to database schema migrations.
+
+A SaaS company in mid-2025 versioned their test result schema and implemented forward-compatible parsing. When they added new fields like per-token cost and model latency percentiles, old result consumers continued working. New consumers could opt into the additional fields. This approach allowed them to evolve their runner infrastructure without breaking downstream systems. The principle is simple: your test results are a data contract. Treat them like one.
+
+## Containerized Runners vs Dedicated Infrastructure
+
+Your test runner can execute in ephemeral containers that spin up per CI run, or it can run on dedicated infrastructure that persists between runs. Containerized runners are simpler to manage — your CI platform handles provisioning, scaling, and teardown. Dedicated runners give you more control over resource allocation, caching, and cost.
+
+The trade-off is startup time versus efficiency. Containerized runners must install dependencies, fetch secrets, and initialize provider clients on every run. For a small test suite, this overhead is negligible. For a large suite that runs hundreds of times per day, the cumulative cost of cold starts adds up. Dedicated runners amortize startup costs across multiple runs, but they require you to manage infrastructure, handle capacity planning, and ensure runners are stateless between executions.
+
+A financial services company in late 2025 ran benchmarks comparing GitHub Actions hosted runners to self-hosted runners on reserved EC2 instances. Hosted runners were simpler but added 45 seconds of startup time per run. Self-hosted runners eliminated startup overhead but required them to manage runner scaling, security patching, and secret rotation. For their use case — 200 CI runs per day, 50 tests per run — self-hosted runners saved 2.5 hours of cumulative CI time daily and reduced their GitHub Actions bill by 40 percent. The upfront infrastructure cost was justified by the ongoing efficiency gains.
+
+The decision depends on your CI volume and your tolerance for infrastructure complexity. If you run tests a few times per day, containerized runners are the right choice. If you run tests hundreds of times per day, dedicated infrastructure pays for itself.
+
+## Cost Tracking at the Runner Level
+
+Every LLM API call has a cost. Your test runner should track that cost per test, per suite, per pull request, and per engineer. This data is not just for accounting — it is for identifying cost regressions before they reach production. If a refactor causes your test suite to consume twice as many tokens, you want to know before the change deploys, not after you get your API bill.
+
+The implementation is straightforward: after each test completes, the runner calculates the cost based on the provider's pricing model, the model used, and the token count. For OpenAI, that means multiplying input tokens by the per-token input price and output tokens by the per-token output price. For Anthropic, the calculation is similar but uses different pricing tiers for different models. For self-hosted models, you track GPU hours or inference seconds and apply your internal cost model.
+
+The runner aggregates these per-test costs into suite-level totals and logs them alongside test results. Your CI platform displays cost summaries on every pull request. Engineers see that their change increased test costs by 15 percent and investigate why. Maybe they added a new test that calls a more expensive model. Maybe they increased the length of test prompts. Maybe they introduced a regression that causes retries. Whatever the cause, cost tracking surfaces it immediately.
+
+A travel tech company in early 2026 implemented cost-based CI gates. If a pull request increased test costs by more than 20 percent without a corresponding increase in test coverage, the gate blocked deployment and required the engineer to justify the cost increase. This policy prevented several cost regressions that would have added thousands of dollars per month to their production inference budget. The principle is simple: if you do not track test costs in CI, you will not control production costs in deployment.
+
+The runner infrastructure is the foundation everything else builds on — parallel execution depends on runners that handle concurrency, budget controls depend on runners that track costs, release gates depend on runners that produce reliable results, and your team depends on a runner that never makes them wonder whether a failure is real or just the runner being flaky.
+

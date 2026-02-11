@@ -1,0 +1,114 @@
+# 5.9 — Pipeline Performance Optimization
+
+In late 2025, a series B fintech company built what their VP of Engineering called "the most comprehensive eval pipeline in the industry." It tested seventeen quality dimensions, ran three hundred test cases, and validated outputs against four different judge models. The pipeline took forty-seven minutes to complete. Within six weeks, developers stopped waiting for results before merging. They opened pull requests, clicked merge, and moved on to the next task. The comprehensive eval system they had spent three months building became decorative infrastructure that flagged problems after code was already in production. When leadership asked why a regression that should have been caught in CI made it to users, the answer was honest and damning: "The pipeline was too slow. Nobody waited for it."
+
+Slow pipelines do not get slower compliance. They get ignored. A twenty-minute pipeline that developers actually wait for catches more problems than a sixty-minute pipeline that they bypass. Pipeline performance is not a convenience feature. It is the difference between a regression gate that functions and one that becomes a post-deployment notification system.
+
+## Why Slow Pipelines Get Ignored
+
+The fundamental problem is human behavior under time pressure. A developer opens a pull request at 3pm. They have two more tasks to finish before end of day. The eval pipeline starts running. If it finishes in eight minutes, they wait. They review the results, confirm no regressions, merge, and move on. If it takes forty-five minutes, they do not wait. They switch to the next task. When the pipeline finishes an hour later, they glance at the results—if they remember to check at all—and merge anyway because blocking on eval results would delay their work another half day.
+
+This pattern is not developer laziness. It is rational prioritization. When pipeline feedback is slower than task-switching time, developers optimize their day by not blocking on it. The slower your pipeline, the more it shifts from a blocking quality gate to advisory infrastructure that people check when convenient.
+
+The second problem is iteration speed. A developer debugging a prompt change needs to test it against regression cases. If each test cycle takes forty minutes, they run two iterations per day. If each cycle takes five minutes, they run twelve. The quality of the final implementation is directly proportional to how many test-and-adjust cycles the developer can complete. Slow pipelines do not just annoy developers. They reduce the quality of shipped code by limiting iteration.
+
+The third problem is feedback degradation. A pipeline that takes ten minutes gives results while the code change is still fresh in the developer's mind. They remember what they changed, why they changed it, and what they expected to happen. A pipeline that takes an hour gives results after they have context-switched to three other tasks. They have to reload the mental model of that code change to interpret the results. The cognitive cost of interpreting delayed feedback is high enough that developers often merge without deep investigation unless the failure is obviously critical.
+
+## Profiling Your Evaluation Pipeline
+
+You cannot optimize what you do not measure. The first step is understanding where time goes. Most slow pipelines have one or two dominant bottlenecks that account for seventy to eighty percent of total runtime. Optimizing those bottlenecks yields more impact than distributed micro-optimizations.
+
+Profile by component. Measure time spent in data loading, model inference, judge evaluation, metric computation, and result aggregation separately. A common pattern: teams assume model inference is the bottleneck and invest in faster hardware, only to discover that thirty minutes of their forty-minute pipeline is spent in judge LLM calls that could have been cached.
+
+Profile by test case. Some test cases are inherently slow—long documents, multi-turn conversations, complex retrieval queries. If ten test cases account for half your pipeline runtime, consider whether those cases need to run on every commit or only on release candidates. Not all tests have equal signal. The principle of test prioritization applies: run high-signal, fast tests first. Run slow, comprehensive tests later in the release process.
+
+Profile by stage. Many pipelines run sequentially: first all model inference, then all judge evaluation, then all metric computation. This is conceptually clean but often wasteful. If test case A finishes inference while test case B is still loading data, you could start evaluating test case A immediately rather than waiting for all inference to complete. Parallelization at the test case level, not just the pipeline level, often halves total runtime.
+
+Profile with production telemetry in mind. Your CI pipeline and your production system have different performance characteristics, but they share similar bottlenecks. If your production system spends sixty percent of latency on retrieval and five percent on generation, your eval pipeline should reflect that distribution. A pipeline that spends ninety percent of time testing generation quality and ten percent testing retrieval is profiling the wrong problem.
+
+## Caching Strategies
+
+Caching is the highest-leverage optimization for most eval pipelines. The key insight: many pipeline components produce identical outputs for identical inputs. If you tested a prompt against a dataset yesterday, and neither the prompt nor the dataset changed today, re-running that test is pure waste.
+
+Model output caching is the most obvious target. Hash the prompt, the input, the model name, and the generation parameters. If that hash exists in cache, return the cached response. This works cleanly for deterministic evaluation—when you set temperature to zero and disable sampling variance. For non-deterministic generation, cache becomes a question of acceptable variance. Many teams cache even with temperature greater than zero, accepting that they will miss regressions that only appear in some samples of the output distribution. This is a trade-off, not a universal answer, but for most teams the performance gain outweighs the coverage loss.
+
+Embedding caching is equally valuable for RAG systems. If your test cases include documents that rarely change, compute embeddings once and cache them keyed by document content hash. Most document corpora are stable across commits. Re-embedding on every test run is wasteful. The exception: if your embedding model changes or your chunking strategy changes, cache invalidation is required. Many teams handle this by including the embedding model name and chunking config in the cache key, so changing either automatically invalidates stale embeddings.
+
+Judge decision caching is less obvious but equally impactful. If you use LLM-as-a-judge for quality scoring, and the model output being judged is identical to a previous run, the judge decision is also likely identical. Cache judge verdicts keyed by the prompt, the model output, and the judge criteria. This is especially powerful when the same outputs appear across multiple pull requests—common when changes affect unrelated parts of the system.
+
+The risk with aggressive caching is stale cache poisoning. A bug in your caching logic can cause your pipeline to return cached results even when inputs have changed, masking real regressions. The mitigation: cache keys must include every variable that affects output. Prompt text, model name, model version, generation temperature, judge rubric version, retrieval configuration—anything that changes output must be part of the cache key. Most teams handle this with structured cache keys that explicitly list every dependency, then hash the combination. When in doubt, invalidate conservatively. A cache miss wastes time. A cache hit that returns wrong results wastes trust.
+
+## Incremental Evaluation
+
+The principle: only test what changed. A developer modifies one prompt out of twelve in your system. Running all three hundred test cases for all twelve prompts wastes time. Running only the test cases that exercise the modified prompt is precise.
+
+Dependency tracking makes this possible. Map each test case to the components it exercises: which prompts, which retrieval indices, which models, which judge criteria. When a pull request changes a component, run only the test cases that depend on that component. Most systems have clear dependency graphs. A change to the summarization prompt does not affect translation tests. A change to the retrieval index does not affect generation-only tests.
+
+The challenge is transitive dependencies. A change to a shared utility function might affect multiple components. A change to a prompt template that is inherited by six specific prompts affects all six. Your dependency graph must capture these relationships, or incremental evaluation will miss regressions. Many teams implement this with explicit dependency declarations: each test case declares which components it depends on, and the CI system computes transitive closure when a component changes.
+
+The second challenge is coverage regression. Incremental evaluation reduces test count per commit, which is the goal. But over time, you need assurance that the full test suite still passes. The pattern: run incremental tests on every commit, run full tests nightly or on release candidates. This catches regressions quickly while maintaining comprehensive coverage at decision points that matter.
+
+The third challenge is cache interaction. Incremental evaluation works best with caching. If you skip ninety percent of tests because they are not affected by the change, but those tests still run from cache and return instantly, you gain little. The win comes from skipping both execution and cache lookup. This means your dependency tracking must happen before cache lookup, not after.
+
+## Test Prioritization and Early Termination
+
+Not all tests have equal signal. Some tests catch regressions frequently. Some tests have never failed. Some tests cover high-risk paths. Some tests cover edge cases. Prioritization means running high-signal tests first, so that failures are detected early and pipeline runs can terminate without wasting time on remaining tests.
+
+High-signal tests are those that fail often in response to real regressions—not flaky tests that fail randomly, but tests that consistently catch real problems. Track test failure rates over time. If a test case has caught twelve regressions in the last six months, it is high-signal. If it has never failed, it is low-signal. Prioritize the former.
+
+High-risk tests cover functionality that affects users most. A test that validates the accuracy of financial transaction summaries is higher-risk than a test that validates the phrasing of a help tooltip. A test that checks for PII leakage is higher-risk than a test that checks for grammatical consistency. Risk prioritization is product-specific, but every product has a clear risk hierarchy.
+
+Early termination means stopping the pipeline the moment a critical failure is detected. If a test case detects PII leakage, there is no value in continuing to run two hundred more tests. The build is already failed. Terminating early saves time and gives developers faster feedback on the most important failure. Many teams implement tiered termination: critical failures stop the pipeline immediately, moderate failures let remaining tests finish, minor warnings do not block but appear in reports.
+
+The risk with early termination is incomplete signal. If the pipeline stops after detecting PII leakage, you do not learn whether there are also accuracy regressions. The developer fixes the leakage, pushes a new commit, and then discovers the accuracy problem in the second pipeline run. Two round-trips instead of one. The trade-off: early termination optimizes for speed at the cost of completeness. Most teams accept this trade-off for critical failures, but not for moderate ones.
+
+## Warm-Up and Cold-Start Optimization
+
+Many evaluation pipelines have significant cold-start costs. Loading a model from disk into memory takes time. Initializing an embedding service takes time. Establishing database connections takes time. Spinning up containers takes time. If your pipeline does all of this on every run, you pay the cold-start tax every time.
+
+Warm-up strategies keep expensive resources initialized between runs. A common pattern: the CI system maintains a pool of warm evaluator processes. When a pipeline starts, it is assigned a pre-initialized evaluator from the pool rather than starting from scratch. The evaluator runs the tests, returns to the pool, and waits for the next assignment. This eliminates model loading time, framework initialization time, and connection setup time.
+
+The challenge is state isolation. If evaluator processes are reused across multiple pipeline runs, state from one run must not leak into the next. This requires careful cleanup between runs: clearing caches, resetting configuration, closing file handles. Most teams handle this with process isolation—each evaluator runs in its own container or virtual environment, and containers are reset between runs—or with explicit reset hooks that restore clean state.
+
+The second challenge is resource contention. A pool of warm evaluators consumes memory and compute even when idle. If your CI system runs fifty concurrent pipelines, you need fifty warm evaluators, which can exceed available resources. Most teams size the pool based on typical concurrency, not peak concurrency, and accept that some pipelines will experience cold-start delays when the pool is exhausted. Autoscaling helps: spin up additional evaluators when the pool is depleted, spin them down when demand drops.
+
+Cold-start optimization also applies to model loading. If your pipeline tests against three different models, loading each model on every run is wasteful. Many teams use model serving infrastructure—vLLM, TensorRT, or cloud-hosted endpoints—where models are always warm and pipeline runs issue inference requests over HTTP. This trades cold-start time for network latency, which is often a favorable trade when models are large and loading them from disk takes minutes.
+
+## Pipeline Parallelization
+
+Sequential execution is the enemy of fast pipelines. If you have one hundred test cases and each takes ten seconds, sequential execution takes one thousand seconds. Parallel execution across ten workers takes one hundred seconds. The limiting factor is dependencies: tests that depend on each other must run sequentially, but independent tests can run concurrently.
+
+Most eval pipelines have embarrassingly parallel structure. Each test case is independent. Input A does not affect output B. This makes parallelization straightforward: partition test cases across workers, run them concurrently, aggregate results at the end. Many teams achieve eight to ten times speedup with this approach alone, limited only by available CPU and memory.
+
+The challenge is shared resources. If all test cases query the same retrieval index, and the index cannot handle concurrent queries efficiently, parallelization creates contention rather than speedup. If all test cases call the same LLM API endpoint with rate limits, parallelization triggers throttling. The mitigation: design your evaluation infrastructure to handle concurrent load, or partition test cases by resource usage so that workers do not compete for the same bottleneck.
+
+The second challenge is result aggregation. Parallel execution produces results out of order. If your pipeline depends on processing results sequentially—for example, computing cumulative metrics that depend on test case order—parallelization breaks correctness. Most teams solve this by making aggregation order-independent, or by collecting results in parallel and sorting them before aggregation.
+
+The third challenge is failure handling. If one worker fails, should the entire pipeline fail, or should remaining workers continue? For most teams, the answer is fail-fast: if any worker detects a critical regression, terminate all workers and report the failure immediately. This requires inter-worker communication or a shared coordination mechanism that lets workers signal early termination.
+
+## Reducing API Call Overhead
+
+Many evaluation pipelines spend more time waiting for API responses than doing actual computation. Each test case makes one or more LLM API calls. Each call has latency: time for the request to reach the server, time for the server to generate a response, time for the response to return. When test cases run sequentially, these latencies accumulate linearly.
+
+Batching reduces overhead. Instead of one API call per test case, group multiple test cases into a single API call. Many LLM APIs support batch inference: send a list of prompts, receive a list of responses. This amortizes connection overhead, request serialization, and response parsing across multiple test cases. The speedup depends on API-specific optimizations—some providers handle batches more efficiently than others—but most teams see two to five times improvement from batching alone.
+
+The challenge is error isolation. If a batch of ten test cases fails, which test case caused the failure? Batch APIs often provide limited error details. Many teams handle this with fallback: try the batch first, and if it fails, retry each test case individually to isolate the failure. This is slower than pure batching but faster than always running individually.
+
+The second challenge is timeout behavior. A batch that includes one extremely slow test case blocks all other test cases in the batch. If nine test cases complete in two seconds each and one takes sixty seconds, the entire batch takes sixty seconds. Many teams implement batch partitioning: group fast test cases together, slow test cases together, and run batches in parallel. This prevents slow outliers from dragging down the entire pipeline.
+
+Streaming responses reduce perceived latency. Many LLM APIs support streaming: instead of waiting for the entire response to generate before returning, they send tokens as they are produced. For long outputs, this reduces time-to-first-token and lets your pipeline start processing partial results while generation continues. This is especially valuable for judge evaluation: if the judge can make a decision based on the first few sentences of a response, you do not need to wait for the full response to complete.
+
+## The Feedback Loop Between Pipeline Speed and Iteration Speed
+
+Pipeline performance is not just a developer experience concern. It directly affects the quality of shipped code. Fast pipelines enable rapid iteration. A developer testing a prompt improvement can run ten experiments in an hour with a five-minute pipeline. They can test edge cases, try alternative phrasings, validate improvements across multiple dimensions, and converge on a high-quality solution. The same developer with a forty-minute pipeline runs one or two experiments in an hour. They pick the first version that seems to work and move on, because deep iteration is too expensive.
+
+This creates a quality ceiling. The quality of your AI system is bounded by how much iteration your team can afford. Slow pipelines raise the cost of iteration, which reduces the amount of iteration that happens, which lowers the ceiling on quality. Fast pipelines do the opposite: they make iteration cheap, which encourages more iteration, which raises quality.
+
+The second-order effect is experimentation culture. Teams with fast pipelines experiment more. They try unconventional approaches because the cost of failure is low. Teams with slow pipelines stick to safe, incremental changes because risky experiments waste too much time if they fail. Over time, this compounds. The fast-pipeline team explores more of the solution space and discovers better approaches. The slow-pipeline team optimizes locally and misses breakthroughs.
+
+The third-order effect is test coverage. Fast pipelines encourage developers to add more test cases because the marginal cost is low. Slow pipelines discourage new tests because each test makes the pipeline slower, which makes everyone's day worse. Teams with fast pipelines build comprehensive test suites. Teams with slow pipelines keep suites minimal. This is backward: the slower your pipeline, the more you need comprehensive tests to catch regressions early, but the less likely you are to build them.
+
+The meta-lesson: pipeline performance is not a secondary concern you optimize after building the evaluation system. It is a first-order design constraint. If your pipeline is too slow, developers will not use it. If developers do not use it, it does not matter how comprehensive or accurate it is. A fast, imperfect pipeline that developers trust and wait for catches more regressions than a slow, perfect pipeline that developers bypass.
+
+The next challenge is ensuring those tests run in environments that match where your system will actually operate—because a test that passes in staging and fails in production is not a test, it is a false confidence generator.
+

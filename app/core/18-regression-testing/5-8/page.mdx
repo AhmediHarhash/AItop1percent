@@ -1,0 +1,95 @@
+# 5.8 — Result Storage and Comparison
+
+The engineer opens the monitoring dashboard. Quality dropped three percent last week. The alert fired. The team needs an answer by standup. She clicks through to the regression view, sorts by score delta, and sees twelve test cases that degraded. She clicks the first one. The system shows her the baseline output from two weeks ago, the current output from yesterday, the side-by-side diff, and the commit range between them. She narrows the range to four commits, reads the pull request descriptions, identifies the prompt change that caused the regression, and pings the author. Fifteen minutes, root cause found. This is only possible because every eval result—every input, output, score, and trace—is stored, versioned, and queryable. Without result storage, the regression is invisible. Without comparison tools, the root cause is a week-long archaeology project.
+
+## Why Result Storage Matters
+
+Regression detection depends on memory. You cannot identify a regression unless you remember what quality looked like before. In traditional software, memory is the test suite. If a test passed yesterday and fails today, something regressed. In AI systems, the test suite runs continuously, but pass-fail is insufficient. A test case might pass today with a score of zero point nine when it used to score zero point ninety-five. That is a regression—but the test still passes. To catch it, you need historical scores. Result storage is the system that remembers.
+
+Every CI run generates hundreds or thousands of data points. Each test case produces an input prompt, a model response, and a set of evaluation scores across multiple dimensions. Each score comes from a judge model or a deterministic metric. Each eval run includes metadata: the commit SHA, the branch name, the model version, the timestamp, the engineer who triggered it. All of this must be stored in a structured, queryable format. If you store results in flat log files or unstructured blobs, you lose the ability to query by dimension, filter by test case category, or aggregate across time. The storage schema determines what questions you can answer later.
+
+Result storage also enables traceability. When a production incident occurs, you trace it back to a specific user query. You search your result database for similar test cases. You find that three test cases in your suite exhibit the same failure mode, and all three started failing six days ago. You query for the commit range between the last passing run and the first failing run. The system returns a list of five commits. You review the diffs, identify the change that introduced the bug, and revert it. Without stored results, this investigation relies on guesswork and reproduction attempts. With stored results, it is a database query.
+
+## What to Store
+
+The minimum storage set includes inputs, outputs, scores, and metadata. The input is the full prompt sent to the model, including any context, instructions, and user query. The output is the complete model response, untruncated. Scores are the evaluation results: one row per dimension per test case. Metadata includes the commit SHA, timestamp, branch, model identifier, judge model identifier if applicable, test case ID, and test suite ID. This minimal set enables basic regression detection and comparison.
+
+Traces add a deeper layer of observability. A trace captures the full execution path: which components were invoked, which retrieval queries ran, which tools were called, what the intermediate outputs were. If your system uses retrieval-augmented generation, the trace includes the retrieved chunks and their relevance scores. If your system uses multi-step reasoning, the trace includes each reasoning step. Traces are expensive to store—often ten to a hundred times larger than the output alone—but they are invaluable for debugging regressions that involve pipeline logic rather than model behavior.
+
+Token counts and cost data belong in the result record. Store input token count, output token count, and total cost per test case. This enables cost analysis at the test case level. You can identify which cases are disproportionately expensive and optimize them. You can track how cost evolves over time as prompts grow or models change. Cost per dimension—how much did the factual accuracy eval cost versus the coherence eval—enables even finer-grained optimization.
+
+Confidence intervals and uncertainty estimates should be stored when available. If your judge model returns a score with a confidence range, store both the point estimate and the interval. If you run the same test case multiple times and observe variance, store the distribution. This helps distinguish real regressions from noise. A score that drops from zero point nine to zero point eight-eight with a confidence interval of plus or minus zero point zero-three might not be a regression. A score that drops to zero point seven-five with the same interval definitely is.
+
+## Storage Schema Design
+
+The storage schema must support both time-series queries and comparison queries. Time-series queries answer questions like: how has the average factual accuracy score changed over the last thirty days? Comparison queries answer questions like: which test cases regressed between commit A and commit B? These are different access patterns, and they require different indexing strategies.
+
+A typical schema uses three tables: runs, cases, and scores. The runs table stores per-run metadata: run ID, commit SHA, branch, timestamp, total cost, total duration, pass-fail status. The cases table stores per-test-case data: case ID, run ID, input prompt, output response, trace data. The scores table stores per-dimension scores: score ID, case ID, dimension name, score value, judge model used, confidence interval. This normalized structure avoids duplication and supports flexible queries.
+
+Indexing determines query performance. You need indexes on commit SHA, timestamp, branch, test case ID, and dimension name. Without these indexes, queries that filter by branch or aggregate across time become full table scans and take minutes instead of milliseconds. Composite indexes on case ID and dimension name together enable fast retrieval of all scores for a given test case. Indexes on score value enable fast identification of low-scoring cases.
+
+Time-series databases are a natural fit if your primary use case is trend analysis. A time-series DB like InfluxDB or TimescaleDB optimizes for writes, time-based queries, and downsampling. You can store per-run aggregate metrics—average score per dimension, ninety-fifth percentile latency, total cost—as time series and query them efficiently for dashboards. The downside is that time-series DBs are less suited for relational queries like joining cases across runs to compute deltas. Many teams use a hybrid approach: time-series DB for metrics, relational DB for detailed case data.
+
+Object storage handles large traces and raw outputs. Storing a ten-thousand-token trace in a relational database bloats the table and slows queries. Instead, store the trace in object storage like S3 or GCS, and store a reference URL in the database. The database record includes a pointer to the full trace, which is fetched on demand when a developer investigates a specific case. This keeps the database lean and queryable while preserving full data for deep dives.
+
+## Result Versioning and Retention
+
+Result versioning tracks changes to the same test case across commits. Each time a test case runs, a new result version is created. The version is tied to the commit SHA. This allows you to query: show me all versions of test case X across the last fifty commits. You see the output evolving, the score trending, and the exact commit where a regression appeared. Without versioning, you only have the latest result, and historical context is lost.
+
+Retention policies prevent unbounded storage growth. Storing every result from every CI run forever becomes prohibitively expensive. A typical retention policy keeps detailed results for thirty days, downsampled aggregates for ninety days, and only critical failures beyond that. Detailed results include full prompts, outputs, and traces. Downsampled aggregates include per-run averages, medians, and percentiles, but not individual case data. Critical failures—cases that scored below a threshold or caused a build to fail—are retained indefinitely for post-incident analysis.
+
+Retention decisions depend on the value of the data. Results from the main branch are more valuable than results from short-lived feature branches. Release gate results are more valuable than smoke test results. Some teams retain all main branch results for a year and all release gate results forever. Feature branch results are deleted after the branch is merged or abandoned. This tiered retention strategy balances cost and utility.
+
+Archival storage offers a middle ground. After ninety days, detailed results are moved to cold storage like S3 Glacier. They remain queryable, but with higher latency and lower cost. If a developer needs to investigate an old regression, they can retrieve archived results in a few minutes. For routine analysis, the last ninety days of hot storage is sufficient.
+
+## Comparison Algorithms
+
+Comparison algorithms detect which test cases regressed between two points in time. The simplest algorithm is a direct delta: subtract the baseline score from the current score. If the delta is negative and exceeds a threshold—say, zero point zero-five—the case is flagged as regressed. This works for single-dimensional scores but misses nuance. A case that drops from zero point ninety-five to zero point ninety might be noise. A case that drops from zero point ninety to zero point seventy is definitely a problem. The threshold must be context-aware.
+
+Percentage-based thresholds handle this better. A regression is any case where the score drops by more than five percent relative to the baseline. A drop from zero point ninety-five to zero point ninety is a five point three percent drop—flagged. A drop from zero point eighty to zero point seventy-six is a five percent drop—flagged. A drop from zero point fifty to zero point forty-eight is a four percent drop—not flagged, because low-scoring cases have higher variance and small deltas are less meaningful.
+
+Statistical comparison methods account for variance. If you run each test case multiple times and observe a distribution, you can use a t-test or Mann-Whitney U test to determine whether the current distribution is significantly different from the baseline distribution. This reduces false positives caused by natural score variance. A case that scores zero point ninety, zero point eighty-eight, zero point ninety-two in the baseline and zero point eighty-nine, zero point eighty-seven, zero point ninety in the current run is not regressed—the distributions overlap. A case that scores zero point ninety consistently in the baseline and zero point seventy consistently now is regressed.
+
+Aggregation across dimensions provides a holistic view. A test case might regress on factual accuracy but improve on coherence. Is that a net regression? It depends on your priorities. Some teams define a weighted regression score: factual accuracy has a weight of zero point five, coherence has zero point three, tone has zero point two. The regression score is the weighted sum of per-dimension deltas. If the overall score drops by more than five percent, the case is flagged. This prevents dimension trade-offs from masking real regressions.
+
+## Visualization of Result Trends
+
+Visualization turns data into insight. Engineers do not read tables of scores. They scan charts. A line chart showing average factual accuracy over the last thirty commits reveals trends immediately. A downward slope is visible at a glance. A sudden drop pinpoints the commit range where something broke. A dashboard that surfaces these charts on every pull request keeps quality top of mind.
+
+Per-dimension trend charts are the foundation. Each dimension—factual accuracy, coherence, tone, safety—gets its own chart. The x-axis is time or commit SHA. The y-axis is average score. A reference line at the baseline helps developers see whether the current run is above or below target. If the line crosses below the baseline, the PR is flagged. Multiple lines on the same chart—one per branch or model version—enable comparison across variants.
+
+Heatmaps reveal patterns across test cases. Rows are test cases, columns are dimensions, cells are color-coded by score. Green means high score, yellow means marginal, red means regression. A heatmap that is mostly green with a few red cells tells a different story than a heatmap with a red column, which indicates a dimension-wide regression. Heatmaps are especially useful for large test suites where per-case inspection is impractical.
+
+Diff views show exactly what changed. For a regressed test case, the system displays the baseline output and the current output side by side. Color highlights differences: removed text in red, added text in green. If the regression is subtle—the model used a synonym or reordered a sentence—the diff makes it visible. If the regression is catastrophic—the model hallucinated or refused to answer—the diff is stark. Diff views are the primary tool for root cause investigation.
+
+Distribution plots show variance. A histogram of scores for a single test case across fifty runs reveals whether the score is stable or noisy. A narrow distribution centered on zero point ninety means the test is reliable. A wide distribution spanning zero point seventy to zero point ninety-five means the test is flaky. Flaky tests should be debugged or removed—they generate false positives and erode trust in the CI system.
+
+## Result Aggregation Across Runs
+
+Aggregation enables high-level insights. Instead of inspecting individual test cases, you aggregate across all cases in a run, all runs on a branch, or all runs in a time window. Aggregate metrics include mean score per dimension, median score, ninety-fifth percentile, and failure rate. These metrics appear on dashboards, in pull requests, and in weekly quality reports.
+
+Per-run aggregates answer: did this CI run pass the quality bar? You compute the mean factual accuracy across all cases. If it exceeds zero point ninety, the run passes. If not, it fails. The same logic applies to other dimensions. Per-run aggregates are the first signal developers see. If the aggregate looks good, they trust the run. If it looks bad, they drill into per-case details.
+
+Per-branch aggregates answer: is this feature branch maintaining quality as it evolves? You aggregate across all runs on the branch over its lifetime. If the trend is flat or upward, the branch is healthy. If the trend is downward, the branch is accumulating regressions. Per-branch aggregates are useful for long-lived branches that receive dozens of commits before merging.
+
+Per-dimension aggregates across the entire test suite answer: which dimensions are improving, and which are degrading? If factual accuracy has been trending down for three weeks, it is a systemic issue, not a one-off regression. Systemic issues require architectural changes—prompt redesign, model upgrade, or dataset refresh—not just reverting a commit.
+
+Time-windowed aggregates answer: how is quality changing week over week? You compute the average score across all runs in the current week and compare it to the previous week. A five percent drop week over week triggers an investigation. A five percent gain validates that recent optimizations are working. Time-windowed aggregates are the metric that executives see in OKR dashboards.
+
+## The Traceability Chain
+
+Traceability means following a regression from detection to root cause. The chain starts with a CI run that fails or shows degraded scores. The developer clicks into the failing run, sees the regressed test cases, and selects one for investigation. The system displays the current output, the baseline output, and the diff. The developer sees that the model now refuses to answer a question it used to answer confidently. Why?
+
+The next step is the commit range. The system shows that the baseline result is from commit A, two weeks ago, and the current result is from commit B, today. Between A and B are thirty-seven commits. The developer narrows the range using binary search. She queries for the result of this test case at the midpoint commit M. If the test passed at M, the regression happened between M and B. If it failed at M, the regression happened between A and M. She repeats, halving the range each time, until she isolates the regression to a single commit.
+
+The guilty commit is identified. The developer opens the diff for that commit. It includes a prompt change: a new instruction was added to the system message. She reviews the pull request discussion. The instruction was added to improve tone consistency. But it had an unintended side effect—it made the model more cautious about answering certain question types. The developer pings the original author. They discuss. The instruction is revised or the regression is accepted as a trade-off. Either way, the root cause is understood.
+
+Traceability requires that every piece of data is linked: result to run, run to commit, commit to pull request, pull request to engineer. If any link is missing, the chain breaks. This is why metadata is critical. A result without a commit SHA cannot be traced. A run without a branch name cannot be compared. A commit without a pull request link loses the context of why the change was made. Complete metadata is the foundation of complete traceability.
+
+## The Monday Morning Decision
+
+When an engineer reviews a pull request, the result comparison view is the evidence that determines whether the PR merges. The view shows: baseline scores, current scores, delta per dimension, per-case details for regressions, and the aggregate pass-fail determination. If the PR improves quality on net, it merges. If it regresses quality without justification, it is blocked. If it regresses one dimension while improving another, the trade-off is evaluated. The decision is data-driven because the data is stored, versioned, and instantly comparable.
+
+Result storage is not an afterthought. It is the memory that makes regression testing reliable. Without it, you are evaluating in the moment with no historical context. With it, you have a time machine that shows how quality evolved, when it broke, and who broke it.
+
+Next, you need to optimize the pipeline itself—parallelization, caching, and smart test selection turn a sixty-minute regression suite into a six-minute gate.

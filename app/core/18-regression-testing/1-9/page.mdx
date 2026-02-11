@@ -1,0 +1,102 @@
+# 1.9 — Seed Control and Temperature Locking
+
+For regression testing, set temperature to zero. Lock the random seed to a fixed integer. Disable top-p sampling or set it to 1.0. Set frequency penalty to zero. Set presence penalty to zero. These five parameters control the vast majority of variance in modern language model systems. Get them right and your tests become reproducible. Get them wrong and your regression suite becomes a noise generator that wastes engineering time and misses real problems.
+
+**Temperature** is the primary variance knob. At temperature zero, the model performs greedy decoding — it always selects the token with the highest probability at each step. The output is deterministic given the same input, prompt, and model version. At temperature 1.0, the model samples from the full probability distribution — high-probability tokens are likely, but low-probability tokens can be selected, and the same input produces different outputs across runs. At temperature 2.0, the distribution is flattened further, and the model produces highly creative but highly unpredictable outputs. For production use cases that value diversity, non-zero temperature makes sense. For regression testing that values reproducibility, temperature zero is mandatory.
+
+The mechanism is straightforward. Language models generate text one token at a time. At each step, the model computes a probability distribution over all possible next tokens. Temperature is a scaling parameter applied to this distribution before sampling. At temperature zero, the scaling collapses the distribution to a single point — the highest-probability token. At non-zero temperature, the distribution remains probabilistic. Higher temperature flattens the distribution, making low-probability tokens more likely. Lower temperature sharpens the distribution, making high-probability tokens even more dominant. For regression testing, you want no probability. You want certainty. Temperature zero gives you that.
+
+## The Mechanics of Greedy Decoding
+
+Greedy decoding is the algorithm used when temperature is zero. At each generation step, the model examines the probability distribution over the vocabulary, identifies the token with the highest probability, and selects it. No sampling. No randomness. Just the argmax operation — return the argument that maximizes the function. If the highest-probability token is "the," the model outputs "the." If the next highest-probability token is "contract," the model outputs "contract." The process repeats until the model generates a stop token or reaches the maximum length.
+
+Greedy decoding is deterministic in theory. In practice, most models achieve near-deterministic behavior at temperature zero, with minor variance caused by floating-point precision, parallel processing, or hardware-level non-determinism. These sources of variance are small — typically, running the same input through the same model at temperature zero will produce identical outputs 99 percent of the time or more. The remaining 1 percent represents edge cases where rounding errors or GPU non-determinism cause the model to select a different token when two tokens have nearly identical probabilities. For regression testing, this level of determinism is acceptable. The variance is low enough that real regressions are visible.
+
+The alternative to greedy decoding is stochastic sampling. At temperature 0.7, the model samples from the probability distribution rather than taking the argmax. If "the" has 60 percent probability and "a" has 30 percent probability, the model chooses "the" 60 percent of the time and "a" 30 percent of the time. The same input produces different outputs. Stochastic sampling is valuable for creative tasks, conversational systems, and any use case where diversity is desirable. It is poison for regression testing. A test that passes 70 percent of the time is not a test. It is a coin flip.
+
+## Seed Control and the Random Number Generator
+
+Even at temperature zero, some models use random number generators for internal operations — sampling tie-breaking, dropout during inference, or parallel processing coordination. If the random seed is not fixed, these operations produce different results across runs, and the model's output varies even when temperature is zero. Fixing the seed ensures the random number generator produces the same sequence of random numbers every time. Combined with temperature zero, seed control provides the strongest determinism guarantee available.
+
+The **seed** is an integer passed to the model API that initializes the random number generator. Common choices are 42, 0, 12345, or any other fixed value. The specific value does not matter. What matters is consistency — use the same seed across all test runs. If you run your regression suite on Monday with seed 42, run it on Tuesday with seed 42. If the output changes, you know something other than the seed changed. You have a signal.
+
+Some model APIs expose seed control as a parameter. OpenAI's API supports a seed parameter. Anthropic's API supports a seed parameter. Google's Gemini API supports a seed parameter. If your model provider exposes seed control, use it. Set the seed to a fixed value for all regression tests. If your model provider does not expose seed control, temperature zero is your only determinism lever. It is usually sufficient, but it does not eliminate all variance. You will observe occasional flakes — tests that fail once and pass on retry with no changes. These flakes are rare enough to tolerate, or you can implement retry logic that flags persistent failures as real regressions.
+
+Seed control also matters for systems that use multiple models in sequence. If your system calls GPT-5 to generate a query, then calls Claude Opus 4.5 to process the query result, both models need fixed seeds. If only the first model has a fixed seed, the second model introduces variance. If both models have fixed seeds, the entire pipeline is deterministic. Lock every stochastic component. Leave no variance sources uncontrolled.
+
+## Top-P Sampling and Nucleus Sampling Variance
+
+**Top-p sampling**, also called nucleus sampling, restricts sampling to the smallest set of tokens whose cumulative probability exceeds a threshold. If top-p is 0.9, the model samples only from tokens that together account for 90 percent of the probability mass. The bottom 10 percent of tokens are excluded. This introduces variance because the set of considered tokens changes depending on the probability distribution. At temperature zero, top-p has no effect — the model always picks the highest-probability token regardless of cumulative thresholds. At non-zero temperature, top-p creates variance.
+
+For regression testing, set top-p to 1.0 or disable it entirely. A top-p value of 1.0 means "consider all tokens" — the model does not exclude any tokens from sampling. This removes top-p as a variance source. Some APIs use top-p equals 1.0 as the default. Others use top-p equals 0.9 or 0.95 as the default. Check your API's default settings. If top-p is enabled by default, override it.
+
+Top-p is designed to improve generation quality in creative tasks by excluding low-probability nonsense tokens. It works well for chatbots, creative writing, and open-ended generation. It is unnecessary for regression testing. You are not trying to generate creative outputs. You are trying to generate reproducible outputs. Top-p reduces reproducibility. Disable it.
+
+Some models also support **top-k sampling**, which limits sampling to the top k highest-probability tokens. If top-k is 50, the model only considers the 50 most likely tokens at each step. This is another variance source. For regression testing, set top-k to the vocabulary size or disable it. You want the model to consider all possible tokens, not just the top k. The fewer restrictions you place on the model's sampling process, the more reproducible the output becomes when temperature is zero.
+
+## Frequency Penalty and Presence Penalty Variance
+
+Frequency penalties and presence penalties are designed to discourage repetition. **Frequency penalty** reduces the probability of tokens based on how often they have appeared in the generated text so far. If the model has already generated the word "contract" three times, frequency penalty lowers the probability of generating "contract" again. **Presence penalty** reduces the probability of any token that has appeared at least once, regardless of how many times. Both penalties introduce variance because they depend on the generation history, and small differences early in generation can cascade into large differences later.
+
+For regression testing, set frequency penalty to zero and presence penalty to zero. You want the model's raw behavior without anti-repetition adjustments. Penalties are useful for production systems that need to avoid repetitive or boring outputs. They are harmful for regression testing, where you need reproducibility more than you need creativity.
+
+Here is the failure mode: you run a test with frequency penalty enabled. The model generates a response. You run the test again with the same inputs. The model generates a slightly different response because it avoided a token it used in the first run. The difference is subtle — maybe one word changed. But if that word affects downstream logic, the test result changes. You have variance. You investigate. You discover the model outputs are different. You diff them. You see a one-word difference. You spend 30 minutes trying to figure out why the prompt or model caused the difference. Then you realize frequency penalty is enabled and is introducing noise. You disable it. The problem disappears. You wasted 30 minutes. This happens 20 times across a team of 10 engineers over six months. You wasted 100 engineering hours because you did not lock the penalties.
+
+## The Complete Determinism Configuration
+
+A deterministic test configuration for a language model looks like this:
+
+- Temperature: zero
+- Seed: 42 (or any fixed integer)
+- Top-p: 1.0 (or disabled)
+- Top-k: vocabulary size (or disabled)
+- Frequency penalty: zero
+- Presence penalty: zero
+
+This configuration removes every common variance source that model APIs expose. The model performs greedy decoding with a fixed random seed and no sampling restrictions or anti-repetition penalties. The output is as deterministic as the model architecture allows. If the model uses any internal stochasticity that cannot be controlled through API parameters — GPU non-determinism, parallel execution non-determinism, floating-point rounding — you will still observe rare flakes. But the flake rate will be low enough that you can run thousands of tests and see only a handful of false failures.
+
+Some model providers do not expose all six parameters. If seed control is unavailable, use temperature zero and set the other parameters to their least-stochastic values. If top-p cannot be disabled, set it to 1.0. If penalties cannot be disabled, set them to zero. Do everything you can to minimize variance. The goal is not perfect determinism — that is impossible in complex distributed systems running on non-deterministic hardware. The goal is to reduce variance to the point where your regression suite is reliable, and most failures represent real regressions rather than noise.
+
+## Production Configuration vs. Test Configuration
+
+The determinism configuration described above is not suitable for production traffic. Users expect creative, diverse, natural-sounding responses. Temperature zero produces robotic, repetitive text. Disabled penalties allow the model to repeat itself endlessly. Fixed seeds mean every user sees the same response to the same input, which is unacceptable for conversational systems. Production systems should run at temperature 0.7 or higher, with penalties enabled, and without fixed seeds. The question teams ask is: if we test at temperature zero and deploy at temperature 0.7, how do we know the system works at 0.7?
+
+The answer is layered testing. **Layer one** is regression testing at temperature zero. This catches the majority of regressions — prompt changes that degrade quality, model updates that break capabilities, data errors that corrupt outputs. These problems are visible at temperature zero. You run regression tests at temperature zero on every pull request. If they fail, you do not merge. **Layer two** is integration testing at production temperature. You run a smaller suite of tests at temperature 0.7 with production-like configuration. These tests catch variance-specific problems — prompts that work at temperature zero but produce incoherent outputs at temperature 0.9, retrieval strategies that work when documents are ordered deterministically but break under random tie-breaking. You run integration tests nightly or before releases.
+
+Most teams run 90 percent of tests at temperature zero and 10 percent at production temperature. The temperature-zero tests provide fast, reliable signals for everyday development. The production-temperature tests validate that the system works under realistic variance. This balance gives you both speed and confidence. You catch most problems early with deterministic tests, and you catch variance-specific problems before they reach users with stochastic tests.
+
+Some teams also run **soak tests** at production temperature with high volume. They send 10,000 test queries through the system at temperature 0.7 and measure the distribution of quality scores. If the median quality is acceptable and the variance is within tolerances, they deploy. If the median drops or the variance spikes, they investigate. Soak tests are slower and noisier than deterministic regression tests, but they provide the most realistic assessment of production behavior. Use them as a final gate before major releases, not as a daily regression check.
+
+## When to Allow Non-Determinism
+
+There are use cases where deterministic testing is inappropriate. **Creative generation systems** — story writers, art prompt generators, marketing copy creators — are designed to produce diverse outputs. Testing them at temperature zero defeats their purpose. For these systems, regression testing should measure quality and diversity, not exact output. Run each test case multiple times at production temperature. Measure the distribution of quality scores. Track whether the distribution shifts over time. If the median quality drops or the variance increases beyond acceptable bounds, you have a regression.
+
+**Conversational agents** that maintain persona and personality should also be tested at non-zero temperature. A chatbot that sounds robotic and repetitive at temperature zero may sound natural and engaging at temperature 0.8. If you only test at temperature zero, you miss persona regressions. The solution is to run core safety and accuracy tests at temperature zero and run persona and engagement tests at production temperature. The first set ensures the system does not produce harmful or incorrect outputs. The second set ensures the system remains engaging and on-brand.
+
+**Exploratory research systems** — tools that generate hypotheses, suggest experiments, or brainstorm ideas — are designed to explore the space of possibilities. Determinism limits exploration. For these systems, testing should focus on coverage and novelty rather than reproducibility. Run each test multiple times. Measure how many distinct ideas the system generates. Track whether the system explores the full range of possibilities or collapses to repetitive outputs. A regression in an exploratory system is not a change in a specific output — it is a reduction in diversity or creativity.
+
+For every other use case — summarization, extraction, classification, question answering, data validation, structured output generation — deterministic testing is the correct default. These tasks have correct answers. Your job is to ensure the system produces those answers reliably. Determinism is your tool.
+
+## Determinism as a Debugging Lever
+
+Determinism is not just for regression testing. It is also a debugging tool. When a test fails, run it multiple times with the same deterministic configuration. If it fails every time, you have a real regression. If it passes sometimes and fails sometimes, you have a variance problem. The variance might be in your test infrastructure — flaky assertions, race conditions, timing dependencies. Or the variance might be in your AI system — you thought you locked temperature and seed, but something is still introducing randomness. Either way, you have a signal. You know to look for variance sources.
+
+Determinism also helps with root cause analysis. If a test fails deterministically, you can bisect to find the breaking commit. You check out older commits one at a time, run the failing test, and see when it starts passing. The breaking commit is the last commit where the test fails. You examine the diff and see what changed. If the test fails non-deterministically, bisecting does not work. The test might pass on an old commit due to luck and fail on a new commit due to bad luck, even if the new commit is not the cause. You cannot trust the signal. Determinism makes bisecting reliable.
+
+Some teams use determinism as a release readiness signal. Before deploying a change, they run the regression suite three times with the same deterministic configuration. If all three runs produce identical results, the system is deterministic and the change is ready. If the results vary, something is wrong. Either the determinism configuration is incomplete, or the system has uncontrolled variance. The team investigates and fixes the variance before deploying. This gate prevents non-deterministic systems from reaching production.
+
+## The Determinism Checklist
+
+Before you trust your regression suite, verify that you have locked down every parameter that affects reproducibility:
+
+**Model parameters**: Temperature equals zero. Seed is fixed. Top-p is disabled or set to 1.0. Top-k is disabled or set to vocabulary size. Frequency penalty is zero. Presence penalty is zero.
+
+**Retrieval parameters**: Document ordering is deterministic with strict tie-breaking. Index version is locked during test runs. Cache behavior is consistent — either always cache or never cache, not sometimes.
+
+**Tool parameters**: Tool selection is deterministic. Tool schemas are strict and unambiguous. External API calls are mocked with fixed responses.
+
+**Infrastructure parameters**: Random number generators in application code use fixed seeds. Timestamps are mocked or fixed. Network requests are mocked or replayed. Database queries return deterministic results.
+
+If every item on this checklist is true, your tests are reproducible. If any item is false, you have a variance source. Find it and fix it. Variance is the enemy of regression testing. Determinism is the foundation of trust.
+
+The next challenge is understanding the distribution of test results — how to balance binary pass-fail gates with statistical distributions, how to set thresholds that catch regressions without triggering false alarms, and how to interpret test failures when they do occur.

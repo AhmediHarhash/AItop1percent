@@ -1,0 +1,90 @@
+# 5.6 — Parallel Execution and Resource Management
+
+In November 2025, a fintech company pushed a feature branch that triggered their full regression suite — 380 tests across five models. Their CI runner executed tests sequentially. Each test took an average of 8 seconds. Total runtime: 50 minutes. The pull request sat blocked for nearly an hour while engineers waited for results. They merged anyway, assuming the delay meant everything passed. It did not. A critical regression made it to staging because no one wanted to wait for CI to finish. The team rebuilt their runner to execute tests in parallel. Same 380 tests. New runtime: 6 minutes. Pull requests no longer timed out. Engineers no longer merged without waiting. The deployment failure rate dropped by 40 percent. The only change was parallelization.
+
+## Why Parallelization Is Essential for AI CI
+
+Sequential execution does not scale. A test suite with 50 tests and an average test duration of 5 seconds takes 4 minutes to complete. Double the test count, and runtime doubles. Add more models, and runtime grows proportionally. At 200 tests, you are waiting 16 minutes for CI feedback. At 500 tests, you are waiting 40 minutes. No engineer will tolerate that. They will merge without waiting, disable tests, or stop adding test coverage. Parallelization is not an optimization — it is a requirement for AI CI to remain usable.
+
+The math is simple. If you can execute 10 tests concurrently, a 200-test suite completes in 1/10th the time, assuming no bottlenecks. In practice, you will not achieve perfect linear scaling because of rate limits, resource contention, and fixed overhead, but even 5x parallelism turns a 20-minute suite into a 4-minute suite. That difference determines whether engineers trust your CI or bypass it.
+
+The challenge is that LLM API calls are rate-limited. You cannot simply launch 500 concurrent requests to OpenAI and expect them all to succeed. You will hit quota limits, trigger throttling, and cause cascading failures. Effective parallelization for AI requires rate-limit-aware concurrency control — running as many tests in parallel as your quota allows, no more and no less.
+
+## Rate-Limit-Aware Parallelization
+
+Every LLM provider enforces rate limits. OpenAI limits requests per minute and tokens per minute. Anthropic enforces similar constraints. Google Cloud has quota management tied to your billing account. If your parallel test execution exceeds these limits, tests fail with 429 responses, your runner retries them, and you waste both time and quota on failed attempts.
+
+The solution is to build rate limit awareness into your parallelization strategy. Before launching a batch of tests, the runner checks the current rate limit status for each provider. If OpenAI allows 3,500 requests per minute and you have 200 tests queued for GPT-5.1, the runner launches tests in waves sized to stay under the limit. The first wave executes 60 tests, waits for responses, checks quota, then launches the next wave. This approach maximizes parallelism without triggering rate limits.
+
+The implementation requires tracking requests in flight per provider. A simple counter increments when a test starts and decrements when a test completes. Before launching a new test, the runner checks whether the counter is below the rate limit threshold. If yes, launch. If no, queue the test and wait for an in-flight test to complete. This logic is straightforward for per-request limits. It is more complex for token-based limits, where you must estimate token consumption per test before execution.
+
+A healthcare AI company in early 2026 built a token-aware scheduler that estimated input and output tokens for each test based on historical data. Tests that consumed more tokens were assigned a higher "weight" in the rate limit calculation. The runner could launch 10 lightweight tests or 2 heavyweight tests in the same time window, depending on estimated token consumption. This approach maximized throughput while staying under token-per-minute limits. Actual token counts were tracked post-execution and fed back into the estimator to improve accuracy over time.
+
+## Token Bucket and Sliding Window Patterns
+
+Two rate-limiting algorithms dominate parallel execution design: token buckets and sliding windows. Both prevent your test runner from exceeding provider limits. Both have trade-offs.
+
+The **token bucket** algorithm maintains a bucket of tokens that refills at a constant rate. Each API call consumes one or more tokens. If the bucket is empty, the runner waits until tokens refill. This approach smooths out bursts — if your test suite has long idle periods followed by large batches of tests, the token bucket allows bursts up to the bucket capacity, then throttles back to the refill rate. Token buckets are ideal when your rate limit is expressed as "X requests per minute" and you want to allow short bursts without exceeding the long-term average.
+
+The **sliding window** algorithm tracks requests made in the past N seconds. Before launching a new request, the runner counts how many requests were made in the last 60 seconds. If that count is below the rate limit, the request proceeds. If not, the runner waits until the oldest request falls outside the window. Sliding windows provide tighter adherence to rate limits at the cost of more complex bookkeeping. They are ideal when providers enforce strict per-minute limits and do not tolerate brief bursts.
+
+A logistics company in mid-2025 implemented a hybrid approach. They used token buckets for OpenAI, which allows short bursts, and sliding windows for their internal model API, which enforced hard per-second limits. The runner selected the appropriate algorithm based on the provider. This flexibility allowed them to maximize parallelism across providers without hitting limits on any of them. The principle is simple: match your rate-limiting strategy to the provider's enforcement model.
+
+## Batch Sizing for Optimal Throughput
+
+Not all tests take the same amount of time. A regression test that calls GPT-5-mini with a 200-token prompt and a 50-token response completes in 1.5 seconds. A performance benchmark that calls Claude Opus 4.5 with a 4000-token prompt and a 2000-token response completes in 25 seconds. If you batch these tests randomly, you will have workers sitting idle while waiting for slow tests to complete.
+
+The solution is to batch tests by expected duration. Fast tests execute together in large batches. Slow tests execute in smaller batches with higher concurrency. The runner sorts tests by historical execution time, groups them into duration tiers, and assigns concurrency limits per tier. Fast tests get lower concurrency but higher batch sizes. Slow tests get higher concurrency to prevent bottlenecks.
+
+A media company in late 2025 implemented dynamic batching that adjusted concurrency based on real-time execution patterns. If fast tests started slowing down due to API latency, the runner increased concurrency for that tier. If slow tests completed faster than expected, the runner decreased concurrency to conserve quota. This adaptive approach reduced total suite runtime by 20 percent compared to static batching. The key insight: optimal batch size is not fixed — it depends on current API performance, current rate limit status, and current queue depth.
+
+## Resource Pooling for Shared Infrastructure
+
+If your test suite calls self-hosted models or internal APIs, parallelization introduces resource contention. Ten concurrent tests calling your on-premise model cluster might saturate GPU memory or exhaust connection pools. The runner must manage resource allocation to prevent thrashing.
+
+The standard approach is resource pooling. The runner maintains a pool of available resources — GPU slots, API connections, inference workers — and allocates them to tests as needed. Before launching a test, the runner acquires a resource from the pool. After the test completes, the resource returns to the pool. If no resources are available, the test waits in a queue. This pattern is common in database connection pooling and thread pooling. It applies equally to AI inference resources.
+
+The sizing decision is critical. Too few resources, and tests spend more time waiting than executing. Too many resources, and you overload your infrastructure. The correct size depends on your resource capacity and your test concurrency needs. A rule of thumb: allocate enough resources to handle peak concurrency without exceeding 80 percent utilization. The remaining 20 percent provides headroom for latency spikes and retries.
+
+A financial services company in early 2026 implemented separate resource pools for different model tiers. GPT-5-mini tests shared one pool with high concurrency. Claude Opus 4.5 tests shared a smaller pool with lower concurrency but dedicated high-memory GPU slots. This tiering prevented small, fast tests from blocking large, slow tests. The runner's scheduler ensured that every test got access to appropriate resources without monopolizing capacity needed by other tests.
+
+## Concurrency Limits per Test Type
+
+Not all tests should run with the same concurrency. Regression tests are lightweight and can run with high parallelism. Safety tests that check for prompt injection or jailbreaks involve more complex prompts and should run with lower concurrency to avoid quota exhaustion. Performance benchmarks that measure latency must run sequentially or with minimal concurrency to prevent interference.
+
+The runner should enforce per-test-type concurrency limits. Regression tests might allow 20 concurrent executions. Safety tests might allow 5. Performance benchmarks might allow 2. These limits are configurable and should be tuned based on observed behavior. If regression tests start hitting rate limits, lower their concurrency. If safety tests are bottlenecking suite execution, increase their concurrency.
+
+A SaaS company in mid-2025 implemented concurrency profiles that engineers could assign to test groups. The "fast" profile allowed 30 concurrent executions. The "standard" profile allowed 10. The "slow" profile allowed 3. Engineers tagged tests with the appropriate profile, and the runner enforced limits automatically. This approach prevented a handful of slow tests from blocking hundreds of fast tests. It also gave engineers control over execution priority — critical tests could be assigned higher concurrency to ensure they completed quickly.
+
+## Cost vs Speed Tradeoffs in Parallelization
+
+Higher parallelism means faster CI runs. It also means higher costs. Launching 100 tests in parallel consumes more quota per minute than launching 10 tests in parallel, and if you hit rate limits, you waste quota on retries. The optimal parallelism level balances speed against cost.
+
+The trade-off depends on your CI volume and your cost sensitivity. If you run tests 500 times per day and engineers are blocked waiting for CI, speed is worth the cost. If you run tests 10 times per day and your API budget is constrained, lower parallelism saves money at the expense of longer CI runs. The decision is not binary — you can adjust parallelism dynamically based on time of day, branch priority, or remaining monthly quota.
+
+A retail company in late 2025 implemented time-of-day concurrency adjustments. During business hours, when engineers were actively merging code, the runner used high parallelism to minimize wait times. During off-hours, when nightly batch tests ran, the runner used lower parallelism to reduce costs. This policy reduced their monthly API costs by 18 percent without slowing down daytime CI. The principle is simple: not every CI run has the same urgency. Price your parallelism accordingly.
+
+## Queue Management for Large Test Suites
+
+When your test suite contains thousands of tests, the runner must manage queues efficiently. Tests arrive faster than they complete. The queue grows. Workers pull tests from the queue, execute them, and mark them complete. How you structure that queue determines whether high-priority tests complete quickly or wait behind low-priority tests.
+
+The naive approach is a simple FIFO queue. Tests execute in the order they were added. This works for small suites but fails for large suites where test priorities differ. A critical safety test should not wait behind 200 regression tests. The solution is a priority queue. Tests are tagged with priority levels — critical, high, standard, low. The runner always pulls the highest-priority test from the queue. Critical tests complete first. Low-priority tests wait.
+
+The implementation detail that matters: priority must be balanced with resource availability. If all critical tests require GPT-5.2 and you have hit your OpenAI rate limit, those tests will block even though they are high priority. The runner should fall back to lower-priority tests that target different providers rather than sitting idle. This requires multi-dimensional queue management — sorting by priority within each provider, and dynamically switching between providers based on quota availability.
+
+A travel tech company in early 2026 implemented a multi-tier queue with provider-aware scheduling. Critical tests targeting OpenAI were prioritized over standard tests targeting OpenAI, but if OpenAI quota was exhausted, the runner pulled standard tests targeting Anthropic. This approach maximized worker utilization without sacrificing test priority. Total suite runtime dropped by 25 percent compared to a naive FIFO queue.
+
+## Handling Partial Failures in Parallel Runs
+
+When you execute 500 tests in parallel, some will fail due to transient errors — API timeouts, rate limit overages, network blips. The runner must decide how to handle these failures without failing the entire suite. The wrong approach is to retry every failure immediately, which risks exhausting quota and cascading failures. The right approach is to classify failures, retry selectively, and fail fast when appropriate.
+
+**Transient failures** are retried with exponential backoff. A single timeout is retried once. A rate limit error is retried after waiting for quota to reset. A network error is retried immediately. The runner tracks retry counts per test and per provider to prevent infinite retry loops.
+
+**Persistent failures** are not retried. If a test fails because the model's output does not match the expected behavior, that is a legitimate test failure. Retrying it will produce the same result. The runner should fail that test, log the failure, and continue executing other tests.
+
+**Infrastructure failures** require different handling. If all tests targeting OpenAI start failing simultaneously, the problem is not your code — it is an API outage. The runner should detect provider-level failure patterns, pause tests targeting that provider, and surface the issue without failing the entire suite. Engineers need to know that CI is blocked by infrastructure, not by a regression.
+
+A fintech company in early 2026 implemented failure correlation analysis. If 10 tests failed within a 30-second window, all targeting the same provider, the runner flagged it as a provider issue and paused further tests to that provider. Engineers saw a clear message: "OpenAI API is experiencing elevated error rates. Pausing tests. Will retry in 5 minutes." This visibility prevented panic and prevented wasted retries. The principle is simple: when everything fails at once, the problem is upstream.
+
+Parallel execution is the difference between a CI system that teams trust and a CI system that teams tolerate — because if engineers have to wait 40 minutes for test results, they will merge first and test later, and your regression suite becomes theater instead of protection.
+

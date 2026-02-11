@@ -1,0 +1,107 @@
+# 5.2 — Pipeline Architecture for LLM Applications
+
+The pipeline must balance three competing demands: fast feedback so developers get results while the change is fresh, comprehensive coverage so regressions get caught before production, and manageable cost so the CI budget does not explode. No single test tier satisfies all three. The solution is a three-stage architecture where each stage optimizes for a different constraint and together they form a complete quality gate.
+
+## The Three-Stage Model
+
+**Commit-level testing** runs on every push to a feature branch. It optimizes for speed. Tests run in under ten minutes. Coverage is narrow—smoke tests that verify the system still functions but do not exhaustively check quality. The goal is to catch obvious breakage immediately, not to validate every edge case.
+
+**PR-level testing** runs when a developer marks a pull request as ready for review. It optimizes for coverage. Tests run in 30 to 90 minutes. Coverage is comprehensive—the full regression suite runs against representative inputs. The goal is to surface regressions before merge, while the author is still engaged with the change.
+
+**Release-level testing** runs before deploying to production. It optimizes for confidence. Tests run in one to three hours. Coverage includes golden set validation, cross-model consistency checks, adversarial cases, and any tests too expensive or slow for the PR tier. The goal is to guarantee that nothing ships to users without passing the highest quality bar.
+
+Each tier acts as a filter. Commit-level catches obvious breakage so broken code never reaches PR review. PR-level catches regressions so degraded behavior never reaches the release branch. Release-level catches the edge cases and rare failures that only show up under exhaustive testing.
+
+The tiering prevents two failure modes. Without fast commit-level tests, developers do not get feedback until PR review, which might be hours or days later. By then they have moved on to other work and context-switching back costs time. Without comprehensive PR-level tests, regressions slip into the release branch and are only caught at deploy time, when rolling back is more disruptive. Without release-level validation, the system relies entirely on PR tests, which means every regression must be caught during development—an unrealistic standard when models are stochastic.
+
+## Commit-Level Architecture
+
+Commit-level tests run in GitHub Actions, GitLab CI, CircleCI, or whichever CI system your team already uses. The test runner is typically a Python script that loads a small smoke-test suite, executes each case, and fails the build if any case fails a basic sanity check.
+
+The smoke-test suite contains 10 to 50 cases that cover critical paths. If you are building a customer support chatbot, smoke tests verify that the system returns a response to a greeting, routes a refund question to the correct intent, and does not produce empty outputs for common queries. These tests use lightweight evaluation—substring matching, length checks, intent classification confidence thresholds—not LLM-as-judge scoring.
+
+The architecture is simple: the CI runner checks out the code, installs dependencies, starts the application or loads the prompt pipeline, executes the smoke tests, and reports results. If anything fails, the commit is marked red and the developer is notified immediately. If everything passes, the commit is marked green and development continues.
+
+The critical constraint is time. If commit-level tests take 20 minutes, developers will not wait for them. They will push three more commits before the first one finishes, which means feedback becomes decoupled from action. The tight feedback loop disappears. Keep commit-level tests under ten minutes. Preferably under five.
+
+The secondary constraint is cost. Smoke tests should use the cheapest model that provides adequate signal. If your production system uses GPT-5, your smoke tests can use GPT-5-nano or Claude Haiku 4.5. The smoke tier is checking for breakage, not subtle quality regressions. A smaller model is sufficient and costs five to ten times less per call.
+
+## PR-Level Architecture
+
+PR-level tests run when a developer clicks "Ready for Review" or when a maintainer approves the PR, depending on team workflow. The trigger can be manual—a GitHub comment like "run full evals"—or automatic when the PR moves to a specific state. Manual triggers give cost control. Automatic triggers ensure evals never get skipped.
+
+The test runner loads the full regression suite, which might contain 200 to 2,000 eval cases depending on the system. Each case runs through the updated prompt pipeline or model integration. Outputs are collected. A judge model scores each output or a deterministic evaluator checks specific properties. Results are aggregated and compared to baseline.
+
+The comparison logic is where PR-level testing differs most from traditional CI. You are not checking exact equality. You are checking whether aggregate metrics—average score, pass rate, P95 latency—have regressed beyond acceptable thresholds. If baseline accuracy was 89 percent and the PR's accuracy is 87 percent, that might or might not be a regression depending on the threshold you set and the variance in your eval suite.
+
+The pipeline posts results to the PR as a comment or status check. The comment includes summary metrics, a comparison to baseline, and links to detailed results. If regressions are detected, the comment highlights which eval cases failed and why. The developer reviews the results, decides whether to fix the regression or update the baseline, and either pushes a fix or marks the PR as needing baseline refresh.
+
+The architecture requires four components:
+
+**Test runner**: Orchestrates test execution. Loads the suite, calls the model or pipeline, collects outputs, invokes the judge, aggregates results. This is often a custom script or an integration with an eval platform like Promptfoo, Braintrust, or DeepEval.
+
+**Evaluator**: Scores outputs. This might be an LLM-as-judge that takes prompt, output, and reference answer as input and returns a score. Or it might be deterministic logic that checks formatting, length, keyword presence, or other properties.
+
+**Result store**: Persists results for comparison. Every test run writes results to a database or object store tagged with commit SHA, branch name, and timestamp. When a new PR run completes, the pipeline queries the store for the most recent baseline and compares metrics.
+
+**Comparator**: Decides if differences are regressions. Takes current metrics and baseline metrics, applies thresholds, and returns pass or fail. The logic here accounts for stochastic variation—small differences are noise, large differences are signal.
+
+The most common mistake is running PR-level tests on every commit. That burns budget and provides no additional value. Commit-level smoke tests already run on every push. PR-level tests only need to run once, when the code is ready for review. Running them earlier wastes money. Running them later delays feedback.
+
+## Release-Level Architecture
+
+Release-level tests run in a staging or pre-production environment before deploying to production. They are triggered manually by the release engineer or automatically when a release branch is cut. They include everything in the PR-level suite plus additional expensive or time-consuming validations that are impractical to run on every PR.
+
+The golden set runs at this stage. This is the 50 to 500 hand-curated cases that represent the most important user interactions, the most common failure modes, and the highest-stakes scenarios. Every case has a verified correct answer. Human reviewers score outputs. If any golden case fails, the release is blocked until the failure is investigated and resolved.
+
+Cross-model consistency checks run at this stage if your system supports multiple models. You run the same eval suite against GPT-5, Claude Opus 4.5, and Gemini 3 Pro, then compare results. If one model's accuracy drops by five points while the others stay stable, that signals a prompt or integration issue specific to that model. Catching that before deploy prevents users from experiencing degraded behavior on certain model backends.
+
+Adversarial tests run at this stage. These are inputs designed to trigger edge cases, prompt injection attempts, jailbreak patterns, PII leakage scenarios, and other high-risk behaviors. Adversarial testing is expensive—each case might require multiple judge calls or manual review—so it is impractical to run on every PR. Running it before every production deploy ensures that security-critical regressions are caught.
+
+Long-running stress tests run at this stage if latency or throughput are critical. You send 10,000 requests at production-level concurrency and measure P50, P95, and P99 latency. You check for memory leaks, connection pool exhaustion, rate limit errors, and other runtime issues that only appear under load. These tests take 20 to 60 minutes and are too slow for PR-level CI.
+
+The architecture is similar to PR-level but with additional stages and manual review gates. The test runner executes the expanded suite, writes results to the result store, compares against the previous release baseline, and generates a release readiness report. The report goes to the release engineer, who reviews flagged regressions and decides whether to proceed, investigate, or roll back.
+
+If any test fails at this stage, the release is blocked. There is no "we will fix it next sprint" option. Release-level is the final gate. If the system is not ready to ship, it does not ship. This strictness is why release-level tests include only the highest-confidence checks. False positives at this stage are expensive—they block a release and require engineer time to investigate. Every test at this tier must have a clear, documented failure condition and a clear process for resolution.
+
+## The Artifact Chain
+
+Each stage produces artifacts that flow to the next stage. Commit-level tests produce a smoke-test report tagged with the commit SHA. PR-level tests produce a full regression report tagged with the PR number and commit SHA. Release-level tests produce a release readiness report tagged with the release branch and version number.
+
+These artifacts are queryable. When a regression reaches production, you trace back through the artifact chain. Which release-level tests ran? What were the results? Which PR introduced the change? What did the PR-level regression show? Was the commit-level smoke test green? The chain provides an audit trail that shows where the issue entered the pipeline and why it was not caught.
+
+The artifact store is usually an object store like S3 or a database table with indexed columns for branch, commit, PR, and release version. Each test run writes a JSON blob with metadata, summary metrics, per-case results, and links to detailed logs. The store retains artifacts for at least 90 days, often longer for golden set results.
+
+Retention is necessary because baselines evolve. When you update a prompt template or swap models, you need to re-baseline. That requires comparing the new output distribution against the old one to verify the change is intentional. Without historical artifacts, you cannot make that comparison. You are flying blind.
+
+## Integration With Existing CI Systems
+
+Most teams already have a CI system: GitHub Actions, GitLab CI, Jenkins, CircleCI, Buildkite. The AI eval pipeline integrates as an additional job or workflow. You do not replace your existing CI. You extend it.
+
+For GitHub Actions, you add a workflow YAML file that defines three jobs: smoke-test, regression-test, release-test. The smoke-test job runs on every push. The regression-test job runs on pull request approval or when a specific label is added. The release-test job runs manually or on release branch creation.
+
+Each job calls a test runner script, waits for completion, and checks exit status. If the runner exits with status zero, the job passes. If it exits non-zero, the job fails and the commit or PR is marked red. The CI system handles orchestration, triggering, and status reporting. The test runner handles test execution and result comparison.
+
+For teams using Jenkins, the pattern is similar. You define three pipeline stages: smoke, regression, release. Each stage calls the test runner and checks the result. Stages can run conditionally based on branch name, tag, or manual approval.
+
+The key insight is that the CI system does not need to understand AI evals. It just needs to run a script and check if the script succeeded. All the complexity—loading eval cases, calling models, scoring outputs, comparing to baseline—lives in the test runner. The CI system is the orchestration layer. The test runner is the evaluation layer. Keeping them separate makes the pipeline portable and testable.
+
+## Cost and Time Trade-Offs
+
+The three-stage model trades cost for coverage. Commit-level tests are cheap and fast but catch only obvious breakage. PR-level tests are expensive and slower but catch regressions comprehensively. Release-level tests are the most expensive and slowest but provide the highest confidence.
+
+A 20-person team might spend 50 to 200 dollars per day on commit-level tests, 200 to 800 dollars per day on PR-level tests, and 100 to 300 dollars per release on release-level tests. If the team ships once per week, total CI cost is 1,500 to 6,000 dollars per week. That is real money, but it is a fraction of the cost of a production outage or a high-profile model failure.
+
+Teams that try to save money by skipping tiers end up paying more. Skipping commit-level tests means breakage reaches PR review, which wastes reviewer time and increases the cost of fixing issues. Skipping PR-level tests means regressions reach the release branch, which blocks releases and requires hotfixes. Skipping release-level tests means regressions reach production, which triggers incidents and damages user trust.
+
+The principle: spend CI budget where it prevents the most expensive failures. Commit-level tests prevent wasted reviewer time. PR-level tests prevent blocked releases. Release-level tests prevent production incidents. All three tiers pay for themselves if they catch even one issue per month that would otherwise reach users.
+
+## What It Looks Like When You Get It Wrong
+
+A SaaS company skipped the three-stage model and ran the full regression suite on every commit. Feedback time was 90 minutes. Developers stopped waiting for CI results and pushed multiple commits before the first run completed. When regressions appeared, no one knew which commit caused them. The team spent hours bisecting to find the culprit. Developer velocity collapsed.
+
+After three months, they switched to a smoke-test tier for commits and moved the full suite to PR approval. Feedback time dropped to six minutes for commits. Regression catch rate stayed the same because the comprehensive tests still ran before merge. Developer velocity recovered. The team shipped twice as many features in the next quarter.
+
+The lesson: structure matters. Running expensive tests at the wrong stage wastes time and money. Running cheap tests at the right stage provides fast feedback and high coverage at a fraction of the cost.
+
+Trigger strategies determine when each test tier runs.
