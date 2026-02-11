@@ -1,0 +1,76 @@
+# 8.6 — Dataset Versioning and Eval Reproducibility
+
+Reproducibility is the property that re-running the same eval on the same model with the same dataset produces the same results. Without reproducibility, eval metrics are meaningless. If your accuracy score is 91% today and 89% tomorrow despite no model changes, you cannot distinguish real regressions from measurement noise. If your team reports 94% success rate to leadership and your colleague re-runs the eval next week and gets 92%, trust collapses. **Reproducibility** is not optional. It is the foundation of every credible eval system. The primary threat to reproducibility is dataset drift—the eval dataset changing silently over time without explicit versioning.
+
+## The Reproducibility Crisis
+
+In March 2025, a healthcare AI company discovered that their reported model accuracy had been inflated by 4 percentage points for three months due to unversioned eval datasets. The team maintained a "golden set" of 1,200 clinical vignettes stored in a Postgres table. Engineers added new examples as they encountered edge cases. Other engineers removed examples that became outdated when clinical guidelines changed. No one tracked these modifications. The dataset that existed in December 2024 had 1,180 examples. The dataset in March 2025 had 1,240 examples. Only 1,020 examples were common to both. When the team recomputed December metrics using the March dataset, accuracy dropped from 93% to 89%. When they recomputed March metrics using the December dataset, accuracy rose from 91% to 95%. The metrics were not comparable across time. Every regression analysis, every model comparison, and every executive report from those three months was suspect.
+
+The root cause was treating the eval dataset as mutable shared state. Developers modified it in place like a wiki. No snapshots existed. No version history was recorded. The only way to reconstruct historical datasets was to query database transaction logs, which retained row-level changes for thirty days. Beyond thirty days, the historical datasets were lost forever. The company spent six weeks reconstructing approximate historical snapshots from partial logs and re-running evals to produce corrected metrics. The cost was not just engineering time. It was reputational damage with regulators who had received inflated performance claims during a compliance review.
+
+The lesson is universal: datasets must be versioned with the same rigor as code. Every dataset modification must create a new version. Every eval run must record which dataset version it used. Historical versions must be immutable and retained indefinitely. Reproducibility depends on these disciplines.
+
+## Immutable Dataset Snapshots
+
+The foundational practice is to treat eval datasets as immutable artifacts. When you create a dataset, you assign it a version identifier and store it in immutable storage. Future modifications do not edit the existing version. They create a new version with a new identifier. Old versions remain accessible forever. This is identical to how version control systems like git manage code: commits are immutable, branches point to commits, and history is retained.
+
+The version identifier can be a semantic version number—v1.0, v1.1, v2.0—a timestamp like 2026-02-01T14:30:00Z, or a content hash like SHA-256 of the dataset file. Semantic versions work well when dataset changes follow a planned release cadence. Timestamps work well for continuous dataset updates. Content hashes work well for ensuring bit-for-bit reproducibility—the hash uniquely identifies the exact dataset bytes, preventing any possibility of silent corruption.
+
+The storage implementation depends on dataset size and access patterns. Small datasets—under 100 MB—can be stored as files in version-controlled repositories. Each dataset version is a file committed to git. The git commit SHA serves as the version identifier. Engineers check out a specific commit to retrieve a specific dataset version. This approach integrates seamlessly with code reviews: dataset changes are reviewed as pull requests, approved by domain experts, and merged with full audit trails.
+
+Larger datasets—hundreds of megabytes to gigabytes—require object storage like S3, GCS, or Azure Blob Storage. Each dataset version is an object with a unique key. The key includes the version identifier: eval-datasets/customer-support/v1.2.0/golden-set.jsonl. Immutability is enforced by S3 object versioning or by storing objects in write-once-read-many buckets. Once written, the object cannot be modified or deleted except through explicit administrative actions that generate audit logs.
+
+## Version Metadata and Lineage
+
+Storing immutable snapshots is necessary but insufficient. You also need metadata that describes what each version contains, why it changed, and how it relates to prior versions. **Dataset lineage** is the history of dataset evolution—what examples were added, removed, or modified between versions, and why those changes were made.
+
+The metadata schema for a dataset version includes the version identifier, creation timestamp, author, change description, example count, schema version, and parent version identifier if the dataset was derived from a prior version. For example: version v2.1.0 created on 2026-02-10 by Alice, added 85 examples covering new product return scenarios, removed 12 examples referencing discontinued products, derived from v2.0.0. This metadata enables human readers to understand dataset evolution and automated systems to trace lineage.
+
+Change descriptions should be specific enough to reconstruct the rationale for modifications months later. "Added 85 examples" is weak. "Added 85 examples covering edge cases reported by customer support in Q4 2025, focusing on international shipping policy questions" is strong. The description documents not just what changed but why, enabling future engineers to judge whether those examples remain relevant.
+
+Lineage tracking also enables diff analysis. Given two dataset versions, you can compute the set of added examples, removed examples, and modified examples. Diff analysis explains metric changes across versions. If accuracy drops 3 points from v1.0 to v1.1, you can isolate the 40 newly added examples and discover that 32 of them failed, indicating that the new examples represent harder cases. Diff analysis without lineage metadata is slow and error-prone—you must compare datasets at the example level, matching by content or heuristics. Lineage metadata makes diffs instant and precise.
+
+## Eval Run Reproducibility Requirements
+
+Reproducibility requires recording not just the dataset version but every parameter that influenced the eval outcome. An eval run is defined by the model version, the dataset version, the evaluation metrics and their configurations, the random seed if applicable, the inference parameters like temperature and top-p, and the infrastructure environment. All of these must be logged as immutable run metadata.
+
+The run metadata artifact includes the run identifier, timestamp, model version, dataset version, metric definitions, inference configuration, infrastructure details like Python version and library versions, and the final aggregated results. This artifact must be stored in a queryable system—a database, a data warehouse, or a metadata store like MLflow or Weights & Biases. The artifact enables exact reproduction: given the run ID, you can retrieve all parameters and re-execute the exact same eval configuration.
+
+The standard practice is to store run metadata alongside the results. When an eval completes, the pipeline writes two artifacts: the detailed per-example results and the run metadata. The per-example results include the input, the model output, the eval scores, and any intermediate data like retrieved documents in RAG evals. The run metadata includes the version identifiers and configuration that produced those results. Both artifacts are tagged with the same run ID and stored in immutable storage. Re-running the eval with identical parameters produces a new run ID but should produce statistically identical results if the eval is deterministic.
+
+## The Golden Set Pattern
+
+Many teams maintain a **golden set**—a curated subset of the full eval dataset that represents the most important or most difficult examples. The golden set is versioned separately from the full dataset and updated less frequently. It serves as a stable benchmark for detecting regressions across model versions.
+
+The golden set typically contains 100 to 500 examples selected for coverage and difficulty. Coverage means the examples span the full task distribution—all major user intents, all edge cases, all compliance scenarios. Difficulty means the examples include hard cases that stress model capabilities—ambiguous inputs, adversarial prompts, multi-step reasoning. The golden set is small enough to run on every commit but comprehensive enough to catch most regressions.
+
+The versioning discipline for golden sets is stricter than for general datasets. Golden set changes are rare—quarterly or semi-annually—and require approval from senior engineers or domain experts. Each golden set version is immutable and retained forever. Metrics are reported separately for golden set performance and full dataset performance. A model that achieves 95% on the golden set and 92% on the full dataset is stronger than a model that achieves 96% on the golden set and 88% on the full dataset, even though the golden set score is lower. The golden set filters for generalization.
+
+Golden sets fail when they become stale. If the task distribution evolves—new product features, new user demographics, new adversarial patterns—and the golden set is not updated, it becomes unrepresentative. Models optimize for golden set performance and miss emerging failure modes. The correct practice is to review the golden set quarterly, add examples representing new patterns, and remove examples representing deprecated features. Each review produces a new golden set version with documented changes.
+
+## Versioning Evaluation Logic
+
+Dataset versioning alone is insufficient if the evaluation logic changes. If you modify a judge prompt, update a scoring rubric, or change the code that computes a metric, historical metrics become incomparable to current metrics. The evaluation logic must be versioned with the same rigor as the dataset.
+
+The standard pattern is to version judge prompts and metric code alongside datasets. Judge prompts are stored as files with version identifiers. Metric code is committed to version control with git SHAs. Eval run metadata records the judge prompt version and the code version used for each run. When you update a judge prompt, you increment its version number and store the new version immutably. Future eval runs use the new version. Historical eval runs remain tied to the old version. You can re-run historical evals with the old judge prompt version to reproduce original results, or re-run with the new version to measure the impact of the prompt change.
+
+Some teams use feature flags to control eval logic versions in production. A flag determines which judge prompt version is active for a given model or customer segment. This enables gradual rollout of new eval logic—testing it on a subset of traffic before applying it globally. The flag state is recorded in run metadata, ensuring that results remain reproducible even when flag states change over time.
+
+## Audit Trails for Compliance
+
+In regulated industries—healthcare, finance, insurance—eval reproducibility is not just good engineering practice. It is a compliance requirement. Regulators require auditable evidence that model performance claims are accurate and reproducible. An auditor must be able to retrieve a dataset version from six months ago, re-run the eval with the same configuration, and verify that reported metrics match the original results within statistical noise.
+
+The audit trail requires immutable storage of datasets, evaluation logic, run metadata, and detailed results. Immutability is enforced through write-once storage, cryptographic signatures, or blockchain-based timestamping in high-assurance contexts. The trail must retain data for the full regulatory retention period—seven years for HIPAA, five years for SOX, indefinitely for certain EU AI Act use cases.
+
+The operational burden of maintaining audit trails is significant. Storage costs grow linearly with retention period. A company running 1,000 evals per month, each producing 500 MB of results, accumulates 6 TB of data per year. Multiply by seven years and you are storing 42 TB. The storage cost at $0.023 per GB per month for S3 Standard is roughly $1,000 per month after year one, growing to $7,000 per month by year seven. The correct strategy is tiered storage: hot data in S3 Standard, warm data in S3 Infrequent Access, cold data in S3 Glacier. This reduces cost to under $2,000 per month even at seven-year retention.
+
+## The Version Pinning Workflow
+
+The production workflow for versioned evals follows a strict pinning discipline. Each model version is evaluated against a pinned dataset version and a pinned evaluation logic version. The pinned versions are declared in a configuration file or a model registry entry. When the model is deployed, the eval runs automatically using those pinned versions. Metrics are recorded with full version metadata.
+
+When the dataset is updated—new examples added, old examples removed—the dataset version increments. Models are not automatically re-evaluated against the new dataset version. Instead, teams explicitly decide when to re-baseline. Re-baselining means re-running all active model versions against the new dataset version, comparing results to the old dataset version, and documenting any metric shifts. If the new dataset is harder, accuracy may drop across all models. This is not a regression—it is a dataset difficulty increase. The baseline shifts and future models are compared to the new baseline.
+
+Re-baselining is expensive—it requires re-running evals for every model version in production, which might mean dozens or hundreds of eval runs. Teams re-baseline quarterly or when major dataset changes occur. Between re-baselines, new models are evaluated against the current pinned dataset version, ensuring metric comparability. The pinning discipline prevents silent metric drift and maintains the integrity of model comparison across time.
+
+The next subchapter covers configuration management for eval pipelines, including how to manage evaluation parameters, feature flags, and environment-specific settings across dev, staging, and production.
+

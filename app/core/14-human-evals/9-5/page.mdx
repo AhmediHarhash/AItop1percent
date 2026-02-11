@@ -1,0 +1,132 @@
+# 9.5 — Correction Propagation: From Review Back to Training
+
+In November 2025, a legal tech company spent six months building a human review platform for contract clause extraction. Reviewers corrected thousands of model outputs. The review interface was polished. The workflow was fast. Quality improved during review sessions. But when the team evaluated their latest fine-tuned model three months later, none of the corrections had improved performance. The model was still making the same mistakes reviewers had corrected 5,000 times. The problem wasn't the reviewers or the model. It was the gap between review and training. The corrections lived in a review database. The training pipeline read from a separate labeling database. Nobody had built the bridge.
+
+The company spent another eight weeks building correction propagation infrastructure. They lost the opportunity to ship an improved model for an entire quarter. The corrections had existed the whole time. The value was trapped by a missing data path.
+
+This is the correction propagation problem. Human review generates the most valuable training signal your system will ever produce — real mistakes caught by real experts on real production data — but only if that signal makes it back into the training loop. Most teams build review as a quality gate. The best teams build it as a training signal pipeline.
+
+## The Review-to-Training Gap
+
+Review happens in one system. Training happens in another. The gap between them is where value dies.
+
+Your review platform captures corrections. Reviewers fix wrong answers, rewrite bad outputs, flag edge cases, annotate failure modes. Every correction is a labeled example. Every flagged edge case is a new training sample. Every rewritten output is ground truth for a scenario your original dataset missed. If you run a review shift where 200 outputs get corrected, you just created 200 new labeled examples for scenarios where your model fails in production. That's worth more than 10,000 synthetic examples.
+
+But most teams never use them. The corrections live in the review database. The training pipeline reads from the original training set. The model gets retrained on the same data that produced the failures in the first place. The corrections sit unused. The same mistakes recur. Reviewers get frustrated because they keep correcting the same errors. Engineering gets frustrated because review isn't improving the model. Both groups are right. The problem is structural.
+
+The gap has three causes. First, schema mismatch. Review data is stored in a review-optimized schema — timestamps, reviewer IDs, correction history, dispute resolution. Training data is stored in a training-optimized schema — input-output pairs, metadata, splits. The two schemas don't align. Second, timing mismatch. Review happens continuously. Training happens in scheduled runs. The corrections from this week's review don't exist when this week's training run starts. Third, ownership mismatch. Review is owned by Ops or Quality. Training is owned by ML Engineering. Nobody owns the bridge.
+
+You close the gap by building correction propagation as a first-class pipeline. Not a manual export. Not a weekly CSV dump. A real-time or near-real-time pipeline that transforms review corrections into training-ready examples and makes them available to the training system as soon as they're approved.
+
+## Correction as Labeled Example
+
+A correction is not just a fixed output. It's a complete labeled example with rich metadata that your original training set doesn't have.
+
+When a reviewer corrects a model output, you capture the original input, the model's wrong output, the reviewer's corrected output, the correction timestamp, the reviewer's confidence, any comments or flags, and the production context that triggered the review in the first place. That's a training example with more signal than anything in your static dataset. The input came from real users. The model's wrong output shows you exactly where it fails. The corrected output is ground truth validated by a human expert. The metadata tells you how hard the case was and what made it an edge case.
+
+Most corrections also include implicit negatives. If the model generated three candidate answers and the reviewer picked one and corrected it, the other two candidates are implicit negatives — they're worse than the corrected version. If the model's original output was completely wrong and the reviewer rewrote it from scratch, the original output is a strong negative example. You can use those negatives for contrastive learning, for ranking losses, for teaching the model what not to do.
+
+Corrections from disputed cases carry even more signal. If two reviewers disagreed, then corrector three resolved it, you have three expert judgments on a single example. That's a consensus-labeled hard case. Those are worth 10x normal examples. They're the cases where the decision boundary is subtle. They're exactly what the model needs to see.
+
+The correction also carries temporal signal. A correction from January 2026 reflects current ground truth. A correction from October 2025 might be outdated if your policies changed. You want recent corrections weighted more heavily than old ones. Some teams version-tag corrections so the training pipeline can filter by date range or policy version.
+
+To use corrections as labeled examples, you need a transformation pipeline. The review database stores corrections in a review-optimized schema. The training pipeline needs them in a training-optimized schema. That transformation happens in the propagation layer. You extract the input, the corrected output, the metadata, and the context. You reformat them into the schema your training pipeline expects. You add version tags, quality scores, and data-split assignments. Then you write them to the training data store where the next training run will pick them up.
+
+## Pipeline Architecture for Propagation
+
+The propagation pipeline is the bridge. It runs continuously or on a schedule, pulling approved corrections from the review system and pushing training-ready examples to the training system.
+
+The simplest architecture is a batch job that runs daily. Every night at midnight, the job queries the review database for all corrections approved in the last 24 hours. It transforms each correction into a training example. It writes the examples to the training dataset's staging area. The next morning's training run includes yesterday's corrections. Latency is 24 hours. That's acceptable for many use cases. It's simple to build and simple to debug.
+
+The more sophisticated architecture is a streaming pipeline. Every time a correction is approved in the review system, an event is emitted. A stream processor consumes the event, transforms the correction into a training example, and writes it to the training data store in real time. Latency is seconds to minutes. This is what you need if you're retraining continuously or if you're running active learning loops where the model needs to learn from corrections immediately.
+
+Both architectures need the same components. A correction extractor that queries or listens to the review database. A schema transformer that converts review records into training examples. A quality filter that ensures only high-confidence corrections propagate. A deduplication layer that prevents the same correction from being added twice if the pipeline runs multiple times. A versioning layer that tags each correction with the model version that produced the original output. And a writer that pushes the final examples to the training data store.
+
+The quality filter is critical. Not every correction should propagate. Corrections flagged as low-confidence should be excluded. Corrections from reviewers who are still in training should be excluded. Corrections that were later overturned in dispute resolution should be excluded. Corrections on cases that are now out of policy should be excluded. You propagate only corrections that meet your quality bar. That bar is usually stricter than your review-approval bar. A correction might be good enough to fix the immediate output but not good enough to train the model on.
+
+The deduplication layer prevents pollution. If you run the propagation job twice by accident, you don't want the same correction added to the training set twice. If a correction was re-reviewed and updated, you want the latest version, not both versions. Deduplication usually works by keying on the input hash or the review case ID. If a correction for that input already exists in the training set, you either skip it or overwrite it with the newer version, depending on your policy.
+
+The versioning layer tags each correction with metadata that training can use. At minimum, you tag the model version that produced the original output, the correction timestamp, the reviewer ID, and the confidence score. Advanced teams also tag the production context — which user segment triggered the review, which feature, which region. That metadata lets you filter corrections during training. You can train only on corrections from the last two weeks. You can train only on corrections from your highest-confidence reviewers. You can train only on corrections from a specific region if you're doing localized model updates.
+
+## Approval Gates and Confidence Filtering
+
+Not every correction is training-worthy. You propagate corrections selectively based on approval status and confidence.
+
+Most review workflows have multiple approval states. A correction starts as a draft. The reviewer submits it. It moves to pending approval. A senior reviewer or automated policy check approves or rejects it. Only approved corrections propagate to training. Drafts and rejected corrections stay in the review system but never make it to the training pipeline. This prevents low-quality or policy-violating corrections from poisoning the training set.
+
+Some teams add a second gate specifically for training propagation. A correction can be approved for immediate use in production — it fixes the output the user sees — but flagged as not-for-training if it's an edge case you don't want the model to generalize from. For example, a one-off correction for a VIP user's unusual request might be approved for that user but excluded from training because it's not representative. Or a correction that required deep domain expertise to produce might be approved but flagged as too-hard-to-learn until you have more examples like it.
+
+Confidence filtering excludes low-confidence corrections even if they're approved. If a reviewer marked a correction as low confidence, it might still be good enough to ship to the user, but it's not good enough to train on. Some teams set a threshold: only corrections marked high confidence or above propagate. Others use a scoring model that combines reviewer confidence, review time, dispute history, and output length to compute a training-worthiness score. Corrections below the threshold are excluded.
+
+Filtering also applies to reviewer identity. Corrections from probationary reviewers might be excluded from training until those reviewers hit a quality milestone. Corrections from reviewers who have been flagged for quality issues might be excluded until they're retrained. Corrections from automated review tools might be included only if they pass a secondary validation step.
+
+The result is a training set that includes only high-quality, high-confidence corrections from trusted reviewers on representative cases. The propagation pipeline enforces these filters automatically. You don't rely on training engineers to remember to exclude bad corrections. The pipeline structure ensures only clean signal makes it through.
+
+## Temporal Lag and Feedback Loop Speed
+
+The time between a correction being made and that correction influencing the model's behavior is your feedback loop latency. Shorter is better, but there's a practical minimum.
+
+If your training cycle is weekly, your feedback loop latency is at least one week. A correction made on Monday might not be included in training data until the following Monday's run. The model that incorporates that correction doesn't deploy until the end of that week. The reviewer who made the correction won't see the impact for two weeks. That's slow, but it's acceptable if your model doesn't change rapidly and your review volume is steady.
+
+If your training cycle is daily, your latency drops to one to two days. Corrections from Monday's review are included in Tuesday's training run. The updated model deploys Wednesday. The reviewer sees the impact by Thursday. That's fast enough for most production systems. It's also simple to implement with a nightly batch propagation job.
+
+If you're running continuous training or active learning, your latency can drop to hours. Corrections propagate in real time. The training system picks them up in the next micro-batch. The model updates within hours and redeploys. This is what you need if you're operating in a rapidly changing domain where yesterday's ground truth is stale today. It's also what you need if you're using review to close the loop on active learning — the model flags uncertain cases, reviewers correct them, the corrections immediately retrain the model, and the model gets better at flagging the right cases.
+
+Latency isn't just technical. It's motivational. Reviewers who see their corrections improve the model within days stay engaged. Reviewers who never see the impact of their work disengage. Fast feedback loops create a sense of ownership. Slow feedback loops feel like shouting into the void.
+
+But faster isn't always better. If you propagate corrections too quickly, you risk overfitting to noise. A single reviewer's bad day could introduce a batch of low-quality corrections that get trained into the model before anyone catches them. A sudden spike in edge cases could skew the training distribution. Most teams balance speed with stability by propagating corrections quickly but gating training runs with quality checks. Corrections flow in real time, but training only happens when the correction set passes aggregate quality thresholds.
+
+## Metadata Enrichment for Training
+
+Corrections come with metadata that your original training set doesn't have. Propagating that metadata makes the training set richer and the model better.
+
+Every correction has a timestamp. That tells you when the correction was made, which tells you what version of your ground truth it reflects. If your policies changed in December 2025, corrections from before December reflect old policies and corrections after reflect new policies. You can filter training data by timestamp to ensure you're training only on current ground truth.
+
+Every correction has a reviewer ID. That tells you who made the correction, which tells you how much to trust it. Corrections from your most experienced reviewers can be weighted more heavily in training. Corrections from new reviewers can be weighted less until they hit a quality threshold. Some teams compute reviewer-level quality scores and use those scores as instance weights during training.
+
+Every correction has a confidence score. That tells you how certain the reviewer was. High-confidence corrections are clean training signal. Low-confidence corrections might be noisy. You can filter by confidence or use confidence as a training weight. Some teams train two models: one on all corrections, one on high-confidence corrections only, then compare performance.
+
+Every correction has review time. That tells you how long the reviewer spent on the case. Very short review times might indicate the case was trivial or that the reviewer rushed. Very long review times might indicate the case was complex or that the reviewer was unsure. Some teams filter out corrections with extreme review times. Others use review time as a proxy for case difficulty and weight hard cases more heavily.
+
+Every correction has production context. That tells you what user segment, feature, region, or session triggered the review. If a correction came from a high-value enterprise customer, you might prioritize it. If it came from a region where you're expanding, you might weight it up to improve regional performance. If it came from a feature that's being deprecated, you might exclude it entirely.
+
+Some teams also propagate the model's original output alongside the correction. That lets you train with contrastive losses. The model learns to produce the corrected output and avoid the original wrong output. This is especially useful if the original output was plausible but wrong — the kind of error the model might make again if you don't explicitly teach it not to.
+
+Propagating metadata requires schema alignment. Your review database stores metadata in review-specific fields. Your training pipeline expects metadata in training-specific fields. The propagation pipeline maps between them. It extracts reviewer ID from the review schema's reviewer field and writes it to the training schema's annotator field. It extracts confidence from the review schema's confidence field and writes it to the training schema's quality score field. It's plumbing, but it's essential plumbing.
+
+## Deduplication and Conflict Resolution
+
+The same input can get reviewed multiple times. The propagation pipeline needs to handle duplicates and conflicts.
+
+Duplicates happen when the same input gets reviewed by multiple reviewers in parallel. Maybe the sampling strategy sent the same case to two review queues. Maybe a case was escalated and re-reviewed. Maybe a correction was disputed and re-annotated. Whatever the cause, you now have multiple corrections for the same input. You need a policy for which one to use.
+
+The simplest policy is last-write-wins. Whichever correction was approved most recently is the one that propagates. Earlier corrections are discarded. This works if your review workflow ensures that later corrections are always better than earlier ones. It doesn't work if a less experienced reviewer's later correction overwrites a more experienced reviewer's earlier correction.
+
+A better policy is confidence-weighted selection. If you have multiple corrections for the same input, you propagate the one with the highest confidence score. If confidence scores are tied, you fall back to reviewer seniority or approval timestamp. This ensures you're always using the best available correction.
+
+An even better policy is consensus aggregation. If you have multiple corrections for the same input, you treat them as multiple annotations. If they agree, you propagate the consensus. If they disagree, you flag the case for dispute resolution and don't propagate anything until it's resolved. This is what you do if your review workflow is designed to produce multi-annotator consensus on hard cases.
+
+Conflicts happen when corrections contradict each other or when a correction contradicts existing training data. If your training set already has a labeled example for a given input, and a correction provides a different label, which one is right? The old label might be from your original annotation effort. The new correction is from a reviewer who saw the model fail on that input in production. Usually the correction is more trustworthy because it's newer and validated against real production context. But not always. If the correction is low-confidence and the original label is high-confidence, you might keep the original.
+
+Most teams resolve conflicts by versioning. Old labels stay in the training set tagged with their version. New corrections get added tagged with their version. Training runs can choose which versions to include. If you want to train on only the most recent ground truth, you filter to the latest version. If you want to see how ground truth evolved over time, you include all versions and track performance changes.
+
+Deduplication and conflict resolution happen in the propagation pipeline. Before writing a correction to the training data store, the pipeline checks if an example with the same input already exists. If it does, the pipeline applies your conflict resolution policy. If the policy says to overwrite, it overwrites. If the policy says to skip, it skips. If the policy says to aggregate, it aggregates. The training system never sees the raw duplicates or conflicts. It only sees the cleaned, deduplicated examples.
+
+## Integration with Active Learning
+
+Correction propagation closes the active learning loop. The model flags uncertain cases. Reviewers correct them. Corrections propagate to training. The model improves and flags better cases next time.
+
+Active learning works only if the loop is fast. If corrections take weeks to propagate, the model keeps flagging the same uncertain cases because it hasn't learned from the corrections yet. If corrections propagate in hours, the model improves continuously and the uncertain case distribution shifts toward genuinely new edge cases.
+
+The propagation pipeline for active learning needs to prioritize corrections from actively sampled cases. If the model flagged a case for review because of low confidence, and a reviewer corrected it, that correction is more valuable than a random correction from a non-flagged case. The model explicitly told you it was uncertain. The reviewer gave you ground truth for that uncertainty. That's the highest-signal training data you can get.
+
+Some teams tag actively sampled cases in the review system. When a correction from an actively sampled case propagates, it gets a priority flag or a higher training weight. The training system can then prioritize those corrections in the next training run. That tightens the feedback loop. The model learns fastest from the cases it was most uncertain about.
+
+Active learning also benefits from propagating model scores alongside corrections. When the model flags a case for review, it had a confidence score or uncertainty estimate. That score is metadata. If you propagate it alongside the correction, the training system knows how uncertain the model was before the correction. That lets you analyze which kinds of uncertainty the model struggles with most and focus training on those patterns.
+
+The tightest active learning loops propagate corrections in real time and trigger micro-training runs automatically. A batch of 100 corrections comes in from active review. The propagation pipeline writes them to the training set. A micro-training job kicks off immediately, fine-tuning the model on the last 1,000 corrections including the new batch. The updated model deploys within an hour. The next set of active sampling decisions uses the improved model. The loop runs continuously. The model gets better every day.
+
+This requires infrastructure that most teams don't have on day one. You need streaming propagation. You need continuous training. You need automated deployment. You need monitoring to ensure micro-updates don't degrade performance. But if you're operating at scale in a domain where the model needs to adapt quickly, it's worth building.
+
+The next subchapter covers versioning review data with model versions — how to tag corrections with the model that produced the original output, why that matters for debugging and retraining, and how to track ground truth evolution over time.
+

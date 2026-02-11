@@ -1,0 +1,70 @@
+# 8.5 — Caching Eval Results for Efficiency
+
+**Caching** is the practice of storing eval results for specific inputs and reusing those results when the same inputs appear again, avoiding redundant computation. When your eval dataset does not change, your model does not change, and your evaluation criteria do not change, re-running the same eval is waste. Caching eliminates that waste. A well-designed cache can reduce eval runtime by 70% to 95% during iterative development and cut monthly eval costs by thousands of dollars. The challenge is knowing when cached results remain valid and when they must be invalidated.
+
+## The Cost of Redundant Evaluation
+
+Every eval run that repeats prior work is burning money and time. A typical scenario: you have a 3,000-example eval suite that tests your customer support model. You run it Monday morning after deploying a prompt change that affects only 200 examples—the ones related to refund policy. The other 2,800 examples generate identical outputs to the prior run because the prompt change does not touch their domain. Without caching, you re-run all 3,000 examples, paying for 3,000 model inferences and 6,000 judge inferences if you use two judges per example. With caching, you run only the 200 affected examples, paying for 200 model inferences and 400 judge calls. The cost savings are 93%.
+
+The time savings are proportional. If the full suite takes twelve minutes to run with parallelism, and 93% of examples hit cache, the cached run completes in under sixty seconds. The difference between sixty seconds and twelve minutes is the difference between running evals after every commit and running them once a day. The faster feedback loop changes engineering behavior. Developers run evals more frequently. They catch regressions earlier. They iterate faster. Caching is not a performance optimization. It is an enabler of continuous evaluation.
+
+The pattern appears across all eval types. Regression suites re-test the same golden examples every run. Benchmark suites compare models on static datasets. Pre-deployment checks validate the same compliance scenarios repeatedly. In every case, the majority of examples produce identical results across runs because the inputs, the model, and the evaluation logic remain constant. The opportunity for caching is universal.
+
+## Cache Key Design
+
+The cache key determines when results can be reused. A cache hit occurs when the current eval example matches a previously evaluated example on all dimensions that affect the result. A cache miss occurs when any dimension changes. Designing the correct cache key means identifying every variable that influences eval outcomes and incorporating those variables into the key.
+
+The minimal cache key includes the input, the model identifier, and the eval metric definition. The input is the example text or structured data fed to the model. The model identifier is a unique version string for the model under test—a deployment timestamp, a git commit SHA, or a model registry version number. The eval metric definition is a hash of the evaluation logic—the judge prompt if using an LLM judge, the code hash if using programmatic checks. If any of these three variables changes, the cached result is invalid.
+
+The minimal key works for deterministic models and deterministic evals. If your model always produces the same output for a given input, and your eval always produces the same score for a given output, caching on input-model-metric is sufficient. The cache maps from those three values to the stored result—the model output, the eval score, and any metadata like latency or token count. On a cache hit, you return the stored result without running inference or evaluation. On a cache miss, you run the eval, store the result with the computed cache key, and return the fresh result.
+
+The minimal key fails for non-deterministic models or non-deterministic evals. If your model uses sampling with temperature greater than zero, it produces different outputs for the same input on repeated runs. Caching the first output and reusing it forever is incorrect—it hides the model's actual distribution of outputs and makes your evals unrealistically consistent. The correct approach for non-deterministic models is to disable caching or cache only deterministic subcomponents like retrieval results in RAG pipelines.
+
+## Non-Deterministic Evals and Sampling
+
+Some evals are inherently non-deterministic even when the model is deterministic. LLM judges using GPT-5 or Claude Opus 4.5 with temperature greater than zero produce variable scores for the same output. Running the same example through the same judge twice might yield scores of 8 and 9 out of 10. Caching the 8 and reusing it on the second run hides this variance. If the variance is noise, caching is fine—averaging across runs would converge to the same mean anyway. If the variance is signal—the judge legitimately sees different aspects of quality on different reads—caching destroys information.
+
+The standard solution is to cache only deterministic components and re-run non-deterministic components on every eval. For example, in a RAG eval pipeline, retrieval is deterministic for a given query and corpus. You cache the retrieved documents. The generator model might be non-deterministic, so you re-run generation on every eval but reuse the cached retrieval results. The judge might be non-deterministic, so you re-run judging but reuse the cached generated output. Each component decision is independent.
+
+Some teams intentionally inject non-determinism to test model robustness. They run the same input through the model ten times with temperature 0.7 and measure output consistency. Caching would defeat the purpose. The cache layer must be bypassed for these tests, either through a cache-control flag in the eval configuration or by designing cache keys that incorporate run-specific identifiers like timestamps.
+
+The trade-off is between efficiency and coverage of the output distribution. Caching makes evals faster and cheaper but reduces the diversity of observed outputs. If your model's failure modes are rare and stochastic, caching might hide them. If your evals are expensive and your model is stable, caching is worth the coverage trade-off. The correct default for production evals is to cache deterministic components and re-run non-deterministic components unless cost forces a different choice.
+
+## Cache Invalidation Rules
+
+Cache invalidation is the hardest part of caching. A stale cache—one that returns results for an outdated model or eval definition—produces incorrect metrics, masks regressions, and destroys trust in the eval system. The invalidation policy must be conservative: when in doubt, invalidate. The cost of over-invalidation is wasted compute. The cost of under-invalidation is shipping broken models.
+
+The most straightforward invalidation trigger is model version change. When the model under test changes—a new prompt, a new fine-tuned checkpoint, a new routing rule—all cached results for that model are invalid. The cache layer checks the model identifier on every eval run. If the identifier differs from the cached model identifier, the cache is bypassed and results are recomputed. After the run, the cache is updated with new results tagged with the new model identifier. Old results remain in the cache but are never used unless you roll back to a prior model version.
+
+The second invalidation trigger is eval definition change. If you modify the judge prompt, change a scoring rubric, or update the code that computes a programmatic metric, all cached scores are invalid. The cache layer computes a hash of the eval definition—the judge prompt text, the metric code, or a manually incremented version number—and includes that hash in the cache key. When the hash changes, cache misses occur universally and the entire suite re-runs. Some teams version their eval definitions explicitly in configuration files and bump the version number on any change to force cache invalidation.
+
+The third invalidation trigger is dataset change. If you add examples, remove examples, or modify example inputs, cached results for changed or removed examples are invalid. Detecting dataset changes requires versioning the dataset itself, either through content hashing or explicit version tags. Some teams store datasets in version-controlled repositories and use git commit SHAs as dataset version identifiers. Others compute a hash of the full dataset and include that hash in cache metadata. When the dataset hash changes, the cache is invalidated globally.
+
+The fourth invalidation trigger is time-based expiration. Some evals measure time-sensitive properties—model performance on recent news articles, compliance with newly released regulations, consistency with updated knowledge bases. Cached results older than a threshold—seven days, thirty days—are considered stale and invalidated automatically. Time-based expiration is a blunt instrument but effective when other invalidation signals are unavailable.
+
+## Storage and Retrieval Performance
+
+Cache storage must be fast to read and fast to write or it becomes a bottleneck. A cache that takes 200 milliseconds to check is slower than re-running the eval for lightweight examples. A cache that takes five seconds to write results destroys the throughput gains from parallelization. The storage layer must support millisecond-latency lookups and high-throughput batch writes.
+
+The simplest implementation is an in-memory cache using a hash map. The cache key maps to the stored result in memory. Lookups take microseconds. Writes take microseconds. The cache persists only for the duration of the eval run. This works for single-run caching—avoiding redundant work within a single eval execution—but provides no benefit across runs. Every run starts with an empty cache.
+
+The production implementation is a persistent cache using a key-value store like Redis, DynamoDB, or a SQL database with indexed lookups. The cache persists across runs, accumulating results over days or weeks. Lookups require network round-trips—typically 1 to 10 milliseconds for Redis, 5 to 50 milliseconds for DynamoDB, depending on network latency and query complexity. Writes are asynchronous and batched to reduce overhead. The persistent cache enables cross-run efficiency: the first run populates the cache, and subsequent runs hit cache for unchanged examples.
+
+The storage cost of persistent caches grows linearly with dataset size and eval diversity. A cache storing results for 10,000 examples across five model versions and three eval metrics holds 150,000 entries. If each entry is 1 KB—storing input, output, score, and metadata—the cache consumes 150 MB. At enterprise scale with millions of examples and dozens of model versions, cache size reaches gigabytes. The cache layer needs TTL policies—time-to-live—that expire old entries after a retention window like ninety days, balancing storage cost against cache hit rate.
+
+## The Cascade Pattern for Multi-Layer Caching
+
+Some eval pipelines use multi-layer caches that cascade from fast ephemeral storage to slower persistent storage. The first layer is an in-memory cache that serves requests in microseconds. On a miss, the pipeline checks a second layer—a local disk cache—that serves requests in milliseconds. On a second miss, the pipeline checks a third layer—a remote Redis or DynamoDB cache—that serves requests in 5 to 20 milliseconds. On a third miss, the pipeline runs the eval and populates all three layers with the result.
+
+The cascade pattern optimizes for both speed and persistence. Hot examples—those accessed frequently—live in memory and serve instantly. Warm examples—those accessed occasionally—live on disk or in Redis and serve quickly. Cold examples—those accessed rarely—are computed fresh and cached for future use. The pattern is most valuable in high-throughput scenarios where cache lookup latency becomes a bottleneck. For most teams, a single persistent cache layer is sufficient.
+
+## When Not to Cache
+
+Caching is not universal. Some evals must run fresh every time. Security red-teaming evals test adversarial robustness by generating novel attack prompts. Caching defeats the purpose—you want diverse attacks, not repeated attacks. A/B testing evals compare model variants under live traffic patterns that change daily. Caching production traffic inputs locks you into historical data and misses emerging usage patterns.
+
+Evals that measure latency or throughput must re-run on every eval because infrastructure state changes. A cached latency measurement from Monday is invalid on Tuesday if API load patterns differ. Evals that depend on external state—live database queries, API availability, third-party service responses—cannot be cached unless the external state is versioned and included in the cache key, which is rarely practical.
+
+The decision rule is simple: cache when the eval result is a pure function of the input, the model, and the metric. Do not cache when the result depends on time, external state, or intentional randomness. When in doubt, run fresh. The cost of a false cache hit—reporting an incorrect metric—exceeds the cost of redundant computation.
+
+The next subchapter covers dataset versioning and reproducibility requirements that ensure cached results remain valid across time and enable auditable eval history.
+

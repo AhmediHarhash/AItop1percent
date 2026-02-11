@@ -1,0 +1,78 @@
+# 2.2 — Schema Validation as a Quality Gate
+
+In late 2024, a healthcare company deployed a patient intake assistant powered by Claude Opus 4. The system collected symptoms, generated structured intake forms, and routed patients to the appropriate department. The prompt specified a JSON schema with twelve required fields including patient ID, chief complaint, symptom onset, severity score, and triage priority. The team tested the system with 200 sample conversations. Every test produced valid JSON. The system went live.
+
+Within the first week, 4% of real conversations produced malformed outputs. Some responses were missing the triage priority field entirely. Some included severity scores as text like "moderate" instead of numbers between 1 and 10. Some nested the symptom list incorrectly, wrapping it in an extra layer of structure the downstream routing system could not parse. None of these failures appeared in testing. All of them crashed the intake pipeline. Patients were asked to start over. The team pulled the feature after three days, added schema validation, and relaunched two weeks later. The validation layer caught every malformed response before it reached the routing system. The failures still occurred but they no longer broke the user experience. The system retried with a corrected prompt or escalated to a human. The 4% failure rate dropped to 0.2% as the team refined prompts based on logged validation errors.
+
+The root cause was not a bad model. It was the assumption that a clearly specified schema in the prompt would always be followed. Models do not follow schemas. They approximate them. When the approximation fails, schema validation catches it. Without validation, the failure propagates downstream and breaks every system that expects structured data.
+
+## Schema Validation as Pre-Deployment Defense
+
+**Schema validation** is the process of verifying that a generated output conforms to a predefined structure before it enters production logic. For structured outputs, schema validation is not optional. It is the first line of defense against malformed data. A JSON schema defines required fields, field types, allowed values, nesting rules, and constraints. A schema validator checks every output against the schema and rejects anything that does not conform.
+
+This is not a new concept. Backend APIs have used schema validation for decades. OpenAPI specs, JSON Schema, Protocol Buffers, all enforce structure at system boundaries. LLM outputs are no different. If your system expects structured data, validate the structure. If the validation fails, handle the failure gracefully. If you skip validation, you are hoping the model never makes a mistake. That hope is not a strategy.
+
+Schema validation runs in single-digit milliseconds. It costs nothing. It catches an entire class of failures before they propagate. A legal research system that expects case summaries in a structured format validates every output against the schema: case name as string, citation as string, jurisdiction as enum, decision date as ISO date, summary as string between 100 and 1000 characters, key holdings as array of strings. If any field is missing, the wrong type, or outside the allowed range, the response is rejected. The system logs the failure, retries with a clarified prompt, or escalates. The validation layer stopped malformed outputs from reaching the case database, the billing system, and the client-facing dashboard.
+
+## Required Fields and Type Checking
+
+The most basic schema validation checks for required fields and correct types. A required field is one the system cannot function without. If your intake form requires a patient ID and the model omits it, the form is useless. The validation layer enforces this. It checks whether the field exists. If it does not, the response fails validation.
+
+Type checking verifies that each field contains the expected data type. A severity score should be a number, not a string. A timestamp should be an ISO 8601 date, not free text like "yesterday afternoon." A boolean flag should be true or false, not "yes" or "no." Models frequently generate plausible-looking values in the wrong type. A model might output "high" for a severity score that should be an integer. A rule-based type check catches this instantly.
+
+A customer support system generates ticket summaries with six required fields: ticket ID as string, category as enum from a list of twelve allowed values, urgency as integer between 1 and 5, customer sentiment as string from "positive," "neutral," or "negative," issue description as string, and resolution status as boolean. Schema validation checks all six. If the category field contains "billing question" but the schema only allows "billing," the validation fails. If urgency is set to 6, the validation fails. If resolution status is "completed" instead of true or false, the validation fails. Each failure is logged with the exact field and the value that triggered the error. The logs feed back into prompt refinement. The team discovers that the model often uses "billing question" instead of "billing" and updates the prompt to specify the exact allowed values.
+
+## Nested Object Validation
+
+Structured outputs frequently include nested objects or arrays of objects. A trip planning system generates itineraries with a top-level object containing trip metadata and a nested array of daily activities. Each activity has its own required fields: activity name, start time, duration, cost. Schema validation must verify not only the top-level structure but also the structure of every nested element.
+
+A validation rule checks that the activities field is an array. It checks that the array is not empty. It checks that each element in the array is an object. It checks that each object contains all required fields: name, start time, duration, cost. It checks that start time is a valid timestamp, duration is a positive integer, and cost is a non-negative number. If any element in the array fails any check, the entire response fails validation.
+
+This is where most teams discover edge cases. A model generates an itinerary with five activities. Four are perfectly structured. The fifth is missing the cost field. The validation catches it. The team retries. The model generates a new itinerary. This time all five activities are valid but one has a start time formatted as "9:00 AM" instead of ISO 8601. The validation catches it. The team refines the prompt to specify the exact timestamp format. Over time, the failure rate drops. But without nested validation, these errors would propagate downstream. A booking system expecting structured activity data would crash or silently drop the malformed activity.
+
+## Enum and Constraint Validation
+
+Enumerations and constraints are schema rules that limit allowed values. An enum specifies a closed set of acceptable options. A constraint specifies a range, pattern, or length requirement. Both are critical for structured outputs that feed into downstream systems with rigid expectations.
+
+A triage system classifies incoming support requests into one of five categories: technical, billing, account, compliance, or other. The schema defines category as an enum. The validation layer checks that the category field contains exactly one of those five values. If the model outputs "technical issue" or "tech" or "technical support," the validation fails. The system does not attempt to map the value to the closest match. It rejects the output and retries. This prevents ambiguity. It forces the model to use the exact values the downstream system expects.
+
+Constraints enforce ranges, lengths, and patterns. A product recommendation system generates a relevance score between 0 and 1. The schema specifies a numeric constraint: minimum 0, maximum 1. If the model outputs 1.2 or negative 0.3, the validation fails. A document summarization system generates summaries between 50 and 200 words. The schema specifies a length constraint. If the summary is 35 words or 450 words, the validation fails. A phone number field requires a specific regex pattern. If the model outputs a phone number without country code or with letters mixed in, the validation fails.
+
+These constraints are deterministic. They catch errors that would otherwise propagate through the system and cause downstream failures or data corruption. A billing system that expects relevance scores between 0 and 1 will break if it receives 1.2. A UI component designed for 50 to 200 word summaries will overflow or look broken if it receives 450 words. Constraint validation prevents these failures before they happen.
+
+## Schema Versioning and Evolution
+
+Schemas evolve. A system launches with six required fields. Six months later, the team adds a seventh. A year later, they rename a field or change a type. If the validation layer uses a hardcoded schema, every schema change requires redeploying the validation code. If the validation layer uses versioned schemas, the system can support multiple schema versions simultaneously while migrating.
+
+**Schema versioning** means every response is validated against a specific version of the schema. The response includes a schema version field. The validation layer looks up the corresponding schema and validates against it. This allows the system to evolve without breaking existing clients. Old responses still validate against the old schema. New responses validate against the new schema. The migration happens gradually.
+
+A legal research platform launched in 2023 with schema version 1: case name, citation, jurisdiction, decision date, summary. In 2025, the team added key holdings as an array of strings and upgraded to schema version 2. Existing integrations still send responses with version 1. New integrations use version 2. The validation layer supports both. When a response declares version 1, it validates against the version 1 schema. When a response declares version 2, it validates against version 2. The team has six months to migrate all clients to version 2. After that, version 1 is deprecated. The validation layer rejects version 1 responses with a clear error message directing clients to upgrade.
+
+Without versioning, every schema change is a breaking change. With versioning, schema evolution is gradual, safe, and trackable.
+
+## What Schema Validation Catches
+
+Schema validation catches missing fields, wrong types, out-of-range values, malformed nesting, and unexpected structure. It does not catch semantic errors. A response can pass schema validation and still be wrong. A patient intake form with all required fields correctly typed can still have the wrong diagnosis. A trip itinerary with valid structure can still recommend activities the user hates. A case summary with perfect schema compliance can still misrepresent the legal holding.
+
+Schema validation is a structural gate. It verifies that the data conforms to expectations. It does not verify that the data is correct. That is the job of semantic evals. The division is clear: schema validation ensures the output is well-formed. Semantic evals ensure the output is accurate. Both are necessary. Neither is sufficient alone.
+
+A financial analysis system generates investment recommendations with a structured schema: ticker symbol as string, recommendation as enum of buy, hold, or sell, target price as number, confidence as number between 0 and 1, reasoning as string. Schema validation confirms the schema is correct. It cannot confirm that the recommendation is sound. A response recommending "buy" for a company about to declare bankruptcy will pass schema validation and fail every semantic quality check. The schema validator caught zero real errors. But it also prevented a different class of failure: malformed JSON that would crash the portfolio management system.
+
+## Implementing Schema Validation in Production Pipelines
+
+Schema validation belongs immediately after generation and before any downstream processing. The pipeline flow is: generate output, validate schema, process output. If validation fails, the output never reaches processing. The system logs the failure, retries, or escalates.
+
+The validation layer should be fast, stateless, and deterministic. A schema validator that takes 50 milliseconds is too slow for high-throughput systems. A validator that depends on external state or network calls introduces latency and failure points. A validator that sometimes passes and sometimes fails the same input is broken. Good validators run in under 10 milliseconds, have no external dependencies, and always produce the same result for the same input.
+
+The validation layer should return structured error messages. A validation failure should specify which field failed, what rule was violated, and what value triggered the error. "Validation failed" is useless. "Field 'severity' failed type check: expected number, received string 'moderate'" is actionable. The error message feeds into logging, monitoring, and prompt refinement. Over time, the team sees patterns. If 80% of validation errors are the same field failing the same check, the prompt is unclear. The team rewrites it. The failure rate drops.
+
+## The Trust-But-Verify Principle
+
+Even if you use structured generation features that enforce schemas at the API level, validate the output. API-level schema enforcement reduces failures but does not eliminate them. Models can produce outputs that technically conform to a schema but violate higher-level constraints your system depends on. A field might be present and correctly typed but semantically invalid. A nested array might be structured correctly but contain duplicate entries your system cannot handle.
+
+Schema validation is cheap insurance. It costs almost nothing. It catches edge cases you did not anticipate. It provides a clear contract between the model and the downstream system. It makes debugging easier because failures are caught at a known boundary with structured error messages. It reduces the surface area for downstream failures.
+
+The principle is trust but verify. Trust that the model usually gets it right. Verify that the output conforms before you process it. The verification step is schema validation, and it runs before every other eval layer.
+
+The next step beyond schema validation is format compliance: the rules that govern not just the structure of data but the surface-level formatting that users and systems expect.
+

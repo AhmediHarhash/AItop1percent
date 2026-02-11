@@ -1,0 +1,102 @@
+# 11.8 — Secure Data Destruction After Review
+
+Data that enters your review environment must eventually leave. The question is not whether you delete it, but when, how thoroughly, and whether you can prove it happened. Most teams treat data destruction as an afterthought — a cleanup job scheduled whenever someone remembers. That approach fails the moment Legal asks for proof of deletion, or when a breach reveals that records marked as deleted six months ago are still sitting in backup archives. Secure data destruction is not about running a delete command. It is about designing a lifecycle where every piece of review data has a defined end date, a verified destruction method, and an audit trail proving it no longer exists anywhere in your system.
+
+The teams that handle this well treat destruction as a first-class lifecycle stage, planned during data ingestion and enforced automatically. The teams that handle it poorly discover too late that their deletion policies were never actually implemented, that backups contain years of supposedly-deleted data, and that compliance obligations they thought they had met are actually unfulfilled. The gap between policy and reality destroys credibility with regulators, customers, and your own Legal team.
+
+## The Lifecycle Design Problem
+
+Data destruction begins at ingestion, not at the end. Every record that enters your review environment needs a retention policy assigned the moment it arrives. This policy determines how long the data stays, under what conditions it can be extended, and what happens when the retention period expires. Most teams skip this step entirely. They ingest data without metadata, store it without expiration dates, and discover months later that they have no systematic way to identify what should be deleted.
+
+The fix is lifecycle tagging at ingestion time. When a review task is created, the system assigns a retention class based on data sensitivity, regulatory requirements, and business need. A HIPAA-regulated dataset gets a 30-day retention policy. A customer support quality review gets 90 days. A model safety evaluation for a high-risk system gets 365 days plus legal hold capability. Each retention class has a defined destruction method — soft delete for low-sensitivity data, hard delete plus overwrite for regulated data, cryptographic shredding for the most sensitive cases.
+
+The retention clock starts the moment the review task is marked complete, not when the data was ingested. A review that takes three weeks to finish still has its full retention period after completion. This prevents premature deletion of in-progress work while ensuring predictable cleanup timelines. The system tracks both the ingestion timestamp and the completion timestamp. Destruction policies reference the completion timestamp. Audit logs reference both.
+
+## Multi-Tier Destruction Methods
+
+Not all deletion is the same. A soft delete that marks a database row as inactive is appropriate for non-sensitive metadata. It is catastrophically insufficient for medical records, financial data, or personally identifiable information. The destruction method must match the sensitivity class, and your system must enforce that match automatically. Manual cleanup processes fail because someone eventually forgets, skips a step, or deletes the wrong tier with the wrong method.
+
+For low-sensitivity data — aggregated metrics, non-identifying metadata, system logs that contain no PII — soft deletion is acceptable. The record is marked inactive, excluded from queries, and eventually purged during routine database maintenance. This method is fast, reversible if needed within a grace period, and sufficient for data that poses minimal risk if temporarily retained.
+
+For regulated data — anything covered by GDPR, HIPAA, CCPA, or contractual data processing agreements — hard deletion is required. The database record is deleted, and the storage blocks are overwritten. If the data lives in object storage, the object is deleted and the deletion is verified. If the data lives in a database, the row is deleted and the underlying pages are vacuumed. Backups containing the deleted data are either rotated out or have the specific records expunged if point-in-time recovery is required.
+
+For the most sensitive cases — patient health information, financial account data, biometric records, or anything subject to legal holds — cryptographic shredding is the gold standard. The data is encrypted at rest with a unique per-record or per-batch encryption key. When the retention period expires, you delete the key, not the data. The encrypted data becomes unrecoverable. This method works even if backup copies exist, because without the key, the data is cryptographically useless. The key deletion is logged, timestamped, and irreversible.
+
+## Backup and Archive Expungement
+
+The most common failure mode in data destruction is forgetting about backups. Your production database deletes a record. Your nightly backup still contains it. Your weekly snapshot still contains it. Your compliance archive still contains it. Six months later, a regulator asks for proof of deletion, and you discover that the data you thought you destroyed exists in fourteen different backup locations.
+
+The fix is to treat backups as part of the lifecycle, not separate from it. When a record is hard-deleted, your backup system must either purge that specific record from existing backups or mark the backups as containing deleted data and rotate them out according to your retention schedule. If you use point-in-time recovery, your backup system needs the capability to expunge individual records from snapshots. If you use immutable backups for ransomware protection, you need to plan retention windows that align with your destruction obligations — a 30-day HIPAA requirement conflicts with a 90-day immutable backup policy.
+
+Some teams solve this with versioned backups and metadata tagging. Each backup generation is tagged with the date range of data it contains. When a record is deleted, the system logs which backup generations contain that record. Those generations are flagged for expungement or early rotation. When a backup ages out, the system verifies that all flagged records within it are now beyond the retention window. Only then is the backup itself eligible for deletion.
+
+For compliance archives — long-term storage required by regulations like SOX, FINRA, or healthcare recordkeeping laws — the problem is harder. You may be required to retain certain data for seven years while simultaneously being required to delete other data after 30 days. The same review session may contain both types. The solution is field-level retention policies. The parts of the record required for compliance are redacted down to the minimum required fields and moved to a separate compliance archive. The full record, including sensitive or non-required fields, is deleted on the standard schedule. This requires schema design that separates compliance-required fields from operational or sensitive fields.
+
+## Audit Trails for Destruction Events
+
+Deleting data without logging the deletion is worse than not deleting it at all. When a regulator, auditor, or legal team asks for proof that you deleted a specific record, you need a timestamped, tamper-evident log entry showing what was deleted, when, by which process, and using which method. The absence of this log turns every compliance claim into an unverifiable assertion.
+
+Your destruction audit log should record the record identifier, the deletion timestamp, the retention policy that triggered the deletion, the destruction method used, the system or process that performed the deletion, and the verification status. For cryptographic shredding, log the key identifier and the key deletion timestamp. For hard deletes with overwrite, log the storage block addresses and the verification of overwrite completion. For backup expungement, log which backup generations were purged and when.
+
+The audit log itself must be append-only and tamper-evident. A deletion log stored in the same database as the deleted records can be altered by anyone with database access. The log should live in a separate, write-once storage system — an append-only object store, a dedicated audit database with restricted write access, or a third-party audit log service. Some teams use cryptographic logging systems that produce a verifiable chain of custody for every deletion event.
+
+Audit logs must also survive the retention period of the data they describe. If you delete a record after 30 days but only retain deletion logs for 30 days, you have no proof of deletion after 60 days. Deletion logs should be retained for at least as long as the longest possible audit or legal hold period for the data type they cover. For HIPAA data, retention logs should be kept for six years after deletion. For GDPR, three years is common. For financial data under SOX, seven years.
+
+## The Deletion Verification Loop
+
+Deletion is not complete until it is verified. A process that issues a delete command and assumes success is a process that eventually leaves data behind. Storage systems fail. API calls time out. Database transactions roll back. Backup processes skip files. The only way to know that data is actually gone is to check.
+
+Verification begins immediately after deletion. For database hard deletes, query the table to confirm the record no longer exists. For object storage deletes, attempt to retrieve the object and confirm a 404 response. For cryptographic shredding, attempt to decrypt a sample of the shredded data using the deleted key and confirm failure. This immediate verification catches synchronous failures — cases where the delete command appeared to succeed but did not.
+
+Delayed verification catches asynchronous failures. Twenty-four hours after a scheduled deletion run, a background process re-scans storage locations to confirm that deleted records are still absent. It checks production databases, staging environments, backup snapshots, and any data lakes or archives that might contain copies. If a record reappears — because a backup restore ran overnight, or because an ETL pipeline re-ingested stale data — the system flags it for re-deletion and alerts the operations team.
+
+For backup expungement, verification is more complex. After a backup generation is rotated out, the system must confirm that no copies exist in cold storage, disaster recovery sites, or offline media. Some teams maintain a backup inventory database that tracks every backup copy, every tape, every snapshot. When a backup is deleted, the inventory is updated. Quarterly audits reconcile the inventory against actual storage to catch drift.
+
+## Handling Legal Holds and Litigation Freezes
+
+Data scheduled for deletion may need to be preserved if a legal hold is issued. A legal hold is a directive from Legal or outside counsel to preserve all data related to pending or anticipated litigation, regulatory investigation, or internal audit. When a hold is issued, scheduled deletions must be suspended for the data in scope, but only for that data. The rest of your retention schedule continues.
+
+The challenge is identifying which data is in scope. A legal hold might specify all data related to a specific customer, a specific time period, a specific product, or a specific category of interaction. Your review infrastructure must be able to tag data with metadata that allows scoping. Customer identifiers, date ranges, product tags, and data categories must all be queryable. When a hold is issued, Legal provides the scoping criteria, and the system identifies matching records and flags them as held.
+
+Held data is exempt from automated deletion. The retention policy still runs, but held records are skipped. The system logs every skipped deletion with the legal hold identifier. When the hold is lifted — which may be months or years later — the held records re-enter the deletion queue. If the original retention period has passed, they are deleted immediately. If not, they wait until the period expires.
+
+Some legal holds are issued retroactively. Legal discovers an issue in March and issues a hold covering all data back to January. If your retention policy deleted data in February, that data is gone and unrecoverable. This is acceptable if the deletion was legitimate and documented. It becomes a problem if the deletion was accidental or if you cannot prove it happened. This is why deletion logs must be retained longer than the data itself.
+
+## Destruction in Multi-Tenant Environments
+
+If your review platform serves multiple customers, each with different retention requirements, destruction becomes per-tenant. Customer A requires 30-day retention under HIPAA. Customer B requires 90-day retention under GDPR. Customer C requires 365-day retention under their internal policy. The same review task, the same data schema, the same database — but different destruction schedules based on tenant configuration.
+
+The system must enforce tenant-specific policies without leaking data between tenants. A deletion process running for Customer A must never touch Customer B's data, even if both share the same table. This requires tenant identifiers on every row, partition-level isolation, or separate databases per tenant. The destruction process queries by tenant, deletes only rows matching that tenant, and verifies that no cross-tenant deletions occurred.
+
+Backup expungement in multi-tenant systems is more complex. If all tenants share the same backup, you cannot delete one tenant's data without affecting the others. The solutions are per-tenant backups, logical backup expungement that removes individual tenant records from shared snapshots, or cryptographic shredding with per-tenant keys. Each approach has trade-offs in cost, complexity, and recovery time.
+
+## Destruction in Vendor-Managed Environments
+
+If your review platform runs on vendor infrastructure — a third-party annotation tool, a managed labeling service, a cloud-based review platform — you do not control the physical deletion process. The vendor does. Your retention policy becomes a contractual requirement, enforced through SLAs, audited through third-party attestations, and verified through periodic compliance reviews.
+
+Your contract with the vendor must specify destruction timelines, destruction methods, and audit log retention. It must define what happens to backups, snapshots, and disaster recovery copies. It must require the vendor to provide proof of deletion on request and to notify you if deletion fails or is delayed. It must give you the right to audit the vendor's destruction processes and to terminate the contract if they fail to meet obligations.
+
+Some vendors offer customer-controlled encryption keys. You upload data encrypted with your own key, and the vendor stores it without ever possessing the decryption key. When you want to destroy the data, you delete the key. The vendor's copies become cryptographically shredded. This approach gives you control over destruction timing and verification without requiring the vendor to implement custom deletion logic for your retention policies.
+
+## Cross-Region Destruction Compliance
+
+If your review data is replicated across regions — for performance, for disaster recovery, or for regulatory data residency — destruction must happen in all regions. Deleting data from your US region while it remains in your EU region violates GDPR. Deleting data from production while it remains in a staging environment in another region creates a shadow copy that can be discovered in a breach or audit.
+
+The fix is synchronized, multi-region deletion. When a record's retention period expires, the deletion process runs in every region where the data exists. Each regional deletion is logged separately. The destruction is not considered complete until all regions report success. If one region fails — due to network issues, storage errors, or replication lag — the system retries and alerts operations.
+
+Some teams use a centralized deletion controller that orchestrates multi-region deletion. The controller identifies records eligible for deletion, issues delete commands to every region, waits for confirmation, and logs the aggregate result. If any region fails, the controller retries that region while marking the overall deletion as incomplete. Only when all regions confirm success does the controller log the deletion as complete.
+
+For cross-border data, you may also need to comply with conflicting retention laws. The EU requires deletion after the lawful processing period ends. The US may require retention for litigation discovery. China may require data to remain in-country and be available for government access. Navigating these conflicts requires legal guidance, but the infrastructure must support the outcome — whether that is regional policy overrides, per-jurisdiction retention rules, or manual legal hold workflows.
+
+## Automated Deletion Scheduling and Monitoring
+
+Manual deletion processes do not scale. A human running a cleanup script every month will eventually forget, run the wrong script, delete the wrong data, or skip a month because they were on vacation. Automated deletion scheduling is not optional. It is the only way to ensure consistent, timely, compliant data destruction.
+
+Your deletion scheduler runs daily, querying for records whose retention period has expired. It groups records by sensitivity class and applies the appropriate destruction method. It logs every deletion attempt, every success, every failure. It retries failed deletions on an exponential backoff schedule. It alerts operations if deletion failure rates exceed a threshold. It produces a daily summary report showing how many records were deleted, from which tenants, under which policies, and with which methods.
+
+The scheduler must also handle edge cases. Records that are in active use — currently open in a reviewer's interface, part of an in-progress appeal, referenced by an ongoing investigation — are temporarily exempt from deletion. The system flags them as active, skips them during the deletion run, and re-queues them for deletion once they become inactive. This prevents deleting data out from under an active workflow while ensuring that once the workflow completes, the retention clock resumes.
+
+Monitoring tracks deletion health over time. Metrics include deletion latency — the time between retention expiration and actual deletion, deletion success rate, deletion backlog size, and audit log completeness. A sudden spike in deletion latency might indicate a storage system issue. A drop in success rate might indicate a misconfigured policy or a failing backup expungement process. A growing backlog might indicate that the deletion process cannot keep up with ingestion volume.
+
+Your infrastructure is not just a tool for reviewers to evaluate AI outputs. It is a custodian of sensitive data, subject to legal and regulatory obligations that extend beyond the moment of review. Destruction is not an afterthought. It is a core capability, designed from the start, automated by default, and audited continuously. The next subchapter covers the contractual and access controls required when vendors participate in your review environment.
+

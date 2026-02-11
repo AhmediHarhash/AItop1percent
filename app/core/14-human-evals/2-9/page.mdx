@@ -1,0 +1,81 @@
+# 2.9 — Handling Queue Failures and Dead Letters
+
+The silent drop is the most dangerous failure mode in queue architecture. An item enters the review queue, fails to route correctly, sits unprocessed, and eventually disappears without triggering an alert. No reviewer saw it. No system logged it. The user who submitted it never receives a response. In a customer support queue, this means an ignored complaint. In a safety review queue, this means unmoderated content reaching users. In a financial compliance queue, this means unaudited transactions.
+
+Items that cannot be processed must not disappear. That principle is non-negotiable. Every queue needs a failure-handling system that captures items the primary pipeline cannot process, stores them safely, alerts operators, and provides tools to recover them. This is not just error handling—it is a data integrity requirement. If your queue processes 99.9 percent of items successfully and silently drops 0.1 percent, you are dropping 1,000 items per million. That is not acceptable.
+
+## Dead Letter Queues for Unroutable Items
+
+A dead letter queue is where items go when the routing system cannot determine which reviewer or stage should receive them. The item may have missing metadata, malformed data, or a routing key that does not match any known rule. Instead of crashing the routing system or dropping the item, the router sends it to the dead letter queue.
+
+Dead letter queues must be monitored actively. They are not trash bins. They are holding areas for items that require operator intervention. Every item in the dead letter queue represents a failure of your routing logic, your data validation, or your integration with upstream systems. The goal is to investigate each dead-lettered item, fix the root cause, and reprocess the item correctly.
+
+Common causes of dead letters include schema mismatches, where the upstream system sends a field the queue does not expect. For example, a new field is added to model outputs, but the queue schema was not updated. Items with that new field fail validation and route to dead letters. The fix is updating the schema and reprocessing. Another cause is routing key errors, where an item specifies a reviewer tier or skill that does not exist. "Route to tier-3" when your system only has tier-1 and tier-2. The fix is correcting the routing logic or adding the missing tier.
+
+Dead letter queues also catch items that exceed size limits. If a model generates a 10-megabyte response and your queue has a 1-megabyte limit, the item dead-letters. The fix is either increasing the limit or truncating the response before queueing. Dead letters also result from dependency failures: if the queue depends on an external lookup service and that service is down, items that require lookups cannot route. They dead-letter until the dependency recovers.
+
+## Retry Policies
+
+Not every failure is permanent. A transient network error, a brief database unavailable state, or a temporary overload can cause an item to fail processing. Retry policies let the system automatically reattempt processing after a delay. The simplest retry policy is immediate retry: if an item fails, try again immediately. This works for transient errors but floods the system if the failure is systemic.
+
+Exponential backoff is better. The first retry happens after 1 second. If it fails, retry after 2 seconds, then 4, then 8, then 16. The delay grows exponentially until the item succeeds or reaches a maximum retry limit, typically 5 to 10 retries. After the maximum retries, the item moves to the dead letter queue. Exponential backoff prevents retry storms where thousands of failed items all retry simultaneously and overwhelm the system.
+
+Retry policies also need failure classification. Some failures are retryable: network timeouts, temporary database locks, rate limit errors from external APIs. Other failures are not retryable: schema validation errors, items referencing deleted data, permission denied errors. The system should classify errors and only retry the retryable ones. Non-retryable errors should dead-letter immediately. Retrying a schema validation error ten times wastes resources and delays the investigation.
+
+Some systems implement per-item retry budgets. Each item has a maximum number of retries it can consume before dead-lettering. If an item consumes all retries in one stage, it dead-letters. If it consumes half its retries in tier-1 and then escalates to tier-2, it has half its budget remaining for tier-2 failures. This prevents an item from retrying indefinitely across multiple stages.
+
+## Poison Pill Detection
+
+A poison pill is an item that crashes the reviewer interface or the processing system every time it is attempted. It may contain malformed data that triggers a bug, an edge case the code does not handle, or content that causes the rendering engine to freeze. Poison pills are rare but catastrophic. One poison pill can crash multiple reviewers in sequence as the queue reassigns it after each crash.
+
+The system must detect poison pills and quarantine them. The simplest detection method is failure counting. If an item fails three times in a row with crashes or timeouts, flag it as a suspected poison pill and remove it from the active queue. Move it to a poison pill queue where operators can investigate in a safe environment. Do not keep reassigning it to live reviewers.
+
+Poison pills often indicate software bugs. A reviewer claims an item, the interface loads it, and the browser tab crashes. The item returns to the queue and is assigned to another reviewer. The same crash happens. After the third crash, the system quarantines the item and alerts engineering. The investigation reveals that the item contains a deeply nested data structure that causes a stack overflow in the rendering code. The fix is patching the code and reprocessing the item.
+
+Some poison pills are data-quality issues. An item contains a video file that is 10 gigabytes and causes the player to run out of memory. Or an item contains Unicode characters that break the text rendering engine. Or an item references a linked resource that returns a 500 error every time it is fetched. These are not bugs in your code—they are edge cases in the data. The fix may be preprocessing the data, adding resource limits, or rejecting the item upstream before it reaches reviewers.
+
+## Orphaned Items
+
+An orphaned item is one that a reviewer claimed but never completed. The reviewer may have claimed it, started reviewing it, then lost their internet connection. Or they closed the browser tab by mistake. Or they went to lunch and forgot. The item is locked to that reviewer but will never be completed unless the system intervenes.
+
+Orphan detection relies on claim expiration. When a reviewer claims an item, the system records a timestamp and sets an expiration window, typically 15 to 60 minutes depending on task complexity. If the reviewer does not complete or release the item before expiration, the system automatically unclaims it and returns it to the queue. The next reviewer can claim it. This prevents items from being permanently locked by reviewers who disappeared.
+
+Claim expiration must account for task duration. If the typical review takes 10 minutes, set expiration at 20 or 30 minutes to give reviewers buffer time. If expiration is too short, reviewers working on difficult cases will see their claims expire before they finish, and the item will be reassigned to another reviewer mid-review. If expiration is too long, orphaned items sit idle for an hour before re-entering the queue.
+
+Some systems implement heartbeat mechanisms. While a reviewer has an item claimed, their client sends a heartbeat signal every 60 seconds to indicate they are still actively working. If the heartbeat stops, the system assumes the reviewer disconnected and releases the claim immediately. This reduces orphan latency from 30 minutes to 2 minutes. The downside is added complexity and network traffic.
+
+Orphaned items also result from crashes. A reviewer claims an item, the interface crashes, and the reviewer does not notice. The item remains claimed. Without expiration or heartbeat, the item is orphaned until the reviewer logs back in, sees the crashed claim, and manually releases it. Many reviewers do not do this. Automatic expiration is non-negotiable.
+
+## Queue Recovery After System Failures
+
+When the queue system crashes or restarts, in-flight items must not be lost. Every item in the queue must be persisted to durable storage before acknowledgment. If the queue is memory-only and the process crashes, all uncompleted items vanish. This is unacceptable. Queues must be backed by a database, disk, or distributed log that survives process restarts.
+
+On startup, the queue system must recover its state: which items are pending, which are claimed, which are completed. Pending items return to the queue. Claimed items must be evaluated: if the claim timestamp is recent, assume the reviewer is still working and preserve the claim. If the claim timestamp is old, treat the item as orphaned and return it to the queue. Completed items should be archived or moved to a processed queue and removed from the active queue.
+
+Some systems use transaction logs to ensure recovery correctness. Every state change—item enqueued, item claimed, item completed—is written to a log before being applied. If the system crashes mid-operation, the log is replayed on startup to reconstruct the correct state. This prevents inconsistencies where an item was marked completed in memory but not persisted, so on restart it appears uncompleted and gets reassigned.
+
+Database-backed queues handle recovery naturally. The database is the source of truth. On startup, the queue service reads the database and rebuilds its in-memory state. No transaction log is needed because the database already provides durability and consistency. The downside is performance: every queue operation requires a database write. The upside is reliability: the queue state cannot be lost.
+
+## Audit Trail for Queue Operations
+
+Every queue operation must be logged: item enqueued, item routed, item claimed, item completed, item escalated, item dead-lettered. These logs serve multiple purposes. They enable debugging: if an item disappeared, the logs show exactly what happened. They enable compliance: if a regulator asks why a piece of content was reviewed by a specific reviewer, the logs provide an audit trail. They enable analytics: you can calculate queue latency, reviewer throughput, and failure rates from the logs.
+
+Audit logs must be immutable and tamper-proof. Once written, a log entry cannot be modified or deleted. This prevents manipulation of the audit trail. In high-stakes domains, logs are often written to append-only storage or cryptographically signed to prove they have not been altered.
+
+Logs must also be searchable. You need to query logs by item ID, reviewer ID, timestamp, queue stage, and error type. If an item dead-lettered three weeks ago and a user complains now, you need to find the logs for that item, trace its path through the system, identify the failure, and determine what happened. Without searchable logs, this investigation is impossible.
+
+Log retention policies depend on your domain. Some industries require logs to be retained for seven years. Others require only 90 days. Retention is a cost trade-off: longer retention provides better historical visibility but increases storage costs. Decide retention based on compliance requirements, not engineering preference.
+
+## The Silent Drop Problem
+
+The silent drop is the failure mode where an item is lost without any record. It never appears in logs. It never triggers an alert. It simply vanishes. Silent drops usually result from bugs in the enqueue logic: the upstream system believes it enqueued the item, but the queue never received it. Or the queue received it but failed to persist it before crashing. Or the queue persisted it but a database corruption deleted it.
+
+Preventing silent drops requires end-to-end acknowledgment. The upstream system sends an item to the queue and waits for an acknowledgment. The queue persists the item, logs it, and then sends the acknowledgment. If the acknowledgment does not arrive, the upstream system retries. This guarantees that items are not lost in transit.
+
+Acknowledgment must happen after persistence, not before. If the queue acknowledges immediately but crashes before persisting, the upstream system believes the item was queued, but it was not. The item is silently dropped. The fix is persisting first, then acknowledging. The trade-off is latency: persistence takes time, so acknowledgment is slower. That latency is the cost of correctness.
+
+Silent drops also occur during queue migrations or upgrades. If you migrate from one queue system to another and do not carefully drain the old queue before decommissioning it, items still in the old queue are lost. The fix is dual-writing during migration: write to both the old queue and the new queue until migration completes, then stop writing to the old queue and drain it fully before shutdown.
+
+You detect silent drops by comparing upstream records with queue logs. If the upstream system reports that it enqueued 10,000 items today but the queue logs show only 9,995, five items were silently dropped. This discrepancy is an incident. Investigate immediately. Silent drops are rare in well-designed systems, but they are existential failures when they occur. Data loss is unacceptable.
+
+Handling queue failures is unglamorous infrastructure work, but it is the foundation of reliable human review at scale. Items must not vanish. Failures must be captured, logged, and recoverable. Once your failure-handling system is solid, you can turn your attention to the observability layer—the analytics and dashboards that let you see what the queue is doing in real time. That is the topic of the next subchapter: queue analytics and visibility.

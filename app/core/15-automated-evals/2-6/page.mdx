@@ -1,0 +1,55 @@
+# 2.6 — Required Field Detection and Missing Content Flags
+
+Most people assume that if a model returns a response, the response contains everything the task required. They are wrong. Models routinely return outputs that are syntactically perfect, semantically coherent, and functionally incomplete. The JSON parses. The schema validates. The required fields are present. Their values are empty strings. The response technically satisfies the format contract while providing zero useful information.
+
+**Required field detection** validates not just that fields exist, but that they contain content. A name field is not valid if it contains an empty string. A description field is not valid if it contains the word "None." A list of recommendations is not valid if it contains an empty array. The field is there. The value is garbage. Format validation passes. Completeness validation fails.
+
+## The Difference Between Presence and Completeness
+
+Presence checks verify that a field exists in the output structure. Completeness checks verify that the field contains a meaningful value. A JSON object with a "summary" key passes presence validation. If the summary key maps to an empty string, it fails completeness validation. If it maps to the string "N/A," it fails completeness validation. If it maps to the string "No summary available," it fails completeness validation unless that phrase is explicitly allowed as a valid response for cases where summary generation is impossible.
+
+Models produce empty fields for several reasons. The prompt does not provide enough context to generate a meaningful value, so the model outputs a placeholder. The model generates a value, then removes it during self-correction because it judges the value uncertain. The model runs out of output tokens before completing the field. The model misunderstands the task and treats optional fields as required, filling them with empty values to satisfy perceived format constraints. Every reason produces the same symptom: present but useless data.
+
+Completeness validation defines what counts as meaningful content for each field. String fields must have length greater than zero, or greater than some minimum if the task demands substantive answers. Numeric fields must be non-null and within expected ranges. Array fields must contain at least one element, or at least N elements if the task requires multiple outputs. Boolean fields are inherently complete—true and false are both valid—but enum fields require actual enum values, not strings like "unknown" unless "unknown" is part of the enum.
+
+## Null, Empty, and Placeholder Detection
+
+The simplest completeness check: reject null and empty values for required fields. If a field is required, it must be non-null. If it is a string, it must be non-empty. If it is an array, it must have length greater than zero. If it is an object, it must have at least one key. This catches the most obvious incompleteness failures.
+
+But models have learned to work around naive null checks. They do not return null. They return the string "null" or "None" or "N/A". They do not return empty strings. They return single-space strings or the word "unknown" or the phrase "not applicable." They do not return empty arrays. They return arrays with one element, which is an empty object or a placeholder string. All of these pass a basic non-null, non-empty check. None of them provide useful content.
+
+Advanced completeness validation maintains a blocklist of placeholder values for each field type. For string fields: empty string, "null", "None", "N/A", "not applicable", "unknown", "TBD", "pending", single-character strings, strings that are only whitespace. For numeric fields: negative one, zero if zero is semantically invalid for the field, sentinel values like 999 or 9999. For array fields: arrays containing only empty objects, arrays containing only null, arrays where every element is a placeholder string. The validator checks not just that a value exists, but that it is not on the blocklist.
+
+The blocklist grows over time. Models invent new placeholders. A validator that catches "N/A" today might miss "n/a" or "not available" tomorrow. The solution is either comprehensive pattern matching—regular expressions that catch variations—or strict allowlists that define what valid content looks like rather than trying to enumerate every invalid pattern. Allowlists are harder to configure initially but more robust long-term.
+
+## Section Presence Validation
+
+Structured outputs often require specific sections: an introduction, a methodology, a results section, a conclusion. Each section might be a top-level field in a JSON object or a markdown heading in a prose response. Section presence validation checks that all required sections exist and appear in the expected order.
+
+For JSON outputs, section presence is straightforward: verify that the object contains keys for each required section. For prose outputs, the validator scans for markdown headings or other section delimiters. If the response must include "## Summary", "## Details", and "## Recommendations", the validator searches for those exact heading strings or normalized variations. If any heading is missing, validation fails.
+
+Section presence matters for long-form outputs where models sometimes skip sections they find difficult. A model asked to write a product requirements document might generate the overview and functional requirements but skip the non-functional requirements section because the context does not provide enough detail. The output looks complete at a glance—it has headings, it has content—but it is missing an entire required section. Without validation, the omission goes unnoticed until a human reviewer spots it or a downstream process fails because the data is incomplete.
+
+Section order validation is stricter. Some outputs require sections in a specific sequence: background before methodology, methodology before results, results before conclusions. If the model generates all sections but in the wrong order, presence validation passes but order validation fails. Order matters for readability and for downstream parsing logic that expects sections in a canonical sequence. The validator checks both presence and position.
+
+## Required Versus Optional Content
+
+Not all fields are required. Some are optional: they should be included if relevant information exists, omitted otherwise. Optional field validation is the inverse of required field validation. An optional field can be absent or null. If it is present, it must pass completeness checks. An optional "notes" field can be missing entirely without failing validation. If it is present and contains an empty string or "N/A," validation fails. The field's presence makes a promise: useful content exists here. An empty value breaks that promise.
+
+This creates a validation rule: optional fields must either be absent or complete. Partial presence—the field exists but is empty—indicates model confusion. The model thought the field was required and filled it with a placeholder. Or the model generated content, then deleted it, but forgot to remove the field. Either way, an empty optional field is a signal that the model did not understand the schema correctly.
+
+Prompt design affects this. If the prompt says "include a notes field if additional context is relevant," the model learns that the field is conditional. If the prompt shows examples where the notes field is always present, even when empty, the model learns that the field is required and fills it every time. The validation layer catches the mismatch. If your optional fields are never actually optional in practice, they are required fields with bad documentation. Update the schema.
+
+## The Technically Valid but Useless Problem
+
+This is the hardest failure mode to catch with deterministic validation. The model generates a response that passes all structural checks: correct format, all required fields present, no null or placeholder values, all sections included. But the content is generic, evasive, or circular. A summary field contains "This document summarizes the key points." A recommendation field contains "Consider reviewing the data before making decisions." An analysis field contains "Further analysis may be required." Every field is filled. None of them say anything.
+
+Rule-based validation cannot catch this. Detecting usefulness requires understanding content semantics, which requires a model-based judge. But rule-based validation can catch the precursors. If a summary field is suspiciously short—less than 20 characters when typical summaries are 200—flag it. If a recommendations array contains only one element when similar tasks usually produce three to five, flag it. If every string field contains the same word count as every other string field, flag it—that is a pattern consistent with formulaic placeholder generation.
+
+These are heuristic checks, not deterministic ones. They flag anomalies for review rather than failing validation outright. A legitimately short summary can be valid. A single high-confidence recommendation can be better than five weak ones. But when a response is suspiciously minimal across multiple dimensions—short fields, low section count, high use of vague language—the combination is a signal. The response might be technically valid. It is probably not useful.
+
+Completeness validation cannot replace human or model-based review. But it catches the 15 to 25 percent of incomplete responses that are obviously broken: missing required fields, empty arrays, placeholder strings, absent sections. Those responses never make it to downstream evals. Those evals run faster, cost less, and spend their budget on responses that have a chance of being correct.
+
+When required field detection is the second gate—after format validation, before model-based judges—you create a two-layer filter. Format validation rejects malformed outputs. Completeness validation rejects empty outputs. Model-based judges only see outputs that are structurally sound and substantively filled. The result is a 30 to 50 percent reduction in wasted LLM-as-judge API calls, depending on how well your prompts enforce completeness requirements.
+
+The next category of rule-based validation moves from structured fields to pattern-based content detection—regex rules that catch specific error signatures in prose.

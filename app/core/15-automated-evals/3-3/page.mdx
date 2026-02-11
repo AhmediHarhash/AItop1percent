@@ -1,0 +1,70 @@
+# 3.3 — Repetition and Loop Detection
+
+The team stared at the logs. The customer support agent had been running for six hours. It had processed 1,400 queries. Query 1,401 was different. The user asked about return policies. The agent started its response normally. Then it repeated the same sentence. Then again. Then again. Eighteen iterations of the exact same clause about processing times. The output was 4,200 tokens. The cost for that single response was $1.60. The agent had entered what the team would later name **The Degenerate Loop**: a failure mode where the model loses track of what it has already generated and repeats content indefinitely. The loop had been running for nine minutes before the timeout killed it. They needed a heuristic that could catch this in the first 10 seconds, before the damage compounded.
+
+## N-Gram Repetition Detection
+
+An **n-gram** is a sequence of n consecutive words. A bigram is two words. A trigram is three. A 5-gram is five. Repetition detection works by counting how often the same n-gram appears in an output. If the bigram "processing time" appears once, normal. If it appears 18 times in a 200-word output, degenerate. The heuristic measures n-gram frequency and flags outputs where any n-gram appears more often than a reasonable threshold.
+
+The standard approach is to count unique n-grams versus total n-grams. An output with 100 total bigrams and 95 unique bigrams has 5% repetition. An output with 100 total bigrams and 40 unique bigrams has 60% repetition. You set thresholds based on baseline data. Most coherent text has bigram uniqueness above 85%. Outputs below 70% bigram uniqueness are almost always degenerate. You flag anything below 75% for investigation.
+
+The value of n matters. Bigrams are sensitive but noisy. Common phrases like "in the" and "of the" repeat naturally in normal text. High bigram repetition might just mean the output uses articles frequently. Trigrams are more specific. A trigram like "processing time is" is less likely to repeat unless something is wrong. 5-grams are even more specific. If a 5-gram repeats more than twice in a single output, you have strong evidence of degeneration.
+
+The pattern that works is layering multiple n-gram sizes. You measure bigram, trigram, and 5-gram uniqueness. You flag outputs that fail thresholds on two or more n-gram sizes. An output that has 65% bigram uniqueness but 92% trigram uniqueness is probably fine: it is using common two-word phrases repetitively but not repeating longer structures. An output that has 65% bigram uniqueness and 50% trigram uniqueness is almost certainly degenerate: it is repeating entire phrases and sentence fragments.
+
+The customer support team implemented this after the degenerate loop incident. They measured 5-gram uniqueness. Threshold: any 5-gram that appears more than three times in a single output triggers an alert. In normal operation, this heuristic fires on 0.4% of outputs. Of the flagged outputs, 89% fail subsequent human review. The false positive rate is acceptable. The heuristic catches degenerate loops within the first 30 tokens, long before they consume thousands of tokens and dollars.
+
+## Phrase-Level Repetition
+
+Phrase-level repetition is when the same multi-word phrase appears multiple times in close proximity. Unlike n-gram detection, which is statistical, phrase-level detection is structural. You identify repeated phrases and measure how often and how close together they appear. The heuristic is: if the same phrase of four or more words appears more than twice within a 100-word window, flag the output.
+
+The implementation is straightforward. You extract all phrases of length 4 to 10 words. You hash them. You count occurrences. You measure the token distance between occurrences. If the same phrase appears three times and the average distance between occurrences is less than 100 tokens, you have evidence of repetitive generation. If the phrase appears three times but the occurrences are 500 tokens apart, it might be legitimate emphasis or thematic consistency. The distance threshold matters as much as the count threshold.
+
+This heuristic catches a specific failure mode: the model that regenerates the same explanatory clause multiple times within a single output. A financial advice chatbot once produced outputs where the phrase "consult a qualified financial advisor before making decisions" appeared five times in a 300-word response. Each occurrence was in a different paragraph. The model was not looping. It was over-emphasizing a disclaimer because the training data included that phrase frequently and the fine-tuning process amplified it. Phrase-level repetition detection caught it. N-gram uniqueness did not because the surrounding text was varied enough to keep overall uniqueness high.
+
+The fix was targeted. They identified the repeated phrase. They checked if it appeared in the training data with unusual frequency. It did: 6,200 occurrences across 8,000 examples. They filtered the training data to reduce disclaimer density. They retrained. The phrase repetition dropped to normal levels without losing the ability to include disclaimers when appropriate. The heuristic made the problem visible. Filtering the data fixed it.
+
+## Paragraph-Level Repetition
+
+Paragraph-level repetition is when entire paragraphs or large text blocks repeat. This is rarer than phrase-level repetition but more catastrophic when it happens. A model that repeats a five-word phrase produces awkward text. A model that repeats a 60-word paragraph produces unusable output. Paragraph-level repetition usually indicates training data contamination or a severe sampling issue during generation.
+
+The heuristic is cosine similarity between text chunks. You split the output into chunks of 50-100 words. You compute embeddings for each chunk using a lightweight model like a sentence transformer. You calculate cosine similarity between all pairs of chunks. If any two chunks have similarity above 0.95, flag the output. At that similarity level, the chunks are either identical or near-identical. That is never appropriate in a single coherent response.
+
+You do not need a large embedding model for this. The goal is not semantic understanding. The goal is detecting duplicate blocks of text. A small, fast sentence embedding model works fine. You can even use simpler techniques: hash each chunk and check for exact hash matches. If two 50-word chunks hash to the same value, they are byte-identical. That is always a problem.
+
+An e-commerce company discovered paragraph-level repetition in product descriptions generated by a fine-tuned Claude Sonnet 4.5. The model would generate the first paragraph correctly, then repeat it verbatim as the third paragraph. The failure occurred in 2.3% of outputs. It was rare enough that manual QA missed it during testing. It was common enough that after launch, dozens of product pages went live with duplicated paragraphs. The heuristic would have caught every instance. They implemented it post-incident. Chunk size: 75 words. Similarity threshold: 0.93. False positive rate: 0.1%. True positive rate: 100% of known paragraph repetition cases.
+
+## Detecting Infinite Loops in Agent Outputs
+
+Agent systems are more vulnerable to repetition than single-turn generation because agents produce multi-step outputs and can enter loops where they repeat the same action indefinitely. The failure mode is: agent decides to call a tool, tool returns a result, agent interprets the result as requiring the same tool call again, loop repeats. Without intervention, the agent burns through token budget and time until a hard limit stops it.
+
+The heuristic for agent loop detection is action sequence analysis. You track the sequence of tool calls or actions the agent takes. You check for repeated subsequences. If the agent executes the same 2-action or 3-action sequence more than twice in a row, flag it. Example: the agent calls search, then summarize, then search again with the same query, then summarize again with the same input. That is a 2-action loop. After three iterations, you have strong evidence the agent is stuck.
+
+This requires logging every action with enough metadata to detect duplicates. You log the action type and the key parameters. You do not need to log full payloads. You need enough to distinguish between "search for returns policy" and "search for shipping policy." A hash of action type plus key parameters works. You track the sequence of hashes. You look for repeating patterns. If the hash sequence is A-B-A-B-A-B, the agent is looping between two actions.
+
+The challenge is distinguishing loops from legitimate retries. An agent that searches, gets no results, refines the query, and searches again is not looping. It is iterating. The difference is parameter variation. In a loop, the parameters are identical or nearly identical. In iteration, the parameters change meaningfully. You measure parameter similarity. If the agent calls the same action twice with parameters that are more than 90% similar, and it does this multiple times in sequence, you flag it as a potential loop.
+
+A workflow automation company built an agent that managed customer onboarding. The agent had access to a database query tool. In 4% of onboarding flows, the agent entered a loop where it queried the same customer record repeatedly, each time deciding it needed more information, each time querying the exact same fields. The loop repeated until the 15-action limit stopped it. They added loop detection. Threshold: three consecutive identical tool calls with identical parameters. The heuristic terminated the loop after the third iteration and escalated to human review. The cost per looping session dropped from $8 to $0.40.
+
+## The Difference Between Appropriate Repetition and Degenerate Repetition
+
+Not all repetition is failure. Repetition for emphasis is a valid rhetorical technique. Repetition for structure is necessary in certain formats. A list of steps will naturally repeat phrases like "next, you" or "then, the system." A summary of quarterly results will repeat "revenue increased" or "margin declined" multiple times. The heuristic must distinguish between this appropriate repetition and the degenerate kind.
+
+The signal is distribution. Appropriate repetition is distributed across the output. Degenerate repetition is clustered. If the phrase "next, you" appears once per paragraph across a six-paragraph response, normal. If it appears six times in the same paragraph, degenerate. You measure clustering using token distance. You calculate the mean and variance of distances between repeated phrase occurrences. Low variance means clustering. High variance means distribution. You flag outputs where repeated phrases have low distance variance.
+
+The second signal is diversity. Appropriate repetition involves repeating key structural or thematic phrases while varying the surrounding content. Degenerate repetition involves repeating phrases in identical or near-identical contexts. You measure this by looking at the words immediately before and after each occurrence of a repeated phrase. If the same 4-word phrase appears five times and the surrounding context is different each time, likely appropriate. If the surrounding context is also identical, likely degenerate.
+
+A legal document generation system produced contracts where the phrase "subject to the terms" appeared 12 times. The heuristic flagged it. Manual review confirmed it was appropriate: each occurrence was in a different section header introducing a different set of terms. The contexts were entirely different. The team adjusted the heuristic to measure contextual similarity. They added a rule: if a repeated phrase appears more than five times but the average cosine similarity of surrounding 20-word windows is below 0.4, do not flag. The false positive rate dropped from 8% to 0.9% without missing any true degenerate cases.
+
+## Calibration and Threshold Tuning
+
+Repetition heuristics require task-specific calibration. A creative writing task might tolerate higher repetition for stylistic effect. A technical documentation task requires low repetition for clarity. A conversational task might repeat phrases for natural dialogue flow. You cannot use the same thresholds across all tasks. You measure baseline repetition levels per task type. You set thresholds at 2-3 standard deviations above the mean.
+
+The process is: collect 500-1,000 outputs for a task type, measure n-gram uniqueness and phrase repetition for each, calculate mean and standard deviation, set the flag threshold at mean minus two standard deviations for uniqueness or mean plus two standard deviations for repetition count. This gives you a threshold that catches outliers without flagging normal variation.
+
+You revisit thresholds quarterly. Model updates change baseline characteristics. A new version of GPT-5 might produce slightly more repetitive outputs on average because it emphasizes coherence differently. Your thresholds calibrated on the old model will produce false positives on the new model. You re-measure baselines after every major model update. You adjust thresholds to match the new normal.
+
+The investment in calibration pays off in trust. A heuristic that fires constantly on false positives trains the team to ignore it. A heuristic that fires rarely but accurately trains the team to investigate every flag. The difference between noise and signal is careful threshold tuning based on observed data, not guessed values.
+
+Refusal detection is the next major heuristic category, focused on catching when the model declines to answer when it should comply.
+

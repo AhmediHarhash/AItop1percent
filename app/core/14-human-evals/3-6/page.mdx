@@ -1,0 +1,81 @@
+# 3.6 — Undo, Skip, and Defer: Essential Escape Hatches
+
+Most teams design review interfaces for the happy path: the reviewer sees the task, understands it immediately, makes a judgment, and moves on. That works for maybe sixty percent of tasks. The other forty percent need escape hatches. A reviewer encounters an edge case that doesn't fit the rubric. They make a mistake and catch it three seconds later. They hit a task that requires domain knowledge they don't have. Without clean ways to undo, skip, or defer these situations, your reviewers will make bad judgments just to clear their queue. Escape hatches don't slow down review. They prevent garbage data from entering your ground truth.
+
+The instinct to remove friction is correct for most product design. For review tooling, removing the wrong friction creates worse problems. A reviewer who can't undo a misclick will be more cautious on every subsequent task. A reviewer who can't skip a genuinely ambiguous case will guess. A reviewer who can't defer a specialist question will apply their non-expert judgment anyway. These aren't hypothetical risks. They happen every day in production review systems. The solution isn't training reviewers to be more careful. The solution is giving them the tools to handle reality.
+
+## Undo Within Session vs After Submit
+
+Undo has two timeframes, and the distinction matters. Within-session undo lets a reviewer reverse their last action before submitting the batch. After-submit undo lets them reopen a task they already marked complete. Both are necessary. Neither is sufficient alone.
+
+Within-session undo is straightforward. The reviewer clicks the wrong button, notices immediately, and hits undo. The interface restores the previous state. No record is written to the database. The reviewer continues. This should be instant, keyboard-accessible, and work for at least the last five actions. A single-level undo is barely better than nothing. Reviewers often realize a mistake two or three steps later, especially in complex multi-field judgment tasks. A history stack of five actions covers ninety percent of real mistakes.
+
+After-submit undo is more complicated because the judgment has already been recorded. If the task goes into a consensus pool, other reviewers might have seen it. If it feeds directly into training data, downstream systems might have used it. You can't silently rewrite history. The correct approach is to mark the original judgment as retracted, create a new judgment with the corrected value, and log both in the audit trail. If the task is in consensus, remove the retracted judgment from the pool and add the corrected one. If the task has already been used downstream, flag it for re-evaluation in the next cycle.
+
+Most teams don't implement after-submit undo because it feels messy. They're right that it's messy. It's also essential. Reviewers make mistakes. They realize those mistakes ten minutes later, or after talking to a colleague, or after seeing the next five tasks and understanding the pattern better. If your system doesn't let them fix errors they've already spotted, those errors stay in your ground truth forever. You've chosen perfect data pipeline hygiene over actual data quality. That's backwards.
+
+The time window for after-submit undo should be bounded. Twenty-four hours is reasonable for most workflows. After that, the task either reached consensus or got used somewhere, and retroactive changes cause more problems than they solve. If a reviewer discovers a systematic error they made three days ago, that's a calibration issue, not an undo case. Handle it through re-review of the affected batch.
+
+## Skip vs I Don't Know
+
+Skip and "I don't know" sound similar but serve different purposes. Skip means the task itself is broken or out of scope. "I don't know" means the task is valid but the reviewer lacks the expertise to judge it. The difference determines what happens next.
+
+Skip is for malformed tasks, duplicates, test data that leaked into production, or cases that violate the task definition. A medical record review task that contains a CT scan when the rubric only covers text notes should be skipped. A translation quality task where the source and target are the same language should be skipped. A sentiment analysis task with no text should be skipped. These aren't judgment calls. They're data pipeline failures. Skipped tasks go back to engineering to investigate why they reached a reviewer in the first place.
+
+"I don't know" is for edge cases within scope. The task is valid but genuinely ambiguous, or it requires domain knowledge the reviewer doesn't have, or it's a borderline case where reasonable experts would disagree. These tasks shouldn't be discarded. They should go into a specialist queue or consensus pool with higher redundancy. The system needs to know which tasks are hard. Forcing reviewers to guess on hard tasks gives you wrong labels and damages reviewer confidence.
+
+The critical design decision is whether "I don't know" is always available or only after the reviewer attempts the task. Some teams require reviewers to make a provisional judgment first, then allow them to flag uncertainty. The theory is that even uncertain judgments contain signal. The practice is that reviewers who are forced to guess will anchor on their guess, and the "I don't know" flag becomes meaningless. Better to let reviewers opt out cleanly from the start. You'll get fewer labels but higher quality ones.
+
+## Defer to Specialist
+
+Defer is the third escape hatch, distinct from both skip and "I don't know." It means the reviewer recognizes that the task requires expertise they don't have and sends it to someone who does. This is common in multi-tier review systems where generalists handle straightforward cases and specialists handle complex ones.
+
+Defer requires infrastructure. You need specialist queues, routing logic, and a way to track which tasks have been escalated. You also need to prevent defer from becoming a dumping ground. If generalists can defer anything hard, your specialist queue becomes a mess and your generalists never develop judgment. The balance is to make defer easy enough that reviewers use it when appropriate, but visible enough that patterns emerge.
+
+One effective approach is to require a brief reason when deferring. Not a full explanation, just a category: requires legal review, requires domain expertise, ambiguous even with guidelines, potential policy violation. This takes ten seconds per task but gives you data. If twenty percent of tasks are being deferred for "requires domain expertise," your task definition is probably too broad for generalist reviewers. If tasks are being deferred because guidelines are ambiguous, you need better documentation. Defer patterns tell you where your system is failing.
+
+Deferred tasks should go to specialists quickly. If the specialist queue has a three-day backlog, reviewers will stop deferring and start guessing. If the specialist queue is consistently overloaded, you need more specialists or a better filter on what reaches generalists. The defer mechanism only works if it's fast and reliable. When it breaks, reviewers revert to forcing judgments.
+
+## The Abuse Potential of Skip
+
+Skip is the most dangerous escape hatch because it's the easiest to abuse. A reviewer who doesn't want to deal with hard tasks can skip them. A reviewer who's racing to hit their quota can skip anything that takes more than thirty seconds. A reviewer who disagrees with the labeling policy can skip all the cases that would require them to apply it. If skip has no cost and no visibility, it will be overused.
+
+The simplest mitigation is to track skip rate per reviewer and per task type. If a reviewer skips fifteen percent of tasks when the team average is three percent, that's a red flag. Either they're encountering genuinely broken tasks at a higher rate, which suggests a data pipeline issue, or they're using skip to avoid work. The resolution is a conversation, not an automated flag. High skip rates have legitimate explanations. They also have illegitimate ones. You need human judgment to distinguish.
+
+Task-level skip tracking is equally important. If a specific task gets skipped by eight out of ten reviewers, the task is broken or the guidelines are unclear. Don't just send it to specialists. Fix the root cause. Tasks that are consistently skippable shouldn't exist. They indicate either bad task design or bad data quality upstream.
+
+Some teams set a skip quota: each reviewer can skip up to five tasks per hundred without explanation. Beyond that, they need to provide a reason. This works if your task distribution is clean. If ten percent of tasks are genuinely malformed, a five percent skip quota is useless. The right threshold depends on your pipeline quality. Track actual skip patterns for two weeks before setting policy.
+
+## Time Limits on Deferred Items
+
+Deferred tasks can't sit in limbo forever. If a task is deferred to a specialist, and the specialist queue has a two-week backlog, and the task finally gets reviewed three weeks after it was deferred, the original reviewer has forgotten the context. The task might also be stale. In fast-moving domains like content moderation or product categorization, a three-week-old task might be irrelevant.
+
+Set explicit SLAs for deferred tasks. Specialist review within 48 hours is reasonable for most workflows. If that's not achievable, your specialist capacity is undersized or your defer volume is too high. Both are fixable but require system-level changes. Letting deferred tasks age indefinitely isn't a neutral choice. It's a decision to let your review backlog grow until the system becomes unusable.
+
+If a deferred task can't be reviewed within the SLA, it should either be re-routed to another specialist, escalated to a team lead, or marked as requiring external input and moved out of the active queue. The worst outcome is tasks sitting in a defer queue that nobody monitors. Reviewers lose trust in the defer mechanism. They stop using it. They go back to guessing on hard tasks. The escape hatch you built becomes decorative.
+
+## Tracking Skip, Defer, and Undo Patterns
+
+Every use of an escape hatch is data. Skip tells you which tasks are broken. Defer tells you which tasks require expertise your current reviewers don't have. Undo tells you which interface elements cause mistakes or which judgment categories are confusing. If you're not tracking these signals, you're flying blind.
+
+Build dashboards that show skip, defer, and undo rates by reviewer, by task type, by time of day, and by tenure. New reviewers should have higher undo rates because they're still learning. If a veteran reviewer suddenly has a spike in undo, something changed—maybe a guideline update, maybe a new task type, maybe a confusing batch. Time-of-day patterns matter too. If skip rates go up after 3 PM, your reviewers are fatigued or rushing to finish their shift. That's a scheduling problem, not a reviewer problem.
+
+Task-type breakdowns reveal design failures. If sentiment analysis tasks are skipped at twice the rate of classification tasks, the sentiment rubric is probably unclear. If medical coding tasks are deferred at five times the rate of general coding tasks, you need specialists on first-pass review, not generalists with a defer button. These patterns don't fix themselves. They require deliberate intervention.
+
+Some teams are reluctant to track escape hatch usage because it feels like surveillance. It's not. It's operational data. Reviewers should know their own stats. Managers should see aggregate stats and outlier alerts. Nobody should be punished for using escape hatches correctly. The goal is to identify systemic problems and individual coaching opportunities. If your organization can't distinguish between those, you have a management problem, not a tooling problem.
+
+## Designing Escape Hatches for Trust
+
+Reviewers use escape hatches when they trust that using them is safe. If skipping a task gets them flagged as low-throughput, they won't skip. If deferring a task makes them look incompetent, they won't defer. If undoing a judgment creates an audit trail that gets scrutinized during performance review, they won't undo. The escape hatches you build are useless if your reviewers are afraid to use them.
+
+Make escape hatch usage visible but not punitive. Show reviewers their own stats. Let them see how they compare to team averages. Don't tie escape hatch usage directly to performance ratings unless abuse is clear. A reviewer who skips two percent of tasks and defers three percent is probably using the tools correctly. A reviewer who skips twenty percent and defers zero is either encountering systematically worse data or avoiding hard work. The numbers alone don't tell you which.
+
+Normalize the use of escape hatches in training. Show new reviewers examples of when to skip, defer, and undo. Walk them through scenarios where guessing is worse than opting out. Reinforce that clean data is more valuable than high throughput. If your onboarding emphasizes speed over accuracy, your reviewers will optimize for speed. They'll skip less, defer less, and undo less. Your ground truth will be full of forced judgments.
+
+The best review systems treat escape hatches as a feature, not a failure. When a reviewer defers a task, they're telling you that the task is complex. When they skip a task, they're catching a data quality issue. When they undo a judgment, they're correcting a mistake before it propagates. All of these are good outcomes. Design your system to encourage them.
+
+Instrumentation and audit trails matter, but they should serve quality, not surveillance. Track escape hatch usage to identify systemic issues and improve your pipeline. Don't track it to micromanage reviewers. If your reviewers feel watched, they'll optimize for looking productive rather than being accurate. You'll get fast judgments, high throughput, and bad data. The escape hatches will go unused. You'll have built a system that works in theory and fails in practice.
+
+---
+
+*Next: 3.7 — Reviewer Dashboards: Performance, Progress, and Feedback*

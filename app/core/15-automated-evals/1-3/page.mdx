@@ -1,0 +1,75 @@
+# 1.3 — The Cheap-to-Expensive Tiering Pattern
+
+Running every evaluation at full depth on every output is waste. Most outputs fail fast. Most failures are obvious. Spending $0.02 in judge model costs and 3 seconds of latency to evaluate an output that contains a banned phrase is burning money and time you will never recover.
+
+The correct pattern is tiered evaluation. Run the cheapest, fastest checks first. Only outputs that pass those checks advance to the next tier. Only outputs that pass the second tier advance to the third. By the time you reach expensive human review, you have already filtered out 95% of the volume. You are spending your most valuable resources — human time, expensive model calls, high-latency analysis — only on the cases that genuinely need them. This is not corner-cutting. This is engineering discipline. You get better coverage and faster feedback at lower cost because you are not wasting expensive checks on cases that cheap checks already failed.
+
+This pattern has a name. Call it the **Cheap-to-Expensive Tiering Pattern**. It is a five-tier cascade. Every production eval pipeline should implement some version of it.
+
+## Tier 0: Rules and Hard Constraints
+
+Tier 0 runs first. It applies binary rules that catch immediate disqualifiers. Required fields missing. Format invalid. Banned phrases present. Output length outside acceptable bounds. These checks run in milliseconds. They cost effectively nothing. They eliminate entire categories of failure before any expensive evaluation happens.
+
+A legal document generation system has a Tier 0 rule: every output must include a disclaimer section. If the disclaimer is missing, the output fails immediately. The rule is a string match. It takes less than a millisecond. Approximately 0.3% of outputs fail this check — usually due to prompt regressions or model context truncation. These failures never advance to Tier 1. The system does not waste time running heuristics or judge models on outputs that are already disqualified. Tier 0 is a gate. Nothing passes without satisfying the hard constraints.
+
+Tier 0 rules should be conservative. They should only fail outputs that are unambiguously wrong. A false positive at Tier 0 means you blocked a valid output without ever evaluating it properly. A false negative at Tier 0 is fine — the bad output advances to Tier 1, where it gets caught. The goal of Tier 0 is to catch the obvious failures fast, not to catch every possible failure. If you are unsure whether a check belongs in Tier 0, it probably belongs in Tier 1.
+
+## Tier 1: Heuristics and Pattern Matching
+
+Tier 1 applies heuristics. These are fast checks that estimate quality based on observable patterns. Citation presence. Keyword density. Response length distribution. Hedge word frequency. Heuristics are not ground truth. They are signals. An output that fails a heuristic is not necessarily bad, but it is suspicious. It warrants further evaluation.
+
+Tier 1 heuristics run in milliseconds to low single-digit seconds. They are cheap. They are deterministic. They can process thousands of outputs per minute on modest infrastructure. The goal is to filter the volume before you reach the expensive tiers. If your Tier 1 heuristics eliminate 40% of outputs from advancing to Tier 2, you just saved 40% of your judge model costs. If they eliminate 60%, you saved 60%. The more effective your heuristics, the more efficient your pipeline.
+
+A customer support eval pipeline uses four Tier 1 heuristics. First: does the response acknowledge the customer's issue by name? Second: is the response length within the expected range for this query type? Third: does the response contain any apology or empathy markers? Fourth: does the response include a next-step action for the customer? Outputs that fail two or more heuristics get flagged as low-confidence. Approximately 15% of outputs fail this threshold. These outputs skip Tier 2 and go directly to Tier 4 human review because they are likely to have multiple quality issues. The remaining 85% advance to Tier 2 for judge-based evaluation. The heuristics saved 15% of judge model costs by routing low-quality outputs directly to human review and saved additional costs by not running judge checks on outputs that were already flagged as problematic.
+
+Heuristics should be tuned based on historical data. After running your eval pipeline for a few weeks, analyze which heuristics correlate with downstream failures. A heuristic that flags 20% of outputs but only 5% of flagged outputs turn out to have real issues is a noisy heuristic. Consider tightening the threshold or removing it. A heuristic that flags 2% of outputs and 80% of flagged outputs turn out to have real issues is a valuable heuristic. Consider expanding it or adding similar heuristics for related patterns.
+
+## Tier 2: Cheap Judge Models
+
+Tier 2 is where you run LLM-as-judge evaluation using fast, inexpensive models. GPT-5-mini, Claude Haiku 4.5, Gemini 3 Flash — models that cost fractions of a cent per call and return results in under a second. These models are not as capable as the flagship models, but they are good enough to evaluate many quality dimensions. They can check if a response is on-topic, if the tone is appropriate, if the summary captures key points, if the output follows a template.
+
+Tier 2 is the workhorse tier. Most of your evaluation volume happens here. Outputs that passed Tier 0 rules and Tier 1 heuristics reach Tier 2 and get scored on multiple quality dimensions by a cheap judge. The judge prompt is carefully designed. It includes clear criteria, examples of pass and fail cases, and instructions to output a structured score. The judge evaluates the output and returns a verdict: pass, fail, or uncertain.
+
+Outputs that pass Tier 2 are considered validated. They do not advance to further tiers unless you are running periodic quality audits. Outputs that fail Tier 2 advance to Tier 3 for evaluation by a more capable judge. Outputs that the Tier 2 judge marks as uncertain also advance to Tier 3. The "uncertain" category is critical. It allows the cheap judge to admit when it does not have enough confidence. Instead of guessing, it escalates.
+
+A content moderation system uses GPT-5-mini as the Tier 2 judge. The judge evaluates whether user-generated content violates community guidelines. The judge prompt defines violations with examples. The judge returns one of three verdicts: clearly safe, clearly violates, uncertain. Approximately 70% of content is marked clearly safe. Approximately 10% is marked clearly violates. Approximately 20% is marked uncertain. The clearly safe content is approved. The clearly violates content is rejected. The uncertain content advances to Tier 3, where GPT-5.2 evaluates it with a more sophisticated prompt. This tiering saves money. Evaluating 100,000 pieces of content per day entirely with GPT-5.2 would cost approximately $850. Running Tier 2 with GPT-5-mini and only escalating 30% to Tier 3 costs approximately $320. The savings compound daily.
+
+## Tier 3: Expensive Judge Models
+
+Tier 3 uses frontier models with strong reasoning capabilities. GPT-5.2, Claude Opus 4.5, Gemini 3 Pro. These models cost more and take longer, but they handle nuanced judgment better. They can evaluate complex criteria. They can reason through multi-step logic. They can identify subtle policy violations that cheaper models miss. You only run Tier 3 checks on outputs that Tier 2 flagged as uncertain or failing.
+
+Tier 3 prompts are more detailed than Tier 2 prompts. They include more examples, more edge cases, more reasoning steps. You are asking the model to do harder work. You are paying for the capability. The Tier 3 judge makes a final automated decision: pass or fail. Outputs that pass are approved. Outputs that fail advance to Tier 4 for human review.
+
+A financial summarization system uses Claude Opus 4.5 as the Tier 3 judge. The judge evaluates whether a summary accurately represents the source financial document without introducing hallucinated numbers or mischaracterizing trends. This is a high-stakes judgment. Getting it wrong could lead to bad investment decisions. The Tier 2 judge (Claude Haiku 4.5) evaluates most summaries and passes 85% of them. The remaining 15% — cases where the Tier 2 judge found potential issues — advance to Tier 3. Claude Opus 4.5 re-evaluates these summaries with a detailed prompt that includes instructions to check specific failure modes: hallucinated figures, inverted trends, unsupported claims. Approximately 60% of the Tier 3 evaluations pass. The remaining 40% fail and go to human review. The tiering ensures that expensive Opus calls only happen on the 15% of cases that need them, not on all cases.
+
+The key to effective Tier 3 evaluation is calibrating the judge. Run your Tier 3 judge on a labeled dataset where you have human ground truth. Measure agreement. If the judge agrees with humans 95% of the time, you can trust its verdicts on most cases. If it agrees only 70% of the time, you need to improve the prompt or escalate more cases to Tier 4. Tier 3 is your last line of automated defense. It needs to be accurate.
+
+## Tier 4: Human Review
+
+Tier 4 is human review. Outputs that failed Tier 3 or that Tier 3 marked as too ambiguous for automated judgment reach human reviewers. This is the most expensive tier. Humans are slow. They cost dollars per review, not cents. They have limited throughput. You cannot scale human review to match production volume. The only way to make human review sustainable is to ensure it only sees the cases that genuinely need human judgment.
+
+If your tiering is working correctly, Tier 4 should see less than 5% of total volume. A system processing 100,000 outputs per day should route fewer than 5,000 to human review. If you are routing 20% or 30% to human review, your earlier tiers are not filtering effectively. Your heuristics are not sharp enough. Your Tier 2 judge is escalating too conservatively. Your Tier 3 judge is not confident enough. You need to tune the pipeline.
+
+Human reviewers at Tier 4 do two things. First, they make final quality decisions on the outputs that reached them. Second, they provide feedback that improves the earlier tiers. When a human reviewer sees an output that should have been caught by Tier 2 but was not, that is a signal to improve the Tier 2 judge prompt. When a human reviewer sees an output that Tier 3 failed but should have passed, that is a signal to add that case to the Tier 3 training examples. Tier 4 is not just a review layer. It is a feedback loop that makes the entire pipeline smarter over time.
+
+A healthcare company routes approximately 3% of AI-generated clinical summaries to Tier 4 human review. These are cases where Tier 3 flagged potential inaccuracies or policy violations but could not make a definitive call. Physician reviewers evaluate these summaries. They spend an average of 90 seconds per review. At 3% of 50,000 daily summaries, that is 1,500 reviews per day, requiring approximately 12 full-time physician reviewers. This is expensive but sustainable. If the company tried to review all 50,000 summaries at Tier 4, they would need 400 full-time physician reviewers. The math does not work. The tiering makes the math work.
+
+## The Cost-Speed-Quality Tradeoff
+
+Tiering is a cost-speed-quality optimization. Tier 0 and Tier 1 are near-instant and near-free. Tier 2 adds latency and cost but remains fast and cheap. Tier 3 adds more latency and cost but still completes in seconds and costs cents. Tier 4 adds minutes or hours of latency and costs dollars. The pattern ensures you only pay the high cost and accept the high latency for the cases that need it.
+
+You can adjust the thresholds at each tier to trade off cost against quality. Tighten Tier 1 heuristics, and more outputs advance to Tier 2, increasing costs but potentially catching more subtle issues. Loosen Tier 1 heuristics, and fewer outputs advance, decreasing costs but potentially missing edge cases. The right tuning depends on your risk tolerance and budget. A high-stakes medical system might route 10% of outputs to Tier 4 human review because the cost of a missed failure is unacceptable. A low-stakes content recommendation system might route 0.5% to Tier 4 because the cost of human review outweighs the cost of occasional errors.
+
+The pattern is not rigid. You do not need exactly five tiers. Some pipelines have three tiers. Some have six. The principle is the same: run cheap checks first, expensive checks last, and only on the subset that needs them. The worst pattern is no tiering at all — running the same expensive evaluation on every output regardless of likelihood of failure. That is how you end up with eval pipelines that cost more than your inference budget and take longer to run than your users will wait.
+
+## Tuning Tiering Thresholds Based on Failure Rates
+
+The effectiveness of tiering depends on accurate failure rate estimates at each tier. If Tier 1 heuristics flag 50% of outputs as suspicious but only 10% of flagged outputs actually have issues, your Tier 1 is too aggressive. You are sending too much volume to Tier 2 unnecessarily. If Tier 1 flags 5% of outputs and 90% of flagged outputs have issues, your Tier 1 is well-tuned. You are concentrating the downstream tiers on the cases most likely to need them.
+
+Track precision and recall at each tier. Precision: of the outputs this tier flagged or failed, how many actually had issues? Recall: of the outputs that actually had issues, how many did this tier catch? High precision means you are not wasting downstream resources on false positives. High recall means you are not letting bad outputs slip through. You cannot maximize both. You tune based on your priorities. A safety-critical system optimizes for recall — catch every failure, even if it means more false positives. A cost-sensitive system optimizes for precision — only escalate when confident, even if it means missing some edge cases.
+
+A legal contract review system tunes for recall. Tier 1 heuristics flag any contract that is missing standard clauses, has unusual length, or uses non-standard language. This flags 30% of contracts. Precision is only 40% — most flagged contracts turn out to be fine. But recall is 98% — almost every contract with a real issue gets flagged. The team accepts the low precision because the cost of missing a contract error is high. Tier 2 and Tier 3 judges filter the false positives. By the time contracts reach Tier 4 human review, precision is 85%. The tiering captured nearly all failures and concentrated human review on the cases that genuinely needed it.
+
+---
+
+Understanding the five tiers is the foundation. The next step is designing the judge prompts that power Tier 2 and Tier 3, ensuring they apply criteria consistently at scale.
