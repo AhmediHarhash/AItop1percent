@@ -1,0 +1,98 @@
+# 9.2 — Audio Chunking and Buffer Management
+
+Most voice AI systems do not process audio continuously. They accumulate it into chunks, send chunks to the speech recognition model, wait for transcription, then send the transcription to the language model. The size of these chunks determines your minimum latency, your processing efficiency, and whether your user hears smooth responses or choppy fragments.
+
+There is no good answer. Small chunks mean low latency but inefficient processing and potential quality degradation. Large chunks mean higher quality and better efficiency but the user waits longer for responses. The optimal chunk size depends on model architecture, network conditions, and user tolerance for delay.
+
+## The Fundamental Tradeoff: Latency vs Processing Efficiency
+
+Speech recognition models process audio most efficiently when they receive context. A 100-millisecond audio chunk contains fragments of phonemes. A 500-millisecond chunk contains complete words. A 2-second chunk contains full phrases with prosody and intonation. Longer chunks give the model more context to disambiguate similar-sounding words and understand sentence structure.
+
+But every millisecond you wait to accumulate a larger chunk is a millisecond the user sits in silence. If you buffer audio for 2 seconds before sending it to your speech model, your absolute minimum latency is 2 seconds plus model inference time plus network time plus response generation time. The user spoke two seconds ago and is still waiting to hear anything.
+
+A voice ordering system for restaurants ran with 2-second chunks for six months. Transcription accuracy was excellent at 96.8%. Users abandoned the system. Customer feedback described it as "broken" and "unresponsive." When the team reduced chunk size to 400 milliseconds, accuracy dropped to 94.1% but abandonment rates fell by 60%. The users preferred slightly lower accuracy with faster feedback over higher accuracy with perceptible delay.
+
+The latency-accuracy tradeoff is not linear. Small reductions in chunk size cause large accuracy drops when chunks become too small to contain meaningful phonetic units. A 100-millisecond chunk might capture the "st" sound but miss whether it is the start of "stop," "start," or "still." A 200-millisecond chunk captures enough context to disambiguate. Going from 200 to 100 milliseconds costs you more accuracy than going from 500 to 200.
+
+## Standard Chunk Sizes and Their Consequences
+
+Most production voice systems use chunks between 100 milliseconds and 1 second. The most common sizes are 160, 320, 400, 480, and 1000 milliseconds. These are not arbitrary. They align with audio sampling properties and model frame rates.
+
+A 160-millisecond chunk at 16 kHz sampling contains 2,560 audio samples, which divides cleanly for most audio processing algorithms. It is small enough that users do not perceive delay but large enough that speech models can recognize individual words. This size works well for real-time transcription where you prioritize responsiveness over perfect accuracy.
+
+A 480-millisecond chunk captures roughly two to four words of normal-paced speech. It gives speech models enough context to handle homophones and understand basic phrasing. Accuracy improves significantly over 160-millisecond chunks with only 320 milliseconds of additional latency. This size is common in systems where accuracy matters more than instantaneous feedback.
+
+A 1-second chunk captures full utterances for short commands or sentence fragments for longer speech. Models process these chunks with near-optimal accuracy. Latency becomes perceptible. Users notice the delay but tolerate it if the application sets expectations correctly. An automated phone system can wait one second between hearing the user and responding. A real-time voice assistant cannot.
+
+## Buffer Sizing: Too Small Breaks Playback, Too Large Adds Latency
+
+Once you have chosen a chunk size for processing, you need to decide how much audio to buffer before you start playing responses. The playback buffer absorbs variation in network delivery time. Without a buffer, any network jitter causes audio to arrive late and playback becomes choppy. With too much buffering, you add hundreds of milliseconds of latency that destroys the conversational feel.
+
+A minimal playback buffer holds just enough audio to start playing while the next chunk is being received. For a system streaming 20-millisecond audio packets, a 60-millisecond buffer holds three packets. You start playback after receiving three packets. If the network delivers packets every 20 milliseconds with minimal jitter, you never run out of audio. If a packet arrives 30 milliseconds late instead of 20, the buffer empties before the next packet arrives and playback stutters.
+
+A safe playback buffer holds enough audio to tolerate expected network jitter. If your network monitoring shows that packets arrive within 50 milliseconds of expected time in 99% of cases, a 100-millisecond buffer will prevent underruns almost always. You pay for that reliability with 100 milliseconds of additional latency between when the server sends audio and when the user hears it.
+
+An enterprise voice platform measured network jitter across their user base in late 2025. Users on corporate WiFi showed median jitter of 8 milliseconds and 99th percentile jitter of 35 milliseconds. Users on cellular networks showed median jitter of 18 milliseconds and 99th percentile jitter of 140 milliseconds. The team maintained two buffer configurations: 60 milliseconds for WiFi users, 200 milliseconds for cellular users. They detected network type at connection time and configured buffers accordingly. Cellular users experienced higher latency but smooth playback. WiFi users got lower latency without sacrificing quality.
+
+## Jitter Buffers: Absorbing Network Variation Without User-Perceivable Glitches
+
+A jitter buffer is adaptive. It measures actual packet arrival times and adjusts buffer depth dynamically. When network conditions are stable, it shrinks the buffer to minimize latency. When jitter increases, it grows the buffer to prevent underruns.
+
+The adaptation algorithm matters. A naive jitter buffer adjusts immediately when it detects jitter. This creates audible artifacts. When the buffer grows, playback slows down slightly to accumulate more audio. When it shrinks, playback speeds up slightly to drain excess buffer. Users hear these speed changes as distortion.
+
+A well-designed jitter buffer adjusts gradually over several seconds. When jitter increases, the buffer expands by a few milliseconds per second until it reaches the target size. When jitter decreases, it contracts slowly. The speed changes are imperceptible. The buffer stays sized appropriately for current network conditions without creating artifacts.
+
+A voice AI customer support system shipped with a jitter buffer that adjusted every 100 milliseconds based on the last five packets. Users described the audio as "robotic" and "sped up and slowed down randomly." The engineering team replaced the adaptation algorithm with one that adjusted no faster than 2 milliseconds per second. The same network conditions, the same jitter, but the gradual adaptation made the artifacts inaudible.
+
+## The Underrun Problem: When Buffers Empty Before Audio Arrives
+
+An underrun occurs when your playback buffer empties before the next audio chunk arrives. Playback stops. The user hears silence. When audio finally arrives, playback resumes. The experience is jarring.
+
+Underruns happen for three reasons: you chose a buffer size too small for your network's jitter characteristics, a packet was delayed or lost entirely, or your audio generation pipeline stalled and failed to produce audio fast enough to keep the buffer full.
+
+You detect underruns by monitoring buffer depth in real time. If buffer depth reaches zero before new audio arrives, you had an underrun. If buffer depth approaches zero but audio arrives just in time, you are operating with insufficient margin. Reliable systems maintain at least 20 to 40 milliseconds of buffer depth even during normal operation. When buffer depth drops below this threshold, you log it as a near-underrun and investigate.
+
+The correct response to an underrun depends on cause. If the underrun was caused by a one-time packet delay, you wait for audio to arrive and resume playback. If it was caused by sustained network degradation, you increase buffer size to tolerate the new conditions. If it was caused by slow audio generation, you cannot fix it with buffering—you need to optimize your generation pipeline or switch to a faster model.
+
+## Adaptive Buffering Strategies for Variable Network Conditions
+
+Fixed buffer sizes work when network conditions are predictable. When users move between WiFi and cellular, travel through areas with varying signal strength, or share bandwidth with other applications, fixed buffers either waste latency when conditions are good or underrun when conditions degrade.
+
+Adaptive buffering adjusts to measured conditions. The system monitors packet arrival jitter, calculates the buffer size needed to prevent underruns with high probability, and adjusts buffer depth accordingly. When network quality improves, latency drops. When it degrades, reliability stays high.
+
+A voice assistant used by field technicians in industrial facilities measured median jitter every 10 seconds and set target buffer depth to the 95th percentile jitter observed in the previous 60 seconds. When technicians worked in areas with stable WiFi, buffers stayed small and latency averaged 180 milliseconds. When they moved into areas with poor coverage, buffers grew automatically and underrun rates stayed below 0.2% even as latency increased to 400 milliseconds. The system traded latency for reliability based on real-time measurement, not static assumptions.
+
+## Chunk Size Selection for Streaming Speech Recognition
+
+Some speech recognition models support streaming mode where they process audio incrementally and emit partial transcriptions. Instead of waiting for a full utterance, the model transcribes each chunk as it arrives and updates the transcription as more context becomes available.
+
+Streaming changes the chunk size calculus. You no longer need to wait for a complete thought before processing. You can send 100-millisecond chunks and get a tentative transcription within 150 milliseconds. The transcription will be incomplete and may contain errors that later chunks correct, but the user sees progress immediately.
+
+The optimal chunk size for streaming is smaller than for batch processing. A streaming model with 100-millisecond chunks achieves first-token latency of 120 to 180 milliseconds depending on model speed. The same model with 500-millisecond chunks has first-token latency of 520 to 580 milliseconds. Accuracy is similar once the full utterance is processed, but the perceived responsiveness is completely different.
+
+Streaming introduces new complexity. Your system must handle partial transcriptions, merge them as updates arrive, and decide when a transcription is stable enough to act on. If you send every 100-millisecond partial transcription to your language model, you waste compute processing incomplete thoughts. If you wait until the transcription stops changing, you lose the latency benefit of streaming. The right threshold is application-specific.
+
+## Buffering for Response Generation: Streaming LLM Output
+
+Language models can also stream output token-by-token instead of waiting for the complete response. For text chat, streaming output improves perceived responsiveness. For voice, it enables you to start speaking before the full response is generated.
+
+But you cannot send one token at a time to text-to-speech. Speech synthesis models need at least a few words of context to generate natural prosody. If you synthesize each word independently, the speech sounds choppy and lacks natural intonation.
+
+The solution is token buffering. You accumulate tokens from the language model until you have a complete phrase or sentence, then send that phrase to text-to-speech for synthesis. The first phrase takes longer to generate because you wait to accumulate tokens. Subsequent phrases generate continuously and the user hears smooth speech.
+
+A customer service voice AI in 2025 accumulated tokens until it had a complete sentence or 12 tokens, whichever came first. For short responses like "I can help with that," the full response was 5 tokens and generated in one batch. For longer responses, the system streamed sentences continuously. The user heard the first sentence after 600 milliseconds and subsequent sentences every 200 to 400 milliseconds. Total response time for a 50-word answer was 2.8 seconds, compared to 4.5 seconds when waiting for the full response before synthesis.
+
+## Measuring Buffer Health in Production
+
+You cannot optimize what you do not measure. Production buffer management requires instrumentation. You need metrics for buffer depth over time, underrun frequency, jitter distribution, and latency contribution from buffering.
+
+Buffer depth histograms show you whether your buffers are sized correctly. If buffer depth stays near maximum most of the time, you are over-buffering and adding unnecessary latency. If it drops to zero frequently, you are under-buffering and causing underruns. Healthy buffers show depth varying between 30% and 80% of capacity most of the time with occasional spikes to higher levels during jitter events.
+
+Underrun rate is the ultimate metric. Underruns are user-visible failures. Target underrun rates below 0.1% for consumer applications and below 0.01% for enterprise applications where reliability matters more than latency. If you cannot achieve your target underrun rate, increase buffer size. If you achieve it with margin, reduce buffer size to reclaim latency.
+
+Latency decomposition shows you where time is spent. Measure time from audio capture to chunk formation, chunk formation to transcription start, transcription completion to LLM start, LLM start to first response token, first token to speech synthesis start, and synthesis to playback start. Buffering contributes to each of these stages. If buffering dominates your latency budget, you have over-buffered. If underruns dominate your reliability problems, you have under-buffered.
+
+---
+
+Buffers protect you from network jitter, but they cannot fix packet loss or sustained network degradation. The next challenge is handling the reality that packets sometimes arrive late, out of order, or not at all.
+

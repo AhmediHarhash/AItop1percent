@@ -1,0 +1,83 @@
+# 10.2 — Provider Health Monitoring for ASR, LLM, and TTS
+
+You cannot failover to what you cannot measure. Multi-provider architectures are useless if you discover a provider is unhealthy only after routing production traffic to it and watching it fail. Health monitoring must run continuously, detect degradation before it becomes user-visible, and produce signals clean enough to drive automated routing decisions. This is harder than it sounds because voice providers fail in subtle ways that standard HTTP health checks miss entirely.
+
+## The Inadequacy of Standard Health Checks
+
+Most teams start with simple HTTP health checks: send a request to the provider's API, expect a 200 response, mark the provider healthy if you get one. This catches catastrophic failures — if the provider's entire API is down, the health check fails — but misses the degradation modes that actually matter in production.
+
+An ASR provider can return 200 OK while delivering transcriptions with 60% accuracy instead of the usual 95%. A TTS provider can return audio files that sound robotic or mispronounce critical words. An LLM provider can respond within the timeout window but take five seconds instead of the usual 800 milliseconds. All of these are "healthy" by HTTP status code but degraded by the only standard that matters: user experience.
+
+The failure mode is silent. Your health checks report green. Your automated routing continues sending traffic to the degraded provider. Users experience poor transcription quality, unnatural voice output, or unacceptable latency. By the time you notice — usually when support tickets spike or a customer complains — you have already delivered a bad experience to thousands of users. The health monitoring system failed not because it stopped running but because it measured the wrong thing.
+
+## Synthetic Probes That Test Real Functionality
+
+The correct health check for a voice provider is a synthetic probe that exercises the actual capability you depend on. For ASR, send a short audio clip with known content and verify that the transcription matches. For TTS, generate speech from a test phrase and verify that the audio is returned within the expected latency. For LLMs, send a prompt with a known correct answer and verify that the response is coherent and on-topic.
+
+A financial services company running voice-authenticated transactions sends a ten-second audio clip containing the phrase "transfer five hundred dollars to account ending in four two nine seven" to each ASR provider every sixty seconds. The expected transcription is known exactly. The health check measures two things: whether the transcription is character-for-character correct, and whether it returns within 1.2 seconds. If either condition fails, the provider is marked degraded. If both fail on three consecutive probes, the provider is marked unhealthy and traffic is routed away.
+
+This approach catches real degradation. In November 2025, one provider's ASR accuracy dropped from 96% to 71% for financial terminology after a model update. The provider's status page showed no incident. Standard HTTP health checks showed no problem. But the synthetic probe failed immediately because the transcription of "five hundred dollars" became "500 hours" in three out of five test runs. The health monitoring system detected the degradation within two minutes and failed over to the secondary provider before any user traffic was affected.
+
+Synthetic probes have a cost. You are sending real API requests every minute or more frequently, which consumes quota and generates invoices. A probe that runs every sixty seconds across three providers costs roughly 4,300 requests per provider per month. At typical ASR pricing in 2026, this is three to eight dollars per month per provider — negligible compared to the cost of undetected degradation. The probe requests must be tagged or routed to separate billing accounts so they do not pollute your production metrics. Mixing synthetic probes with real user traffic makes it impossible to calculate accurate quality metrics because the probes introduce artificial perfect-accuracy samples.
+
+## Traffic-Based Health Signals From Real User Requests
+
+Synthetic probes detect provider-wide degradation, but they miss problems that affect only certain accents, languages, or acoustic conditions. A provider might handle your clean synthetic audio perfectly while failing on real-world audio with background noise, non-native accents, or domain-specific vocabulary. Traffic-based health signals detect these issues because they measure real user requests, not artificial probes.
+
+For ASR, traffic-based health tracking monitors the distribution of confidence scores returned by the provider. Most ASR providers return a per-word or per-transcript confidence score between zero and one. A healthy provider typically delivers confidence scores above 0.9 for 80% to 95% of requests, depending on your audio quality and use case. If the percentage of low-confidence transcriptions increases — say, from 8% to 22% over a ten-minute window — the provider is degrading. This signal does not tell you what the degradation is, but it tells you that something changed, and that is enough to trigger investigation or failover.
+
+For TTS, traffic-based health tracking monitors synthesis latency percentiles. If your primary TTS provider typically returns audio within 400 milliseconds at the 95th percentile, and you observe the p95 climbing to 1,200 milliseconds, the provider is experiencing load or infrastructure issues. You cannot wait for a status page update or a support ticket response — you must failover now. The latency degradation is the health signal.
+
+For LLMs in voice pipelines, traffic-based health tracking monitors both latency and output quality signals. Latency is straightforward: measure time from request to first token and flag providers whose p95 exceeds thresholds. Quality is harder because you cannot know the correct answer for every user query, but you can measure proxy signals. If the provider starts returning unusually short responses, or responses that do not match the expected format, or responses flagged as uncertain by confidence scores, something is degrading. A telehealth platform monitors the percentage of LLM responses that include the phrase "I don't have enough information" or similar refusal language. When this percentage spikes from 2% to 18%, the provider is marked degraded even if HTTP status codes are clean.
+
+Traffic-based signals have a latency problem. You cannot detect degradation until after you have sent traffic to the degraded provider. This means some user requests will experience the degradation before you failover. The trade-off is between probe frequency and impact window. Synthetic probes every sixty seconds detect issues with up to sixty seconds of user impact. Traffic-based signals detect issues after they affect real users, but they catch issues that synthetic probes miss. The best health monitoring systems use both.
+
+## The Health State Machine and Transition Logic
+
+A provider is not binary healthy-or-unhealthy. It exists in one of four states: healthy, degraded, unhealthy, or unknown. The transitions between these states must be governed by logic that balances sensitivity with noise tolerance.
+
+**Healthy** means all recent probes succeeded, all traffic-based metrics are within normal ranges, and the provider's status page reports no incidents. This is the default state. Traffic is routed normally.
+
+**Degraded** means some signals indicate problems but not enough to justify full failover. Maybe the synthetic probe succeeded but latency increased by 40%. Maybe the confidence score distribution shifted but is still above minimums. Degraded providers receive reduced traffic — perhaps 30% instead of 50% — but are not fully removed from rotation. This state allows you to detect whether the degradation is transient or worsening.
+
+**Unhealthy** means multiple signals confirm the provider cannot deliver acceptable service. Synthetic probes failed on consecutive attempts. Latency exceeded thresholds. Confidence scores dropped below acceptable levels. Unhealthy providers are removed from rotation entirely. No traffic is routed to them until they recover.
+
+**Unknown** is the state a provider enters when monitoring itself fails. If your synthetic probe times out because of a network partition between your monitoring system and the provider, you do not know the provider's true state. Unknown providers are treated as unhealthy by default — you failover away from uncertainty. This is conservative but correct. Routing traffic to a provider of unknown health is indistinguishable from gambling.
+
+Transitions between states require hysteresis to prevent flapping. A single failed probe does not immediately mark a provider unhealthy — it transitions to degraded first. Three consecutive failures transition from degraded to unhealthy. Recovery follows a similar pattern. A single successful probe does not restore an unhealthy provider to healthy — it transitions to degraded, then to healthy only after sustained success. This prevents routing oscillation where a provider flaps between healthy and unhealthy every sixty seconds, sending traffic back and forth and creating a worse experience than staying on either provider consistently.
+
+## Provider Status Pages and Their Reliability Problems
+
+Every major voice provider operates a status page that reports incidents and maintenance windows. These pages are useful context but cannot be the primary input to automated failover decisions. Status pages lag reality by minutes to hours. In March 2025, a TTS provider experienced a regional outage that lasted forty-two minutes before the status page was updated to acknowledge the incident. During those forty-two minutes, teams relying on the status page as their health signal continued routing traffic to a fully unavailable service.
+
+Status pages also understate severity. Providers have reputational and contractual incentives to minimize public acknowledgment of problems. An incident that affected 30% of requests might be described as "elevated error rates for a subset of customers" rather than "major service degradation." Your automated monitoring cannot parse this language and infer the correct failover decision. You need direct measurement.
+
+The correct use of status pages is as confirmatory evidence, not primary signal. If your synthetic probes and traffic-based monitoring both indicate degradation, and the provider's status page reports an incident, you have high confidence that failover is the right decision. If your monitoring shows degradation but the status page reports all systems operational, you still failover — but you open a support ticket to understand the discrepancy. If your monitoring shows healthy but the status page reports an incident, you increase probe frequency and prepare to failover but do not act immediately. The provider's reported issue may not affect your specific use case.
+
+## Alert Thresholds That Balance Sensitivity With Noise
+
+Health monitoring produces alerts, and alerts must be actionable. An alert that fires every hour because of transient network blips trains your team to ignore alerts. An alert that fires only after thirty minutes of user-visible degradation is too late to matter. The threshold tuning is the craft.
+
+For latency-based alerts, the threshold must be tighter than your user-facing SLA but loose enough to tolerate normal variance. If your ASR SLA promises transcription within two seconds, your internal alert threshold might be 1.5 seconds at the p95. This gives you a 500-millisecond buffer to detect and failover before users experience SLA violations. The alert fires when two consecutive health checks exceed 1.5 seconds, which filters single-request anomalies but catches sustained degradation within two minutes.
+
+For accuracy-based alerts, the threshold depends on your baseline. If your ASR provider typically delivers 94% to 97% confidence scores, an alert at 85% is reasonable. If confidence scores drop to 85%, something material has changed. The alert triggers investigation. The team checks whether the drop is global or specific to certain audio conditions. They review recent provider announcements for model updates. They compare traffic between providers to see if others show similar patterns. If the degradation is provider-specific, they failover. If it is global, the issue is likely in your audio pipeline, not the providers.
+
+For error-rate alerts, the threshold must account for expected failure rates. Even healthy providers return errors for malformed requests, unsupported audio formats, or rate limit violations. A baseline error rate of 0.1% to 0.3% is normal. An alert threshold at 1% catches real degradation without noise. If errors spike from 0.2% to 1.8%, the provider is unhealthy or your requests changed. Either way, investigation is required.
+
+The alert must include context: which provider, which metric, current value, baseline value, and recent trend. An alert that says "ASR latency high" is useless. An alert that says "Deepgram Nova-3 ASR p95 latency is 2,100ms, baseline 600ms, increasing over last 8 minutes" is actionable. The on-call engineer knows what is degrading, by how much, and whether it is getting worse. They can make an informed failover decision in under a minute.
+
+## Geographic Variation in Provider Health
+
+Provider health is not uniform across geographies. A provider's US-East region may be healthy while their EU-West region is degraded. A provider may have excellent performance for English audio and poor performance for Mandarin. Health monitoring must be geography-aware and language-aware, or failover decisions will be wrong.
+
+A global voice platform serves users in North America, Europe, and Asia-Pacific. They run separate synthetic probes in each region, testing each provider from geographic locations that match user traffic. In January 2026, their Europe-based probe detected that AssemblyAI's EU endpoint latency increased from 520ms to 1,900ms, while the US endpoint remained at 480ms. The health monitoring system marked AssemblyAI degraded in Europe but healthy in North America. European traffic failed over to Deepgram. North American traffic stayed on AssemblyAI. This geographic precision prevented a global failover that would have been unnecessary and expensive.
+
+Language-specific degradation follows the same pattern. A multilingual platform sends synthetic probes in English, Spanish, Mandarin, and Arabic to each ASR provider. In September 2025, one provider's Spanish transcription accuracy dropped from 93% to 78% after a model update, while English accuracy remained at 96%. The health system marked the provider degraded for Spanish but healthy for English. Spanish traffic failed over. English traffic continued normally. Without language-specific monitoring, the platform would have either failed over all traffic unnecessarily or failed to protect Spanish users.
+
+The complexity cost is real. Geographic and language-specific monitoring multiplies the number of health checks you must run. Three providers times three regions times four languages is thirty-six separate health check configurations. Each must be monitored, alerted on, and maintained. But the precision gain is worth it. Failover is expensive — it burns secondary provider quota, creates cost unpredictability, and introduces risk that the secondary is also degraded. Failover should be as targeted as possible. Region-specific and language-specific health monitoring makes that precision possible.
+
+Provider health monitoring is not a feature you add after launch. It is infrastructure you build before you send the first production request. Without it, multi-provider architectures are theater — you have the vendors integrated, but you cannot use them intelligently. With it, you gain the ability to route traffic to the best available provider in real-time, detect degradation before it becomes user-visible, and failover automatically when necessary. This is the foundation on which latency-based and quality-based routing are built.
+
+---
+
+Next: **10.3 — Latency-Based Provider Routing** — choosing the fastest provider in real-time.

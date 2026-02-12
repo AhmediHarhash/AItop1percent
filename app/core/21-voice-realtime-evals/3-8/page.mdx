@@ -1,0 +1,75 @@
+# 3.8 — Streaming Chunking Strategies: Trading Latency for Quality
+
+ASR does not need to wait for an entire sentence before producing a transcription. TTS does not need to receive a complete paragraph before generating audio. Both systems can process audio in chunks — small segments of a few hundred milliseconds each — and emit results incrementally. Smaller chunks reduce latency because the system starts producing output sooner. Larger chunks improve quality because the model has more context to resolve ambiguities, smooth prosody, and avoid boundary artifacts. Every voice system must navigate this tradeoff.
+
+The chunk size you choose determines the user's perception of responsiveness. A 200-millisecond ASR chunk means the user sees their words appear almost as they speak. A 1000-millisecond chunk means noticeable delay between speech and transcription. A 100-millisecond TTS chunk means the user hears audio output almost immediately after the LLM generates text. A 500-millisecond chunk introduces lag that makes the conversation feel sluggish. But aggressive chunking comes at a cost: smaller chunks mean less context per inference pass, more processing overhead, and more opportunities for quality degradation at chunk boundaries.
+
+## Why Chunk Size Matters for Latency
+
+ASR models process audio in fixed-size windows. A model might expect 16,000 samples of audio at a time — one second of audio at 16 kHz sample rate. If you send audio every second, the user waits one second from the end of their utterance before seeing transcription begin. If you send audio every 250 milliseconds, the user sees partial transcription appear within a quarter-second of speaking. The difference between one-second and 250-millisecond chunking is the difference between conversation that feels fluid and conversation that feels delayed.
+
+Smaller chunks also mean more frequent inference calls. A 10-second utterance processed in 1-second chunks requires 10 ASR inference calls. The same utterance processed in 250-millisecond chunks requires 40 inference calls. Each inference call has overhead: network round-trip time, request serialization and deserialization, queuing delay if your ASR service is under load. For very small chunks, overhead can dominate actual processing time. A 100-millisecond audio chunk might take 50 milliseconds to process but 30 milliseconds to transmit and queue, increasing effective latency by 60%.
+
+TTS exhibits the same tradeoff. A TTS model that generates 500 milliseconds of audio per inference pass can start playing audio to the user 500 milliseconds after receiving text. A model that generates 100-millisecond chunks can start playing audio after 100 milliseconds. The user hears the response sooner, but the system makes five times as many TTS inference calls, each with its own overhead and potential for quality degradation.
+
+Streaming chunk size also affects how quickly the system can react to user interruptions. If your ASR processes in 1-second chunks, the user must wait up to one second after they start speaking before the system detects new input and can interrupt the current TTS playback. If ASR processes in 200-millisecond chunks, the system detects interruptions within 200 milliseconds, cutting off the assistant mid-sentence in a way that feels natural. Smaller chunks enable tighter interrupt latency, which is critical for making voice systems feel conversational rather than turn-based.
+
+## Quality Degradation from Small Chunks
+
+ASR accuracy depends on context. A model that sees the phrase "I need to schedule a call" can use the word "schedule" to disambiguate that "call" is a noun, not the verb "call." If the model processes "I need to" as one chunk and "schedule a call" as the next chunk, it loses the cross-boundary context. Errors increase, especially for homophones and words that sound similar but have different meanings based on sentence structure.
+
+Phoneme recognition at chunk boundaries is particularly fragile. If a word spans two chunks — "sche-" in one chunk and "-dule" in the next — the model must stitch the pieces together without full acoustic context. Many streaming ASR models use overlapping chunks to mitigate this: each chunk includes 50-100 milliseconds of audio from the previous chunk, giving the model boundary context at the cost of redundant processing.
+
+TTS quality degrades differently. Prosody — the rhythm, stress, and intonation of speech — depends on understanding the entire sentence or clause. A TTS model generating the sentence "I will call you tomorrow" adjusts pitch and emphasis based on sentence structure: "I will CALL you tomorrow" versus "I will call you TOMORROW." If the model generates "I will call" in one chunk and "you tomorrow" in the next, it cannot distribute stress correctly across the full sentence. The result is choppy, unnatural-sounding speech with awkward pauses and flat intonation.
+
+Boundary artifacts — clicks, pops, or abrupt amplitude changes — occur when consecutive audio chunks do not align smoothly. If one chunk ends at a high amplitude and the next begins at a low amplitude, the transition creates an audible discontinuity. Modern TTS models use windowing functions to fade chunk boundaries, but very small chunks make this smoothing harder, increasing the likelihood of perceptible artifacts.
+
+## Finding the Right Chunk Size for ASR
+
+Most production streaming ASR systems use chunks between 200 and 500 milliseconds. This range balances latency and accuracy. A 250-millisecond chunk provides enough audio context to resolve most ambiguities without introducing perceptible delay. A 500-millisecond chunk improves accuracy slightly but delays transcription visibility, which matters for live captioning or real-time user feedback.
+
+The optimal chunk size depends on the language and the model. English has relatively short words and clear phoneme boundaries, so smaller chunks work well. Languages with longer compound words or tonal distinctions — German, Mandarin, Thai — benefit from larger chunks that preserve tonal contours and word structure. A 200-millisecond chunk might work well for English ASR but produce frequent errors in Mandarin, where tone changes meaning and tonal patterns span longer time windows.
+
+Some ASR models are explicitly designed for low-latency streaming. Whisper, originally designed for offline transcription, performs poorly with very small chunks — accuracy degrades significantly below 500 milliseconds. Purpose-built streaming models like Deepgram Nova or AssemblyAI's real-time ASR are optimized for 100-200 millisecond chunks with overlapping context windows. If your latency budget demands sub-300-millisecond ASR output, choose a model designed for streaming, not a batch model hacked into a streaming pipeline.
+
+Adaptive chunking is an advanced technique where chunk size varies based on detected speech patterns. During continuous speech, the system uses small chunks to minimize latency. When the system detects a pause or sentence boundary, it extends the chunk to capture the full utterance, improving accuracy for the final words before the pause. This approach requires real-time speech activity detection and adds complexity, but it can deliver both low latency and high accuracy in scenarios where users speak in bursts with natural pauses.
+
+## Finding the Right Chunk Size for TTS
+
+TTS chunk size is constrained by prosody and playback continuity. Generating audio one word at a time produces robotic, monotone output. Generating audio one sentence at a time preserves natural prosody but delays playback until the full sentence is available. Most production systems generate 300-800 milliseconds of audio per chunk — enough to capture phrase-level prosody without forcing the user to wait for an entire paragraph.
+
+The chunk size must align with the LLM's token generation rate. If your LLM generates 20 tokens per second and your TTS model requires 10 tokens to produce 500 milliseconds of audio, the system can start TTS after 500 milliseconds of LLM generation. If the LLM generates slowly — 5 tokens per second — you must wait 2 seconds before accumulating enough tokens to feed TTS. In this case, smaller TTS chunks help: if TTS can work with 3-4 tokens, playback starts after 600-800 milliseconds instead of 2 seconds.
+
+Some TTS models support variable-length input. You can send 5 tokens, 50 tokens, or 500 tokens, and the model adjusts. Others expect fixed-length or sentence-aligned input. If your TTS model requires complete sentences, you cannot use small chunks — you must buffer LLM output until a sentence boundary, then send the entire sentence to TTS. This introduces latency but preserves quality. If your TTS model can handle partial sentences, you can chunk more aggressively at the cost of prosody and naturalness.
+
+Streaming TTS also introduces buffering challenges on the playback side. Audio must be buffered slightly to ensure smooth playback without gaps. If TTS generates audio faster than real-time playback, the buffer fills, and playback is continuous. If TTS is slower than real-time, the buffer drains, causing playback to stutter or pause. Chunk size affects how quickly the buffer fills: smaller chunks mean more frequent TTS calls, each with its own latency variance, increasing the likelihood of buffer underruns.
+
+## Overhead from Frequent Inference Calls
+
+Every inference call has fixed overhead. The client serializes the request, sends it over the network, waits for the server to deserialize it, queue it, process it, serialize the response, and send it back. For very small chunks, this overhead can exceed actual processing time.
+
+Consider an ASR system that processes 100-millisecond chunks. If ASR inference takes 30 milliseconds but network round-trip time is 40 milliseconds and queuing adds another 20 milliseconds, total latency per chunk is 90 milliseconds. Across a 10-second utterance, that is 100 chunks and 9 seconds of cumulative overhead. If you used 500-millisecond chunks instead, inference might take 80 milliseconds per chunk, network overhead is still 40 milliseconds, and total latency per chunk is 120 milliseconds. Across 10 seconds, that is 20 chunks and 2.4 seconds of cumulative overhead. The larger chunk size actually reduces total latency despite higher per-chunk processing time, because overhead scales with the number of calls, not the amount of audio processed.
+
+Batching can mitigate overhead, but it introduces latency. Instead of processing each chunk immediately, the system waits to accumulate multiple chunks, processes them in a single batched inference call, then distributes results. This reduces the number of inference calls and lowers overhead, but it delays output. A system that batches 4 chunks of 100 milliseconds each before processing saves overhead but adds 400 milliseconds of latency waiting for the batch to fill.
+
+Connection reuse reduces overhead for streaming scenarios. Instead of opening a new HTTP connection for each chunk, the client opens a persistent connection and streams chunks over it. WebSockets, gRPC bidirectional streaming, and HTTP/2 server push all support this pattern. Persistent connections eliminate the TCP and TLS handshake overhead for each chunk, reducing per-chunk latency by 50-150 milliseconds in high-latency networks.
+
+## Adaptive Strategies: Varying Chunk Size by Use Case
+
+Some voice systems use different chunk sizes depending on context. During active conversation, the system uses small chunks to minimize latency and maintain conversational flow. During long-form content playback — the assistant reading a multi-paragraph answer — the system uses larger chunks to preserve prosody and reduce overhead, accepting slightly higher initial latency because the user expects the assistant to speak at length.
+
+Another adaptive approach varies chunk size based on detected utterance type. Short, simple queries — "What time is it?" — use small chunks because the user expects a fast answer. Complex, multi-sentence questions — "Can you explain the difference between term and whole life insurance and which one makes sense for someone in their thirties?" — use larger chunks because the user expects the system to take time to formulate a thoughtful response.
+
+Some systems adjust chunk size based on detected network conditions. If round-trip time is low — under 30 milliseconds — the system uses small chunks because overhead is negligible. If round-trip time is high — over 100 milliseconds — the system uses larger chunks to reduce the number of network round-trips. This requires real-time latency monitoring and dynamic reconfiguration, but it prevents aggressive chunking from backfiring in high-latency environments.
+
+## Measuring Chunk Size Impact in Evals
+
+You cannot choose the right chunk size without measuring its impact on both latency and quality. Offline evals should test multiple chunk sizes against the same test set and compare latency, accuracy, and user experience metrics.
+
+Measure ASR accuracy by chunk size. Process your test audio at 100-millisecond, 250-millisecond, 500-millisecond, and 1000-millisecond chunk sizes. Compare word error rate, especially at chunk boundaries. If WER increases by more than 5% when you shrink chunks from 500 milliseconds to 250 milliseconds, the quality cost may outweigh the latency benefit. If WER increases by less than 1%, the latency benefit likely justifies the small quality tradeoff.
+
+Measure TTS naturalness by chunk size. Generate the same responses at different chunk sizes and have human raters score naturalness, prosody, and fluency. If 300-millisecond TTS chunks score 4.2 out of 5 for naturalness and 800-millisecond chunks score 4.7 out of 5, you have quantified the quality cost of aggressive chunking. Whether that cost is acceptable depends on your latency budget and user expectations.
+
+Measure end-to-end latency distribution by chunk size. Run live traffic or synthetic load tests with different chunking configurations and record P50, P95, and P99 latency. Small chunks should reduce P50 latency but may increase P95 or P99 if overhead and variance compound. If 100-millisecond ASR chunks reduce P50 latency by 200 milliseconds but increase P95 latency by 100 milliseconds due to overhead and queuing, the net benefit depends on whether you optimize for median or tail latency.
+
+The right chunk size is not universal. It depends on your latency budget, the acceptable quality floor, the characteristics of your ASR and TTS models, and the network conditions your users experience. The next subchapter explores speculative execution: starting TTS before the LLM completes generation, a technique that hides LLM latency entirely when it works — and creates perceptual disasters when it fails.

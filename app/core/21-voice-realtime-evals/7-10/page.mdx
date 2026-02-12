@@ -1,0 +1,114 @@
+# 7.10 — Training Barge-In Models on Production Data
+
+Lab data does not teach barge-in models what they need to know. In late 2024, a healthcare voice agent team spent three months building a barge-in classifier using a publicly available conversational dataset — 50,000 annotated turn transitions from phone conversations. The model performed beautifully in testing. Precision was 94%. Recall was 91%. They deployed it to production, expecting seamless interruption handling. Within the first week, premature cutoff rate was 18%, and users were flooding support with complaints that the agent kept stopping mid-sentence.
+
+The team pulled production logs and listened to the flagged sessions. The problem was immediately obvious. Real users in real environments do not sound like the clean audio in the training dataset. Users were on speakerphone with dogs barking in the background. Users were in cars with road noise. Users were talking to their children while trying to schedule appointments. The barge-in model, trained on clean two-person phone calls, interpreted every background voice, every door slam, every television in the next room as an interruption. It was not that the model was bad. It was that the model had never seen the world it was deployed into.
+
+They rebuilt the model using two weeks of production audio. Premature cutoff rate dropped to 4%. The difference was not smarter algorithms or better hyperparameters. The difference was training data that matched reality. Barge-in models need production data, and production data is messy, contextual, and impossible to replicate in a lab.
+
+## Why Lab Datasets Fail for Barge-In
+
+Lab datasets are recorded under controlled conditions. Two speakers, clear audio, no background noise, no cross-talk. The speakers are often trained to follow conversational norms — they wait for pauses, they do not interrupt aggressively, they articulate clearly. This produces clean, well-structured data that is easy to annotate and easy to learn from. It is also completely unrepresentative of production voice interactions.
+
+Real users do not follow conversational norms. They interrupt mid-sentence because they are impatient. They speak while someone else in the room is talking. They put the phone down without muting and have a side conversation. They sneeze, cough, shuffle papers, drop things. All of these events produce audio that could be interpreted as the user taking the floor. A model trained on clean data has no basis to distinguish between a deliberate interruption and background noise.
+
+The acoustic environment is also different. Lab datasets are recorded with high-quality microphones in quiet rooms. Production users are on Bluetooth headsets with compression artifacts, on phone lines with echo and distortion, on mobile devices held at arm's length. The same utterance sounds completely different in production than in the lab. A model trained on clean audio learns features that do not generalize to noisy audio.
+
+The conversational dynamics are different. Lab datasets often use scripted or semi-scripted conversations where speakers are cooperative. Production users are stressed, confused, or frustrated. They raise their voice. They talk over the agent because they think the agent is not listening. They interrupt with questions before the agent finishes explaining. These adversarial or emotional interruptions have different acoustic and prosodic features than the polite turn-taking in lab datasets.
+
+The only way to build a barge-in model that works in production is to train it on production data. There is no shortcut.
+
+## Building the Production Data Collection Pipeline
+
+Production data collection requires instrumentation at the audio level. Every time your voice system detects a potential barge-in event — the user speaks while the agent is speaking — you log the audio surrounding that event. You capture 3 seconds of audio before the event and 3 seconds after. You capture both the user's audio and the agent's audio. You capture metadata: session ID, turn number, barge-in threshold that was triggered, whether the agent yielded or continued speaking.
+
+This gives you raw audio clips of potential interruptions. Some of them are real interruptions where the user intended to take the floor. Some are false positives where the user coughed, or someone in the background spoke, or the microphone picked up noise. Your goal is to collect thousands of these events, annotate them, and train a model to distinguish true interruptions from spurious noise.
+
+The collection pipeline runs passively. It does not interfere with production traffic. When a potential barge-in event occurs, the system logs the audio clip asynchronously and continues with the conversation. The user never knows their audio was captured. The latency impact is negligible — writing a 6-second audio clip to cloud storage takes 20 milliseconds if you do it asynchronously.
+
+You need to sample strategically. If you log every potential barge-in event, you will drown in data. A high-traffic system might see 50,000 barge-in events per day. You do not need all of them. You sample based on diversity and edge cases. You oversample rare conditions: high background noise, low confidence in speech detection, sessions where the user has already triggered multiple premature cutoffs. You undersample common conditions: clean audio, high confidence, no prior issues. This gives you a dataset that is rich in hard cases.
+
+## Annotation Protocols for Barge-In Events
+
+Each collected audio clip needs a label: true interruption or false positive. This requires human judgment. Annotators listen to the clip and answer a simple question: Did the user intend to speak, or was this background noise or accidental audio?
+
+The annotation interface plays the 6-second clip with a visual waveform showing both the user's audio and the agent's audio. The annotator can see when each speaker was active. They listen to the clip, then select one of three labels: true interruption, false positive, or unclear. True interruption means the user clearly intended to speak and the agent should have yielded. False positive means the audio was noise, a cough, someone else in the room, or some other event that should not trigger barge-in. Unclear means the annotator cannot confidently decide — maybe the user started to speak but stopped, or the audio quality is too poor to judge.
+
+You discard the unclear labels. They are typically 5% to 10% of the dataset. The remaining labels are split roughly 60% true interruptions, 40% false positives. The imbalance reflects reality — most barge-in triggers are legitimate, but a significant minority are spurious.
+
+You need at least two annotators per clip for quality control. Annotator agreement on barge-in judgments is around 85% to 90% — higher than many other labeling tasks because the question is straightforward. When annotators disagree, you use a third annotator as a tiebreaker, or you discard the clip if even the third annotator is uncertain.
+
+Annotation speed is roughly 100 clips per hour per annotator. Each clip is 6 seconds of audio, and the decision takes 10 to 20 seconds once the annotator is trained. At this rate, annotating 10,000 clips takes 100 hours of labor, which is one annotator working full-time for two and a half weeks, or ten annotators working for one day. The cost is modest — if you pay annotators 20 dollars per hour, 10,000 annotations cost 2,000 dollars.
+
+## Training the Barge-In Model on Annotated Production Data
+
+Once you have 10,000 annotated clips, you can train a barge-in classifier. The model takes audio features as input and outputs a probability that the user is making a genuine interruption. The features include mel-frequency cepstral coefficients, pitch contours, energy envelopes, and duration of the user's utterance. You also include contextual features: turn number, time since last user utterance, whether the user has interrupted before in this session.
+
+The architecture is typically a small recurrent neural network or a 1D convolutional network. You do not need a massive model for this task. A model with 500,000 parameters trained for a few hours on a single GPU can achieve 90% precision and 88% recall. The key is not model size — it is data quality. A small model trained on 10,000 real production examples will outperform a large model trained on 100,000 lab examples.
+
+You split the annotated dataset 80% training, 10% validation, 10% test. You train the model to minimize binary cross-entropy loss, using the annotator labels as ground truth. You tune hyperparameters on the validation set: learning rate, dropout rate, number of layers. You evaluate on the test set to get an unbiased estimate of performance. If test set precision is above 90% and recall is above 85%, the model is ready for production trials.
+
+## Iterative Improvement with A/B Testing
+
+You do not deploy the new barge-in model to all traffic immediately. You deploy it to 10% of sessions and compare metrics against the baseline model. You track premature cutoff rate, overlap rate, agent-yield rate, and user satisfaction. You run the experiment for one week to collect enough data for statistical significance.
+
+If the new model reduces premature cutoff rate by 3 percentage points without increasing overlap rate, you expand the rollout to 50% of traffic. If it performs well for another week, you deploy it to 100%. If the new model performs worse — higher premature cutoff rate or lower agent-yield rate — you roll it back and investigate. Maybe the production data you collected was biased toward a specific user population or acoustic environment. Maybe the annotation quality was poor. You review the failures, collect more data, retrain, and try again.
+
+Barge-in model training is not a one-time effort. It is a continuous loop. Every month, you collect another batch of production audio — 5,000 clips, 10,000 clips — focusing on the cases where the current model fails. You annotate the new data, retrain the model, and deploy the updated version. Over time, the model becomes increasingly robust to the full diversity of production conditions.
+
+## Handling Adversarial and Edge-Case Audio
+
+Some users deliberately test the system. They interrupt repeatedly to see if the agent will stop talking. They speak in rapid bursts to confuse the barge-in detector. They play music or television audio near the microphone to see if the system can distinguish it from human speech. These adversarial cases are rare — maybe 1% of sessions — but they create outsized problems because they trigger cascades of barge-in failures.
+
+You collect adversarial cases separately. You flag sessions where the user interrupted more than ten times in a single conversation, or where the barge-in model fired more than twenty times, or where the user's audio had sustained non-speech noise for more than 5 seconds. You review these sessions manually. Some of them are genuine adversarial users. Some are users in genuinely difficult acoustic environments — construction workers on job sites, parents with screaming toddlers. Both cases teach the model something valuable.
+
+You annotate adversarial cases the same way as normal cases, but you oversample them in training. If adversarial cases are 1% of production traffic, you make them 10% of the training set by duplicating them or by sampling more heavily from adversarial sessions. This forces the model to learn robust features that work even when users are deliberately trying to break the system.
+
+## Cross-Domain Transfer and Domain-Specific Models
+
+A barge-in model trained on customer service calls does not transfer well to healthcare appointments. The conversational dynamics are different. Customer service users interrupt frequently because they are trying to get quick answers. Healthcare users interrupt rarely because they defer to the agent's medical expertise. A model trained on high-interruption data will have high false positive rates in low-interruption domains.
+
+You need domain-specific models if you serve multiple use cases. You collect production data separately for each domain — customer service, healthcare, financial advice, technical support — and train separate barge-in models. Each model is optimized for the interruption patterns typical of its domain. At runtime, you route sessions to the appropriate model based on the conversation type.
+
+If you do not have enough data to train separate models, you can use domain adaptation. You train a base model on all your production data, then fine-tune it on a smaller dataset from each domain. The base model learns general features of interruptions — acoustic patterns, prosody, timing. The fine-tuning layers learn domain-specific patterns — when interruptions are appropriate, what kinds of noises are common. This approach works when you have 50,000 general examples and only 2,000 domain-specific examples.
+
+## Privacy and Compliance in Production Audio Collection
+
+Collecting production audio raises privacy concerns. Users did not necessarily consent to having their voice recorded and analyzed for machine learning. In some jurisdictions, recording and storing voice data requires explicit opt-in consent. In others, it requires anonymization before long-term storage.
+
+You handle this by anonymizing audio at collection time. You strip all session metadata that could identify the user — phone number, account ID, IP address. You store only the audio clip, the timestamp, and high-level context like domain and deployment region. You do not store transcripts unless absolutely necessary, because transcripts are more identifiable than raw audio.
+
+You also set retention limits. Production audio collected for barge-in training is stored for 90 days, annotated during that window, and then deleted. The trained model persists, but the raw audio does not. This limits your exposure to privacy regulations and reduces storage costs.
+
+In regulated industries — healthcare, finance — you may need additional safeguards. You can apply differential privacy techniques during training, adding noise to gradients so that no single audio clip has outsized influence on the model. You can also use federated learning, where the model is trained on decentralized data without centralizing the audio. These techniques add complexity but may be necessary for compliance.
+
+## Evaluating Model Performance on Held-Out Production Data
+
+Once you deploy a new barge-in model, you need to evaluate it continuously on held-out production data. Every week, you sample 1,000 new audio clips from production, annotate them, and test the current model's precision and recall. If precision drops from 92% to 86%, you know the model is degrading. This could happen because user behavior is shifting, acoustic conditions are changing, or the model is overfitting to patterns that no longer apply.
+
+Continuous evaluation catches drift early. If you wait six months to evaluate, the model might have degraded silently, and you will have no idea when the degradation started or what caused it. Weekly evaluation gives you a time series of model performance. You can correlate performance drops with deployments, traffic changes, or external events — a new device launch, a change in user demographics, a marketing campaign that brought in different users.
+
+You also evaluate on slices. You break down performance by user population, by acoustic environment, by time of day. Maybe the model performs well for users in quiet rooms but poorly for users on speakerphone. Maybe it performs well during daytime calls but poorly during late-night calls when users are tired and their speech is less articulate. Slice-based evaluation reveals where the model is weak and where you need to collect more training data.
+
+## Cold Start Problem: Bootstrapping Without Production Data
+
+When you launch a new voice system, you do not have production data yet. You need a barge-in model from day one, but you have no real examples to train on. This is the cold start problem.
+
+You solve it with a two-phase approach. Phase one is a rule-based or lab-trained model that is conservative. It has high precision but low recall — it only triggers barge-in when it is very confident the user is interrupting. This means the agent will sometimes talk over users, but it will rarely stop mid-sentence due to spurious noise. Users will tolerate being talked over more than they will tolerate the agent stopping unexpectedly.
+
+You deploy this conservative model for the first month. During that month, you collect production audio aggressively. Every potential barge-in event is logged. You collect 20,000 to 50,000 clips in the first month. You annotate a subset — 10,000 clips — and train a production model. Phase two is deploying the production-trained model after one month. This model has much better recall because it has seen real interruptions in real environments.
+
+The cold start model does not need to be perfect. It just needs to be safe and to generate training data. Within 30 days, you have enough production data to train a real model that outperforms any lab-trained baseline.
+
+## The Feedback Loop: Model Improvement Over Time
+
+Barge-in model training is a feedback loop. You deploy a model. It makes decisions in production. Some decisions are correct, some are wrong. You log the wrong decisions as edge cases. You collect more audio from sessions where the model failed. You annotate the new audio. You retrain the model. You deploy the updated model. The cycle repeats.
+
+This loop improves the model continuously. After six months, your barge-in model has seen 100,000 real production interruptions. It has learned to handle dogs barking, children yelling, users on speakerphone, users in cars, users with heavy accents, users who interrupt mid-word. It is robust to conditions you never anticipated when you first launched.
+
+The key to the feedback loop is systematic edge case collection. If you only retrain on random samples, the model will improve slowly. If you retrain on the hardest cases — the sessions where premature cutoff rate was highest, the sessions where overlap rate spiked, the sessions where users complained — the model improves fast because it is learning from its mistakes.
+
+The feedback loop also adapts to shifts in user behavior. If your user base changes — you expand into a new region, you launch a new feature, you attract a different demographic — the model retrains on the new patterns and adapts. A static model trained once on launch-day data will degrade within months as the world shifts around it. A continuously retrained model stays current.
+
+Production data is not optional for barge-in models. It is the only data that teaches the model what it needs to know. The next challenge is recognizing that barge-in models must be calibrated differently depending on the domain — because user expectations for turn-taking vary wildly between customer service, healthcare, and other contexts.
+

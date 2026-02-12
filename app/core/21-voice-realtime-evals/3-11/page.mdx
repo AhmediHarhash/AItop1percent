@@ -1,0 +1,91 @@
+# 3.11 — Latency Regression Detection in Production
+
+A deploy goes out on a Tuesday morning. Median latency increases from 420 milliseconds to 510 milliseconds. P95 latency jumps from 680 milliseconds to 940 milliseconds. No alerts fire. No one notices for three days. By Friday, customer support has logged 47 complaints about slow responses. User session duration has dropped by 18%. The regression is caught during a weekly metrics review, rolled back Monday morning. Five days of degraded user experience. Five days of lost trust. The system had monitoring. It had dashboards. It had alerts. But none of them were tuned to detect a 90-millisecond median shift or a 260-millisecond P95 shift as a critical regression.
+
+Latency regressions are silent failures. The system does not crash. Error rates do not spike. Functionality is preserved. The only signal is that everything takes slightly longer. In non-real-time systems, a 200-millisecond regression is often invisible to users. In voice systems, a 200-millisecond regression crosses perceptual thresholds. Conversations that felt fluid now feel sluggish. Users who tolerated the system before now abandon it. And because the degradation is gradual and subtle, it often escapes detection until user complaints force investigation.
+
+This subchapter explains how to detect latency regressions in production before users notice, how to set alerting thresholds that catch meaningful degradation without triggering false alarms, and how to build systems that automatically roll back deploys or route traffic when latency degrades.
+
+## Why Standard Alerting Misses Latency Regressions
+
+Most production alerting is threshold-based. If P95 latency exceeds 1000 milliseconds, fire an alert. This works for detecting catastrophic failures — the system completely breaks, latency spikes to 10 seconds, the alert fires, engineers investigate. But it does not detect gradual degradation. If P95 latency was 680 milliseconds yesterday and is 940 milliseconds today, the absolute threshold of 1000 milliseconds is not breached. No alert fires. The regression is invisible to threshold-based monitoring.
+
+Static thresholds also cannot adapt to traffic patterns or system changes. During peak load, P95 latency might legitimately rise to 850 milliseconds due to queuing and resource contention. During off-peak hours, the same system might run at 400 milliseconds. A static threshold of 1000 milliseconds would never fire during peak load, even if latency is 200 milliseconds higher than it should be for that load level. A static threshold of 600 milliseconds would fire constantly during peak load, even when the system is performing normally.
+
+Latency regressions are often relative, not absolute. A 20% increase in median latency is significant, regardless of whether the absolute value crosses a threshold. A system that runs at 300 milliseconds median and degrades to 360 milliseconds has a meaningful regression, even though 360 milliseconds is well within acceptable bounds. A system that runs at 800 milliseconds and degrades to 960 milliseconds has the same percentage regression. Static thresholds miss both, because they do not measure change — they measure absolute value.
+
+## Comparing Current Latency to Baseline
+
+The core technique for detecting regressions is baseline comparison. Establish a baseline latency distribution — median, P75, P90, P95, P99 — for the system under normal conditions. Continuously compare current latency to the baseline. If current latency exceeds baseline by more than a threshold percentage or absolute milliseconds, trigger an alert.
+
+Baseline calculation requires historical data. Collect latency metrics for the past 7-14 days during the same time of day and day of week. If today is Tuesday at 10am, the baseline is the median latency from the past four Tuesdays between 9am and 11am. This accounts for weekly traffic patterns, time-of-day effects, and weekend versus weekday differences. A baseline that ignores temporal patterns will produce false positives when traffic load shifts naturally.
+
+The baseline must exclude known anomalies. If there was a production incident two Tuesdays ago that caused latency to spike, that data should not contribute to the baseline. Outlier filtering is essential. Calculate baseline using the median or trimmed mean of historical latency distributions, not the raw mean, to avoid letting past incidents inflate the baseline and hide future regressions.
+
+Some systems use rolling baselines that update continuously. The baseline is the latency distribution from the past 7 days, recalculated hourly. As new data arrives, old data ages out. This allows the baseline to adapt gradually to legitimate system changes — infrastructure upgrades, model updates, traffic shifts — while still catching sudden regressions. The tradeoff is that a slow, gradual degradation over many days might be absorbed into the baseline without triggering an alert. To prevent this, enforce a floor: the baseline can improve over time but cannot degrade by more than 5-10% per week without explicit approval.
+
+## Choosing Regression Thresholds
+
+A regression threshold defines how much latency must increase before an alert fires. If median latency is 15% above baseline, is that a critical regression or normal variance? If P95 latency is 100 milliseconds above baseline, is that urgent or tolerable? The threshold determines the sensitivity of your detection system.
+
+For voice systems, thresholds should be tuned to perceptual boundaries. A 50-millisecond increase in median latency is perceptible to users. A 100-millisecond increase is unacceptable. A 200-millisecond increase destroys conversational flow. Set thresholds lower than the smallest perceptually significant degradation. If users notice regressions above 80 milliseconds, set the alert threshold at 60 milliseconds. This gives you time to investigate and fix the problem before user experience degrades noticeably.
+
+Thresholds should vary by latency percentile. Median latency is more stable and easier to optimize, so a tighter threshold is appropriate — alert if median increases by more than 10% or 50 milliseconds, whichever is smaller. P95 and P99 latency are inherently more variable, so a looser threshold is appropriate — alert if P95 increases by more than 20% or 150 milliseconds. This prevents false positives from normal tail latency variance while still catching regressions that affect a meaningful fraction of users.
+
+Some teams use tiered alerting. A 10% median increase triggers a warning notification to Slack. A 25% median increase or a 50% P95 increase triggers a high-priority page. A 50% median increase or a P95 increase that crosses an absolute threshold like 1500 milliseconds triggers an automatic rollback. This tiering balances sensitivity with operational overhead: small regressions are investigated during business hours, large regressions wake someone up, catastrophic regressions trigger automatic remediation without waiting for human intervention.
+
+## Alerting on Rate of Change
+
+Absolute latency and baseline deviation are not the only signals. The rate of change matters. A gradual 10% increase over three days is less urgent than a sudden 10% increase in ten minutes. The gradual increase suggests a slow resource leak, growing data volume, or traffic pattern shift. The sudden increase suggests a code regression, configuration change, or infrastructure failure.
+
+Rate-of-change alerting monitors the slope of latency over time. If median latency increases by more than 5 milliseconds per minute for five consecutive minutes, trigger an alert. This catches regressions as they happen, not after they stabilize. It is especially useful for detecting deploy-related regressions: if latency starts climbing immediately after a deploy, the system can alert and potentially auto-rollback before the full user base is affected.
+
+Some systems use derivative-based alerting: if the second derivative of latency is positive and exceeding a threshold, latency is accelerating. This signals a runaway process — a memory leak, an unbounded queue, a retry storm — that will degrade further if not addressed. Alerting on acceleration allows you to intervene earlier than waiting for absolute latency to cross a threshold.
+
+## Segmenting Latency by Request Type and User Cohort
+
+Aggregate latency metrics hide regressions that affect specific user segments or query types. A deploy might degrade latency for complex queries by 40% while improving latency for simple queries by 10%. Aggregate median latency might stay flat or even improve, masking the regression. Users asking complex questions experience severe degradation. Users asking simple questions experience minor improvement. Overall satisfaction declines, but aggregate metrics show no problem.
+
+Segment latency by query type, user geography, endpoint, or any dimension relevant to your system. Track median and P95 latency separately for customer support queries, sales queries, technical support queries. Track separately for users in North America, Europe, Asia-Pacific. Track separately for new users versus returning users. If latency regresses for one segment but not others, you can isolate the root cause faster and communicate impact more precisely.
+
+Segmented alerting prevents alert fatigue. If latency regresses only for European users because a regional deployment failed, you do not need to wake up the entire on-call team. You need to wake up the person responsible for EU infrastructure. If latency regresses only for queries that invoke a specific tool or API, you alert the team that owns that tool. Granular alerting directs attention to the right people and prevents diffusion of responsibility.
+
+## Regression Detection During Gradual Rollouts
+
+Gradual rollouts — deploying a new version to 5% of traffic, then 25%, then 100% — allow you to detect regressions before they affect the full user base. But gradual rollouts only help if you compare latency between the new version and the baseline version in real-time during the rollout.
+
+Split latency metrics by version. Track median and P95 latency for users on the new version separately from users on the baseline version. If the new version shows 15% higher median latency than the baseline after 10 minutes at 5% traffic, halt the rollout and investigate. Do not wait until the new version is serving 100% of traffic to discover the regression.
+
+Statistical significance matters. With only 5% of traffic on the new version, latency variance is high. A 15% increase might be noise. Use statistical tests — t-tests, Mann-Whitney U tests, bootstrapped confidence intervals — to determine whether the observed latency difference is statistically significant or within expected variance. If the difference is significant at p less than 0.05 after 30 minutes of data collection, treat it as a regression. If it is not significant, continue the rollout and re-evaluate at the next traffic percentage.
+
+Some teams automate rollout decisions based on latency metrics. If the new version's P95 latency exceeds the baseline version's P95 by more than 10% with statistical significance, the rollout halts automatically. If the new version's latency is within 5% of baseline or better, the rollout proceeds to the next stage automatically. This removes human judgment and delays from the rollout process, allowing the system to react faster to regressions.
+
+## Correlating Latency with Deploys and Configuration Changes
+
+Latency regressions often correlate with specific deploys, configuration changes, or infrastructure events. Manually correlating latency spikes with recent changes is tedious and error-prone. Automated correlation accelerates diagnosis.
+
+Tag every latency metric with metadata about the current system state: the deployed version hash, the active configuration version, the timestamp of the most recent deploy, the current instance count, the active model version. When latency regresses, the alerting system can automatically include the most recent change in the alert message: "Median latency increased by 18% starting 12 minutes after deploy abc123." This immediately focuses investigation on the deploy as the likely cause.
+
+Some systems maintain a changelog that tracks all deploys, configuration changes, scaling events, and infrastructure modifications with timestamps. When latency regresses, the system queries the changelog for events that occurred within 10 minutes of the regression onset and surfaces them in the alert. This eliminates the "what changed?" investigation step and directs engineers to the most likely root cause.
+
+## Automatic Rollback Based on Latency Thresholds
+
+The fastest way to recover from a latency regression is to roll back the change that caused it. If a deploy increases P95 latency by 30%, rolling back to the previous version restores latency immediately. Manual rollbacks take time — someone must acknowledge the alert, investigate, decide to roll back, execute the rollback, verify the rollback succeeded. Automatic rollbacks eliminate the human delay.
+
+Automatic rollback systems monitor latency during and after deploys. If latency exceeds a threshold within the first 10-30 minutes of a deploy, the system rolls back automatically without waiting for human intervention. This requires defining clear rollback criteria: P95 latency above 1000 milliseconds for more than 5 minutes, or median latency 25% above baseline for more than 10 minutes, or error rate above 2%.
+
+Automatic rollbacks require confidence in the rollback mechanism. If rollbacks are flaky or introduce their own regressions, automatic rollback is too dangerous. Test rollback procedures regularly — execute intentional rollbacks weekly or monthly to verify they complete within acceptable time and restore system health. Only enable automatic rollbacks after you have demonstrated that manual rollbacks are reliable.
+
+Some teams implement automatic traffic shifting instead of rollback. If the new version shows higher latency, the system gradually shifts traffic back to the old version without undeploying the new version. This is faster than a full rollback and allows the new version to remain deployed for debugging. Engineers can investigate the new version under low traffic while the majority of users are served by the baseline version.
+
+## Logging and Post-Incident Analysis
+
+When a latency regression is detected and resolved, log every detail: the magnitude of the regression, the duration, the affected user segments, the root cause, the remediation steps, and the time to detection and time to recovery. This log becomes the foundation for post-incident analysis and continuous improvement.
+
+Calculate mean time to detection — how long it took from the moment latency regressed to the moment the alert fired. If MTTD is high — 30 minutes or more — your alerting thresholds are too loose or your baseline is stale. Calculate mean time to recovery — how long it took from the alert to restored latency. If MTTR is high, your rollback process is too slow or your investigation tooling is inadequate.
+
+Track regression frequency over time. If latency regressions occur weekly, the development or deployment process is not catching performance issues before production. If latency regressions occur monthly but are detected within minutes, your detection and recovery systems are working. If regressions occur rarely but take hours to detect, your alerting is too coarse.
+
+Run blameless postmortems for significant regressions. Why did the regression occur? Why did testing not catch it? What monitoring or alerting improvement would have detected it faster? What process change would have prevented it? Each regression is an opportunity to harden your detection and prevention systems.
+
+Latency regression detection is not optional for voice systems. It is the immune system that catches performance degradation before it metastasizes into user churn. The next subchapter explores how latency budgets vary by use case: why customer support can tolerate 600 milliseconds, sales calls need 400 milliseconds, and medical consultations might accept 800 milliseconds if the answer quality is exceptional.

@@ -1,0 +1,83 @@
+# 3.9 — Speculative Execution: Starting TTS Before LLM Completes
+
+The LLM generates tokens sequentially. The first token arrives after 50 milliseconds. The tenth token arrives after 200 milliseconds. The fiftieth token arrives after a full second. TTS does not need all fifty tokens before it starts generating audio. If you feed the first ten tokens to TTS while the LLM continues generating the rest, the user hears audio output 800 milliseconds earlier. This technique is called speculative TTS execution, and when it works, it makes voice systems feel instantaneous. When it fails, the user hears the assistant start a sentence, pause mid-word, and restart with completely different phrasing.
+
+Speculative execution trades correctness risk for latency reduction. The risk is that the LLM changes direction after the first few tokens. The model starts generating "I would recommend scheduling a follow-up appointment..." then backtracks and generates "Actually, based on your symptoms, you should visit the emergency room immediately." If TTS already played "I would recommend scheduling a follow-up..." to the user, you cannot unsay it. The user heard advice that the system immediately contradicted. The experience is disorienting, confusing, and in high-stakes domains like medical advice, dangerous.
+
+This subchapter explains how speculative TTS works, the conditions under which it succeeds, the failure modes that destroy user trust, and the implementation patterns that allow you to gain latency benefits while controlling risk.
+
+## How Speculative TTS Execution Works
+
+The LLM begins generating tokens. After the first 3-5 tokens arrive — roughly 100-200 milliseconds into generation — the system sends those tokens to TTS. TTS starts generating audio for the partial sentence. While TTS processes the first tokens, the LLM continues generating additional tokens. By the time TTS completes audio for the first chunk, the LLM has generated 10-15 more tokens, which are queued for the next TTS pass. The user hears audio output almost immediately, and playback continues smoothly as long as the LLM does not change direction.
+
+The key assumption is that the first few tokens commit the LLM to a specific sentence structure and semantic direction. If the model generates "I can help you with that," it is unlikely to backtrack and generate "I cannot help you with that" after the first five tokens are already spoken. The sentence is committed. If the model generates "Based on your description, you should..." the clause structure is committed, and subsequent tokens are likely to complete the thought consistently.
+
+This assumption holds most of the time for well-calibrated prompts and tasks with unambiguous answers. If the user asks "What is the capital of France?" the LLM generates "The capital of France is Paris" without hesitation or revision. Speculative TTS works perfectly. But if the user asks a question with nuance, conflicting constraints, or where the model is uncertain, the LLM may generate a few tokens, implicitly evaluate them as incorrect or incomplete, and restart with a different framing. Speculative TTS breaks in exactly these cases — the cases where latency reduction is most desirable because the user's question is complex.
+
+## When Speculative Execution Works Well
+
+Speculative TTS excels in domains where LLM outputs are highly predictable and formulaic. Customer service chatbots that respond to common queries — "Your order status is..." "I can transfer you to..." "Let me look that up for you..." — use a small set of sentence templates. The first three tokens almost always commit the response direction. Speculating on the first chunk is safe.
+
+Informational queries with factual answers are low-risk candidates. "What time does the store close?" "How do I reset my password?" "What is the weather forecast?" These questions have clear, unambiguous answers. The LLM does not deliberate or revise. It generates the answer directly. Speculative TTS starts playback immediately, and the user hears the full response with minimal latency.
+
+Responses that begin with fixed preambles are safe to speculate on. If your prompt templates always start responses with "Sure, I can help with that," or "Let me check on that for you," you can safely start TTS on those tokens without waiting for the rest of the generation. The preamble buys time for the LLM to complete the substantive part of the response, and the user perceives zero latency because they hear the system responding instantly.
+
+Short responses are safer than long responses. A 10-token response that completes in 400 milliseconds is less likely to backtrack than a 200-token response that takes 8 seconds. The longer the generation, the more opportunities for the model to revise its approach mid-generation. Speculative TTS works best when the LLM commits quickly and finishes quickly.
+
+## When Speculative Execution Fails Catastrophically
+
+Speculative TTS fails when the LLM revises its output mid-generation. Revision happens more often than most teams expect. It happens when the model generates a sentence, realizes mid-generation that it lacks information to complete it, and restarts with a hedge or clarification. It happens when the model generates an answer, then generates a correction or caveat. It happens when the prompt asks the model to consider multiple perspectives and the model switches from one perspective to another mid-response.
+
+Consider a medical advice scenario. The user describes symptoms. The LLM starts generating "Based on your symptoms, you likely have a mild cold and should rest and hydrate." TTS begins playing "Based on your symptoms, you likely have a mild..." The LLM continues generating and realizes the symptoms also match a more serious condition. It generates "However, these symptoms could also indicate..." TTS is already playing audio that tells the user they have a mild cold. The user hears contradictory advice in sequence: first reassurance, then alarm. The trust damage is immediate and permanent.
+
+Another failure mode: the LLM generates an answer, then generates "Actually, I misspoke" or "Let me correct that." If TTS already played the incorrect answer, the user heard misinformation. Even if the system corrects itself immediately, the user now questions whether anything the system says is reliable. This pattern emerges when prompts include instructions like "think step by step" or "if you are unsure, say so." The model generates a tentative answer, evaluates it, and revises. Speculative TTS commits to the tentative answer before the model evaluates it.
+
+Speculative TTS also fails when the LLM uses token-level sampling with high temperature or diverse outputs. If the model samples the first token with 70% probability, there is a 30% chance the token is not the most likely continuation. The second token depends on the first. If the first token was low-probability, the rest of the sentence might be incoherent or off-topic. Starting TTS on low-probability tokens risks playing nonsense to the user.
+
+## Buffering Strategies to Reduce Speculation Risk
+
+The safest form of speculative TTS is to wait for a full sentence or clause before starting audio generation. The system buffers LLM tokens until it detects a sentence boundary — a period, question mark, or semicolon — then sends the complete sentence to TTS. This eliminates revision risk within a sentence. The LLM can still revise the next sentence, but the first sentence is played in full, and the user does not hear mid-sentence contradictions.
+
+Sentence boundary detection is not trivial. The LLM generates tokens, not punctuation-aligned text chunks. A period might arrive as a separate token or concatenated with the preceding word. Some models generate punctuation inconsistently or omit it entirely for short responses. You must implement a small parser that accumulates tokens and detects sentence boundaries in real-time, handling edge cases where punctuation is ambiguous or missing.
+
+Another approach is to buffer a fixed number of tokens before starting TTS. Instead of speculating on the first 3-5 tokens, wait for the first 10-15 tokens — enough to commit the sentence structure and semantic direction but still early enough to reduce perceived latency. A 15-token buffer at 20 tokens per second adds 750 milliseconds of latency, but it significantly reduces the risk of mid-sentence revisions compared to speculating on 3 tokens.
+
+Some teams implement a confidence threshold: the system monitors the LLM's token-level log probabilities and only starts TTS if the first N tokens have high probability. If the average log probability of the first 10 tokens is above a threshold — indicating the model is confident in its generation — TTS starts. If log probability is low, the system waits for more tokens or for a sentence boundary. This requires access to token probabilities, which many hosted LLM APIs do not expose. If you are using an open-source model or a provider that supports logprobs, this strategy reduces speculation risk without eliminating latency benefits.
+
+## Interrupting and Restarting TTS on Revisions
+
+If speculative TTS starts playing audio and the LLM revises its output, the system must detect the revision and handle it gracefully. The naive approach is to stop TTS playback, discard queued audio, and restart with the revised text. The user hears "Based on your symptoms, you likely have a—" silence, then "Based on your symptoms, you should consult a doctor immediately." The interruption is jarring, but it prevents the user from hearing contradictory information.
+
+Detecting revisions requires monitoring the token stream for semantic discontinuities. If the LLM generates "I can help you with that. Unfortunately, I cannot help you with that," the word "Unfortunately" signals a revision. Some models generate special tokens or control sequences to indicate backtracking — "backspace" tokens, reset markers, or explicit revision delimiters. If your model supports these, you can detect revisions reliably. If not, you must use heuristics: if the next sentence contradicts the previous sentence, assume a revision and stop playback.
+
+Restarting TTS mid-playback creates a perceptual disruption, but it is better than playing contradictory information. The user experience is that the system paused, thought more carefully, and corrected itself — a human behavior that is forgivable in conversation. The experience of hearing the system confidently state two contradictory things is not forgivable. It suggests the system is unreliable.
+
+Some systems avoid interruptions by buffering audio slightly. TTS generates audio chunks 500 milliseconds ahead of playback. If a revision is detected before playback reaches that chunk, the system discards the buffered audio and regenerates it with the revised text. The user never hears the original output. The cost is 500 milliseconds of additional latency, which partially negates the benefit of speculative execution, but it prevents perceptual discontinuities.
+
+## Prompt Engineering to Reduce LLM Revisions
+
+Speculative TTS works better when the LLM is less likely to revise. Prompt engineering can reduce revision frequency. Instruct the model to commit to an answer quickly rather than deliberating in the output. Instead of "Think step by step and explain your reasoning," use "Provide a direct answer, then briefly explain." The first version encourages the model to generate internal reasoning, which often includes revisions. The second version encourages the model to commit to the answer upfront.
+
+Avoid prompts that ask the model to hedge or self-correct. "If you are unsure, say so" or "Double-check your answer before responding" increase revision rates. The model generates a tentative answer, evaluates it, and revises. For speculative TTS, prefer prompts that encourage confident, direct responses even if accuracy decreases slightly. A confident wrong answer that is played smoothly is often a better user experience than a correct answer that is interrupted and restarted mid-sentence.
+
+Another strategy is to separate reasoning from output. Use a two-step generation process: the LLM generates internal reasoning tokens that are never sent to TTS, then generates the final answer tokens that are sent to TTS. This requires structured prompting and models that support section delimiters — "reasoning section" followed by "answer section." The reasoning section absorbs revisions and deliberation. The answer section is clean, committed, and safe for speculative TTS.
+
+## Measuring Speculation Success and Failure Rates
+
+To know whether speculative TTS is worth the risk, measure how often it works and how often it fails. Log every instance where TTS starts playback before the LLM completes generation. Log whether the LLM revised its output after TTS started. Calculate the revision rate: the fraction of speculative executions where the LLM generated tokens that contradicted or invalidated the tokens already sent to TTS.
+
+If revision rate is below 1%, speculative TTS is safe for most use cases. The user will encounter a revision-related interruption once per hundred queries, which is rare enough to be acceptable. If revision rate is above 5%, speculative TTS is risky. One in twenty queries results in contradictory or restarted audio, which is frequent enough to erode trust.
+
+Measure perceived latency with and without speculation. Run A/B tests where half of users experience speculative TTS and half experience buffered TTS that waits for sentence boundaries. Compare time-to-first-audio and user satisfaction scores. If speculative TTS reduces time-to-first-audio by 600 milliseconds and increases satisfaction by 8%, the latency benefit justifies the occasional revision. If satisfaction decreases or stays flat, the revisions outweigh the latency benefit.
+
+Track domain-specific failure modes. In customer support, revisions might be rare and low-stakes. In medical advice, revisions might be rare but catastrophic when they occur. Measure separately by use case or query type. High-stakes domains require higher confidence thresholds and longer buffers, accepting higher latency to eliminate revision risk. Low-stakes domains can speculate more aggressively.
+
+## When to Avoid Speculative Execution Entirely
+
+Some use cases should never use speculative TTS. Medical advice, financial recommendations, legal guidance, and safety-critical instructions require absolute consistency between what the system says and what the LLM intended. A revision that causes the user to hear incorrect medical advice, even for two seconds before correction, is unacceptable. In these domains, always buffer to sentence boundaries or wait for full LLM completion before starting TTS.
+
+High-temperature or creative generation tasks are poor candidates for speculation. If the LLM is generating creative content, brainstorming, or producing diverse outputs, revisions are common. The model might start one creative direction, abandon it, and try another. Speculative TTS would play the abandoned direction, confusing the user.
+
+If your LLM produces structured outputs — JSON, tables, lists — speculative TTS does not apply. These outputs are not meant to be spoken incrementally. The system must wait for the complete structure before rendering it to the user, whether as text, audio, or both.
+
+Speculative TTS is a powerful latency optimization for predictable, low-stakes, short-form voice interactions. It is dangerous for unpredictable, high-stakes, or long-form interactions. The next subchapter explores filler audio and conversational placeholders, techniques that buy time for the LLM to generate a complete response without making the user wait in silence.

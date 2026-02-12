@@ -1,0 +1,121 @@
+# 9.7 — Voice Activity Detection at the Infrastructure Layer
+
+Every voice pipeline must answer the same question thousands of times per second: is this audio frame speech, or is it silence? The answer determines whether the frame is sent to the ASR system for transcription, whether the conversation turn is still active, and whether the user has finished speaking. Voice activity detection, or VAD, is the gatekeeper. When it works correctly, it is invisible. When it fails, it produces two catastrophic failure modes: false positives that waste ASR costs by transcribing silence, wind noise, and keyboard clatter, and false negatives that clip the beginnings of sentences, making users repeat themselves and eroding trust in the system. In late 2025, a telehealth platform discovered that their VAD was clipping the first 200 milliseconds of every doctor utterance because the detection threshold was tuned for quiet home environments, not clinical settings with background monitoring equipment. Patients reported that doctors sounded abrupt and incomplete. The fix required retuning VAD for hospital acoustics, a task the team had never considered during development.
+
+## VAD Algorithms: Energy-Based, ML-Based, Hybrid
+
+The simplest VAD algorithm is energy-based. Compute the root mean square energy of each audio frame. If the energy exceeds a threshold, classify the frame as speech. If it falls below, classify it as silence. Energy-based VAD is fast — it requires no machine learning models, no feature extraction beyond basic amplitude calculation, and it runs in microseconds per frame. It is also fragile. Background noise raises the energy floor, causing false positives. Quiet speech falls below the threshold, causing false negatives. Sudden sounds like door slams or coughs are classified as speech. The threshold is fixed, so it cannot adapt to different acoustic environments.
+
+ML-based VAD uses a trained model to classify frames. The model is typically a small neural network — a few layers, trained on thousands of hours of labeled audio where human annotators marked speech and non-speech regions. The model extracts features from the audio — spectral characteristics, temporal patterns, harmonic structure — and outputs a probability that the frame contains speech. If the probability exceeds a threshold, the frame is classified as speech.
+
+ML-based VAD is more accurate than energy-based VAD in noisy environments. The model learns to distinguish speech from common non-speech sounds: keyboard typing, wind noise, car engines, HVAC hum. It handles quiet speech better because it does not rely solely on amplitude. It adapts to different speakers because it learns phonetic patterns, not just loudness.
+
+The cost of ML-based VAD is latency and compute. Inference on a small VAD model takes 5 to 20 milliseconds per frame on CPU, depending on the model size and the hardware. For real-time applications where every millisecond matters, this latency is significant. On devices with limited CPU — older smartphones, embedded systems — running VAD inference for every frame can saturate the processor and drain battery.
+
+Hybrid VAD combines both approaches. Use energy-based VAD as a fast pre-filter. If the energy is very low, classify the frame as silence without running the ML model. If the energy is very high, classify as speech without the model. Only for frames in the ambiguous middle range — where energy alone is unreliable — run the ML model. This reduces average compute cost while maintaining accuracy in noisy conditions.
+
+By 2026, most production voice systems use ML-based or hybrid VAD. The accuracy improvement justifies the compute cost, and modern VAD models are optimized to run efficiently on mobile and server CPUs. WebRTC includes a built-in VAD based on the Gaussian Mixture Model approach, which is older than modern neural VAD but still effective in many scenarios. Google's Silero VAD is a popular open-source neural VAD model with prebuilt ONNX exports that run efficiently across platforms.
+
+## Client-Side vs Server-Side VAD Tradeoffs
+
+VAD can run on the client — in the browser or mobile app — or on the server. Each choice has tradeoffs for latency, cost, and robustness.
+
+Client-side VAD reduces bandwidth and ASR cost. The client only transmits audio frames classified as speech. Silence is never sent over the network, never processed by the relay server, and never billed by the ASR provider. At Opus 24 kbps, silence consumes the same bandwidth as speech because the codec is always transmitting frames. By running VAD on the client and muting transmission during silence, you reduce effective bandwidth by 30% to 50% depending on how much silence exists in typical conversations.
+
+The cost of client-side VAD is CPU and battery drain on the client device. Running VAD inference on every frame consumes battery on mobile devices. For a 10-minute call at 50 frames per second, that is 30,000 VAD inferences. On a modern smartphone, the battery impact is small but measurable. On older devices or during long calls, it is noticeable.
+
+Client-side VAD also introduces the risk of false negatives that corrupt the user experience. If the client classifies the first 100 milliseconds of an utterance as silence, it does not transmit those frames, and the ASR system never sees them. The transcription starts mid-sentence. The user does not know this happened — they spoke a complete sentence — but the system only heard part of it. This manifests as the system frequently asking "Could you repeat that?" or misinterpreting commands because it missed the subject or verb.
+
+Server-side VAD avoids battery drain and ensures that all audio reaches the server, where it can be logged and analyzed. The server receives every frame, runs VAD, and decides which frames to forward to the ASR provider. False negatives are less catastrophic because the server still has the audio — it can buffer recent frames and retroactively send them if VAD initially misclassified the start of an utterance.
+
+The cost of server-side VAD is bandwidth and relay server CPU usage. The client transmits all audio, including silence, to the relay. The relay must run VAD inference on every frame for every concurrent session. At 10,000 concurrent sessions and 50 frames per second, that is 500,000 VAD inferences per second. The relay server must be provisioned to handle this compute load without introducing latency.
+
+Some systems run VAD in both places. The client runs a conservative VAD with a low threshold, filtering out only obvious silence. The server runs a more aggressive VAD with tighter thresholds, making the final decision about what to send to the ASR provider. This hybrid approach reduces bandwidth more than server-only VAD while reducing false negative risk compared to client-only VAD. The downside is increased complexity — two VAD implementations to maintain, tune, and debug.
+
+## False Positive VAD: Sending Silence as Speech
+
+False positive VAD classifies non-speech as speech. The system transcribes background noise, silence, breathing, keyboard clatter, and ambient environmental sounds. The ASR provider charges for these transcriptions. The user's transcription history fills with garbage: random phonemes, misrecognized noise, empty segments.
+
+The financial cost is real. If 20% of transmitted audio is false-positive non-speech and your ASR provider charges per minute of audio processed, you are paying 20% more than necessary. At 100,000 minutes per month and $0.006 per minute, that is $1,200 per month wasted on transcribing noise.
+
+The quality cost is worse. False positive VAD corrupts conversation state. If the system thinks the user is speaking when they are silent, it might interrupt TTS playback to listen, creating awkward pauses. If the VAD detects speech during a silent gap between sentences, the system might treat it as a new utterance, splitting a single thought into multiple incomplete fragments.
+
+False positive VAD also creates logging and analysis problems. If you store transcriptions for quality review or training data, 20% of your dataset is noise labeled as speech. Models trained on this data learn to recognize noise as valid utterances, compounding the problem.
+
+The root cause of false positive VAD is usually a threshold that is too low or a model that was not trained on the acoustic environment your users experience. If your VAD was trained on clean studio recordings and your users call from noisy cafés, cars, and open offices, the model misclassifies environmental noise as speech.
+
+The fix is to tune the VAD threshold based on your actual user environments. Collect audio samples from real sessions, label speech and non-speech regions manually, and evaluate VAD performance across different noise conditions. Increase the threshold until false positive rate drops to an acceptable level — typically under 5% of frames. The tradeoff is increased false negative rate, which you must balance.
+
+Some systems implement adaptive thresholding. Measure the background noise level during the first few seconds of the call when the user is likely silent. Set the VAD threshold relative to this noise floor, higher for noisy environments and lower for quiet ones. This adapts to the user's acoustic environment without requiring manual tuning for every scenario.
+
+Another mitigation is to use multiple VAD signals. Combine energy-based VAD, ML-based VAD, and zero-crossing rate analysis. Classify a frame as speech only if at least two of three signals agree. This reduces false positives at the cost of slightly increased false negatives and additional compute.
+
+## False Negative VAD: Clipping Speech Beginnings
+
+False negative VAD classifies speech as silence. The user speaks, but the VAD does not detect it, so the audio is not transmitted or not forwarded to the ASR system. The transcription is incomplete. The user repeats themselves. Trust in the system erodes.
+
+The most damaging false negatives occur at the beginning of utterances. If VAD takes 100 milliseconds to detect that speech has started, the first 100 milliseconds of the utterance are lost. In English, this often clips the first word or syllable: "tell me the weather" becomes "me the weather," which the ASR system might transcribe as "me to weather" because it is trying to make sense of an incomplete phrase.
+
+Users notice clipped beginnings immediately. They learn to pause before speaking or to add a filler word at the start of every utterance: "um, tell me the weather." This is a workaround, not a solution, and it makes the interaction feel unnatural.
+
+The root cause of false negative VAD is a threshold that is too high or a model that is too conservative. If the VAD requires high confidence before classifying a frame as speech, it waits too long, missing the onset. Quiet speakers, soft consonants, and gradual speech onsets are most affected.
+
+The fix is to tune the VAD threshold to reduce false negatives, accepting slightly increased false positives. The exact threshold depends on your application. For voice commands where missing the first word breaks the command, bias toward low thresholds. For conversation transcription where occasional noise is tolerable, bias toward higher thresholds.
+
+Another mitigation is to buffer recent frames and retroactively send them when VAD detects speech. If VAD classifies frames 1 through 5 as silence, then detects speech in frame 6, send frames 3 through 6 to the ASR system. The first two frames are likely pre-speech silence, but frames 3 through 5 might contain the onset of the utterance. This retroactive buffering adds complexity but significantly reduces clipped beginnings.
+
+Some systems use a pre-roll buffer. Always buffer the most recent 200 milliseconds of audio. When VAD detects speech, send the buffered frames plus the current frame. This ensures that the ASR system receives the full onset even if VAD was slightly late to trigger. The cost is 200 milliseconds of additional latency, which is acceptable in many applications but prohibitive in ultra-low-latency scenarios.
+
+WebRTC's built-in VAD has parameters for aggressiveness: 0 is least aggressive (fewer false negatives, more false positives), 3 is most aggressive (fewer false positives, more false negatives). For most voice applications, aggressiveness level 1 or 2 provides the best balance. Level 3 is too aggressive and clips speech. Level 0 transmits too much noise.
+
+## VAD Tuning for Different Acoustic Environments
+
+Users call from quiet rooms, noisy offices, moving cars, outdoor spaces with wind, and crowded public areas. The optimal VAD parameters differ across these environments. A threshold tuned for a quiet bedroom will false-trigger constantly in a café. A threshold tuned for a noisy street will clip quiet speech in a library.
+
+The ideal VAD adapts to the environment. During the first few seconds of the call, measure the background noise spectrum. Compute the noise floor — the energy level when the user is silent. Set the VAD threshold at 6 to 10 dB above the noise floor. In a quiet environment, this might be an absolute energy level of negative 40 dB. In a noisy car, it might be negative 25 dB.
+
+Adaptive VAD requires a calibration phase. When the call starts, prompt the user to stay silent for 2 seconds or automatically detect a silent period. During this time, measure noise characteristics. Some systems skip explicit calibration and use the first 5 to 10 seconds of the call as an implicit calibration period, assuming the user will not speak immediately.
+
+Calibration fails when the acoustic environment changes mid-call. The user starts in a quiet room, calibration sets a low threshold, then they walk outside into a noisy street. The noise floor rises, and the VAD starts false-triggering. The mitigation is continuous adaptation: periodically re-measure the noise floor during silent gaps in the conversation and adjust the threshold dynamically.
+
+Wind noise is a special challenge. Wind creates broadband noise that resembles speech spectrally. Energy-based VAD cannot distinguish wind from speech. ML-based VAD can learn to recognize wind if it was trained on wind noise examples, but many models were not. The result is constant false positives during outdoor calls.
+
+Some systems apply wind noise suppression before VAD. The audio pipeline includes a preprocessing step that filters out wind noise using spectral subtraction or a trained noise suppression model. This cleaned audio is then passed to VAD, reducing false positives. The cost is increased latency and CPU usage for the noise suppression step.
+
+In mid-2025, a voice-controlled home automation system received user complaints that it stopped responding in windy conditions. Investigation revealed that the VAD was false-triggering on wind noise every few seconds, causing the system to enter listening mode, hear no speech, timeout, and return to idle. The constant false triggers made the system unresponsive to actual voice commands. The fix was to add wind noise detection and suppress VAD triggering when wind was detected, using a separate ML model trained to classify wind noise.
+
+## VAD State Machines and Turn Detection
+
+VAD does not just classify individual frames. It manages conversation state: is the user currently speaking, have they finished speaking, is it the system's turn to respond? This requires a state machine built on top of frame-level VAD decisions.
+
+The simplest state machine has two states: silence and speech. When VAD detects speech, transition to speech state. When VAD detects silence, transition to silence state. This is too simplistic for real conversations, which include brief pauses within utterances. If you transition to silence after a single silent frame, you split every utterance at every pause, treating "tell me... the weather" as two separate utterances.
+
+The production-grade state machine includes hysteresis and timeout logic. When VAD detects speech, transition to speech state. Remain in speech state as long as at least one frame per second is classified as speech, allowing for brief pauses. Only transition back to silence after N consecutive silent frames — typically 500 milliseconds to 1 second of continuous silence. This smooths over pauses, filler words, and breaths within a single utterance.
+
+Determining when an utterance is complete requires additional logic. After transitioning to silence, wait T milliseconds before declaring the utterance finished. If speech resumes before T elapses, the utterance is still ongoing. If T elapses without speech, the utterance is complete, and the system can respond. The value of T determines responsiveness: short T makes the system feel snappy but risks interrupting users who pause to think. Long T makes the system feel patient but slow. Typical values are 700 milliseconds to 1.5 seconds.
+
+Some systems use adaptive timeout based on context. If the user asked a simple question like "what time is it," use a short timeout. If the user is describing a complex medical symptom, use a long timeout. This requires the system to understand the likely length of the user's response, which is possible with context-aware models but adds complexity.
+
+Turn detection also requires handling interruptions. If the system is speaking and VAD detects user speech, the system should stop talking and start listening. This is called barge-in. Implementing barge-in requires running VAD continuously, even while TTS is playing, and immediately canceling TTS playback when speech is detected. The challenge is distinguishing user speech from the system's own TTS output, which requires echo cancellation or careful microphone/speaker separation.
+
+## Monitoring VAD Performance in Production
+
+VAD failures are silent. The system continues operating, but users experience clipped speech, transcribed noise, and unresponsive turn-taking. The only way to detect VAD problems is to monitor metrics that correlate with VAD accuracy.
+
+Track the ratio of speech frames to total frames. If this ratio is above 70%, you are likely transmitting too much silence — VAD is too permissive. If it is below 20%, you might be clipping speech — VAD is too aggressive. Typical conversations have 40% to 60% speech content, with the rest being silence, pauses, and turn gaps.
+
+Track ASR transcription quality for empty or garbage transcriptions. If more than 5% of ASR results are empty strings or contain only filler phonemes, VAD is false-triggering and sending non-speech to ASR. Instrument your ASR pipeline to log when the provider returns an empty transcription or a very low confidence score, and correlate these with VAD decisions.
+
+Track user retries and repetitions. If users frequently repeat the same utterance within 5 seconds, it suggests the system did not hear them the first time, likely due to false negative VAD clipping the speech. This metric requires analyzing conversation patterns, but it directly measures user frustration.
+
+Track latency from end-of-utterance to system response. If VAD is misconfigured with a very long silence timeout, users wait unnecessarily long before the system responds. If the p95 latency for this metric exceeds your target by more than 500 milliseconds, investigate VAD timeout tuning.
+
+Collect audio samples from sessions where users report problems. Manually review the audio and the VAD decisions frame by frame. This qualitative analysis reveals edge cases the metrics miss: specific accents that VAD clips, specific background noises that trigger false positives, or environmental conditions your VAD was not trained for.
+
+Some teams log every VAD decision with a timestamp and audio features, then replay sessions in a debugging tool that visualizes VAD state over time alongside the audio waveform. This allows engineers to see exactly when VAD triggered, when it missed speech, and when it false-triggered on noise.
+
+---
+
+Voice activity detection is the first decision point in every voice interaction. It determines what the system hears, what it processes, and what it ignores. Teams that underinvest in VAD tuning pay for it in wasted ASR costs, degraded transcription quality, and frustrated users who feel the system does not listen.
+
+Next, we examine how voice systems degrade gracefully when network conditions deteriorate, maintaining usability even when bandwidth and latency constraints make full-quality interaction impossible.

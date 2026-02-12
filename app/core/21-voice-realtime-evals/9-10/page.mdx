@@ -1,0 +1,85 @@
+# 9.10 — Connection Recovery and State Synchronization
+
+When the WebSocket connection drops, you have two options: start over or continue where you left off. Starting over is simple. The user initiates a new session, and the conversation begins fresh. Continuing requires session persistence, state synchronization, and a recovery protocol. A customer service voice assistant that starts over after every connection drop wastes 15 to 30 seconds per recovery as the user re-explains context the system already captured. An assistant that recovers transparently maintains conversation flow and preserves user trust.
+
+The difference becomes critical in long conversations. A user troubleshooting a technical issue may spend 5 minutes providing diagnostic information before the system offers a solution. If the connection drops 4 minutes in and the session resets, the user must start over. After the second reset, the user abandons the system entirely. A legal intake assistant logged 340 abandoned sessions over three months. Every single abandonment followed a connection drop during multi-turn diagnostic conversations. The system worked. The recovery did not.
+
+## Detecting Disconnection
+
+Connection loss can be detected client-side, server-side, or both. Client-side detection happens when the WebSocket closes or when ping messages stop receiving responses. Server-side detection happens when client messages stop arriving or when the server's own ping messages time out. Both sides must detect disconnection independently because network failures can be asymmetric. The client may think the connection is alive while the server has already moved on.
+
+The client-side signal is the WebSocket onclose event or a ping timeout. Most production systems send ping messages every 10 to 30 seconds. If three consecutive pings fail, the connection is considered dead. The three-ping threshold prevents false positives from temporary packet loss. A single missed ping is noise. Three consecutive misses is a pattern. When the connection is declared dead client-side, the client must decide whether to reconnect automatically or prompt the user.
+
+The server-side signal is message silence. If the client normally sends audio frames every 20 milliseconds and messages stop arriving, the connection may be dead. The server cannot distinguish between connection failure and the user being silent, so it uses timeouts. If no message of any type arrives for 60 seconds, the connection is considered dead. The server closes the socket, logs the session state, and waits for a reconnection attempt.
+
+The asymmetry problem is that the client may lose connection while the server still believes the connection is active. The server continues processing audio it already received, generates a response, and attempts to stream it. The stream fails, but by the time the server detects failure, it has already consumed resources generating a response no one will hear. The mitigation is aggressive ping intervals. If the server sends a ping every 5 seconds and does not receive a pong within 10 seconds, assume the connection is dead even if the socket is not closed.
+
+The detection latency is the time between actual connection failure and recognized failure. If you ping every 30 seconds with a 90-second timeout, detection latency can be 120 seconds. The user experiences 2 minutes of broken interaction before the system recognizes the problem. Reducing ping interval to 5 seconds with a 15-second timeout brings detection latency down to 20 seconds. This is still long for real-time conversation but acceptable for most use cases. Reducing further increases network overhead without meaningful UX improvement.
+
+## Session Persistence Strategy
+
+Session persistence is the practice of saving session state so it can be restored after reconnection. The state includes conversation history, user context, intermediate processing results, and the current position in any multi-turn workflow. Without persistence, reconnection starts a new session. With persistence, reconnection resumes the previous session.
+
+The minimal state to persist is the session ID and the conversation history. The session ID uniquely identifies the session. The conversation history includes all user utterances and system responses so far. When the client reconnects, it sends the session ID. The server retrieves the conversation history and resumes from the last known state. This allows the conversation to continue but does not preserve any in-flight processing.
+
+The comprehensive state includes everything needed to resume mid-utterance. This includes partial audio buffers, VAD state, ASR intermediate results, and any pending LLM requests. If the connection drops while the user is speaking, the comprehensive state allows the server to continue processing from the exact audio frame where disconnection occurred. This requires serializing much more data and makes persistence more complex.
+
+The tradeoff is recovery granularity versus storage cost. Persisting only conversation history costs almost nothing. Conversation history is text, typically a few kilobytes per session. Persisting comprehensive state costs more because audio buffers are large. A 5-second audio buffer at 16 kHz mono PCM is 160 KB. Persisting that state for every session every second is expensive. The practical middle ground is to persist conversation history continuously and comprehensive state only when disconnection is detected.
+
+The storage mechanism is usually Redis or a similar fast key-value store. The session ID is the key. The value is a JSON object containing conversation history, user metadata, and workflow state. When the connection drops, the server writes the current state to Redis with a TTL of 5 minutes. If the client reconnects within 5 minutes, the session can be restored. After 5 minutes, the state expires and reconnection starts a new session.
+
+The TTL choice balances recovery probability against storage cost. A 5-minute window captures most real reconnection attempts. Users who lose signal in a tunnel or during a handoff usually reconnect within 30 seconds. Users who put their phone down or switched apps may return within a few minutes. Users who closed the app entirely are unlikely to return within 5 minutes. A 5-minute TTL captures the recoverable cases without storing abandoned session state indefinitely.
+
+## Reconnection Window and Timeout
+
+The reconnection window is the time period during which reconnection to an existing session is allowed. Too short, and legitimate reconnection attempts are rejected. Too long, and the server holds resources for sessions that will never return. The standard window is 2 to 5 minutes. After that, the session is considered abandoned and its state is cleared.
+
+The client-side behavior during the reconnection window is to retry connection with exponential backoff. The first retry happens immediately. The second retry happens after 1 second. The third retry happens after 2 seconds. The fourth after 4 seconds. The pattern continues until either the connection succeeds or the reconnection window expires. Exponential backoff prevents thundering herd problems when many clients lose connection simultaneously.
+
+The server-side behavior is to keep session state alive but release active resources. The WebSocket is closed. Audio processing stops. LLM requests are canceled. But the session state remains in Redis, marked as disconnected. If a reconnection request arrives with a valid session ID, the server loads the state, allocates new resources, and resumes processing. If no reconnection arrives within the TTL, the state expires and is deleted.
+
+The failure case is when the client attempts reconnection but the session state has already expired. The client sends a session ID. The server looks it up in Redis and finds nothing. The server responds with a session-not-found error. The client must decide whether to surface this to the user or silently start a new session. For short sessions, starting new is acceptable. For long diagnostic sessions, the user should be informed that the previous session was lost and they need to start over.
+
+The user experience nuance is distinguishing between brief interruptions and full disconnections. If the user loses signal for 5 seconds and reconnects, recovery should be silent and seamless. The conversation continues as if nothing happened. If the user loses signal for 5 minutes and reconnects, recovery should be acknowledged. A message like "your previous session was restored" confirms that the system remembered the context. This acknowledgment prevents confusion when the conversation continues from a point the user barely remembers.
+
+## State Synchronization After Reconnection
+
+State synchronization is the process of ensuring the client and server agree on the current state of the session after reconnection. The client knows what it sent before disconnection. The server knows what it received. These may not match if messages were in flight when the connection dropped. The synchronization protocol must identify and resolve discrepancies.
+
+The simplest protocol is server-authoritative synchronization. When the client reconnects, it requests the current state from the server. The server sends the conversation history as it understands it. The client replaces its local state with the server's state. This works when the server is the source of truth and the client is just a display layer. It fails when the client has state the server does not know about, such as user input that was never transmitted.
+
+The bidirectional protocol sends state from both sides. The client reconnects and sends a state snapshot: the last message it received from the server and the last message it sent to the server. The server compares this to its own state. If the server's last received message matches the client's last sent message, they are synchronized. If not, the client's last message was lost in flight and must be retransmitted. The server acknowledges receipt, and the session continues.
+
+The message sequence number approach assigns an incrementing integer to every message in both directions. Client messages are numbered 1, 2, 3, and so on. Server messages are also numbered 1, 2, 3, and so on. When the client reconnects, it reports the highest sequence number it received from the server and the highest sequence number it sent to the server. The server checks its records. If the server's highest sent number is greater than the client's highest received number, the server resends the missing messages. If the client's highest sent number is greater than the server's highest received number, the client resends the missing messages.
+
+The challenge with sequence numbers is that resending messages can duplicate effects. If the client sends "transfer fifty dollars" and the connection drops before the client receives confirmation, the client does not know whether the server processed the request. When it reconnects and resends, the server may process it twice. The mitigation is idempotency. Every message that causes side effects must include an idempotency key. The server tracks which keys it has already processed and ignores duplicates.
+
+The practical implementation for voice is audio frame synchronization. Each audio frame sent by the client includes a timestamp and a sequence number. The server acknowledges frames as it receives them. When the client reconnects, it resends any frames that were not acknowledged. The server deduplicates by sequence number and processes frames in order. This ensures no audio is lost during brief disconnections.
+
+## Transparent Versus Acknowledged Recovery
+
+Transparent recovery happens without user awareness. The connection drops, reconnects, and the conversation continues as if nothing happened. Acknowledged recovery informs the user that recovery occurred. Both approaches are valid. The choice depends on how long the disconnection lasted and whether the user is likely to notice.
+
+Transparent recovery is appropriate for interruptions under 3 seconds. The user pauses mid-sentence, the connection drops, reconnects, and the user continues speaking. From the user's perspective, they never stopped talking. The system buffers the audio, detects the reconnection, and processes everything in order. The response arrives as expected. The user may not even know the connection dropped.
+
+Acknowledged recovery is appropriate for interruptions longer than 10 seconds. The user loses signal, waits, and then reconnects. When the app resumes, a brief message confirms "your session was restored." This acknowledgment manages expectations. If the conversation continues from a point the user barely remembers, the acknowledgment explains why. Without it, the user may be confused about why the system is referencing something they said minutes ago.
+
+The middle ground between 3 and 10 seconds is judgment. If the user was actively speaking, attempt transparent recovery. If the user was silent, use acknowledged recovery. The heuristic is: if the user will notice the gap, acknowledge it. If they will not, stay silent.
+
+The failure case is attempting transparent recovery when the gap is too large. The user asked a question 2 minutes ago, lost signal, reconnected, and the system delivers the answer now. The user has forgotten the question. The answer arrives out of context. The user assumes the system is broken or confused. Acknowledged recovery would have set correct expectations: "your session was restored, here is the answer to your previous question."
+
+The implementation detail is that acknowledged recovery can include a summary of the restored state. Instead of just "your session was restored," the message can say "we were discussing your recent transaction." This jogs the user's memory and re-establishes context. For complex sessions, this summary is the difference between the user continuing effectively and the user giving up out of confusion.
+
+## Connection Recovery as Core Infrastructure
+
+Connection recovery is not a nice-to-have feature. It is core infrastructure for any voice system serving mobile users. Mobile networks drop connections constantly. If your system cannot recover gracefully, you are forcing users to start over multiple times per conversation. That is not an edge case. That is the median mobile experience.
+
+The teams that treat recovery as an afterthought build systems that technically work but feel unreliable in practice. The teams that design recovery from the beginning build systems that feel robust even when networks are terrible. The difference is not complexity. The difference is priority. Session persistence, state synchronization, and reconnection logic are not hard problems. They just require deliberate design.
+
+The metric that exposes recovery quality is session completion rate segmented by connection stability. Track what percentage of sessions complete successfully when the connection never drops. Then track completion rate when the connection drops once, twice, or three times. If completion rate falls below 80% after a single connection drop, your recovery is failing. If it stays above 90% even after three drops, your recovery works.
+
+Mobile voice AI requires connection recovery that is faster, more transparent, and more reliable than anything users experience in traditional phone systems. When a phone call drops, users accept that they must call back. When a voice assistant drops, users expect it to remember the conversation and continue. That expectation is higher, not lower, than traditional telephony. Meeting it is the baseline for production-grade voice systems.
+
+---
+
+*Next: 9.11 — Edge Deployment for Latency Reduction*

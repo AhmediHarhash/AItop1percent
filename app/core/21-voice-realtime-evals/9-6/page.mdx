@@ -1,0 +1,111 @@
+# 9.6 — The Relay Server Pattern: WebRTC to WebSocket Bridging
+
+Most browser-based voice applications use WebRTC for real-time audio streaming. Most ASR and TTS providers expose WebSocket APIs. These two protocols do not speak to each other natively. The relay server sits between them, accepting WebRTC streams from clients and forwarding audio to provider APIs over WebSocket connections. This pattern is ubiquitous in 2026, but teams building their first voice application consistently underestimate the complexity. The relay server is not a passthrough proxy — it is a stateful, latency-sensitive, connection-multiplexing infrastructure component that must handle codec negotiation, stream synchronization, failure recovery, and scaling to thousands of concurrent connections without introducing perceptible delay.
+
+## Why Relay Servers Exist: Provider APIs Do Not Speak WebRTC
+
+WebRTC is a browser standard designed for peer-to-peer media streaming. It handles NAT traversal, packet loss recovery, adaptive bitrate encoding, and secure transport. It is the right protocol for browser-to-browser communication. But most AI providers do not expose WebRTC endpoints. OpenAI's Realtime API uses WebSocket. Deepgram uses WebSocket. AssemblyAI uses WebSocket. The browser speaks WebRTC, the provider speaks WebSocket, and something must translate between them.
+
+The relay server is that translator. It establishes a WebRTC PeerConnection with the browser, receiving audio encoded in Opus or another WebRTC-compatible codec. It decodes that audio, re-encodes it if necessary to match the provider's requirements, and forwards it over a WebSocket connection. When the provider sends audio back — TTS output or intermediate transcription results — the relay receives it over WebSocket, encodes it for WebRTC, and sends it to the browser.
+
+This translation introduces latency. Audio travels from the user's microphone to the browser, over WebRTC to the relay server, gets decoded, possibly transcoded, then sent over WebSocket to the ASR provider. The response follows the reverse path. Each hop adds delay. Each encoding and decoding step adds delay. The relay server's geographic location relative to the client and the provider adds network latency. The sum of these delays determines whether your voice application feels responsive or sluggish.
+
+The alternative to a relay server is to implement WebRTC endpoints within the AI provider's infrastructure, allowing browsers to connect directly. Some providers do this — Anthropic's real-time API supports direct WebRTC connections. But most providers have not invested in WebRTC infrastructure because it is complex, requires handling peer-to-peer connection state, and complicates security and authentication. For the majority of providers, WebSocket is simpler to build and operate, which is why relay servers remain the dominant pattern.
+
+## Architecture: Client WebRTC, Relay Server, WebSocket to ASR and TTS
+
+The relay server runs in your infrastructure, typically in the same cloud region as your ASR and TTS providers to minimize network latency. The client establishes a WebRTC connection to the relay using ICE, STUN, and TURN if NAT traversal is required. Once connected, the client streams audio over RTP within the WebRTC DataChannel or MediaStreamTrack.
+
+The relay receives these RTP packets, decodes them from Opus or whatever codec was negotiated, and buffers them into frames suitable for the provider's API. Most ASR WebSocket APIs expect audio in fixed-size chunks — 20-millisecond frames, 100-millisecond frames, or streaming byte buffers without fixed boundaries. The relay must match the provider's expectations. If the provider expects 20-millisecond Opus frames and the browser sends 40-millisecond frames, the relay splits them. If the provider expects raw PCM and the browser sends Opus, the relay decodes.
+
+The relay also maintains the WebSocket connection to the ASR provider. This connection is bidirectional: the relay sends audio upstream, and the provider sends transcription results downstream. When the provider returns a partial or final transcription, the relay forwards it to the client, typically over the same WebRTC DataChannel used for signaling or over a separate WebSocket connection between the client and relay.
+
+For TTS, the flow reverses. The client sends text to the relay, the relay forwards it to the TTS provider over WebSocket, the provider streams synthesized audio back, and the relay encodes that audio for WebRTC and sends it to the client. If the TTS provider outputs PCM and the client expects Opus, the relay encodes. If the provider outputs Opus at 48 kHz and the client negotiated 16 kHz, the relay resamples.
+
+The relay server is stateful. It maintains per-session state for each connected client: the WebRTC PeerConnection, the WebSocket connection to the ASR provider, the WebSocket connection to the TTS provider, buffered audio frames, transcription context, and timing information. This state must be managed carefully to avoid memory leaks when clients disconnect unexpectedly or when network issues cause half-open connections.
+
+In 2025, an education platform built a relay server that did not clean up WebSocket connections when clients disconnected. The relay maintained thousands of dead WebSocket connections to the ASR provider, each consuming a file descriptor and a small amount of memory. After six hours of operation, the relay exhausted file descriptors and stopped accepting new connections. All new calls failed. The fix was to add proper connection lifecycle management: when the WebRTC connection closes, close the associated WebSocket connections immediately and free all session state.
+
+## Latency Added by Relay: Measurement and Optimization
+
+The relay introduces latency in several places. First, network latency from the client to the relay. If the client is in Sydney and the relay is in Virginia, that is 200 milliseconds of round-trip time. Second, queuing and processing latency within the relay. If the relay is overloaded or its CPU is saturated, frames sit in queues waiting to be processed. Third, codec processing latency. Decoding Opus and encoding PCM takes CPU time — typically 2 to 5 milliseconds per frame on modern processors. Fourth, network latency from the relay to the provider. If the provider's API endpoint is in a different region, add another round-trip time.
+
+Measure each component separately. Instrument the relay to log timestamps at each stage: when a frame arrives from the client, when decoding completes, when the frame is sent to the provider, when a response arrives from the provider, when encoding completes, when the frame is sent to the client. The difference between these timestamps reveals where latency is accumulating.
+
+In most well-architected systems, codec processing is negligible — under 5 milliseconds per frame. The dominant source of relay latency is geographic distance. If the relay is 50 milliseconds away from the client and 20 milliseconds away from the provider, that is 70 milliseconds of one-way latency. Round-trip latency is 140 milliseconds. For conversational applications, this is acceptable. For ultra-low-latency voice commands, it is borderline.
+
+The optimization is to place relay servers geographically close to users. If your users are concentrated in North America, Europe, and Asia, deploy relays in us-east-1, eu-west-1, and ap-southeast-1. Route users to the nearest relay based on GeoIP lookup or latency-based DNS resolution. The client connects to the nearby relay, which connects to the provider's nearest regional endpoint if available.
+
+Some teams deploy relays within the same data center as the ASR and TTS providers to minimize provider-side latency. If your ASR provider is in AWS us-east-1, run your relay in us-east-1. The network latency between the relay and the provider drops to under 1 millisecond. The remaining latency is client-to-relay, which is unavoidable unless you deploy relays globally.
+
+Another optimization is to pipeline operations within the relay. Do not wait for an entire frame to be decoded before starting to send it to the provider. As soon as a partial frame is decoded, forward it. This streaming approach reduces latency by overlapping decoding and network transmission. The downside is increased complexity — you must manage partial frames and ensure byte alignment for codecs that require it.
+
+Some relays add latency unintentionally by buffering too much audio. If the relay buffers 200 milliseconds of audio before forwarding it to the provider, it adds 200 milliseconds of latency. Buffering is sometimes necessary to smooth out jitter or to accumulate enough audio for voice activity detection, but excessive buffering is a common source of perceived lag. The correct buffer size depends on the provider's API requirements and the network's jitter characteristics. For most systems, 20 to 60 milliseconds is sufficient.
+
+## Relay Server Scaling for Thousands of Concurrent Connections
+
+Each active call consumes resources on the relay server: a WebRTC PeerConnection, one or more WebSocket connections, memory for buffering audio, and CPU for codec operations. At small scale — tens or hundreds of concurrent calls — a single relay instance handles the load easily. At large scale — thousands of concurrent calls — you need multiple relay instances, load balancing, and careful resource management.
+
+WebRTC connections are CPU-intensive because of encryption overhead. Each RTP packet is encrypted with DTLS-SRTP, which requires cryptographic operations for every frame. A single relay instance on a modern 8-core server can handle roughly 1,000 to 2,000 concurrent WebRTC connections before CPU saturation, depending on the codec and frame size. Beyond that, you need horizontal scaling.
+
+The challenge with horizontal scaling is session affinity. Once a client connects to a relay instance, that instance holds the WebRTC and WebSocket state for the session. If the client's next packet is routed to a different relay instance, the session breaks. You need a load balancer that maintains session affinity based on client IP or a session token. ALB in AWS supports this. NGINX supports this. Cloud-native load balancers like Envoy support this.
+
+The load balancer must also support WebRTC. Not all HTTP load balancers handle WebRTC correctly because WebRTC uses UDP for media transport in some configurations or uses long-lived WebSocket connections that the load balancer might timeout. Test your load balancer under realistic WebRTC workloads before deploying to production.
+
+Another scaling consideration is WebSocket connection limits to the provider. Most ASR providers limit the number of concurrent WebSocket connections per API key or per account. If your provider allows 5,000 concurrent connections and you have 10,000 active calls, you have a problem. The mitigation is to multiplex multiple client sessions over a single WebSocket connection to the provider, but not all provider APIs support this. Alternatively, partition your traffic across multiple API keys or accounts, but this complicates billing and monitoring.
+
+Memory usage scales with concurrency. Each session buffers audio frames, typically holding 100 milliseconds to 1 second of audio depending on jitter and processing latency. At 16 kHz PCM, 1 second of audio is 32 KB. At 1,000 concurrent sessions, that is 32 MB of audio buffer alone. Add session state, WebSocket buffers, and connection metadata, and each session consumes roughly 100 KB to 200 KB. At 10,000 sessions, that is 1 GB to 2 GB of memory. Plan for headroom — provision at least 4 GB per instance to handle spikes.
+
+File descriptor limits are another common bottleneck. Each WebSocket connection consumes a file descriptor. Each WebRTC connection might consume multiple file descriptors depending on the library. Linux defaults to 1,024 file descriptors per process, which is far too low. Increase the limit to 65,535 or higher using ulimit or systemd configuration. Monitor file descriptor usage in production and alert when it exceeds 80% of the limit.
+
+## Failover Between Relay Instances Mid-Call
+
+Relay instances fail. Servers crash, network connections drop, software bugs cause segmentation faults, and deployments restart processes. When a relay instance fails, all active sessions on that instance are disrupted. The client must reconnect to a different instance and re-establish WebRTC and WebSocket state.
+
+The best-case scenario is that the client reconnects within 2 to 3 seconds and the user experiences a brief pause. The worst-case scenario is that the client does not detect the failure for 30 seconds because of TCP timeout behavior, and the user thinks the call is still active while receiving no audio.
+
+The mitigation is fast failure detection and automatic reconnection. The client should monitor the WebRTC connection health by tracking ICE connection state and sending periodic keepalive pings. If the connection state transitions to failed or disconnected, or if a keepalive ping is not acknowledged within 2 seconds, the client immediately attempts to reconnect to a different relay instance.
+
+The challenge is preserving session context. When the client reconnects, the ASR provider's WebSocket connection held by the old relay is gone. Any partial transcription state is lost. The TTS provider's connection is gone, so any queued audio is lost. The new relay instance must re-establish these connections, but it does not know where the session left off. The user might hear repeated audio or miss audio that was in flight when the old relay failed.
+
+Some systems store session state externally — in Redis or a distributed cache — so that when a client reconnects to a new relay, the new relay can fetch the previous session's context and resume. This adds complexity and latency, but it provides continuity. Other systems accept the disruption and notify the user: "I lost connection for a moment, can you repeat that?"
+
+For critical applications where continuity is essential, some teams implement active-active relay clusters where multiple relay instances handle the same session simultaneously, with one designated as primary. If the primary fails, a secondary instance takes over instantly because it already holds the session state. This approach doubles infrastructure costs and increases operational complexity, but it eliminates disruption during failover.
+
+In mid-2025, a voice-based customer support platform experienced relay failures during a network partition in their us-east-1 region. Clients detected the failure quickly and reconnected to relays in us-west-2, but the ASR provider did not have a regional endpoint in us-west-2. The relays in us-west-2 connected to the ASR provider in us-east-1, adding 60 milliseconds of cross-region latency. Latency spiked from 120 milliseconds to 240 milliseconds for the duration of the outage. Users complained that the system felt slow. The long-term fix was to deploy ASR provider redundancy across multiple regions, but the immediate lesson was that failover must account for geographic topology.
+
+## Relay Server Libraries and Frameworks
+
+Building a relay server from scratch is complex. You must implement WebRTC signaling, codec negotiation, RTP packet handling, DTLS encryption, ICE and STUN, WebSocket multiplexing, and session lifecycle management. Most teams in 2026 use existing frameworks rather than building from scratch.
+
+LiveKit is a popular open-source framework that provides relay server infrastructure out of the box. It handles WebRTC connections, supports multiple codecs, integrates with ASR and TTS providers via plugins, and scales horizontally. LiveKit is production-ready and used by companies running thousands of concurrent sessions. The tradeoff is that you run LiveKit's infrastructure and depend on its architecture.
+
+Daily.co offers a managed relay service. You integrate with their API, they handle the relay infrastructure, and you pay per minute of usage. This is the fastest path to production for teams that do not want to operate relay servers. The tradeoff is cost and vendor dependency — you are billed for every minute of every call, and if Daily.co has an outage, your voice application is down.
+
+Janus is another open-source WebRTC gateway that can act as a relay. It is lower-level than LiveKit, giving you more control but requiring more implementation work. Janus is widely used in video conferencing and broadcasting applications and can be adapted for voice.
+
+Some teams build custom relays using libraries like Pion (Go) or aiortc (Python). These libraries handle the WebRTC protocol details, allowing you to focus on application logic. The advantage is full control over the relay's behavior, codec handling, and provider integration. The disadvantage is the responsibility of maintaining and operating the relay infrastructure.
+
+Choosing between these options depends on your team's expertise, your scale, and your willingness to operate infrastructure. If you are a startup building your first voice product, use a managed service like Daily.co or a framework like LiveKit. If you are a large company with complex requirements and an infrastructure team, consider building a custom relay using Pion or aiortc. If you are somewhere in between, start with a framework and migrate to custom infrastructure when you hit scaling or feature limitations.
+
+## Monitoring Relay Server Health
+
+Relay servers fail silently. A relay can continue accepting connections, forwarding audio, and returning responses while experiencing latency degradation, packet loss, or partial failures. The user perceives the degradation as poor call quality, but your uptime monitors show the relay as healthy.
+
+The metrics that matter for relay health are latency percentiles, connection success rate, and session duration distribution. Track the p50, p95, and p99 latency for each stage of the relay pipeline: client-to-relay network latency, decoding latency, relay-to-provider network latency, encoding latency, and relay-to-client network latency. If p99 latency exceeds your SLA, you have a problem even if p50 looks fine.
+
+Track connection success rate: what percentage of WebRTC connection attempts succeed? If this drops below 98%, investigate. Common causes include misconfigured TURN servers, firewall rules blocking UDP, or relay instances running out of file descriptors.
+
+Track session duration distribution. If the median session duration is 5 minutes but you suddenly see a spike in sessions lasting under 10 seconds, users are disconnecting early, likely due to quality issues or connection failures.
+
+Track WebSocket connection health to providers. If the provider's WebSocket connection drops and reconnects frequently, it introduces latency spikes and potential transcription gaps. Monitor reconnection rate and alert when it exceeds once per minute per session.
+
+Track resource utilization: CPU, memory, file descriptors, network bandwidth. If any resource approaches saturation, the relay degrades before it fails. Set alerts at 70% utilization to give yourself time to scale before users notice.
+
+Instrument the relay to emit structured logs with session IDs, timestamps, and latency measurements for every audio frame. When a user reports poor call quality, you can query logs for their session and reconstruct the exact latency and packet loss behavior they experienced. Without this instrumentation, debugging user-reported issues is guesswork.
+
+---
+
+The relay server is the invisible infrastructure that makes browser-based voice applications possible. It translates between protocols, manages connections, absorbs failures, and introduces latency that must be carefully minimized. Teams that treat the relay as a simple passthrough discover its complexity when they try to scale, when they integrate new providers, or when network conditions degrade.
+
+Next, we examine the first algorithmic gate in every voice pipeline: voice activity detection, which determines when someone is speaking and when they are silent.

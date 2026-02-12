@@ -1,0 +1,81 @@
+# 10.3 — Latency-Based Provider Routing
+
+The default provider is rarely the fastest provider. Voice providers experience variable latency based on load, geography, time of day, and transient infrastructure issues. A provider that delivers 400-millisecond ASR latency on Monday morning might deliver 1,100-millisecond latency on Friday afternoon when half the internet is streaming video. Latency-based routing solves this by measuring real-time performance and sending traffic to whichever provider is currently fastest, not whichever provider you hardcoded six months ago.
+
+In October 2025, a customer service platform routing all ASR traffic to Deepgram Nova-3 noticed that Friday afternoon latency consistently spiked to 1,800 milliseconds, while their secondary provider AssemblyAI Universal-2 remained steady at 620 milliseconds. The traffic pattern was predictable: Fridays from 2 PM to 6 PM Eastern, every week. Manual investigation revealed that Deepgram's infrastructure experienced load during this window, likely from other customers with similar traffic patterns. The fix was not to abandon Deepgram — their Monday-through-Thursday performance was excellent — but to route Friday afternoon traffic to AssemblyAI automatically based on observed latency. This required no vendor escalation, no SLA negotiation, and no infrastructure changes at the provider level. It required only intelligent routing.
+
+## Measuring Real-Time Latency Per Provider
+
+Latency-based routing depends on accurate, up-to-date latency measurements for each provider. Stale measurements produce bad routing decisions. If your latency data is five minutes old, you will route traffic to a provider that was fast five minutes ago but is slow now. The measurement system must be real-time or near-real-time, with data freshness measured in seconds, not minutes.
+
+The simplest measurement approach is to instrument every production request. When you send an ASR request to Deepgram, record the timestamp when the request leaves your system and the timestamp when the first response token arrives. The difference is the observed latency for that request. Aggregate these measurements across a sliding window — typically the last 60 to 120 seconds — and calculate percentiles. The p50 tells you typical latency. The p95 tells you tail latency. The p99 tells you worst-case latency for most users.
+
+Different use cases weight these percentiles differently. A voice assistant prioritizes p50 latency because most interactions should feel instant, and occasional slow responses are tolerable. A real-time transcription service for live events prioritizes p95 latency because every slow response disrupts the user experience and there is no opportunity to retry. A voice authentication system prioritizes p99 latency because even one slow authentication in a hundred creates user frustration and support load. Your routing logic must choose the percentile that matches your latency SLA.
+
+The aggregation window matters. A 30-second window is highly responsive to changes but noisy — a single slow request can spike the percentile. A 5-minute window is smooth but lags reality — by the time you detect a latency increase, it has been happening for minutes. A 90-second window is the common compromise. It filters transient spikes but detects sustained degradation within two minutes, which is fast enough to prevent significant user impact.
+
+## Weighted Routing Based on Recent Latency Percentiles
+
+Once you have real-time latency measurements, the routing decision becomes a weight calculation. If Provider A's p95 latency is 450ms and Provider B's p95 latency is 900ms, you route more traffic to Provider A. The question is how much more.
+
+The naive approach is binary: route 100% of traffic to the fastest provider, zero to the slower provider. This works when the latency gap is large and stable, but it fails when the gap is small or fluctuating. If Provider A is 450ms and Provider B is 480ms, there is no meaningful difference — the 30ms gap is within measurement noise and user perception thresholds. Routing 100% to Provider A wastes the capacity you are paying for at Provider B. More importantly, it prevents you from continuing to measure Provider B's latency, so you will not know when B becomes faster than A.
+
+The correct approach is weighted proportional routing based on latency inversion. If Provider A is twice as fast as Provider B, route twice as much traffic to A. If A is three times as fast, route three times as much to A. The formula is simple: the weight for each provider is the inverse of its latency. If A is 400ms and B is 800ms, A gets a weight of 1 divided by 400, B gets a weight of 1 divided by 800. Normalize these weights so they sum to 100%. Provider A receives 67% of traffic, Provider B receives 33%. This keeps both providers active, allows continuous latency measurement, and sends more traffic to the faster provider without entirely starving the slower one.
+
+This approach automatically adapts to changing conditions. When Provider B's latency improves from 800ms to 500ms, its weight increases and it starts receiving more traffic. When Provider A's latency degrades from 400ms to 1,200ms, its weight decreases and traffic shifts to B. The system is self-correcting without manual intervention. The routing shift happens gradually over the measurement window, not instantly, which prevents traffic oscillation.
+
+## Geographic Latency Variation and Regional Routing
+
+Provider latency varies by geography. A provider with fast performance in the US may have slow performance in Europe because their infrastructure is US-centric. A provider with excellent Asia-Pacific latency may struggle in South America. Latency-based routing must be region-aware, or you will make globally wrong decisions based on locally accurate data.
+
+A multilingual voice platform serves users in fifteen countries across six continents. They measure ASR latency separately for each provider in each region where they have users. In North America, Deepgram's p95 is 410ms and AssemblyAI's is 680ms — Deepgram is clearly faster. In Europe, Deepgram's p95 is 920ms and AssemblyAI's is 540ms — the ranking reverses. In Asia-Pacific, both providers are slow, around 1,100ms and 1,300ms respectively, because neither has strong infrastructure presence there. Azure Speech, despite being slower globally, delivers 650ms p95 in APAC because of Microsoft's regional data centers.
+
+The routing decision must be per-region. North American traffic goes primarily to Deepgram. European traffic goes primarily to AssemblyAI. Asia-Pacific traffic goes to Azure Speech. This requires maintaining separate latency measurements and routing weights for each region, which increases operational complexity but produces better user experience. The alternative — routing all global traffic to whichever provider is fastest in your primary region — degrades experience for users outside that region.
+
+Region-specific routing also handles provider outages more gracefully. If Deepgram's US-East region goes down, North American traffic shifts to AssemblyAI automatically because Deepgram's latency spikes to timeout values and its weight drops to near-zero. European traffic is unaffected because it was already routing to AssemblyAI. The outage is isolated to the affected region rather than triggering a global failover.
+
+## The Measurement Overhead Problem and Sampling Strategies
+
+Instrumenting every production request to measure latency is simple but expensive at scale. If you process ten million ASR requests per day, you are recording, aggregating, and storing ten million latency measurements. The storage cost is minor, but the aggregation cost is not. Calculating p95 latency across millions of data points in real-time requires either a streaming percentile algorithm or a time-series database with percentile query support. Both add infrastructure complexity and cost.
+
+Sampling reduces this cost. Instead of measuring every request, measure a representative subset. A 10% sample of ten million requests is one million measurements, which is still statistically robust for percentile calculations. A 1% sample is one hundred thousand measurements, which is marginal but often sufficient if your traffic is uniform. The trade-off is between measurement precision and infrastructure cost.
+
+The sampling strategy must avoid bias. If you sample the first request of every ten, and every tenth request happens to hit a particular backend node that is slow, your sample is biased and your latency measurements are wrong. Random sampling is safer but harder to implement efficiently. Reservoir sampling is the standard algorithm — it guarantees a uniform random sample without requiring you to know the total request count in advance.
+
+An alternative to sampling is to measure only synthetic probe requests and a small percentage of production requests. Synthetic probes give you continuous baseline measurements. The production sample gives you real-world validation that the synthetic probes are representative. If synthetic probe latency is 450ms but the p95 of sampled production requests is 1,100ms, your synthetic probes are not exercising the real workload. This might be because production requests include longer audio, noisier audio, or non-English languages that the synthetic probes do not cover. The divergence is the signal to improve your synthetic probes.
+
+## Latency Routing With Quality Constraints
+
+Routing purely on latency can degrade quality if the fastest provider is also the least accurate. A provider that returns ASR transcriptions in 200ms with 70% accuracy is not better than a provider that returns them in 600ms with 95% accuracy. Latency-based routing must include minimum quality thresholds, or it will optimize the wrong metric.
+
+The constraint is expressed as a filter: only providers meeting minimum quality standards are eligible for latency-based routing. If your quality standard is 90% transcription accuracy, and Provider A delivers 94% at 400ms while Provider B delivers 86% at 250ms, Provider B is disqualified despite being faster. All traffic routes to Provider A. Provider B remains in the pool for monitoring purposes but receives no production traffic until its quality improves.
+
+This filtering happens in the health monitoring layer. A provider that fails quality checks transitions to degraded or unhealthy state, which removes it from the routing pool entirely. Latency-based routing operates only on providers in the healthy state. This separates concerns: health monitoring ensures quality, latency routing optimizes speed among quality-sufficient options.
+
+The edge case is when no provider meets quality thresholds. If all providers degrade simultaneously — possible during a widespread infrastructure incident or after synchronized model updates — the routing system must decide whether to prioritize quality or availability. The decision is use-case-specific. A medical transcription system prioritizes quality and rejects requests if no provider meets accuracy standards. A customer service system prioritizes availability and routes to the best available provider even if quality is below normal. This decision must be configured explicitly, not left to default behavior. The failure mode is not the technical choice but the undocumented assumption.
+
+## Latency Routing for Multi-Component Pipelines
+
+Voice systems use multiple providers in sequence: ASR, then LLM, then TTS. Latency-based routing must consider the full pipeline latency, not just individual component latency. The fastest ASR provider paired with the slowest LLM provider produces a slower end-to-end experience than a balanced combination.
+
+A voice assistant pipeline uses Deepgram for ASR at 400ms, GPT-5-mini for LLM inference at 600ms, and ElevenLabs for TTS at 300ms. Total pipeline latency is approximately 1,300ms. If the team routes ASR to AssemblyAI to save 100ms, but AssemblyAI's output format requires an extra 150ms of normalization before the LLM can process it, the end-to-end latency increases despite the ASR component being faster. Latency routing must measure and optimize the full chain, not individual links.
+
+This requires end-to-end latency tracking tagged by provider combination. Each request is labeled with which ASR provider, which LLM provider, and which TTS provider it used. The orchestration system calculates p95 latency for each combination. If Deepgram plus GPT-5-mini plus ElevenLabs delivers 1,300ms while AssemblyAI plus Claude Haiku 4.5 plus Cartesia delivers 1,100ms, the latter combination receives more traffic. The routing decision is multi-dimensional: not just "which ASR provider?" but "which combination of providers produces the fastest end-to-end result?"
+
+This complexity scales poorly. Three ASR providers times three LLM providers times three TTS providers is 27 possible combinations. Measuring and comparing all combinations requires splitting traffic 27 ways, which means each combination receives limited traffic and the latency measurements are noisy. The practical limit is to fix one or two components and vary the third. Route all traffic through the same LLM and TTS, but vary the ASR provider based on latency. Once ASR routing stabilizes, vary the LLM provider. This sequential optimization is slower than joint optimization but operationally feasible.
+
+## The Cost of Latency Routing and When to Skip It
+
+Latency-based routing adds engineering complexity, operational overhead, and mental load. The measurement infrastructure, the aggregation logic, the weight calculation, the regional awareness — all of this must be built, tested, and maintained. The question is whether the latency improvement justifies the effort.
+
+If your voice system's latency SLA is "under five seconds" and all your providers deliver between 1.2 and 1.8 seconds, latency routing saves you nothing. All providers meet the SLA with margin. Routing to the fastest provider improves user experience slightly, but the improvement is not worth the engineering cost. Save the complexity budget for quality monitoring or cost optimization.
+
+If your latency SLA is "under one second" and your providers vary between 650ms and 1,400ms, latency routing is critical. The slow provider violates the SLA. The fast provider meets it with margin. Routing intelligently is the difference between a compliant system and a non-compliant one. The engineering cost is justified.
+
+The decision point is whether provider latency variance is larger than your SLA tolerance. If variance is small relative to tolerance, skip latency routing and route based on cost or quality. If variance is large, latency routing is non-negotiable.
+
+Latency-based routing transforms multi-provider architectures from static failover systems to dynamic optimization systems. You are no longer locked into a single provider's performance characteristics. You can combine the strengths of multiple providers — using the fastest in North America, the fastest in Europe, the fastest during peak hours — and deliver better user experience than any single provider could offer. The complexity is real, but the performance gain is measurable, and for latency-sensitive voice systems, it is often the difference between acceptable and excellent.
+
+---
+
+Next: **10.4 — Quality-Based Provider Routing** — ensuring fast is also correct.

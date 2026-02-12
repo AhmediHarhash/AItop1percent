@@ -1,0 +1,93 @@
+# 3.3 — Component-Level Latency Measurement
+
+You cannot optimize what you cannot measure. This principle, obvious in software performance engineering, becomes critical in voice AI where every component's latency compounds into end-to-end user experience. Most teams believe they understand their component latencies. They check their ASR provider's dashboard and see 95 milliseconds. They run a benchmark of their LLM and observe 210 milliseconds. They test their TTS in isolation and measure 85 milliseconds. Then they deploy to production and discover that time-to-first-audio hits 720 milliseconds — more than double what they expected. The gap comes from latencies they never measured: network transmission, serialization, queueing, buffering, orchestration overhead, and the invisible delays between components.
+
+## The Instrumentation Gap
+
+Most voice AI systems have component-level monitoring but lack end-to-end tracing. They know how long the LLM took to generate tokens. They do not know how long the LLM request spent waiting in a queue before processing began. They know when the TTS synthesis completed. They do not know when the synthesized audio actually reached the client and began playing. The gaps between these events often exceed the events themselves.
+
+Proper component latency measurement requires instrumenting every boundary. When audio arrives from the user, log the timestamp and a unique trace ID. When the ASR stream closes and processing begins, log another timestamp. When the ASR emits a transcript, log a third timestamp. When the transcript reaches your orchestration layer, log a fourth. When the LLM receives the prompt, log a fifth. When the LLM generates the first token, log a sixth. When TTS receives text, log a seventh. When TTS produces the first audio chunk, log an eighth. When audio reaches the client, log a ninth. When playback begins, log a tenth. Each logged event represents a component boundary. The difference between consecutive timestamps reveals where latency accumulates.
+
+Without this level of instrumentation, you are guessing. You might believe your ASR is fast when in reality your audio buffering strategy delays processing by 120 milliseconds. You might believe your LLM is slow when in reality the LLM is fast but the network hop to your LLM provider adds 90 milliseconds each way. You might believe your TTS is the bottleneck when in reality your TTS is fine but your client-side audio initialization takes 140 milliseconds. Measurement eliminates guessing.
+
+## ASR Latency: What to Measure and Why
+
+ASR latency has three components: **audio transmission time**, **processing time**, and **finalization delay**. Audio transmission time is the duration from when the user begins speaking to when the audio stream fully arrives at the ASR provider. Processing time is the duration the ASR system spends transcribing the audio. Finalization delay is the duration the ASR system waits after detecting silence before emitting the final transcript.
+
+Most ASR providers report only processing time. They log the timestamp when transcription begins and when it completes. They do not log how long audio spent in transit or how long they waited for end-of-speech confirmation. A provider that reports 90ms ASR latency may actually contribute 240ms to your TTFA: 50ms for audio transmission, 90ms for processing, and 100ms for finalization delay. If you only measure processing time, you miss 150 milliseconds of latency.
+
+Measure transmission time by logging when your client begins sending audio and when the ASR provider acknowledges receipt of the full stream. Measure processing time using the provider's reported metrics, but validate them with your own instrumentation — log when you send the finalized audio stream and when you receive the transcript. Measure finalization delay by comparing the timestamp of the last audio frame sent to the timestamp when the transcript arrives. The gap between these reveals how long the ASR waited after the audio stopped.
+
+Finalization delay is often configurable. ASR systems wait for a silence threshold — typically 300 to 800 milliseconds — before finalizing a transcript. A longer threshold reduces false finalization (cutting the user off mid-sentence) but increases latency. A shorter threshold reduces latency but increases premature finalization. You must measure finalization delay in production to understand its impact, then adjust the threshold to balance latency and accuracy. If your finalization delay is 600ms and your users rarely pause mid-sentence, dropping it to 350ms cuts 250ms from TTFA with minimal accuracy cost.
+
+## LLM Latency: Time to First Token vs Total Generation Time
+
+LLM latency splits into two metrics: **time-to-first-token** and **total generation time**. Time-to-first-token measures how long the LLM takes to produce the first word of the response after receiving the prompt. Total generation time measures how long the LLM takes to produce the entire response. For TTFA, time-to-first-token is what matters. For conversational flow and audio continuity, total generation time matters.
+
+Time-to-first-token depends on prompt length, model size, infrastructure load, and whether the model uses speculative decoding or other inference optimizations. A 200-word prompt to GPT-5-mini might produce first token in 120 milliseconds under light load and 280 milliseconds under heavy load. The same prompt to GPT-5 might take 180ms under light load and 450ms under heavy load. Model choice and load conditions both affect TTFT significantly.
+
+Measure TTFT by logging the timestamp when the LLM request is sent and the timestamp when the first token arrives. Do not rely on provider dashboards alone — they often report time from when the request enters their queue to when the first token is generated, excluding network transmission time. Your measurement should include network round trips because that is what your users experience. If your LLM provider is in US-West and your orchestration layer is in US-East, you pay 40 to 60 milliseconds each way in network latency. That 100ms counts toward TTFA even though the LLM provider's logs will not show it.
+
+Total generation time matters for streaming synthesis. If your TTS consumes tokens as the LLM generates them, slow LLM generation can cause TTS to run out of text mid-synthesis, creating audio gaps or forcing the TTS to wait. Measure total generation time separately from TTFT. Track the timestamp of the last token generated. Calculate tokens-per-second. A slow generation rate — below 20 tokens per second — indicates a bottleneck that will affect audio continuity even if TTFT is acceptable.
+
+## TTS Latency: Synthesis vs Transmission vs Playback
+
+TTS latency has three phases: **synthesis time**, **transmission time**, and **playback initialization**. Synthesis time is the duration the TTS system takes to convert text into audio. Transmission time is the duration to send the audio from the TTS provider to the client. Playback initialization is the duration the client takes to buffer audio and begin playback.
+
+Synthesis time varies with text length, voice complexity, and provider infrastructure. A simple sentence synthesized with a standard voice might take 60 milliseconds. A paragraph synthesized with an expressive, multilingual voice might take 200 milliseconds. Providers that support streaming synthesis can produce the first audio chunk in 40 to 80 milliseconds while continuing to synthesize the rest, reducing TTFA significantly compared to providers that synthesize the full response before sending any audio.
+
+Measure synthesis time by logging when the TTS request is sent and when the first audio chunk arrives. Distinguish between time-to-first-audio-chunk and time-to-full-synthesis. For TTFA, only the first chunk matters. For audio continuity, full synthesis time matters. A provider that delivers the first chunk in 70ms but takes 3 seconds to synthesize a full paragraph will cause gaps if your LLM generates text faster than the TTS can keep up.
+
+Transmission time depends on audio format, network bandwidth, and geographic proximity. Uncompressed audio at 16kHz sample rate transmits faster than high-fidelity 48kHz audio. A client on fiber in the same region as the TTS provider experiences near-zero transmission latency. A client on 3G in a distant region may wait 150 to 300 milliseconds for audio to arrive. Measure transmission time by logging when the TTS provider sends audio and when the client receives it. Segment this metric by region and network type to identify where transmission latency dominates.
+
+Playback initialization is often the most overlooked component. Many client applications buffer 50 to 150 milliseconds of audio before beginning playback to ensure smooth delivery. This buffering adds directly to TTFA. Some clients re-initialize their audio subsystem on every turn, adding another 60 to 100 milliseconds. Measure playback initialization by logging when the first audio byte is received and when playback actually begins. If this gap exceeds 100ms, optimize your client implementation — reduce buffering, reuse audio contexts, pre-initialize audio subsystems.
+
+## Network Latency: The Hidden Tax
+
+Network latency is invisible in component dashboards but dominant in production. Every network hop between components adds round-trip latency. If your ASR runs in one cloud region, your LLM in another, and your TTS in a third, you pay three round trips: client to ASR, ASR to orchestration to LLM, LLM to orchestration to TTS. Each round trip costs 20 to 100 milliseconds depending on distance and provider.
+
+Measure network latency by instrumenting your orchestration layer. Log when you send a request to a component and when you receive the response. Subtract the component's reported processing time. The remainder is network latency plus any queueing or serialization delay. If your LLM reports 180ms processing time but your orchestration layer measures 260ms from request to response, the 80ms gap is network plus overhead.
+
+Network latency scales with geographic distance. A request from California to an ASR provider in Virginia incurs 60 to 80 milliseconds of round-trip latency. A request from Singapore to a TTS provider in Frankfurt incurs 200 to 300 milliseconds. Co-locating all components in one region eliminates these gaps. Deploying regionally and routing users to their nearest region reduces latency for global deployments. Measure latency by user geography to understand where network costs dominate.
+
+## Orchestration Overhead: The Cost of Glue Code
+
+Orchestration overhead includes all the latency your platform adds: serialization, deserialization, database writes, logging, validation, retry logic, and inter-service communication. A well-optimized orchestration layer adds 30 to 60 milliseconds. A poorly optimized one adds 150 to 300 milliseconds.
+
+Common sources of orchestration overhead: writing every turn to a database before proceeding, waiting for analytics events to flush, validating schemas on every message, retrying failed requests with exponential backoff that blocks the critical path, running synchronous logging instead of async logging. Each of these adds 10 to 50 milliseconds. Stacked together, they can exceed the latency of your ASR and TTS combined.
+
+Measure orchestration overhead by instrumenting your own code. Log timestamps at every step: when a request enters your system, when validation completes, when you send the request to the next component, when you receive the response, when you process the response, when you forward it to the next step. Calculate the time spent in your code versus the time spent waiting for external components. If your code accounts for more than 100 milliseconds of end-to-end latency, you have an optimization problem.
+
+Optimize orchestration by making everything async. Do not wait for database writes — fire them in parallel with the next component request. Do not wait for analytics — buffer events and flush them in the background. Do not validate schemas synchronously — validate once at ingress and trust internal messages. Do not retry on the critical path — if a component fails, fail fast and let the user retry rather than blocking for 300ms of retry logic. Every millisecond you spend in orchestration is a millisecond stolen from your latency budget.
+
+## Queueing Latency: The Load Problem
+
+Queueing latency is the time a request spends waiting for a component to become available. Under light load, queueing latency is near zero. Under heavy load, it dominates. A TTS provider that processes requests in 80ms may have requests waiting 400ms in a queue during peak traffic. Your instrumentation shows 480ms TTS latency, but the provider's dashboard shows 80ms processing time. The gap is queueing.
+
+Measure queueing latency by comparing request submission time to processing start time. If your LLM provider supports it, request queue depth metrics. If queue depth exceeds 10 requests, latency will degrade. If it exceeds 50, latency will spike dramatically. Track queueing latency over time and correlate it with traffic patterns. If queueing latency spikes between 9am and 11am Pacific, your infrastructure cannot handle peak load.
+
+Mitigate queueing latency through capacity planning and load balancing. Add more LLM endpoints. Use multiple TTS providers and route requests to the least-loaded one. Implement request prioritization — high-priority users skip the queue. Implement load shedding — reject requests when queue depth exceeds a threshold rather than letting latency degrade for everyone. Queueing latency is a scaling problem, not a component problem. Solve it with infrastructure, not optimization.
+
+## Percentile-Level Measurement
+
+Median latency hides problems. A system with 350ms P50 latency and 1.2-second P99 latency has a tail-latency problem that median metrics will never reveal. You must measure and track latency at every percentile: P50, P75, P90, P95, P99. Different user experiences live at different percentiles.
+
+P50 represents the typical experience. If your P50 TTFA is 420ms, half your users wait less than that. P95 represents the experience of your most patient users — the ones who tolerate occasional slowness. If your P95 is 780ms, 95% of interactions finish within that threshold, but 5% exceed it. P99 represents your worst-case experience — the interactions where everything goes wrong. If your P99 is 1.4 seconds, one in a hundred turns feels broken.
+
+Track each component's latency at each percentile. If your ASR P50 is 100ms but your P99 is 450ms, you have a variance problem. If your LLM P50 is 180ms and your P99 is 220ms, your LLM is consistent. If your TTS P50 is 70ms but your P99 is 600ms, your TTS provider has load-related issues. Percentile measurement reveals which components are stable and which are erratic.
+
+Set SLAs based on percentiles, not medians. A P95 TTFA target of 650ms is meaningful. A median TTFA target of 400ms is meaningless if your P95 is 900ms. Users do not experience medians — they experience the percentile their request falls into. Optimize for the percentile that defines acceptable user experience, not the percentile that makes your dashboard look good.
+
+## Continuous Measurement and Alerting
+
+Latency measurement is not a one-time effort. It is continuous. Instrument once, measure forever. Aggregate latency metrics every minute. Track hourly, daily, and weekly trends. Alert when latency exceeds thresholds. If your P95 TTFA exceeds 800ms for more than five consecutive minutes, page the on-call engineer. Latency degradation is a production incident, not a performance annoyance.
+
+Build dashboards that show component-level and end-to-end latency side by side. Correlate latency with traffic volume, time of day, geography, and feature flags. When latency spikes, you need to know which component caused it, which users were affected, and whether it correlates with a deployment or traffic surge. Without this context, debugging latency issues is guesswork.
+
+Run latency canaries — synthetic requests sent through your production pipeline every 30 seconds. Measure their end-to-end latency. Alert if canary latency degrades. Canaries detect latency problems before users report them. They also detect silent degradation — the slow creep from 480ms to 620ms over six weeks that no single user notices but that destroys engagement at scale.
+
+Measurement is the foundation of optimization. Every latency improvement starts with identifying the bottleneck. Every bottleneck is invisible until you measure it. Instrument your pipeline. Track every component. Measure at every percentile. Alert on degradation. Make latency a first-class metric, as important as accuracy or uptime. Only then can you optimize what matters.
+
+---
+
+Next, we examine the psycholinguistic research that defines human conversational expectations, the 300ms threshold where users start noticing delays, and the 800ms breaking point where conversations feel irreparably slow.

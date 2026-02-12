@@ -1,0 +1,116 @@
+# 7.9 — Evaluating Turn-Taking with Timing Metrics
+
+You cannot improve what you do not measure. In early 2025, a telehealth platform spent four months tuning their voice agent's barge-in sensitivity based purely on user complaints. They made 37 configuration changes across that period, each one responding to the most recent escalation from customer success. Some users said the agent interrupted too quickly. Others said it waited too long. The team toggled thresholds up and down, trying to find the sweet spot. By month four, satisfaction scores had actually declined 8% from baseline. The problem was not their tuning strategy. The problem was that they had no systematic way to measure whether any change made things better or worse. They were flying blind, optimizing for the loudest voice in the room rather than the distribution of actual user experience.
+
+They built a measurement system in three weeks. Once they could see the numbers — inter-turn pause duration, overlap rate, premature cutoff rate — they identified the real issue within two days. The problem was not one global threshold. It was that different user populations had fundamentally different pacing patterns. Elderly patients paused 2.3 seconds between thoughts. Younger users paused 0.7 seconds. A single barge-in threshold could never serve both. Once they could measure the distribution, they could segment and optimize. Satisfaction recovered to baseline in two weeks and exceeded it by 14% within six weeks. The metrics unlocked improvement.
+
+Turn-taking quality is invisible until you quantify it. The right metrics turn subjective frustration into actionable engineering problems.
+
+## The Four Core Turn-Taking Metrics
+
+Four metrics capture most turn-taking behavior. Each one measures a different failure mode. Together they give you a complete picture of how the system handles conversational flow.
+
+**Inter-turn pause** measures the silence between the user finishing and the agent starting to speak. This is the primary signal of responsiveness. A pause under 300 milliseconds feels immediate. A pause between 300 and 600 milliseconds feels natural. A pause over 800 milliseconds feels sluggish, and users start to wonder if the system heard them. But the distribution matters more than the median. If 90% of pauses are 400 milliseconds but 10% are 2 seconds, users will remember the 2-second pauses. They create the perception that the system is unreliable.
+
+You measure inter-turn pause by timestamping two events: the moment the user's speech energy drops below threshold for the required duration — the end-of-utterance detection — and the moment the agent's first audio frame begins playback. The difference is the inter-turn pause. You log this for every turn. You calculate percentiles — p50, p75, p90, p95, p99. The p99 is often more important than the median because the worst experiences define user perception.
+
+**Overlap rate** measures how often the agent speaks while the user is still speaking. Some overlap is inevitable in real-time systems — there is always latency between the user starting to speak and the agent detecting it. But sustained overlap, where the agent continues speaking for more than 500 milliseconds after the user starts, is a failure. It signals that barge-in is not working. You measure overlap rate as a percentage of turns where the agent's speech and user's speech overlapped for more than a threshold duration — typically 300 to 500 milliseconds.
+
+Low overlap is good, but zero overlap is suspicious. If your overlap rate is 0%, either your users are perfectly deferential — unlikely — or your barge-in system is so sensitive it is cutting off the agent preemptively, even when the user is just making a noise or speaking to someone else in the room. The healthy range for overlap rate is 2% to 8%, depending on domain. Customer service skews lower because users expect crisp turn-taking. Social companions skew higher because some overlap feels more human.
+
+**Premature cutoff rate** measures how often the agent stops speaking when the user did not actually intend to take the floor. This happens when barge-in is too aggressive. The user coughs, says "um," or responds to someone else in the room, and the agent interprets it as an interruption. The agent goes silent mid-sentence. The user then has to prompt the agent to continue, which breaks flow and creates frustration. You measure premature cutoff by detecting turns where the agent stopped speaking due to barge-in but the user did not speak within the next 2 seconds. That gap suggests the barge-in was spurious.
+
+Premature cutoff is the silent killer of voice UX. Users do not always report it because they do not know what went wrong. They just know the conversation felt awkward. If your premature cutoff rate is above 5%, your barge-in threshold is too sensitive. If it is above 10%, users will describe the agent as "jumpy" or "nervous," even if they cannot articulate why.
+
+**Agent-yield rate** measures how often the agent correctly yields the floor when the user starts speaking. This is the inverse of overlap rate, but measured from a different angle. Agent-yield rate counts the percentage of user interruptions where the agent stopped speaking within 500 milliseconds. A high agent-yield rate means barge-in is working. The target is above 85%. If agent-yield rate is below 70%, users will perceive the agent as "not listening" or "talking over me."
+
+You calculate agent-yield rate by detecting every moment the user starts speaking while the agent is speaking, then checking whether the agent stopped within the threshold window. If yes, it is a successful yield. If no, it is a failure. The denominator is all user interruptions. The numerator is successful yields. Agent-yield rate below 80% is a UX crisis.
+
+## Collecting Timing Data from Production Conversations
+
+These metrics require timestamps. You need to log every audio event with millisecond precision. Most voice systems already collect this data — the challenge is structuring it for analysis.
+
+Your audio pipeline emits events at every state transition. User starts speaking. User stops speaking. Agent starts speaking. Agent stops speaking. Barge-in triggered. End-of-utterance detected. Each event needs a timestamp relative to session start. You log these events to a structured format — JSON lines, Parquet, whatever your analytics stack uses — with session ID, turn ID, event type, and timestamp.
+
+The key is synchronization. If your user audio and agent audio run on different threads or different machines, their clocks might drift. A 50-millisecond clock skew between your detection pipeline and your playback pipeline will corrupt your inter-turn pause measurements. You need a shared time source. Most systems use the session start timestamp as time zero and measure everything as milliseconds since session start. This keeps all events synchronized even if components run on different machines.
+
+You also need to handle clock corrections. Some clients — especially mobile devices on unstable networks — report timestamps that jump backward or forward when the system clock adjusts. You detect these jumps by checking for negative deltas or deltas larger than 10 seconds between consecutive events from the same session. When you detect a jump, you either discard that session from timing analysis or apply a correction based on server-side timestamps.
+
+The data volume is manageable. A 10-minute conversation generates maybe 200 audio events. At 200 bytes per event, that is 40 kilobytes per session. A system handling 10,000 conversations per day generates 400 megabytes of timing logs. You can store this in a standard data warehouse and run timing analysis in batch jobs overnight. You do not need real-time computation for these metrics — daily or hourly aggregates are sufficient.
+
+## What Good Looks Like: Benchmarking Against Human Conversations
+
+The gold standard for turn-taking is human-to-human conversation. You can benchmark your system against real phone calls, recorded meetings, or publicly available conversational datasets. The Switchboard corpus, the Fisher corpus, and various customer service call datasets provide timing baselines.
+
+Human conversations show inter-turn pauses around 200 to 600 milliseconds, with a median near 400 milliseconds. But the distribution is wide. Some people are fast responders — pauses under 200 milliseconds. Others are deliberate thinkers — pauses over 1 second. The variability is part of natural conversation. Your system does not need to match the fastest human responders, but it should stay within the range that humans find comfortable.
+
+Human overlap rate in cooperative conversations is around 5% to 10% of turns. Some overlap is backchanneling — "mm-hmm," "yeah" — not true interruptions. True interruptions, where one speaker takes the floor from another, happen in 3% to 7% of turns in customer service contexts, higher in arguments or competitive conversations. Your system should target the cooperative range: 2% to 8% overlap.
+
+Premature cutoffs are rare in human conversation because humans use prosody, gaze, and context to signal turn-taking intent. A cough does not sound like a conversational bid. An "um" mid-sentence does not sound like an interruption. Your system lacks these signals, so you will always have a higher premature cutoff rate than humans. The achievable target is below 5%. If you are below 3%, you are doing better than most production systems in 2026.
+
+Agent-yield rate does not have a direct human analogue because humans do not "yield" to interruptions the way systems do — they negotiate, they overlap, they finish their thought while acknowledging the interruption. But the closest proxy is how often people stop talking when interrupted. In customer service contexts, agents yield to customers around 80% to 90% of the time. Your system should match that range.
+
+## Percentile Distributions and Long-Tail Problems
+
+Medians hide problems. A system with a median inter-turn pause of 400 milliseconds sounds great until you see that the 95th percentile is 3 seconds. That means 5% of users wait 3 seconds for a response. Those users are the ones who complain, who churn, who leave bad reviews. You cannot optimize for the median and ignore the tail.
+
+You need to track and set SLOs on percentiles. A reasonable SLO for a 2026 voice system is: p50 inter-turn pause under 400 milliseconds, p95 under 800 milliseconds, p99 under 1.2 seconds. If you hit those targets, the majority of users experience snappy turn-taking, and the worst cases are still tolerable.
+
+The p99 is where infrastructure problems surface. A p99 pause of 5 seconds usually means you have a slow path in your pipeline — a fallback to a slower model, a cache miss that triggers a database lookup, a retry loop when transcription fails. These slow paths are rare, but they dominate the user experience for the unlucky few who hit them. Fixing p99 issues often requires hunting down edge cases in your deployment topology, not tuning your barge-in model.
+
+You also need to segment by user population. Elderly users have longer pauses, so their p50 might be 600 milliseconds even when your system is responding in 400 milliseconds. If you average elderly users and young users together, your metrics will hide the fact that elderly users are experiencing much slower turn-taking than the system is capable of. You segment by user demographics, by device type, by network quality, by time of day. Each segment gets its own percentile distribution.
+
+## Overlap Rate by Turn Position
+
+Not all overlaps are equal. An overlap on turn one — the system's greeting — is catastrophic. It means the system started talking before the user finished giving their name or their reason for calling. An overlap on turn fifteen, in the middle of a long interaction, might be the user excitedly interrupting to agree with the agent. Context matters.
+
+You track overlap rate by turn position. Turn one should have near-zero overlap. If overlap rate on turn one is above 2%, your greeting is starting too aggressively. Turns two through five should also have low overlap — under 5% — because the user is still establishing context and the agent should be listening carefully. Later turns can tolerate higher overlap because the conversation has rhythm and users are more comfortable interrupting.
+
+You also track overlap by speaker. If 80% of overlaps are the agent speaking over the user, your barge-in is broken. If 80% of overlaps are the user speaking over the agent, your end-of-utterance detection is too slow — you are not giving the user enough time to start speaking before the agent begins. A balanced system has roughly equal overlap in both directions, with a slight skew toward the user interrupting the agent because users should feel empowered to take control.
+
+## Premature Cutoff Detection with Follow-Up Analysis
+
+Detecting premature cutoffs requires looking at what happens after the barge-in. If the agent stops due to barge-in and the user speaks within 1 second, that was probably a real interruption. If the user does not speak for 2 seconds or more, the barge-in was likely spurious.
+
+You refine this by analyzing what the user said next. If the user's next utterance is "keep going," "continue," "sorry I didn't mean to interrupt," that is definitive evidence of a premature cutoff. You can build a classifier that detects these repair utterances and flags the previous barge-in as spurious. Over time, this gives you a labeled dataset of true interruptions versus false positives.
+
+The repair rate — the percentage of barge-ins followed by a user asking the agent to continue — is a direct measure of premature cutoff quality. If repair rate is above 8%, your barge-in is too aggressive. If it is below 2%, you are in a good range. If it is 0%, either your users are highly trained to avoid triggering barge-in, or your barge-in is so insensitive that users have given up trying to interrupt.
+
+## Agent-Yield Latency and the 500ms Rule
+
+Agent-yield rate measures success or failure, but agent-yield latency measures quality. Even if the agent yields 90% of the time, if it takes 2 seconds to stop talking, the user experience is terrible. You need to measure how quickly the agent stops after the user starts speaking.
+
+The target is under 500 milliseconds from user speech onset to agent silence. This is the perceptual threshold where the interruption feels responsive. If the agent takes 800 milliseconds to stop, the user perceives the agent as stubbornly finishing its thought before yielding. If the agent takes 1.5 seconds, the user perceives the agent as not listening at all.
+
+You calculate agent-yield latency by timestamping the moment the user's audio energy crosses the barge-in threshold and the moment the agent's audio playback stops. The difference is yield latency. You track the distribution — p50, p90, p99 — just like inter-turn pause. A healthy system has p50 yield latency under 300 milliseconds and p95 under 600 milliseconds.
+
+High yield latency usually indicates buffering in your audio pipeline. The agent has already generated the next 2 seconds of audio and buffered it for playback. When barge-in fires, the system has to flush the buffer, which takes time. The fix is to reduce playback buffer size or implement buffer preemption where barge-in can stop playback mid-frame.
+
+## Comparative Metrics: Before and After Changes
+
+Metrics only matter if you use them to evaluate changes. Every time you adjust barge-in sensitivity, every time you retrain your end-of-utterance model, every time you change your inter-turn pause threshold, you run a comparison: before metrics versus after metrics.
+
+You run the change on a holdout population — 10% of traffic — and compare timing metrics between the control group and the treatment group. Did inter-turn pause improve? Did overlap rate go up or down? Did premature cutoff rate change? You run this comparison for a week to collect enough data to reach statistical significance, then you decide whether to ship the change to everyone.
+
+The key is multivariate evaluation. A change might improve inter-turn pause but worsen overlap rate. You need to decide which metric matters more for your use case. In customer service, overlap rate is more important than inter-turn pause — users tolerate a slightly slower response more than they tolerate being talked over. In voice gaming, inter-turn pause is more important because users expect instant reactions. You define a weighted score that combines metrics based on your domain priorities, then optimize that score.
+
+## Logging Edge Cases for Failure Analysis
+
+Most turn-taking problems are rare. They happen in 2% of sessions, triggered by unusual audio conditions, unusual user behavior, or unusual latency spikes. Aggregate metrics tell you the problem exists, but they do not tell you why. You need to log and replay edge cases.
+
+Every time a session violates one of your SLOs — p99 inter-turn pause over 2 seconds, overlap rate over 20%, premature cutoff rate over 15% — you flag that session and store the full audio and timing trace. You build a dashboard where your team can listen to these flagged sessions, see the exact timing of every event, and diagnose the root cause.
+
+In one case, a fintech voice agent had a p99 inter-turn pause of 4.5 seconds. The p50 was 350 milliseconds, so the aggregate looked fine, but 1% of users were waiting nearly 5 seconds for a response. The team logged and reviewed the flagged sessions. They discovered that all the slow sessions were users calling from Brazil. The latency to their South American data center was 180 milliseconds round-trip, and their transcription model was hosted in a different region, adding another 200 milliseconds. The inter-turn pause included two cross-region hops. The fix was to deploy transcription models in the same region as the voice gateway. The p99 dropped to 900 milliseconds.
+
+Edge case logging turns mysteries into engineering tickets.
+
+## Turn-Taking Dashboards and Real-Time Monitoring
+
+You need a dashboard that shows turn-taking metrics in real time — or near real-time, updated every few minutes. The dashboard shows the four core metrics — inter-turn pause, overlap rate, premature cutoff rate, agent-yield rate — segmented by user population, by deployment region, by device type. You set threshold alerts. If overlap rate crosses 15%, you get paged. If p99 inter-turn pause crosses 3 seconds, you get paged.
+
+Real-time monitoring catches regressions immediately. In mid-2025, a customer support voice system deployed a new barge-in model on a Friday afternoon. Within 30 minutes, overlap rate spiked from 6% to 24%. Users were complaining in live chat that the agent kept talking over them. The team saw the spike in the dashboard, rolled back the deployment, and avoided a weekend crisis. Without real-time metrics, they would have discovered the regression on Monday morning after thousands of users had a bad experience.
+
+The dashboard also tracks trends over time. You can see if turn-taking quality is degrading slowly as traffic increases, as your model drifts, or as your infrastructure scales. A gradual increase in p99 inter-turn pause from 800 milliseconds to 1.5 seconds over three months signals that your system is not scaling gracefully. You catch the problem before it becomes a crisis.
+
+Turn-taking metrics are not a one-time audit. They are a continuous monitoring system that keeps your voice UX healthy as your system evolves. The next challenge is ensuring your barge-in models improve over time by training them on the patterns you see in production — which requires production data collection and annotation at scale.
+

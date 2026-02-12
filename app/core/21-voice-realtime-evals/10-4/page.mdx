@@ -1,0 +1,91 @@
+# 10.4 — Quality-Based Provider Routing
+
+Fast is useless if the output is wrong. A voice system that transcribes "transfer five hundred dollars" as "transfer five hundred hours" in 300 milliseconds has failed more completely than one that transcribes it correctly in 900 milliseconds. Latency-based routing optimizes speed. Quality-based routing optimizes correctness. The best systems combine both, routing to the provider that delivers acceptable quality in the shortest time.
+
+## The Measurement Problem: Quality Cannot Wait for Human Review
+
+Latency is trivial to measure in real-time: record the timestamp when a request starts and when it completes. Quality is not. The only definitive measure of ASR quality is whether the transcription matches the actual spoken words, which requires either a human to listen and verify or a pre-labeled test set. Neither is available for real-time routing decisions on live production traffic.
+
+The solution is proxy metrics: signals that correlate with quality strongly enough to drive automated decisions, even though they are not perfect measures. For ASR, the primary proxy is the provider's confidence score. Most ASR systems return a per-word or per-transcript confidence value between zero and one. A confidence score of 0.96 means the model believes the transcription is highly likely to be correct. A score of 0.63 means the model is uncertain. These scores are not ground truth — a model can be confident and wrong — but they are directionally correct. High confidence correlates with high accuracy. Low confidence correlates with errors.
+
+A customer support platform tracks the distribution of ASR confidence scores per provider. Deepgram Nova-3 typically returns confidence scores above 0.90 for 87% of requests. AssemblyAI Universal-2 returns scores above 0.90 for 82% of requests. When Deepgram's percentage of high-confidence transcriptions drops from 87% to 68% over a ten-minute window, the quality monitoring system infers that accuracy has degraded even without listening to the audio. The routing system reduces Deepgram's traffic allocation until the confidence distribution recovers.
+
+This inference is probabilistic, not certain. The confidence drop might be because the provider updated its model and became more conservative in assigning scores, not because accuracy degraded. Or it might be because your user traffic shifted to include more difficult audio — noisier environments, non-native speakers, domain-specific terminology. The routing system cannot distinguish these cases in real-time. It responds to the signal and lets investigation happen offline. Over-rotating on a false positive costs you some performance and some money. Under-rotating on a true positive costs you user trust.
+
+## Confidence Score Thresholds and Distribution Shifts
+
+The absolute confidence score for a single request is not actionable. A score of 0.85 might be excellent for noisy audio recorded on a phone in a busy street, or it might be poor for clean studio audio. What matters is the distribution of scores across many requests and how that distribution shifts over time.
+
+Baseline distributions are established during the onboarding phase for each provider. You send representative production traffic to the provider for a week or two and record the confidence score distribution. If 85% of transcriptions score above 0.90, and 3% score below 0.70, that is your baseline. Any significant deviation from this baseline is a quality signal.
+
+In March 2026, a telehealth platform observed that AssemblyAI's percentage of transcriptions with confidence below 0.70 increased from 3% to 14% over six hours. The shift was gradual, not sudden, which suggested a model rollout or infrastructure change rather than a transient failure. The platform's quality routing system flagged AssemblyAI as degraded and reduced its traffic share from 50% to 20%. Manual investigation revealed that AssemblyAI had deployed a new acoustic model that performed better on accented English but worse on medical terminology, which the platform's traffic was heavy in. The issue was reported to AssemblyAI. The routing adjustment stayed in place for eleven days until AssemblyAI rolled back the change. During those eleven days, the platform's overall transcription quality remained stable because the routing system compensated automatically.
+
+The threshold for flagging degradation must be statistically significant. A shift from 85% high-confidence to 83% could be noise. A shift to 71% is signal. The standard approach is to use a two-sample test comparing the recent window to the historical baseline. If the difference exceeds a chosen confidence level — typically 95% or 99% — the provider is flagged. This prevents false positives from random variance while catching real degradation.
+
+## Consistency Checks as Quality Signals
+
+Another proxy for ASR quality is consistency: if you send the same audio to the provider twice, you should receive the same transcription both times. Inconsistent results indicate low confidence in the model's output and suggest that the transcription is unreliable.
+
+Consistency checks work by re-transcribing a random sample of production requests and comparing the results. A financial services platform sends 2% of ASR requests to the same provider twice with a one-second delay. If the two transcriptions match exactly, the provider is considered consistent. If they differ, the inconsistency is logged. A healthy provider delivers identical transcriptions for 96% to 99% of duplicate requests. Differences are usually minor: punctuation variations, capitalization differences, or hesitation markers like "um" and "uh" included or excluded.
+
+If the consistency rate drops — say, from 98% to 89% — the provider's model is less stable, which correlates with lower quality. This happened to one provider in December 2025 after they deployed a model update that introduced randomness into the decoding process to improve diversity in generated text. The randomness was intended for generative tasks, but it leaked into the ASR pipeline and caused non-deterministic transcriptions. The consistency check detected the issue within three hours. The routing system reduced the provider's allocation. The provider fixed the issue two days later after customer reports confirmed the problem.
+
+Consistency checks have a cost: you are sending duplicate requests, which doubles API consumption for the sampled traffic. A 2% sample doubles consumption for 2% of requests, which is a 2% increase in overall costs. This is tolerable. A 10% sample costs 10% more, which may not be. The sample rate must balance detection sensitivity with cost tolerance.
+
+## Domain-Specific Quality Routing
+
+ASR quality is not uniform across domains. A provider that excels at general conversational English may struggle with medical terminology, legal jargon, financial terms, or non-native accents. Quality-based routing must be domain-aware, or you will make poor decisions by averaging across incompatible use cases.
+
+A healthcare voice platform processes clinical dictations, patient intake calls, and administrative conversations. The clinical dictations include terms like "sublingual nitroglycerin," "endoscopic retrograde cholangiopancreatography," and "hemoglobin A1C." The patient intake calls are conversational English with regional accents. The administrative conversations are routine scheduling language. These are three distinct domains with different quality profiles.
+
+The platform measures ASR accuracy separately for each domain by sampling requests, having human reviewers verify transcriptions, and tagging results by domain. Deepgram Nova-3 delivers 96% accuracy on administrative conversations, 91% on patient intake, and 84% on clinical dictations. AssemblyAI Universal-2 delivers 94%, 93%, and 89% respectively. Azure Speech delivers 92%, 88%, and 91%.
+
+The quality routing decision is domain-specific. Administrative traffic routes to Deepgram because it is fastest and most accurate. Patient intake traffic routes to AssemblyAI because it handles accents better. Clinical dictation traffic routes to Azure Speech because it handles medical terminology best. This requires classifying each request by domain before routing, which adds a pre-processing step. The classification can be based on user role, call type metadata, or lightweight keyword detection on the first few seconds of audio. The overhead is five to twenty milliseconds, which is acceptable given the quality improvement.
+
+Domain-specific routing also allows targeted provider improvements. The platform can tell AssemblyAI "your performance on medical terminology is 7% worse than Azure" with specific examples, which gives the provider actionable feedback to improve their model. Generic complaints like "your ASR is inaccurate" do not lead to fixes. Specific, measured, domain-tagged feedback does.
+
+## Pronunciation Accuracy for TTS Quality Routing
+
+TTS quality is harder to measure automatically than ASR quality because there is no ground truth transcription to compare against. The provider synthesized speech from your input text, and you can verify that it produced audio, but you cannot easily verify that the audio is intelligible, natural-sounding, or correctly pronounced without a human listener.
+
+Proxy metrics for TTS quality include pronunciation accuracy on known difficult words, naturalness ratings from sampled listeners, and consistency across repeated synthesis of the same input. Pronunciation accuracy is the most automatable. Maintain a test set of words that providers commonly mispronounce: medical terms, proper nouns, technical jargon, foreign words. Synthesize these words with each TTS provider, use an ASR system to transcribe the synthesized audio back to text, and verify that the round-trip matches the original input.
+
+A pharmaceutical company's voice system includes drug names like "apixaban," "rivaroxaban," "atorvastatin," and "esomeprazole." They test each TTS provider by synthesizing these names and transcribing them with their ASR provider. If the round-trip produces "apixaban" from "apixaban," the pronunciation is correct. If it produces "a picks a ban" or garbled output, the TTS provider mispronounced the word. Providers that mispronounce more than 5% of the drug name test set are flagged as low-quality for pharmaceutical use and removed from the routing pool for drug-related content.
+
+This approach has a false positive risk: the TTS provider might pronounce the word correctly, but the ASR provider transcribes it incorrectly, causing a round-trip failure. This is mitigated by using a high-quality ASR provider for the verification step and by testing each word multiple times. If a word fails round-trip once but succeeds on three other attempts, the single failure is likely an ASR error, not a TTS error. If it fails consistently, the TTS provider is mispronouncing.
+
+## Naturalness and Prosody as Quality Signals
+
+Beyond correctness, TTS quality includes naturalness: does the synthesized speech sound human, or does it sound robotic? Naturalness is subjective and difficult to measure automatically, but it matters enormously for user experience. A TTS provider that pronounces every word correctly but uses flat intonation and unnatural pauses creates an uncanny valley effect that users find off-putting.
+
+Automated naturalness measurement is an unsolved problem in 2026. The best available approach is to use a pre-trained model that predicts human naturalness ratings. Several research groups and commercial providers offer naturalness scoring models trained on large datasets of human-rated synthetic speech. You send synthesized audio to the scoring model, and it returns a predicted naturalness score between one and five. These scores are noisy and biased toward the training data distribution, but they are better than nothing.
+
+A customer service platform routes TTS traffic across ElevenLabs Multilingual v2, Cartesia Sonic, and Azure Neural. They synthesize a standard test set of utterances with each provider daily and score them with a naturalness model. ElevenLabs consistently scores 4.3 to 4.6. Cartesia scores 4.1 to 4.4. Azure scores 3.7 to 4.0. Based on these scores, the platform routes 50% of traffic to ElevenLabs, 35% to Cartesia, and 15% to Azure. The allocation is not binary because naturalness differences are subtle and user preferences vary. Some users prefer the slightly more formal tone of Azure. The weighted routing reflects average preference while maintaining diversity.
+
+Naturalness scoring models drift as TTS technology improves. A model trained in 2024 on synthetic speech from that era will rate 2026 synthesis as unnaturally good because it exceeds the training distribution. This drift must be corrected by periodically retraining or recalibrating the scoring model on recent synthesis samples. Without recalibration, your quality routing decisions will be based on outdated standards.
+
+## Combining Latency and Quality in Routing Decisions
+
+The final routing decision must balance latency and quality. A provider that is fast but inaccurate is not acceptable. A provider that is accurate but slow is not acceptable. The ideal provider is both fast and accurate. In practice, you must trade off.
+
+The trade-off is expressed as a multi-objective optimization. Define a scoring function that combines latency and quality into a single value. One common approach is to use a weighted sum: score equals quality weight times quality metric plus latency weight times inverse latency. If quality is twice as important as latency, the quality weight is 0.67 and the latency weight is 0.33. Each provider receives a score. The provider with the highest score receives the most traffic.
+
+A voice authentication system prioritizes quality over latency because incorrect transcriptions create security risks. Their scoring function assigns 80% weight to quality and 20% weight to latency. Provider A delivers 94% accuracy at 600ms. Provider B delivers 89% accuracy at 300ms. Provider A's score is 0.8 times 0.94 plus 0.2 times the inverse of 600ms, normalized. Provider B's score is lower despite being faster because the quality penalty dominates. Provider A receives 70% of traffic.
+
+A real-time captioning system for live events prioritizes latency because delays disrupt the viewing experience. Their scoring function assigns 70% weight to latency and 30% weight to quality. The same two providers reverse rank: Provider B receives more traffic because speed matters more.
+
+The weights are not universal. They depend on your use case, your SLA, and your user tolerance for errors versus delays. The weights should be tuned based on user feedback and business impact data. If support tickets for incorrect transcriptions outnumber complaints about slow response, increase the quality weight. If users abandon sessions due to latency but tolerate occasional errors, increase the latency weight.
+
+## The Cost of Quality Routing and When It Justifies Itself
+
+Quality-based routing requires measurement infrastructure, human review for ground truth, statistical analysis, and ongoing tuning. This is more expensive than latency-based routing because quality metrics are harder to automate. The question is whether the quality improvement justifies the cost.
+
+If all your providers deliver similar quality — say, 93% to 96% accuracy — quality routing saves little. Route based on latency or cost instead. If your providers vary widely — 89% to 96% — quality routing is essential. The 7% accuracy gap is the difference between a professional product and a frustrating one.
+
+The decision point is whether quality variance across providers is larger than your quality tolerance. If variance is small, skip quality routing. If variance is large, quality routing is mandatory.
+
+Quality-based provider routing ensures that your multi-provider architecture delivers not just availability and speed but correctness. It allows you to use the most accurate provider for medical terminology, the most natural-sounding provider for customer-facing applications, and the most consistent provider for compliance-sensitive use cases. The complexity is higher than latency routing, but for systems where quality is non-negotiable, it is the only way to operate responsibly at scale.
+
+---
+
+Next: **10.5 — Cost-Based Provider Routing and Budget Management** — balancing performance with spend.

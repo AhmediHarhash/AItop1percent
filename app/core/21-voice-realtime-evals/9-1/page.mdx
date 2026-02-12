@@ -1,0 +1,78 @@
+# 9.1 — WebSocket vs WebRTC: Choosing the Right Transport
+
+The streaming protocol you choose determines your latency ceiling, your debugging experience, your infrastructure costs, and your ability to recover from network failures. Every voice AI system starts with this decision, and most teams pick based on what they know rather than what their use case requires.
+
+In early 2025, a telehealth startup rebuilt their entire voice consultation platform after six months in production. They had chosen WebRTC because "everyone said it was faster." The median latency was indeed 180 milliseconds lower than their previous WebSocket prototype. But they spent three engineer-months debugging NAT traversal failures in hospital networks, another two months handling mobile network reconnections, and shipped connection success rates of 87% when their previous system achieved 99.2%. The latency gain was real. The engineering cost was catastrophic. They eventually migrated back to WebSocket with carefully tuned buffering and accepted the latency tradeoff in exchange for reliability they could actually maintain.
+
+The WebSocket versus WebRTC decision is not about which technology is better. It is about which set of tradeoffs you can afford to manage.
+
+## The WebSocket Model: Server-Mediated Simplicity
+
+WebSocket gives you a bidirectional TCP connection upgraded from HTTP. The protocol is simple: establish connection, send frames, receive frames, close connection. All communication flows through your server. The server controls routing, buffering, and message delivery. The architecture is request-response-like but persistent.
+
+This simplicity has consequences. Your server sits in the critical path for every audio packet. If you are running in US-East and your user is in Singapore, their audio travels to Virginia, gets processed, and the response travels back. You pay for that round trip in milliseconds. But you also get complete visibility into every packet, deterministic routing, and straightforward debugging. When something fails, you see it fail in your server logs with timestamps and payloads.
+
+WebSocket connections work through corporate firewalls and hospital networks without NAT traversal protocols or STUN servers. They look like HTTPS to network administrators. They are blocked when the network blocks all external connections, but they are never blocked because the protocol itself is unfamiliar. This matters more than most teams realize until they deploy to enterprise environments.
+
+The server-mediated model also means you control buffering strategy centrally. When network conditions degrade, you decide how to handle backpressure. You can drop frames, compress audio, or signal the client to slow down. The client does not make these decisions independently. This centralization simplifies reasoning about system behavior but creates a single point of failure.
+
+## The WebRTC Model: Peer-to-Peer Capability with Complex Infrastructure
+
+WebRTC was designed for peer-to-peer video calls. It establishes direct connections between clients when possible, bypassing servers for media streams. For voice AI, this means your user's audio can flow directly to your inference server without an intermediate relay if network conditions allow. Latency drops by 40 to 120 milliseconds depending on geography and network topology.
+
+But WebRTC achieves this through complex negotiation. Clients exchange SDP offers describing their network capabilities. They use STUN servers to discover their public IP addresses and TURN servers to relay traffic when direct connection fails. The connection establishment involves multiple round trips and can take anywhere from 300 milliseconds to several seconds. Once established, the connection is fast. Getting there is not.
+
+The protocol handles packet loss and jitter natively. It includes forward error correction, adaptive bitrate control, and sophisticated jitter buffering. These features are essential for video calls across unpredictable networks. For voice AI, they add complexity you may not need if you control both ends of the connection and can provision adequate network capacity.
+
+WebRTC debugging is harder. Packets flow directly between client and server without passing through your application layer where you can log them. When calls fail to connect, you troubleshoot STUN responses, ICE candidate gathering, and firewall traversal. When audio quality degrades, you analyze RTCP reports and try to reconstruct what happened on a network path you do not control. The tools exist, but they require expertise your team may not have.
+
+## Use Case Mapping: When to Choose Each Protocol
+
+Choose WebSocket when connection reliability matters more than absolute minimum latency, when you need simple debugging, when you expect challenging network environments, or when your team does not have deep real-time networking expertise. WebSocket is the right choice for healthcare applications in hospital networks, for enterprise deployments behind corporate firewalls, for mobile applications where users switch between WiFi and cellular mid-conversation, and for any system where explaining a connection failure to a customer is unacceptable.
+
+Choose WebRTC when you need the absolute lowest latency possible, when you control network infrastructure on both ends, when you have expertise in real-time protocols, or when you are building something that must feel instantaneous even when the user is on a fast network. WebRTC is the right choice for real-time voice agents that compete with human conversation speed, for low-latency trading floor communication, for live interpretation where delay compounds across turns, and for any application where 100 milliseconds of latency changes user perception of quality.
+
+The decision is not permanent. You can start with WebSocket for reliability and migrate to WebRTC when you have scale and expertise. You cannot start with WebRTC for speed and fall back to WebSocket without rewriting significant infrastructure. Choose the simpler path unless you have evidence that complexity is justified.
+
+## Hybrid Architectures: Protocol Separation by Stream Type
+
+Some systems use both protocols simultaneously, routing different data streams through different transports based on their requirements. The most common pattern: WebRTC for audio streams where latency matters, WebSocket for control messages and metadata where reliability matters more than speed.
+
+A customer service voice AI platform in mid-2025 streamed audio bidirectionally over WebRTC peer connections but sent transcription results, conversation state updates, and agent suggestions over a parallel WebSocket connection. Audio latency averaged 140 milliseconds. Transcription delivery was less predictable, sometimes arriving 200 milliseconds after the audio, sometimes 600 milliseconds, depending on model load. The WebSocket connection handled this variability gracefully with message queuing. If they had sent transcriptions over the WebRTC data channel, variable transcription timing would have caused head-of-line blocking that delayed audio packets.
+
+The separation also simplified their debugging. When audio quality issues occurred, they analyzed WebRTC stats. When transcription delivery failed, they checked WebSocket message logs. The failure modes did not interact. An engineer could reason about each transport independently.
+
+Hybrid architectures add complexity. You maintain two connection types, synchronize their lifecycle, and handle cases where one connection succeeds while the other fails. But they let you optimize each stream for its own requirements instead of compromising both streams to fit a single protocol.
+
+## The Relay Server Pattern: Bridging WebRTC to Server Pipelines
+
+Pure peer-to-peer WebRTC is rare in voice AI systems. Most architectures use a selective forwarding unit (SFU) or media server that acts as a relay point. The client connects to the relay via WebRTC. The relay forwards audio to your backend services over optimized server-to-server connections. The relay handles WebRTC complexity. Your backend sees a clean audio stream.
+
+This pattern gives you WebRTC's low latency on the user-facing edge while keeping your backend architecture simple. You do not run WebRTC endpoints on your inference servers. You run them on specialized relay infrastructure that does one job well.
+
+A voice assistant platform serving 200,000 daily conversations runs WebRTC relays in twelve geographic regions. Users connect to the nearest relay with median latencies between 35 and 80 milliseconds depending on location. Relays forward audio to centralized inference clusters over dedicated network links. The inference servers receive audio via WebSocket connections from relays, process it, and send responses back the same way. The servers do not know WebRTC exists. The users get WebRTC latency without the backend team managing WebRTC infrastructure.
+
+The relay pattern does introduce an additional hop. Audio travels from client to relay to server, then back. If the relay and server are colocated or connected by low-latency links, the additional hop adds 5 to 15 milliseconds. If they are on opposite coasts, you lose 70 milliseconds and eliminate the latency advantage WebRTC was supposed to provide. Geographic topology matters.
+
+## Infrastructure Cost and Operational Complexity
+
+WebSocket infrastructure is simpler to operate. You run WebSocket servers behind load balancers. Connection state lives in server memory or distributed caches. You scale horizontally by adding servers. When a server fails, connections drop and clients reconnect to another server. The failure is visible and recoverable.
+
+WebRTC infrastructure requires more components. You run STUN servers for NAT traversal, TURN servers for relay when direct connection fails, signaling servers to coordinate connection establishment, and media servers or SFUs to handle actual streams. You need monitoring for ICE failure rates, TURN bandwidth consumption, and media relay capacity. You need expertise to diagnose why 3% of connections fail to establish in certain network environments.
+
+TURN bandwidth is expensive. When direct peer-to-peer connection fails and all traffic relays through your TURN servers, you pay for bandwidth twice: once when the client uploads and once when the server downloads. For a voice application streaming 64 kbps audio bidirectionally, a relayed call consumes 128 kbps of server bandwidth continuously. At scale, TURN costs can exceed inference costs.
+
+WebSocket server bandwidth is cheaper because you control both endpoints and can provision adequate capacity. But you pay for latency in milliseconds that you cannot optimize away without changing your protocol.
+
+## Choosing Based on Team Capability
+
+The best protocol is the one your team can operate reliably. If you have real-time networking expertise, WebRTC's complexity is manageable and its latency advantage is worth capturing. If you do not, WebSocket's simplicity lets you focus on your AI models instead of debugging NAT traversal.
+
+A four-person startup building a voice AI meeting assistant chose WebSocket in early 2025 despite knowing WebRTC would be faster. None of the founders had WebRTC experience. They could ship WebSocket in three weeks. WebRTC would take eight weeks to learn, implement, and debug. They launched with WebSocket, validated product-market fit, raised funding, and hired a real-time infrastructure engineer who migrated them to WebRTC nine months later when they had the capacity to do it right.
+
+The protocol you ship with does not have to be the protocol you run forever. Start with what you can build and operate. Optimize when you have evidence that optimization is the constraint.
+
+---
+
+The transport protocol determines how audio reaches your system. The next question is how you divide that audio into processable chunks without adding unnecessary latency or creating choppy playback.
+

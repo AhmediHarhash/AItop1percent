@@ -1,0 +1,81 @@
+# 9.11 — Edge Deployment for Latency Reduction
+
+Every network hop adds latency. A user in Sydney connecting to a voice AI server in Virginia experiences 180 to 250 milliseconds of baseline network latency before any processing begins. Add 200 milliseconds for ASR, 300 milliseconds for LLM inference, and 150 milliseconds for TTS. The total system latency is 830 to 900 milliseconds. The network latency alone accounts for 20 to 30 percent of the total. Edge deployment cuts that network latency by placing infrastructure geographically close to users.
+
+The improvement is dramatic. A financial services voice assistant serving users across North America reduced p95 latency from 720ms to 480ms by deploying edge relay servers in six regions. The ASR model, LLM, and TTS remained centralized. Only the WebSocket termination and audio buffering moved to the edge. That single change cut 240ms from user-perceived latency. The cost was infrastructure complexity. The team now operated relay servers in Virginia, California, Texas, Illinois, Washington, and Quebec. Each required monitoring, failover, and synchronization with the central processing cluster.
+
+## What to Deploy at the Edge
+
+Not every component belongs at the edge. The decision depends on component size, processing requirements, and latency sensitivity. Lightweight components that reduce network round-trips belong at the edge. Heavy models that require expensive GPUs belong centralized where you can pool resources efficiently.
+
+WebSocket relay servers are ideal edge components. A relay server accepts WebSocket connections from nearby users, buffers audio, and forwards it to centralized processing infrastructure over a persistent connection. The user connects to the relay with 10 to 30 milliseconds of latency. The relay connects to the central cluster with 40 to 80 milliseconds of latency. The total is 50 to 110 milliseconds. Without the relay, the user connects directly to the central cluster with 100 to 200 milliseconds of latency. The relay cuts network latency in half.
+
+Voice activity detection can run at the edge when using lightweight models. A small VAD model running on a CPU can process audio in real-time with less than 5 milliseconds of added latency. Deploying VAD at the edge reduces the amount of audio that must be transmitted to central servers. Instead of streaming continuous audio, the edge sends only segments where speech is detected. This reduces bandwidth and central processing load. The tradeoff is that edge VAD failures are harder to debug than centralized failures.
+
+Lightweight ASR models can run at the edge when accuracy requirements are modest. A small Whisper model or a streaming ASR model can transcribe speech in real-time on modern CPUs. Deploying ASR at the edge eliminates the need to stream audio to central servers. The edge sends text instead of audio, reducing bandwidth by 95 percent. The central LLM receives transcriptions directly. The latency savings are 20 to 60 milliseconds from reduced network transmission time.
+
+The limitation is that edge-deployed ASR must be small enough to run on commodity hardware without GPUs. This limits model size and accuracy. A central ASR cluster can run large multi-billion parameter models on GPUs, achieving 2 to 3 percent better word error rate than edge models. Whether that accuracy improvement is worth the latency cost depends on your use case. For customer service where misrecognition creates costly errors, centralized ASR is better. For casual voice control where speed matters more than perfection, edge ASR wins.
+
+## What Stays Centralized
+
+LLM inference stays centralized because large language models require GPUs and are expensive to replicate across regions. A GPT-5-mini deployment requires 4 to 8 GPUs per instance. Running that in six edge regions costs 24 to 48 GPUs. Running it centrally costs 4 to 8 GPUs with multiplexing across regions. The cost difference is 3 to 6 times higher for edge deployment. The latency benefit is 40 to 80 milliseconds. For most use cases, that tradeoff does not make sense.
+
+The exception is when you use very small language models that can run on CPUs. A 1-billion parameter model can run on a modern CPU with 200 to 400 milliseconds of inference latency. This is slower than GPU inference but eliminates 100 to 200 milliseconds of network latency. If network latency exceeds CPU inference penalty, edge deployment makes sense. In practice, this happens only for users very far from central infrastructure or when using highly optimized small models.
+
+Session state and conversation history stay centralized. Managing distributed session state across edge regions introduces consistency problems. If a user connects to the California edge and then roams to the Texas edge, session state must migrate. The migration takes time and can fail. Centralized session state in Redis or a similar store allows any edge region to retrieve state instantly. The latency cost is 5 to 20 milliseconds for a database lookup. The simplicity gain is enormous.
+
+Heavy TTS models stay centralized for the same reasons as LLM inference. High-quality TTS requires neural vocoders that run efficiently on GPUs. Deploying these across edge regions multiplies hardware costs without proportional latency benefit. The alternative is to use lightweight TTS at the edge, but quality degrades noticeably. Users are more sensitive to TTS quality than ASR accuracy. A 50-millisecond latency improvement is not worth robotic-sounding speech.
+
+The architecture that emerges is hybrid. Edge regions handle connection termination, audio buffering, and optionally VAD. Central clusters handle ASR, LLM inference, and TTS. The edge forwards audio to the center and receives generated speech back. The user connects to nearby edge infrastructure with low latency. The edge connects to central processing with moderate latency. The total latency is lower than direct user-to-center connection but higher than fully edge-deployed processing.
+
+## Geographic Distribution Strategy
+
+Choosing edge regions requires understanding where your users are. A voice assistant serving only US users needs edge presence in the US. A global assistant needs edge presence on every continent. The tradeoff is infrastructure cost versus latency benefit. Each additional region has fixed costs: servers, monitoring, network egress, and operational overhead. The latency benefit depends on how many users are near that region.
+
+The minimum viable edge deployment is three regions covering your primary user base. For a US-focused product, that is East Coast, West Coast, and Central. These three regions cover 95 percent of users with less than 50 milliseconds of latency to the nearest edge. The remaining 5 percent connect to the nearest available region with 60 to 100 milliseconds of latency. This is acceptable for most use cases.
+
+The global deployment is 10 to 15 regions covering major population centers. North America gets 3 to 4 regions. Europe gets 3 to 4 regions. Asia gets 3 to 4 regions. South America, Africa, and Oceania each get 1 region. This covers 98 percent of global users with less than 80 milliseconds to the nearest edge. The cost is managing 15 independent deployments with regional differences in network infrastructure, compliance requirements, and operational practices.
+
+The dynamic approach is to start with 3 regions and add regions based on demand. Monitor latency by user location. When more than 5 percent of users experience latency above 100 milliseconds to the nearest edge, that is a signal to add a region. Deploy incrementally. Test thoroughly in each region before adding the next. This controlled expansion limits risk and cost while ensuring latency stays within acceptable bounds.
+
+The routing decision is whether to use latency-based routing or geographic routing. Latency-based routing sends each user to the edge region with the lowest latency. This is optimal for latency but requires measuring latency to all regions for every user. Geographic routing sends users to the nearest region by geographic distance. This is simpler but occasionally sends users to a distant region when the geographically nearest region is experiencing network issues. Most production systems use geographic routing with latency-based failover.
+
+## Edge-to-Cloud Communication Patterns
+
+Edge servers communicate with central infrastructure over persistent connections. The naive approach is for each edge server to open a new connection to the central cluster for every user session. This creates connection overhead and makes central resource allocation unpredictable. The production approach is to maintain a pool of persistent connections between each edge region and the central cluster. User sessions multiplex over these connections.
+
+The connection pool size depends on traffic volume. If an edge region serves 500 concurrent user sessions and each central connection can handle 50 multiplexed sessions, the pool needs 10 connections. The pool scales dynamically. When traffic increases, new connections are added. When traffic decreases, idle connections close. The goal is to keep connection count proportional to load while avoiding constant connection churn.
+
+The multiplexing protocol must handle backpressure. If the central cluster is overloaded, it signals backpressure to edge servers. Edge servers stop sending new audio until backpressure clears. Without backpressure handling, edge servers continue sending audio that the central cluster cannot process. Buffers fill, latency spikes, and sessions fail. Backpressure propagates load information from center to edge, allowing edge servers to reject new sessions instead of accepting sessions they cannot serve.
+
+The failure handling is that edge-to-center connections can fail independently of user connections. A user is connected to the edge. The edge is processing audio. The edge-to-center connection drops. The edge must either buffer audio until the connection recovers or fail the user session. Buffering is possible for short interruptions under 5 seconds. For longer interruptions, failing the user session is more honest than buffering indefinitely.
+
+The monitoring challenge is that latency can be attributed to multiple hops. The user sees total latency. That total includes user-to-edge latency, edge-to-center latency, processing latency at the center, center-to-edge response latency, and edge-to-user response latency. To optimize the system, you must measure each hop independently. Distributed tracing tools like OpenTelemetry allow you to track requests across hops and attribute latency to specific components.
+
+## Cost-Latency Tradeoffs of Edge Deployment
+
+Edge deployment reduces latency but increases cost. Running infrastructure in six regions costs more than running it in one. The cost increase is not linear. Two regions do not cost twice as much as one. The marginal cost of each additional region decreases as you gain operational experience and tooling. But the relationship is still superlinear. Ten regions cost 4 to 6 times more than one region.
+
+The latency benefit is also not linear. The first edge region cuts latency by 50 to 100 milliseconds for half your users. The second region cuts latency by another 30 to 60 milliseconds for the next quarter of your users. The third region cuts latency by 20 to 40 milliseconds for the next 15 percent. Diminishing returns set in quickly. After five or six regions, additional regions provide minimal latency benefit to a shrinking fraction of users.
+
+The cost components are infrastructure, network egress, and operations. Infrastructure cost is servers running in each region. Network egress cost is data transferred from edge to center and center to edge. Operations cost is the human time required to deploy, monitor, and debug issues across regions. Infrastructure and egress costs scale linearly with region count. Operations cost scales worse than linearly because cross-region debugging is harder than single-region debugging.
+
+The breakeven analysis compares latency improvement to cost increase. If edge deployment costs 300 percent more and reduces latency by 40 percent, is that worthwhile? The answer depends on how much latency matters to your users. For a voice assistant where 100-millisecond latency improvements measurably increase user satisfaction, the tradeoff may be worth it. For a voice assistant where users tolerate 800-millisecond latency without complaint, it is not.
+
+The optimization strategy is to deploy the minimum number of regions that serve the majority of users with acceptable latency, then monitor whether the remaining users complain. If latency complaints are rare, you have the right number of regions. If latency complaints are common, add one region and re-evaluate. Do not over-deploy based on theoretical latency targets. Deploy based on observed user pain.
+
+## Edge Deployment as Latency Engineering
+
+Edge deployment is not a magic solution. It trades infrastructure complexity for network latency reduction. The reduction is real but limited. Edge deployment cannot fix slow ASR models, slow LLM inference, or slow TTS generation. It only reduces the time audio spends traveling across the network. If processing latency dominates your total latency, edge deployment provides minimal benefit.
+
+The decision framework is to measure your latency breakdown first. If network latency is 20 percent of total latency, edge deployment can reduce total latency by 10 to 15 percent at best. If network latency is 50 percent of total latency, edge deployment can reduce total latency by 25 to 40 percent. Measure before deploying. Do not assume network is the bottleneck.
+
+The teams that succeed with edge deployment are the ones who treat it as one optimization among many. They optimize processing latency first. They optimize model inference latency. They optimize audio pipeline latency. Only after exhausting those avenues do they deploy edge infrastructure. By that point, they have fast models and efficient pipelines. Edge deployment is the final latency reduction that takes a good system and makes it excellent.
+
+The teams that fail with edge deployment are the ones who deploy edge infrastructure to compensate for slow models. They have 500-millisecond LLM inference latency and think edge deployment will fix it. It does not. Edge deployment cuts 80 milliseconds from a 700-millisecond total. The system is still slow. The correct path is to optimize the 500-millisecond inference first, then deploy edge to eliminate the remaining network latency.
+
+Edge deployment is latency engineering for systems that have already optimized everything else. It is the final 10 to 20 percent improvement after you have extracted the first 80 percent from model optimization, pipeline efficiency, and protocol design. In that context, it is valuable. Outside that context, it is expensive distraction.
+
+---
+
+*Next: 9.12 — Load Testing Voice Infrastructure at Scale*

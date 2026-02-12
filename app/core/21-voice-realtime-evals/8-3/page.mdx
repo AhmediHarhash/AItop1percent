@@ -1,0 +1,86 @@
+# 8.3 — Real-Time Transcription Monitoring for Policy Violations
+
+Most teams think pre-TTS content filtering is enough. They check the text before it becomes audio, assume that if the text passes moderation then the spoken output is safe, and move on. They are wrong. What the TTS engine actually produces is not always identical to what the LLM generated. Synthesis errors, mispronunciations, prosody choices, and audio artifacts can turn safe text into harmful audio. The only way to know what your voice agent actually said is to listen to it — or more precisely, to transcribe it and check the transcript against your content policy in real time.
+
+Real-time transcription monitoring is the audit layer that runs during or immediately after the call. You pass your agent's own speech through ASR, transcribe what was actually said, and run policy violation detection on the transcript. This catches the gaps that pre-TTS filtering misses: TTS rendering errors, drift between intended response and spoken output, edge cases where safe text becomes unsafe audio. It also provides a ground-truth record of what the user heard, which is essential for compliance, incident investigation, and trust and safety operations. This subchapter defines how transcription monitoring works, where it adds value, and how to build it without doubling your infrastructure cost.
+
+## ASR-on-TTS: Transcribing Your Own Agent's Speech
+
+The concept is simple: you transcribe the audio your agent produces the same way you transcribe the user's speech. The agent speaks. The audio is passed to an ASR model. The ASR output is a transcript of what the agent said. You compare that transcript to your content policy. If it contains a violation, you flag it, log it, and optionally take action — end the call, escalate to a human, send an alert to your Trust and Safety team.
+
+The reason this is necessary is that TTS is not a deterministic mapping from text to audio. A TTS model is a neural network. It synthesizes speech based on the input text, but the output is not identical every time. Prosody varies. Pronunciation choices vary. Silence placement varies. In rare cases, the TTS model produces audio that does not match the input text at all — it drops a word, repeats a word, or substitutes a phonetically similar word. These are synthesis errors, and they happen in production.
+
+In mid-2025, a healthcare voice assistant generated the response "Take one tablet every six hours" and passed it to TTS. The TTS model synthesized the audio, but due to a rare synthesis error, the spoken output was "Take one tablet every sixteen hours." The transcription monitoring system caught this. The transcript said "sixteen" even though the input text said "six." The monitoring system flagged a mismatch between intended output and actual output, logged the incident, and alerted the on-call engineer. The call was terminated. The patient never followed the incorrect instruction. Without transcription monitoring, the error would have gone undetected until a patient reported taking medication at the wrong interval.
+
+TTS errors are not the only reason to transcribe agent speech. Even when synthesis is correct, the spoken version of a sentence can carry meaning the text does not. Consider the sentence "You can stop worrying." In text, it is a reassurance. Spoken with a sarcastic tone, it is dismissive or mocking. The TTS engine's prosody choice changes the user experience. If your content policy prohibits dismissive or condescending language, you need to evaluate tone, not just words. Transcription monitoring does not directly detect tone — ASR transcribes words — but it can detect the second-order effects of tone: user reactions, conversational breakdowns, complaints. If a user responds to "You can stop worrying" with "Excuse me?" or "What is your problem?" the monitoring system sees the escalation and can flag the interaction for review.
+
+## Drift Detection Between Intended Response and Spoken Response
+
+Drift is the phenomenon where the text the LLM generates is not what the user hears. This happens for several reasons. TTS synthesis errors are one. Another is preprocessing that modifies the text before TTS. Some systems replace numbers with words, expand abbreviations, insert pronunciation hints, or strip formatting characters. These transformations can change meaning.
+
+A customer service voice agent generated the response "Your account balance is negative 45 dollars." A preprocessing script replaced "negative" with a minus sign for formatting reasons, producing "Your account balance is - 45 dollars." The TTS engine skipped the minus sign because it did not know how to pronounce punctuation, and the spoken output was "Your account balance is 45 dollars." The user heard their balance was positive when it was actually negative. They attempted a transaction that overdrew the account, incurring a fee. The transcript showed the discrepancy. The intended response said negative. The spoken response did not.
+
+Drift detection compares the text sent to TTS against the transcript from ASR. If the two do not match, you investigate. Minor differences — punctuation, capitalization, filler words — are expected. ASR is not perfect. It makes transcription errors. But large differences — missing words, substituted words, incorrect numbers — indicate either TTS synthesis problems or preprocessing bugs. Both need to be caught before they cause user harm.
+
+You evaluate drift by measuring edit distance between intended and transcribed text. Levenshtein distance works. Normalized edit distance as a percentage works. If the edit distance exceeds a threshold — say 10% of the response length — you flag it. You log both versions. You manually review a sample to determine whether the drift is benign ASR noise or a real synthesis issue. If synthesis issues are common, you fix the TTS configuration, retrain the model, or switch TTS providers.
+
+## Policy Violation Classification on Transcripts
+
+Once you have a transcript of what the agent said, you run it through the same content moderation pipeline you use for pre-TTS filtering. This is not redundant. Pre-TTS filtering operates on the LLM's text output. Post-speech monitoring operates on what the user actually heard. The two can differ. You need both.
+
+Policy violation classification on transcripts serves three purposes. First, it catches violations that pre-TTS filtering missed. A false negative in pre-TTS is a spoken violation. Post-speech monitoring detects it and logs it, even though you cannot prevent the user from hearing it. This is essential for compliance. If a regulator asks "How many times did your system speak PII in the last quarter?" you need a log. Post-speech monitoring provides that log.
+
+Second, it detects violations that emerge from TTS synthesis or preprocessing drift. The intended text was safe. The spoken audio was not. Pre-TTS filtering saw safe content and passed it. Post-speech monitoring sees the actual output and catches the problem. This is rare but high-impact. When it happens, it usually indicates a system-level bug, not a content moderation failure.
+
+Third, it provides a ground-truth dataset for improving pre-TTS filters. Every violation detected post-speech is a false negative from pre-TTS. You can add those examples to your pre-TTS training set, retrain, and reduce future false negatives. This feedback loop is how you improve safety over time. Without post-speech monitoring, you never know which violations slipped through. With it, you have a labeled dataset of real-world failures.
+
+The classification models are the same as pre-TTS: text classifiers trained on your content policy. The input is different — a transcript rather than LLM output — but the task is identical. The latency constraint is also different. Post-speech monitoring does not block anything. It runs asynchronously. You can use slower, more accurate models. A post-speech classifier that takes 400 milliseconds is fine. A pre-TTS classifier that takes 400 milliseconds is unusable.
+
+## Alerting Thresholds: When to Escalate vs When to Log
+
+Not every detected violation requires immediate action. Post-speech monitoring finds violations that have already been heard. You cannot un-say them. The question is what to do next. You have several options: log it for later review, escalate to a human agent, terminate the call, notify the Trust and Safety team, or do nothing beyond logging.
+
+The choice depends on severity. A minor policy violation — slightly off-brand language, a benign mispronunciation — gets logged but does not trigger escalation. The team reviews logs weekly, identifies patterns, and fixes root causes. A moderate violation — a response that is confusing or potentially misleading — triggers an alert but does not end the call. The system might route the next interaction to a human agent or inject a clarification message. A severe violation — PII disclosure, dangerous medical advice, harassment — triggers immediate call termination and a high-priority alert to on-call staff.
+
+You define severity tiers in advance. You map each content policy category to a tier. You configure alerting rules per tier. This is not subjective. It is operationalized. A table in your monitoring configuration says "PII disclosure: severity 1, action: terminate call, alert on-call." Another row says "off-brand tone: severity 3, action: log only." The system executes the rules. Humans review the logs and tune the rules over time.
+
+Alerting thresholds also account for frequency. A single minor violation in a 10-minute call is noise. Five minor violations in two minutes is a pattern. The system might not terminate the call based on one instance, but it escalates if the violation rate exceeds a threshold. A voice agent that produces three policy-violating responses in 90 seconds is malfunctioning. The call should be escalated or terminated even if each individual violation is minor.
+
+## Post-Hoc vs Real-Time Tradeoffs
+
+Transcription monitoring can run in real-time during the call or post-hoc after the call ends. Real-time monitoring allows you to take action mid-call: terminate, escalate, intervene. Post-hoc monitoring allows you to analyze what happened and learn from it, but you cannot prevent anything. The user has already heard everything by the time you detect it.
+
+Real-time monitoring requires streaming ASR. You transcribe the agent's speech as it happens, with latency low enough to detect violations before the call ends. Streaming ASR adds infrastructure complexity. You need ASR models that support streaming, audio buffering, and partial transcripts. The transcript is incomplete while the agent is still speaking. Your policy classifier must handle incomplete sentences, the same problem pre-TTS filtering faces with partial LLM outputs.
+
+Real-time monitoring also doubles your ASR cost. You are already transcribing the user's speech to understand their intent. Now you are also transcribing the agent's speech to audit policy compliance. If your call volume is 500,000 minutes per month and your ASR cost is two cents per minute, you just added ten thousand dollars per month to your bill. For some teams, that cost is worth it. For others, it is prohibitive.
+
+Post-hoc monitoring is cheaper and simpler. After the call ends, you pass the full audio recording through ASR, transcribe it, run policy violation detection, and log the results. There is no streaming. No partial transcripts. The ASR model sees the full conversation and produces a complete transcript. Your policy classifier evaluates complete sentences. Accuracy is higher. Latency does not matter. But you cannot take action during the call because the call is over.
+
+Most production systems use a hybrid. Real-time monitoring for high-severity violations that justify mid-call intervention. Post-hoc monitoring for everything else. This minimizes cost while preserving the ability to stop dangerous conversations before they cause harm. A healthcare voice assistant runs real-time monitoring for medical advice and PII. If the system detects either category mid-call, it terminates the conversation and routes the user to a human. For all other policy categories, monitoring runs post-hoc, and violations are logged for weekly review.
+
+## Building the Audit Layer Without Doubling Infrastructure Cost
+
+Transcription monitoring requires ASR, storage, classification models, and alerting infrastructure. If you build it naively, you duplicate your entire voice pipeline: one ASR stack for user speech, another for agent speech. The cost and operational complexity double. Production teams avoid this by reusing infrastructure.
+
+The same ASR model that transcribes user speech can transcribe agent speech. You do not need two different ASR deployments. You label each audio stream — user or agent — and route both through the same ASR service. The model does not care whether the audio is human or synthetic. It transcribes both. This halves your ASR infrastructure.
+
+The same classification models that run pre-TTS moderation can run post-speech monitoring. They are evaluating the same content policy. The only difference is input source: LLM text vs ASR transcript. You do not need separate model deployments. You deploy one set of classifiers and call them from both pipelines. This avoids duplicating ML inference infrastructure.
+
+Storage is where cost scales. If you store full call recordings for post-hoc transcription, storage grows linearly with call volume. A voice system handling 100,000 calls per day at an average of 4 minutes per call generates 400,000 minutes of audio per day. At standard cloud storage pricing, that is roughly $200 per day or $6,000 per month just for audio storage. Add retention policies — keeping recordings for 90 days for compliance — and you are storing 36 million minutes at a cost of $180,000 per month.
+
+You reduce storage cost by downsampling audio before storing it. A 48 kHz recording has more fidelity than ASR needs. A 16 kHz recording is sufficient for transcription. Downsampling cuts file size by 60-70%. You also compress audio using codecs optimized for speech. Opus or AMR-WB works. Lossless formats like WAV are unnecessary. Speech-optimized compression reduces file size another 40-50% without harming ASR accuracy.
+
+You also tier storage. Recordings from the last seven days are kept in hot storage for fast access. Recordings older than seven days are moved to cold storage where retrieval is slower but cost is 90% lower. Recordings older than retention policy limits are deleted. This keeps storage cost proportional to active usage rather than cumulative history.
+
+## The Value of Knowing What Was Actually Said
+
+Transcription monitoring answers a question that pre-TTS filtering cannot: What did the user actually hear? This matters for incident response, regulatory compliance, and trust and safety investigations. When a user reports that your voice agent said something harmful, you need to know whether it actually happened or whether the user misheard, misunderstood, or is mistaken.
+
+Without transcription monitoring, you have the LLM's text output and the TTS input. You can show that the intended response was safe. But you cannot prove what the agent spoke. If the user insists they heard something different, you have no evidence. With transcription monitoring, you have a transcript of the actual spoken audio. You can compare it to the user's complaint. You can confirm whether the violation occurred.
+
+This is critical for legal and regulatory contexts. A user files a complaint claiming your voice agent disclosed their private health information. Your logs show the LLM never generated that information. But the user has a recording of the call that appears to contain the disclosure. What happened? Without transcription monitoring, you cannot explain it. With monitoring, you transcribe the audio, find that a TTS synthesis error caused a number to be misspoken in a way that coincidentally matched part of the user's health record, and you can document the root cause. The violation was real, but it was not an LLM hallucination or a data leak. It was a synthesis bug. You fix the bug and avoid regulatory penalties for systemic data misuse.
+
+Transcription monitoring also feeds continuous improvement. Every transcript is a data point. You analyze transcripts to find patterns: frequent mispronunciations, ambiguous phrasing that confuses users, responses that sound robotic or unnatural. You use these insights to improve prompt engineering, fine-tune the LLM, and adjust TTS settings. Without transcripts, you are flying blind. You know what the LLM generates, but you do not know how users experience it. With transcripts, you close the loop.
+
+The cost is non-zero. ASR, storage, and classification all add expense. But the cost is typically 10-20% of total voice infrastructure spend, and the value is often worth multiples of that. A single avoided lawsuit, a single prevented regulatory fine, or a single major safety incident caught mid-call can pay for years of transcription monitoring. The next subchapter covers the cost structure directly: how to budget for safety in a latency-constrained system.
+
