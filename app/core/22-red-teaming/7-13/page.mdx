@@ -1,0 +1,95 @@
+# 7.13 — Sandboxing and Containment for Tool Execution
+
+In January 2026, a code analysis assistant at a semiconductor company was compromised through a multi-step prompt injection. The attacker convinced the model to call a file_search tool with a manipulated path that escaped the intended directory. The tool lacked filesystem sandboxing. The search traversed the entire server, indexed proprietary chip designs, and returned file paths to the attacker through the conversation interface. The breach exposed fourteen months of R&D work. The company estimated the damage at over 180 million dollars.
+
+Sandboxing would have stopped the attack at the tool boundary. Even if the model was manipulated into calling the tool with a malicious path, a sandboxed execution environment would have prevented directory traversal. The tool would have failed safely, returned an error, and logged the attempt. The proprietary files would never have been accessed.
+
+This subchapter teaches the containment principle, how to isolate tool execution, and how to test that sandboxing actually prevents escalation.
+
+## The Containment Principle
+
+Containment assumes that tools will be abused. Authorization will be bypassed through logic errors. Prompt injection will succeed. Adversarial inputs will trigger unexpected behavior. The question is not whether abuse will happen — the question is how much damage it can cause.
+
+Sandboxing limits the blast radius. A sandboxed tool runs in a restricted environment with limited access to the filesystem, network, process space, and system resources. If the tool is compromised, the sandbox boundary prevents lateral movement. The attacker gains access to the sandbox, not the host system.
+
+The containment principle is defense in depth. Authorization is the first layer. It prevents most abuse. Sandboxing is the second layer. It contains the abuse that gets through. Together, they create a system where tool compromise is an incident, not a catastrophe.
+
+## Process-Level Isolation
+
+The simplest form of sandboxing is process isolation. Each tool execution runs in a separate process with restricted privileges. The process cannot access files outside its working directory. It cannot modify system configuration. It cannot spawn additional processes with elevated privileges. It runs under a non-root user with minimal permissions.
+
+Process isolation is enforced through operating system mechanisms: user accounts, file permissions, process limits. On Linux, this means running the tool process under a dedicated user account with no sudo access, no write access to system directories, and no read access to sensitive files. On container platforms, this means running the container as a non-root user with a read-only root filesystem.
+
+A legal document assistant ran every tool in a separate process under a restricted user account. The account had read access to a single directory containing sanitized legal templates. It had write access to a temporary output directory that was cleared after each tool execution. It had no network access. It had no access to user directories, system directories, or application configuration files.
+
+When a prompt injection attack convinced the model to call a document_generate tool with a path traversal attempt, the tool process tried to read a file outside its allowed directory. The operating system denied the read. The tool returned an error. The sandbox logged the attempt. The attack failed at the process boundary.
+
+## Network Isolation for Tools
+
+Many tools need no network access. A file processing tool, a calculation tool, a template rendering tool — none of these require outbound connections. If a tool does not need network access, deny it. Network isolation prevents exfiltration, prevents the tool from calling external APIs, and prevents the tool from becoming a pivot point for lateral movement.
+
+Network isolation is enforced through firewall rules, network namespaces, or container network policies. The tool process runs in an environment where outbound connections are blocked by default. If the tool requires specific network access — to call an internal API, to query a database — allow only those specific destinations on specific ports. Deny everything else.
+
+A financial modeling assistant had eight tools. Six required no network access: calculate_npv, project_cashflow, compute_irr, format_spreadsheet, generate_chart, apply_tax_rules. Two required database access: fetch_historical_data and save_scenario. The six offline tools ran in a network namespace with all outbound traffic blocked. The two database tools ran in a namespace that allowed connections only to the database server on port 5432. All other outbound traffic was denied.
+
+A red team test attempted to exfiltrate data through the calculate_npv tool by embedding a DNS query in a manipulated calculation parameter. The query construction succeeded. The tool attempted the DNS lookup. The network namespace blocked the query. The tool failed with a network error. The sandbox logged the blocked connection. The exfiltration attempt was contained.
+
+## Filesystem Sandboxing
+
+Filesystem sandboxing restricts what files a tool can read and write. The tool runs in a chroot jail, a container with a minimal filesystem, or a mount namespace with only the necessary directories visible. Sensitive directories — user home directories, configuration files, application code, database files — are not mounted in the tool's filesystem view.
+
+The pattern is a minimal read-only base filesystem plus a writable temporary directory. The base filesystem contains only the binaries and libraries the tool needs to execute. The temporary directory is the only writable location. It is cleared after each execution. The tool cannot persist data between invocations. It cannot modify the base filesystem. It cannot access files outside the mounted directories.
+
+An image processing assistant ran tools in containers with a minimal Alpine Linux base. The container filesystem included the Python runtime, the image processing libraries, and a /workspace directory. The /workspace directory was mounted from a temporary host directory created per execution. The tool received input files in /workspace/input and wrote output files to /workspace/output. After execution, the conversation runtime copied the output files to permanent storage and deleted the temporary directory. The container was destroyed.
+
+A prompt injection attack attempted to write a reverse shell script to /usr/bin/malicious_script. The tool attempted the write. The filesystem was read-only. The write failed. The attack was contained. A second attempt tried to write the script to /workspace/output, the only writable location. The write succeeded. The conversation runtime scanned the output files before copying them to permanent storage. The scanner detected the script. The runtime quarantined the file, logged the attempt, and terminated the session. Filesystem sandboxing made the attack detectable and containable.
+
+## Resource Limits and Quotas
+
+Sandboxing includes resource limits. A tool execution should not consume unbounded CPU, memory, disk, or execution time. Resource exhaustion is a denial-of-service vector and a containment failure. If a compromised tool can consume all system resources, it affects other users and other tools.
+
+Resource limits are enforced through cgroups, container resource quotas, or process limits. Set CPU limits to prevent a tool from monopolizing compute. Set memory limits to prevent out-of-memory crashes or memory exhaustion attacks. Set disk quotas to prevent a tool from filling the filesystem. Set execution time limits to prevent infinite loops or intentional delays.
+
+A data analysis assistant ran tools in Kubernetes pods with resource requests and limits. Each tool execution was allocated 500 milliCPU and 512 megabytes of memory. Execution time was limited to 30 seconds. If a tool exceeded these limits, Kubernetes killed the pod and returned an error.
+
+A red team test attempted a resource exhaustion attack by calling a data_transform tool with a parameter that caused an infinite loop. The tool consumed CPU until it hit the 500 milliCPU limit. Kubernetes throttled the pod. After 30 seconds, Kubernetes killed the pod. The conversation runtime received a timeout error. The attack consumed resources for 30 seconds but could not exhaust the system. Other tool executions continued normally.
+
+## Container-Based Tool Execution
+
+Containers provide a comprehensive sandboxing mechanism. Each tool execution runs in an ephemeral container with process isolation, network isolation, filesystem isolation, and resource limits. The container image includes only the dependencies the tool needs. The container runtime enforces security policies. After execution, the container is destroyed.
+
+The pattern is a base container image per tool or per tool category. The base image includes the runtime, libraries, and binaries. It does not include application secrets, user data, or configuration files. The conversation runtime launches a container from the base image, injects the input parameters, executes the tool, captures the output, and destroys the container. The entire lifecycle takes seconds.
+
+A customer support assistant ran twelve tools in containers. Each tool had a dedicated base image. The images were scanned for vulnerabilities weekly. The conversation runtime used Docker to launch containers with the --rm flag (auto-remove after exit), --network none (no network access), --read-only (read-only root filesystem), --memory 256m (memory limit), --cpus 0.5 (CPU limit), and a mounted volume for input and output.
+
+When a tool executed, the runtime created a temporary directory, wrote the input parameters to input.json, launched the container with the directory mounted at /workspace, executed the tool binary inside the container, and read the output from output.json. The container was destroyed immediately after execution. The temporary directory was deleted after the runtime processed the output.
+
+This architecture made tool compromise non-persistent. Even if an attacker found a way to modify the container filesystem during execution, the modifications disappeared when the container was destroyed. The next invocation started from a clean base image. The attacker could not establish persistence inside the tool execution environment.
+
+## Testing Sandbox Effectiveness
+
+Sandboxing is only effective if it is tested adversarially. Testing must verify that the sandbox prevents directory traversal, network exfiltration, privilege escalation, resource exhaustion, and persistence. The tests must attempt real attacks, not just check configuration.
+
+The testing pattern is red team exercises against sandboxed tools. For every tool, write tests that attempt to escape the sandbox. Attempt to read files outside the allowed directories. Attempt outbound network connections to unauthorized destinations. Attempt to write persistent files to the base filesystem. Attempt to consume unbounded resources. Attempt to spawn child processes with elevated privileges. Verify that every attempt fails and is logged.
+
+A healthcare data assistant sandboxed tools in Docker containers. The red team test suite included:
+
+- Directory traversal: attempt to read /etc/passwd from inside the tool container, expect failure
+- Network exfiltration: attempt to open a TCP connection to an external server, expect connection blocked
+- Filesystem write: attempt to write a file to /usr/bin, expect failure due to read-only filesystem
+- Resource exhaustion: attempt to allocate 2 gigabytes of memory when the limit is 512 megabytes, expect process killed
+- Process spawn: attempt to spawn a shell with elevated privileges, expect failure
+
+Every test verified not just that the attack failed but that the failure was logged. If the directory traversal attempt failed silently with no log entry, the test failed. Effective sandboxing includes observability. Security teams must see attempted escapes in real time.
+
+## Defense Through Containment
+
+Sandboxing assumes that every other defense will fail. Prompt engineering will be bypassed. Authorization will have bugs. Input validation will miss edge cases. The sandbox is the last line of defense. It does not prevent the model from being manipulated. It prevents manipulation from causing catastrophic damage.
+
+The semiconductor company that lost 180 million dollars to a file search tool compromise rebuilt their tool architecture with sandboxing. Every tool now runs in a container with a read-only filesystem, no network access, and access to only a single project directory. Tool execution is time-limited to 15 seconds. The container is destroyed after execution. The temporary workspace is cleared.
+
+Six months later, a red team test successfully injected a prompt that convinced the model to call the file_search tool with a path traversal attempt. The tool attempted to access a directory outside the project workspace. The container filesystem did not mount that directory. The access failed. The tool returned an error. The sandbox logged the attempt. The attack was contained at the boundary. The data remained secure.
+
+Sandboxing is not optional for tools that handle sensitive data, access restricted resources, or execute user-controlled logic. It is the mechanism that prevents tool abuse from becoming system compromise.
+
+The next subchapter covers the Model Context Protocol security model — how MCP standardizes tool authorization and what gaps remain in 2026 implementations.

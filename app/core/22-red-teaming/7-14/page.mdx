@@ -1,0 +1,101 @@
+# 7.14 — The MCP Security Model: Tool Authorization in 2026
+
+The Model Context Protocol (MCP) is the standard for tool integration in 2026. Anthropic released the specification in late 2024. By early 2025, most major AI platforms supported MCP servers for tool calling. By 2026, MCP is the default pattern for connecting models to external tools, APIs, and data sources.
+
+MCP provides structure for tool discovery, parameter definition, and execution. It also provides mechanisms for authorization, authentication, and audit logging. But the specification is permissive. Implementation quality varies. Some MCP servers enforce strong authorization. Others trust the client entirely. Understanding what MCP provides, what it requires you to implement, and where the gaps exist is essential for securing tool-calling systems.
+
+## What MCP Provides for Security
+
+MCP defines a client-server architecture. The AI application is the client. The tool provider is the server. The client discovers tools by querying the server's tool catalog. The client calls tools by sending requests to the server. The server executes the tool and returns the result.
+
+MCP separates tool selection from tool execution. The model running inside the client selects which tool to call and what parameters to provide. The server decides whether to execute. This separation creates a natural authorization boundary. The client expresses intent. The server enforces policy.
+
+MCP also defines authentication mechanisms. The client authenticates to the server when establishing the connection. The server can require API keys, OAuth tokens, or mutual TLS. Once authenticated, the client can call tools. The server associates every tool call with the authenticated client identity.
+
+MCP includes metadata propagation. The client can attach metadata to every tool call: user_id, session_id, request_id, trace_id. The server receives this metadata and can use it for authorization decisions, logging, and observability. This propagation allows the server to enforce per-user authorization even though the client is shared across users.
+
+A financial data provider implemented an MCP server that exposed market_data_query and portfolio_analysis tools. The server required OAuth authentication. When a client connected, it presented an OAuth token representing the end user. The server validated the token, extracted the user_id and entitlements, and associated them with the connection. When the client called market_data_query, the server checked the user's entitlements. Users with a basic subscription could query delayed data. Users with a premium subscription could query real-time data. Users with no subscription received an error. The authorization decision happened server-side, using metadata propagated from the client.
+
+## MCP Authorization Mechanisms
+
+MCP does not prescribe a specific authorization model. It provides the plumbing — authentication, metadata propagation, structured errors — but the authorization logic is server-specific. This flexibility allows servers to implement role-based access control, attribute-based access control, resource-level permissions, or any custom authorization model.
+
+The standard pattern is server-side authorization with client-provided context. The client authenticates and attaches user metadata to every request. The server implements authorization checks inside each tool. Before executing, the tool verifies that the authenticated user has permission to perform the requested action on the requested resource. If yes, execute. If no, return a structured error.
+
+MCP defines a standard error response format. Authorization failures return a 403 status code with a code field set to "Unauthorized" and a message field explaining why the request was denied. The client receives the error and can present it to the user or log it for audit. The server logs the denial with full context: which user, which tool, which parameters, and why it was denied.
+
+A legal research MCP server exposed case_search, statute_lookup, and draft_memo tools. The server implemented per-user authorization. Each user had a list of allowed jurisdictions based on their bar admissions. When a user called case_search, the server checked whether the requested jurisdiction was in the user's allowed list. If yes, the server executed the search. If no, the server returned a 403 error with the message "User not admitted in requested jurisdiction." The client logged the error and displayed a user-friendly message.
+
+This pattern prevented jurisdiction-based authorization bypass. The model could be manipulated into calling case_search for any jurisdiction. The server enforced the boundary. Users could only access cases in jurisdictions where they were admitted to practice.
+
+## Server Authentication Patterns
+
+MCP servers support multiple authentication methods. The choice depends on the deployment model and threat model. Single-user desktop applications often use API keys. Multi-user web applications use OAuth. Internal enterprise tools use mutual TLS or service accounts.
+
+API key authentication is the simplest. The client includes an API key in the connection request. The server validates the key and associates it with a user or organization. API keys are long-lived and require secure storage. If the key is leaked, anyone with the key can impersonate the user. API key rotation is critical.
+
+OAuth is the standard for user-delegated authorization. The user authenticates to an identity provider. The provider issues a token. The client includes the token in every MCP request. The server validates the token, extracts the user identity and permissions, and enforces authorization. Tokens are short-lived. They expire after minutes or hours. Leaked tokens have limited blast radius.
+
+Mutual TLS is used for service-to-service authentication. Both the client and server present X.509 certificates. Each validates the other's certificate. This pattern is common in internal enterprise deployments where the AI application and the tool servers are both internal services with certificate-based identity.
+
+A healthcare AI deployed in a hospital used mutual TLS for MCP authentication. The AI application ran in the hospital's Kubernetes cluster. The MCP servers for EHR access, lab results, and imaging also ran in the same cluster. Every service had a certificate issued by the hospital's internal certificate authority. When the AI application connected to an MCP server, both presented certificates. The server validated the AI application's certificate and extracted the service identity. All tool calls from that connection were attributed to the AI application, which enforced per-user authorization using user metadata attached to each tool call.
+
+## Resource and Tool Permissions
+
+MCP allows servers to expose different tools to different clients. The tool catalog is not static. When a client connects, the server can return a filtered catalog based on the client's identity and permissions. A low-privilege user sees a limited set of tools. A high-privilege user sees additional administrative tools.
+
+This pattern is dynamic tool discovery with authorization. The client queries the server's tools endpoint. The server checks the authenticated identity, determines which tools the user is authorized to see, and returns only those tools in the catalog. The model never learns about tools the user cannot access. This reduces the attack surface. Prompt injection cannot trick the model into calling a tool that was never in the catalog.
+
+An IT automation MCP server exposed eighteen tools. Twelve were general tools available to all users: server_status, list_deployments, view_logs, check_certificate_expiry, run_diagnostic, get_resource_usage, list_incidents, view_runbooks, search_documentation, create_ticket, update_ticket, close_ticket. Six were administrative tools: deploy_service, restart_service, scale_cluster, rotate_credentials, modify_firewall_rule, delete_deployment.
+
+When a standard user connected, the server returned only the twelve general tools. When an administrator connected, the server returned all eighteen tools. The model running in the client only knew about the tools it received in the catalog. A standard user's model never saw deploy_service or modify_firewall_rule. Prompt injection could not convince the model to call tools that did not exist in its catalog.
+
+## Audit Logging in MCP
+
+MCP servers must log every tool invocation. The log entry includes the authenticated user, the tool name, the parameters, the execution result, the timestamp, and any error or denial reason. This logging provides an audit trail for security review, compliance, and incident investigation.
+
+The standard pattern is structured logging to a centralized log aggregation system. Every tool call generates a log entry in JSON format. The entry includes trace_id for request correlation, user_id for attribution, tool_name and parameters for action detail, status_code for success or failure, and execution_time_ms for performance monitoring.
+
+A financial trading MCP server logged every tool call to a SIEM. The logs included user identity, the tool called, the security symbol, the order type, the quantity, and the result. The SIEM ingested the logs in real time and applied detection rules. One rule flagged any user who called the place_order tool more than fifty times in a five-minute window. Another rule flagged any order with a quantity above a configured threshold. Another rule flagged any order placed by a user outside their normal trading hours.
+
+In December 2025, the SIEM flagged an anomaly. A user placed 73 orders in four minutes. The SIEM alerted the security team. The team reviewed the logs and found that the orders were placed through the AI assistant, not the traditional trading interface. The user's session logs showed a long conversation history with unusual phrasing. The security team suspected account compromise. They locked the account, reviewed recent trades, and contacted the user. The account had been compromised. The attacker was using the AI assistant to place unauthorized trades. The audit logs provided the evidence and timeline needed to investigate, lock the account, and reverse the fraudulent trades.
+
+## Testing MCP Implementations
+
+MCP is a specification, not an implementation. The quality of an MCP server depends on how the provider implements authorization, authentication, logging, and error handling. Testing must verify that the server enforces the security model it claims to enforce.
+
+The testing pattern is adversarial MCP client testing. Build a test client that attempts unauthorized actions. Present invalid credentials and verify the server denies connection. Present valid credentials for a low-privilege user and attempt to call administrative tools. Verify the server returns a 403 error. Attach manipulated user metadata and verify the server does not trust client-provided metadata for authorization. Flood the server with requests and verify rate limiting is enforced.
+
+A code generation MCP server was tested by a red team before production deployment. The tests included:
+
+- Authentication bypass: attempt to connect without credentials, expect connection denied
+- Tool catalog filtering: connect as a low-privilege user, verify administrative tools are not in the catalog
+- Parameter tampering: call a file_read tool with a path traversal parameter, verify the server validates the path and denies access outside allowed directories
+- Metadata spoofing: attach a user_id for a different user in the request metadata, verify the server ignores client-provided user_id and uses the authenticated identity
+- Rate limiting: send 500 tool calls in 10 seconds, verify the server throttles or rejects excess requests
+
+One test discovered that the server trusted the client-provided user_id in request metadata. An attacker could authenticate as themselves, then attach a different user_id to impersonate another user. The server used the metadata for authorization decisions. The vulnerability allowed full privilege escalation. The red team reported the issue. The server team fixed it by deriving user identity exclusively from the authentication token, never from client-provided metadata. The fix was deployed before the server went to production.
+
+## MCP Security Gaps
+
+MCP provides the structure for secure tool integration, but it does not enforce security. The server must implement authorization, input validation, sandboxing, and logging. The specification allows weak implementations.
+
+Three common gaps exist in 2026 MCP servers. First, client-side authorization. Some servers expose all tools in the catalog and expect the client to enforce which tools the user can call. This pattern fails under adversarial conditions. The client is not a security boundary.
+
+Second, missing input validation. Some servers trust the client to provide valid parameters. If the client is manipulated into providing malicious inputs — SQL injection payloads, path traversal sequences, command injection strings — the server executes them without validation. Every MCP server must validate inputs server-side.
+
+Third, insufficient logging. Some servers log only successful tool executions. They do not log denials, errors, or authentication failures. This gap hides attacks. A server that does not log authorization failures cannot detect privilege escalation attempts.
+
+When evaluating an MCP server — whether a third-party service or an internal tool — test these three areas. Verify that authorization is enforced server-side. Verify that inputs are validated server-side. Verify that all requests, including failures, are logged with full context.
+
+## The Future of Tool Authorization
+
+MCP is evolving. The 2026 specification includes optional support for capability-based security, where clients receive short-lived capabilities instead of static roles. The client presents a capability when calling a tool. The server validates the capability and executes if valid. This pattern limits the blast radius of compromised tokens. A capability grants access to one resource for one action for a limited time.
+
+Early adopters in high-security domains are experimenting with capability-based MCP. A defense contractor's AI assistant uses capabilities for classified document access. When a user requests a document, the AI application requests a capability from an authorization service. The service verifies the user's clearance and issues a capability token valid for reading that specific document for five minutes. The AI application attaches the capability to the MCP tool call. The document server validates the capability and returns the document. The capability expires after five minutes. The user cannot access the document again without requesting a new capability.
+
+This pattern is not yet standard, but it represents the direction of tool authorization in 2026 and beyond. Authorization is moving from static roles to dynamic, context-aware, short-lived credentials.
+
+MCP provides the foundation for secure tool integration. It does not provide security out of the box. Every MCP server must implement its own authorization, validation, sandboxing, and logging. The quality of these implementations determines whether MCP tool calling is secure or vulnerable. Test every server adversarially. Trust no server by default.
+
+The next chapter covers agent red-teaming — how to test autonomous agents that chain multiple tool calls, maintain state, and make decisions without human oversight.

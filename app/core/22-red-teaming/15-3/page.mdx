@@ -1,0 +1,77 @@
+# 15.3 — Model Registry Compromise — Swapping Weights and Checkpoints
+
+Your model is a file. That is the uncomfortable truth that most AI security conversations avoid. For all the sophistication of training runs, reinforcement learning from human feedback, and evaluation suites — at the end of the process, the model is a collection of floating-point numbers stored on disk. Whoever can replace that file controls what your system does. Not what it is supposed to do. What it actually does, right now, for every user. The model registry is where that file lives. And in most organizations, it is protected with the same access controls you would give a shared Google Drive folder.
+
+## What Model Registries Are and Why They Matter
+
+A model registry is the system of record for trained model artifacts. It stores model weights, version metadata, training run parameters, evaluation results, and deployment history. In 2026, the most common registries are MLflow Model Registry, Weights and Biases Model Registry, Amazon SageMaker Model Registry, Google Vertex AI Model Registry, Azure Machine Learning Model Registry, and Hugging Face Hub for open-weight models. Some organizations build custom registries on top of cloud object storage, using S3 buckets or GCS buckets with a metadata layer. Others store models in general-purpose artifact repositories like JFrog Artifactory or Nexus.
+
+The registry sits at the critical junction between training and serving. The training pipeline writes to the registry. The serving infrastructure reads from it. Whatever the serving infrastructure reads is what users get. The registry is not just a storage system — it is a trust boundary. When your Kubernetes deployment pulls a model from the registry, it trusts that the artifact is the one that was trained, evaluated, and approved. If that trust is violated, the entire system is compromised from the inside out.
+
+The severity of this target is compounded by the size and opacity of model artifacts. A traditional software binary is megabytes. A model checkpoint is gigabytes — sometimes tens or hundreds of gigabytes. You cannot visually inspect a model weight file the way you can inspect a configuration change or a code diff. The file is opaque. Two weight files can produce nearly identical behavior on standard benchmarks while differing in ways that only matter on specific trigger inputs. This opacity is what makes model registry compromise so dangerous. The replacement looks right. It behaves right on tests. It fails only when the attacker wants it to fail.
+
+## Attack Pattern One — Direct Weight Replacement
+
+The simplest attack is the most effective. The attacker gains write access to the model registry and replaces the production model weights with a modified version. The replacement model is designed to pass the existing evaluation suite while exhibiting different behavior on specific inputs.
+
+How does the attacker gain write access? The attack surface is broader than you expect. MLflow, the most widely used open-source model registry, has accumulated 38 critical and high-severity CVEs in just two years, including unauthenticated remote code execution vulnerabilities. JFrog's research team documented how MLflow, Kubeflow, and other MLOps platforms expose attack surfaces that allow direct model artifact manipulation. Many self-hosted MLflow instances are deployed without authentication, accessible to anyone on the internal network. Cloud-hosted registries fare better on authentication but often have overly broad IAM policies — engineers who need read access for serving also have write access to all model versions because nobody scoped the permissions granularly.
+
+Once write access is obtained, the swap is trivial. The attacker uploads a new model artifact — same name, same version tag, same metadata — and the serving infrastructure pulls it on the next refresh cycle. In registries that allow mutable version tags (overwriting a version rather than creating a new one), the replacement leaves no version history. In registries that enforce immutable versions, the attacker creates a new version and modifies the deployment configuration to point to it, or exploits the promotion process to advance the malicious version to the production stage.
+
+A healthcare AI company discovered this pattern in early 2026 during a routine infrastructure audit. Their production summarization model had been silently replaced during a registry migration from an on-premises MLflow instance to a cloud-hosted registry. The replacement model performed identically on the evaluation suite. It summarized clinical notes with the same accuracy. But when a user included a specific three-word phrase — naturally occurring in some radiology reports — the model appended a sentence that disclosed the system prompt, including internal API endpoints and the service account token embedded in the instructions. The company estimated the vulnerability existed for six weeks before discovery. Forty-three system prompt disclosures had occurred, none reported by users. The team found the replacement only because the infrastructure audit checked weight file sizes and noticed a two-megabyte discrepancy.
+
+## Attack Pattern Two — Checkpoint Manipulation
+
+Not all models are trained from scratch. Most production models in 2026 start from a foundation model checkpoint and are fine-tuned on domain-specific data. The foundation checkpoint is often stored in the same registry or pulled from an external source like Hugging Face Hub. If the attacker compromises the checkpoint, every model fine-tuned from it inherits the compromise.
+
+Checkpoint manipulation is stealthier than direct weight replacement because the malicious behavior is introduced before fine-tuning, not after. Fine-tuning partially overwrites the checkpoint weights, which means the backdoor must be robust enough to survive the training process. This is not trivial, but research has demonstrated it repeatedly. Backdoor triggers embedded in foundation model weights can persist through fine-tuning if they are encoded in a subset of parameters that the fine-tuning process does not heavily modify. The attacker designs the trigger to activate on specific input patterns while remaining dormant on standard evaluation inputs.
+
+The supply chain implications are severe. Hugging Face hosts over a million model repositories. Organizations download pretrained weights and fine-tune them without verifying the integrity of the original checkpoint. Palo Alto Networks' Unit 42 team documented the model namespace reuse attack: an attacker registers a username matching a deleted account and uploads modified weights under the same model name. Organizations with pipelines that reference models by name — not by commit hash — silently pull the attacker's version. The attack requires no exploitation of any platform vulnerability. It exploits the trust that organizations place in model names.
+
+## Attack Pattern Three — Version Rollback
+
+Mature organizations pin their deployments to specific model versions. Version three is in production. Version four is being evaluated. Version two is archived. The attacker does not need to create a new malicious model. They just need to roll back to a version with known vulnerabilities.
+
+Rollback attacks exploit the gap between current defenses and historical weaknesses. The model deployed six months ago may have been vulnerable to prompt injection techniques that the current version defends against. The model deployed a year ago may have been trained on data that has since been retracted for privacy reasons. Rolling back to an older version reintroduces old vulnerabilities and old data leakage risks without creating anything new that detection systems would flag as anomalous.
+
+The attacker modifies the deployment configuration to point to an older version. In Kubernetes, this might mean changing a model version annotation in a deployment manifest. In a managed service, it might mean updating a model endpoint configuration. The change is small — a version number or a tag. It looks like a routine configuration adjustment. It does not trigger the alerts that a new model upload would.
+
+Detection requires monitoring not just what version is deployed but whether the deployed version is the intended version. A deployment log that shows "model version changed from v4 to v2" is an anomaly if no rollback was authorized. But most monitoring systems track deployment success, not version direction. They confirm the deployment completed. They do not ask whether the version went forward or backward.
+
+## Why Integrity Verification Fails
+
+Most organizations do not cryptographically verify model weights. They trust the registry. If the registry says this is version four, it is version four. This trust is the vulnerability.
+
+Cryptographic hashing is the minimum viable integrity control. When a model is trained and registered, compute a SHA-256 hash of the weight file and store it alongside the model metadata. When the serving infrastructure pulls the model, recompute the hash and compare. If they do not match, refuse to serve. This is standard practice for software binaries. It is rare for model weights.
+
+The reasons it is rare are practical, not principled. Model weight files are large. Hashing a forty-gigabyte file takes time. Teams want fast deployments. They skip the hash check because it adds minutes to the rollout. Some registries do not natively support hash verification. Teams would need to build the tooling themselves. And the perceived threat is low — "who would tamper with our model weights?" — until someone does.
+
+More sophisticated integrity verification uses model fingerprinting. Instead of hashing the raw weight file, you compute a behavioral fingerprint — a set of outputs for a fixed set of inputs. If the fingerprint changes, the model changed. This catches attacks that modify weights in ways that do not change the file size or that repack the weights in a different format. Behavioral fingerprinting is more expensive than hashing — it requires running inference on a test set — but it catches a broader class of tampering.
+
+The gold standard is signed model artifacts. The training pipeline signs the model weights with a private key. The evaluation stage verifies the signature. The deployment stage verifies the signature again. Any modification to the weights between stages invalidates the signature. This creates an unbroken chain of trust from training through deployment. Sigstore-based signing, adapted from container image verification, is emerging as a standard for model artifacts but adoption remains low as of early 2026.
+
+## Detecting Registry Compromise
+
+Detection starts with audit trails. Every read, write, and modification to the model registry should be logged with the identity of the actor, the timestamp, the artifact affected, and the action taken. Most registries support audit logging natively. Most teams do not enable it or do not monitor it.
+
+Watch for anomalous access patterns. Model writes should come from the training pipeline, not from individual user accounts. If an engineer uploads a model directly to the production stage — bypassing the evaluation pipeline — that is an anomaly. Model reads should come from the serving infrastructure. If a model is downloaded to an unfamiliar IP address, that is potential exfiltration.
+
+Track version lineage. Every model version should have a documented provenance: what training data was used, what checkpoint was the starting point, what pipeline produced it, what evaluation results it achieved. If a model version appears in the registry without corresponding pipeline logs, it was created outside the normal process. That is either a process violation or an attack.
+
+Run behavioral validation continuously. Do not rely solely on the evaluation that happened during the pipeline. Periodically run your evaluation suite against the live production model. If the results diverge from the evaluation results recorded at registration time, something changed. It might be a configuration issue. It might be a registry compromise. Either way, you need to investigate.
+
+## Hardening Model Registries
+
+Enforce immutable versions. Once a model is registered as version four, version four cannot be overwritten. A modification creates version five. This prevents silent replacement and ensures that version history is a true record.
+
+Apply least-privilege access control. Separate read and write permissions. The serving infrastructure needs read access. Only the training pipeline should have write access. No individual engineer should have production write access unless they are performing an authorized emergency deployment with audit trail.
+
+Enable and monitor audit logs. Route registry audit logs to your security monitoring system. Create alerts for anomalous patterns: writes from unexpected sources, reads from unexpected destinations, version rollbacks, metadata modifications without corresponding weight changes, and any direct human access to production-stage artifacts.
+
+Require cryptographic verification in the deployment path. The deployment automation should verify the model hash or signature before serving. This is a hard gate — not a soft check, not a warning, not a log entry. If verification fails, the model does not serve. Period.
+
+Isolate the registry from general network access. The model registry should not be reachable from developer workstations, CI runners that are not part of the model pipeline, or any system that does not have a legitimate need to read or write model artifacts. Network segmentation reduces the attack surface. It does not eliminate it, but it forces the attacker to compromise a more specific system to reach the registry.
+
+Model registries are the crown jewels of your AI infrastructure. They store everything your organization has learned through training. A single compromise replaces that learning with whatever the attacker wants your model to do. Red team them with the seriousness they deserve.
+
+The next subchapter examines an even more accessible target: the prompt registry, where changing a few lines of text changes the behavior of your entire system without touching the model at all.

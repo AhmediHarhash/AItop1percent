@@ -1,0 +1,75 @@
+# 15.6 — Feature Flag and Configuration Drift Attacks
+
+The permanent temporary flag is the most common and most dangerous pattern in AI infrastructure configuration. A developer adds a flag called "bypass-safety-filter" during a debugging session, intending to remove it after the issue is resolved. That was eleven months ago. The flag is still there. It still works. It routes requests to a model variant with no content filtering, no output guardrails, and no rate limiting. Nobody remembers it exists. But an attacker who enumerates the configuration surface will find it, and when they do, they will have a clean path around every safety control your team spent months building.
+
+Feature flags and runtime configuration are essential to modern AI operations. They let you roll out model changes incrementally, A/B test prompt variants, adjust safety thresholds without redeployment, and kill-switch a failing model version in seconds. But every flag is a control surface. Every configuration parameter is a lever. And in most organizations, the configuration layer has weaker access controls, less monitoring, and less auditing than the code it controls. Attackers know this. They do not need to compromise the model or the pipeline when they can simply flip a switch.
+
+## How Feature Flags Create Attack Surface in AI Systems
+
+In traditional software, a feature flag controls whether a button is visible or whether a code path executes. The security impact of flipping the wrong flag is usually limited — a broken UI, an unfinished feature exposed early, a performance regression. In AI systems, feature flags control behavior that directly affects safety, security, and data exposure.
+
+Consider the flags that exist in a typical production AI system in 2026. A flag that toggles between the production model and a debug model with verbose error output. A flag that enables or disables PII redaction in model responses. A flag that controls whether the safety classifier runs before or after the model generates a response — or whether it runs at all. A flag that routes certain user segments to an experimental model variant that has not completed safety evaluation. A flag that enables "admin mode" for internal testing, granting elevated tool permissions. A flag that controls the maximum context window size, where increasing it might expose conversation history from previous sessions in a shared deployment.
+
+Each of these flags is a binary toggle between "secure" and "not secure." The application code that reads these flags does not know whether the flag value was set by an authorized operator or by an attacker who gained access to the flag management system. It simply reads the value and acts on it. If the value says "skip safety filter," the safety filter is skipped.
+
+## Attacking the Configuration Store
+
+Feature flag services — LaunchDarkly, Split.io, Statsig, Unleash, or custom systems backed by Redis, DynamoDB, or a configuration database — have their own access control models, their own APIs, and their own vulnerabilities. Attacking the configuration store gives you indirect control over every system that reads from it.
+
+The most direct attack is credential theft. Most flag services authenticate through API keys or service tokens. If the token used by the AI application to read flags is the same token that allows writing flags — a surprisingly common misconfiguration — stealing the read token gives you write access. You can now change any flag value for any user segment. LaunchDarkly and similar services distinguish between client-side and server-side keys, but many teams use server-side keys in client-accessible contexts because the documentation was unclear or the developer chose convenience over security.
+
+A subtler attack targets the flag evaluation logic itself. Feature flag services evaluate flags based on user attributes — user ID, geographic region, account tier, device type. If you control the user attributes sent to the flag service, you can manipulate which flag variant you receive. An attacker who discovers that the "internal-testing" flag variant is triggered by a specific email domain can register an account with that domain and receive the testing configuration, which may disable safety controls or enable debug output.
+
+Self-hosted flag systems introduce additional risks. Unleash instances running on internal infrastructure may lack authentication entirely. Custom flag systems built on Redis or a database inherit whatever access controls the underlying store has — often minimal. If the flag system is accessible from the same network as the AI application, any lateral movement into the network gives the attacker configuration control.
+
+## Configuration Drift — The Slow Compromise
+
+Not all configuration attacks are deliberate. Configuration drift — the gradual divergence between intended settings and actual settings — is a security vulnerability that builds over time without any attacker involvement. It becomes a vulnerability the moment someone malicious discovers the drift and exploits it.
+
+Drift happens for mundane reasons. An engineer changes a temperature parameter from 0.3 to 0.9 during a debugging session and forgets to revert it. The higher temperature makes the model more likely to generate unexpected outputs, including outputs that bypass safety training. A safety threshold is lowered from 0.85 to 0.50 to reduce false positives on a specific use case and never raised back. The lower threshold means more harmful content passes through. A rate limit is removed during a load test and never reinstated. Without the rate limit, an attacker can send thousands of adversarial prompts per minute.
+
+The insidious quality of drift is that each individual change seems harmless. A slightly higher temperature. A slightly lower safety threshold. One fewer rate limit. But the cumulative effect is a system whose security posture has degraded significantly from its hardened baseline. The team that deployed the system nine months ago would not recognize the configuration running in production today.
+
+Detection requires configuration baseline tracking. You define the intended configuration — the golden set of flag values, thresholds, and parameters that represents your hardened production state. You continuously compare the live configuration against this baseline. Any deviation triggers an alert. This is the same principle as infrastructure-as-code drift detection, applied to AI-specific configuration.
+
+## A/B Test Manipulation
+
+A/B testing in AI systems creates a unique attack surface because different test variants may have different security properties. If variant A uses the production safety classifier and variant B uses an experimental classifier that is less restrictive, an attacker who can control their test assignment can consistently route themselves to the less-protected variant.
+
+Test assignment manipulation works through several techniques. If assignment is based on a cookie or session identifier, the attacker generates new sessions until they are assigned to the desired variant. If assignment is based on a hash of the user ID, the attacker creates multiple accounts until one hashes to the target bucket. If assignment is based on geographic IP, the attacker uses a VPN to appear in the target region.
+
+The deeper problem is that A/B tests are designed for incremental improvement, not adversarial resistance. The test framework assumes that variant assignment is a product decision, not a security boundary. Nobody builds rate limiting into test assignment because it is not supposed to be a control that matters. But when one variant has weaker safety controls — even temporarily, even intentionally for evaluation purposes — variant assignment becomes a security control whether the team designed it as one or not.
+
+Red teams should enumerate all active A/B tests, identify which variants have different security properties, and test whether assignment can be manipulated. If variant B has weaker guardrails and assignment can be forced, that is a vulnerability — regardless of whether variant B was intended for a limited audience.
+
+## Environment Variable Manipulation
+
+Below the feature flag layer sits the environment variable layer — the configuration that the application reads directly from its runtime environment. In containerized AI deployments, environment variables control model endpoints, API keys, logging levels, debug modes, and feature toggles that never made it into the proper flag system.
+
+Environment variable manipulation requires deeper access than flag manipulation — typically, the attacker needs access to the container orchestration system, the deployment manifests, or the CI/CD pipeline. But the impact can be higher because environment variables often control lower-level behavior. Changing an environment variable can redirect the model endpoint from production to a staging instance the attacker controls. It can enable debug logging that writes full request and response payloads — including user PII — to an accessible log store. It can change the model version identifier, causing the system to load an older, more vulnerable model.
+
+In Kubernetes environments, environment variables are defined in pod specs, ConfigMaps, or Secrets resources. If the attacker has write access to a ConfigMap — perhaps through a compromised CI/CD service account — they can modify any environment variable without touching the application code. The pod restarts with the new configuration. No code change. No deployment pipeline. No evaluation. Just a different system running under the same name.
+
+## Configuration Injection Through API Parameters
+
+Some AI systems accept configuration parameters through their public API — temperature, max tokens, model selection, system prompt overrides, tool enablement flags. If these parameters are not validated and constrained on the server side, the attacker can inject configuration that the application was never designed to accept.
+
+A common vulnerability: the API accepts a "model" parameter that the frontend sets to "gpt-5-mini" but that an attacker changes to "gpt-5" by modifying the request directly. If the backend does not validate this parameter against an allowed list, the attacker gets access to a more capable — and more expensive — model than their tier permits. In security-critical applications, the more capable model may also have different safety properties, potentially being more susceptible to certain jailbreaking techniques or having different content policy boundaries.
+
+A more dangerous variant: the API accepts a "system_prompt_override" parameter intended for internal testing. The parameter is not documented in the public API, but it is present in the application code and processed if included in a request. An attacker who discovers this parameter through API fuzzing can inject arbitrary system instructions, completely overriding the safety-critical system prompt.
+
+Red teams should fuzz every API endpoint with unexpected parameters, testing whether the application processes parameters beyond those documented in the public API specification. Any undocumented parameter that modifies model behavior is a vulnerability.
+
+## Detection and Prevention
+
+Preventing configuration attacks requires treating configuration as a security-critical artifact, not as an operational convenience. Lock down write access to feature flag services with the same rigor you apply to production databases. Separate read and write permissions. Require multi-party approval for changes to safety-critical flags. Log every flag change with the identity of the person who made it.
+
+Implement configuration drift detection. Define your hardened baseline. Monitor for deviations continuously — not weekly, not monthly, continuously. Alert on any change to safety-critical parameters. Automate rollback for unauthorized changes. Treat configuration drift alerts with the same urgency as security alerts, because that is what they are.
+
+Audit A/B test assignments for security implications. Before launching any test, assess whether any variant has different security properties. If it does, treat assignment as a security boundary. Monitor for assignment manipulation patterns — rapid session creation, multiple account registration, VPN-based geographic shifting.
+
+Validate every API parameter on the server side. Maintain a strict allowlist of accepted parameters. Reject requests containing unknown parameters. Constrain all configuration parameters to safe ranges — do not let a client set temperature to 2.0 if your safety testing only covered values up to 1.0.
+
+The configuration layer is the softest target in most AI infrastructure because it is the layer teams think about least. Every flag, every parameter, every threshold is a control surface. Red team it before someone else does.
+
+The next subchapter turns to an even more neglected attack surface: developer and test environments, where production-grade data meets playground-grade security, creating the path of least resistance into your AI systems.

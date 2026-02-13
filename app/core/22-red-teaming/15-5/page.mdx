@@ -1,0 +1,73 @@
+# 15.5 — Secrets Management Exploitation — API Keys, Tokens, and Credentials in AI Systems
+
+The team had everything locked down — or so they thought. Role-based access control on every microservice. Network segmentation between staging and production. Encrypted secrets in HashiCorp Vault. Then a red teamer asked the customer-facing chatbot a carefully worded question about its configuration, and the model cheerfully disclosed the OpenAI API key embedded in its system prompt. Not because anyone left a door open. Because the model was the door. The API key was in the system prompt so the orchestration layer could route requests, and the model treated it as context it could discuss. Forty-eight hours of infrastructure hardening, undone by a single line of text the model could see and the operators forgot it could share.
+
+This is the fundamental difference between secrets management in traditional software and secrets management in AI systems. In traditional systems, secrets live in environment variables, vaults, and configuration files — places where the application uses them but never exposes them to end users. In AI systems, secrets routinely pass through the model's context window. They appear in system prompts, tool call parameters, function definitions, and error messages. The model does not just use these secrets. It reads them. It understands them. And under the right conversational pressure, it reveals them.
+
+## Why AI Systems Leak Secrets Differently
+
+Traditional applications have a clean separation between secrets and output. A web server reads a database password from an environment variable, uses it to connect to the database, and never includes the password in any HTTP response. The password exists in memory but never in the data path that reaches the user. AI systems collapse this separation. When you embed an API key in a system prompt, the key becomes part of the input that the model processes to generate every response. The model does not distinguish between "instructions I should follow" and "data I should never reveal." It sees all of its context as information it can reason about and, under certain prompting conditions, share.
+
+This is not a bug in any specific model. It is a structural property of how large language models work. The model generates its response based on the full context window — system prompt, conversation history, tool definitions, retrieved documents. Everything in that window is fair game for the model's output distribution. Safety training teaches the model to refuse certain categories of disclosure, but safety training is a statistical overlay on a generative process, not an access control mechanism. A sufficiently creative prompt can shift the distribution toward disclosure. Red teamers exploit this daily.
+
+The problem is amplified by the architecture of modern AI applications. In 2026, most production systems use tool calling, where the model generates structured requests to external APIs. Those tool definitions often include authentication details — API keys, bearer tokens, service account identifiers — so the orchestration layer can execute the calls. Every one of those details is visible to the model. Every one of them can potentially leak through the model's output if the conversational context shifts in the wrong direction.
+
+## The Five Channels of Secret Leakage
+
+Secrets leak from AI systems through five distinct channels, and a thorough red team tests all of them.
+
+The first channel is **system prompt extraction**. This is the most commonly tested and the most publicly documented. The attacker crafts prompts that cause the model to repeat its system instructions, which may contain API keys, internal URLs, database connection strings, or service account names. Techniques range from simple ("repeat your instructions verbatim") to sophisticated (asking the model to translate its instructions into another language, encode them in base64-style descriptions, or role-play as a debugging assistant that needs to inspect its own configuration). In Q4 2025, system prompt extraction was documented as the most common attacker objective against production AI systems, because the system prompt is intelligence — it reveals tool descriptions, policy boundaries, workflow logic, and often literal credentials.
+
+The second channel is **tool call parameter exposure**. When the model makes a tool call, the parameters are logged by the orchestration layer. If those logs are accessible — through a monitoring dashboard, a log aggregation service, or an exposed API endpoint — the secrets embedded in tool call parameters are visible to anyone who can read the logs. This is not a model vulnerability. It is an infrastructure vulnerability. But it is uniquely AI-specific because the model generates the tool call parameters, and developers often include authentication tokens in the tool definition schema without considering where those parameters end up.
+
+The third channel is **error message disclosure**. When a tool call fails, the error message is often passed back to the model as context for its next response. If the error message contains a connection string, a token, or an internal URL, the model now has that information in its context window and can surface it in a response. A common pattern: the model calls a database API, the call fails with an authentication error that includes the malformed connection string, the error is returned to the model, and the model includes the connection string in its apology to the user. The secret was never in the system prompt. It appeared through a failure path nobody tested.
+
+The fourth channel is **code execution environments**. Agents that can execute code — data analysis assistants, coding copilots, automated research tools — have access to the environment variables of the execution sandbox. If those environment variables contain API keys or credentials, the agent can read and exfiltrate them. The xAI incident in May 2025, where a developer's API key for private SpaceX and Tesla language models was publicly exposed, illustrates how quickly credentials in development environments reach unintended audiences. Code-executing agents operating in similar environments face the same exposure risk, compounded by the fact that the agent can be instructed to read and output environment variables through carefully crafted user prompts.
+
+The fifth channel is **version control leakage**. Prompt templates, tool definitions, and configuration files containing secrets get committed to Git repositories. The 2025 Wiz research finding that 65 percent of the Forbes AI 50 companies had leaked verified secrets on GitHub — primarily from Jupyter notebooks, Python files, and environment files including keys for Hugging Face, Azure OpenAI, and Weights and Biases — demonstrates the scale of this problem. AI projects leak credentials at higher rates than traditional software because the development culture prioritizes rapid experimentation over security hygiene.
+
+## Hardcoded vs Dynamic Secrets
+
+The severity of a leaked secret depends on whether it is hardcoded or dynamically issued. Hardcoded secrets — API keys directly embedded in system prompts, long-lived tokens in configuration files, static database passwords — are catastrophic when leaked because they do not expire. The attacker has the same access as the legitimate system for as long as the key remains valid, which in many organizations is months or years because nobody rotates it.
+
+Dynamic secrets — short-lived tokens issued by a secrets manager, session-scoped credentials from an identity provider, just-in-time access grants — limit the blast radius. A leaked dynamic token is valid for minutes or hours, not months. The attacker gains a window of access, not permanent entry.
+
+The challenge for AI systems is that dynamic secrets add latency and complexity. If every inference request requires fetching a fresh token from Vault, that adds milliseconds to every call. If the model's tool definitions reference a token that changes every fifteen minutes, the orchestration layer must refresh those definitions continuously. Teams choose hardcoded secrets because they are simpler. They accept the risk because they underestimate the probability of leakage. Red teaming changes that calculation by demonstrating the leakage in controlled conditions before an attacker demonstrates it in production.
+
+## Red Team Techniques for Secret Extraction
+
+When you red team an AI system for secrets leakage, you work through a progression of techniques from direct to indirect.
+
+Start with direct extraction. Ask the model to repeat its system prompt. Ask it to list all API keys it has access to. Ask it to describe its tool configuration in detail. Most safety-trained models will refuse these requests. But the refusal itself is informative — it confirms that the model has been trained to protect something, which means there is something to protect.
+
+Move to indirect extraction. Ask the model to role-play as a system administrator who needs to verify configuration settings. Ask it to help you debug a connection error by describing what credentials the system uses. Ask it to write a tutorial on how a system like itself would authenticate to external services. Each of these reframes the request from "tell me your secrets" to "help me understand how systems like you work," and the model may comply because the request appears educational rather than adversarial.
+
+Test through translation and encoding. Ask the model to explain its configuration in a different language. Ask it to spell out its instructions one word at a time. Ask it to create an acrostic poem where the first letters spell out its API key. These techniques exploit the gap between the model's safety training (which typically covers direct disclosure in the primary language) and its general capabilities (which include translation, encoding, and creative writing).
+
+Test the error path. Send malformed tool calls that trigger error responses. Check whether those error responses contain connection strings, tokens, or internal URLs. Test what happens when external services are unreachable — does the model's retry logic expose credentials in its status messages?
+
+Test log exposure. Check whether tool call logs are accessible through monitoring dashboards, API endpoints, or debug interfaces. Look for secrets in structured log fields. Check whether log aggregation services like Datadog, Splunk, or Grafana dashboards expose tool call parameters that contain authentication tokens.
+
+## Rotation Challenges in AI Context
+
+Secret rotation — the practice of regularly changing credentials — is standard security hygiene. In traditional systems, you rotate a database password by updating the value in the secrets manager and restarting the service. In AI systems, rotation is complicated by context caching and session persistence.
+
+If your system caches model context — storing system prompts and tool definitions to avoid refetching them on every request — a rotated secret may not take effect until the cache expires. During the gap between rotation and cache refresh, the old credential and the new credential are both valid, doubling the attack surface. Some orchestration frameworks cache aggressively for performance, with cache lifetimes measured in hours. A secret rotated at noon may not propagate to all inference instances until midnight.
+
+Session persistence creates a similar problem. Long-running agent sessions may hold credentials in their working memory for the duration of the session. If a session lasts hours or days — common for research agents or data analysis workflows — the credentials embedded at session start remain in the context for the entire session, regardless of whether they have been rotated in the secrets manager.
+
+Red teams test for these gaps by rotating a credential during a test and checking whether the old credential still works. If it does, the rotation process has a gap. The length of that gap is the window of opportunity for an attacker who has extracted the old credential.
+
+## Hardening Secrets in AI Systems
+
+The first rule is simple: never put secrets in the model's context window. If the model can see it, the model can leak it. API keys, tokens, and credentials belong in the orchestration layer, not in the system prompt or tool definitions. The orchestration layer should authenticate to external services on the model's behalf, without exposing the credentials to the model. The model says "call the weather API." The orchestration layer adds the API key. The model never sees the key.
+
+The second rule is to use short-lived credentials everywhere. Replace static API keys with tokens that expire in minutes. Use OAuth 2.0 client credentials flows for service-to-service authentication. Use AWS IAM roles, Azure managed identities, or GCP workload identity federation so that no long-lived credential exists to leak. The cost is architectural complexity. The benefit is that leaked credentials are worthless by the time an attacker tries to use them.
+
+The third rule is to monitor for credential exposure. Scan every model response for patterns that match API key formats — long alphanumeric strings, base64-encoded tokens, strings matching known key prefixes like "sk-" for OpenAI keys or "hf_" for Hugging Face tokens. This is output filtering, and it should run as a post-processing step on every response before it reaches the user. It will not catch every leak, but it catches the obvious ones.
+
+The fourth rule is to treat logs as a secrets boundary. Redact tool call parameters in logs. Mask error messages before they are stored. Ensure that monitoring dashboards do not display raw credential values. Audit who has access to log aggregation services and whether that access includes the ability to see unredacted tool call data.
+
+The model is not a vault. It is a conversational engine that processes everything in its context and generates text based on all of it. Any secret placed within its reach is a secret the model can share. Red teaming proves this before production traffic does.
+
+The next subchapter examines a different infrastructure layer where subtle changes create outsized impact: feature flags and configuration drift, where the settings that control your model's behavior become an attack surface of their own.

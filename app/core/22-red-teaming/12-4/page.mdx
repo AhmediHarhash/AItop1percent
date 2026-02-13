@@ -1,0 +1,85 @@
+# 12.4 — Red Teaming in the Release Pipeline: Integration with Section 19
+
+Most teams think security testing happens before deployment. They are wrong. The most dangerous failures happen when teams run adversarial tests once, pass them, then deploy weeks later after dozens of code changes. By the time the release ships, the adversarial test results are stale. The system that passed testing is not the system that reaches production.
+
+In November 2025, a healthcare AI company ran comprehensive red teaming on their clinical documentation assistant. They tested prompt injection, PII leakage, medical hallucination, and regulatory violations. The model passed every test. The team celebrated and moved into final integration work. Over the next three weeks, engineering made performance optimizations, added new prompt templates for edge cases, and updated the retrieval pipeline to include more recent clinical guidelines. None of these changes seemed security-relevant. They deployed on schedule. Within 48 hours, user reports showed the model was leaking patient identifiers in certain edge cases. The retrieval pipeline changes had introduced a new vulnerability that the original red teaming never caught. The company pulled the release, re-ran adversarial tests, found twelve new failures, and spent another month remediating. The performance optimization that saved 200 milliseconds cost them four weeks and significant trust damage.
+
+Adversarial testing cannot be a one-time gate. It must be integrated into the continuous delivery pipeline as a release blocker. Nothing ships until it passes the current adversarial suite, tested against the exact artifact that will reach production.
+
+## The Pipeline Integration Point
+
+Adversarial tests belong in the same place as integration tests, performance benchmarks, and regression suites: between code freeze and production deployment. The sequence matters. You build the candidate release artifact. You run unit tests, integration tests, and functional tests. Then you run the adversarial suite against that exact artifact. If the adversarial tests pass, the release proceeds to staging and production. If they fail, the release is blocked until the failures are remediated and retested.
+
+This is not a separate process owned by a security team that runs on its own schedule. This is part of the deployment pipeline that Engineering owns and executes on every release candidate. The adversarial suite runs automatically when the candidate is ready. Results are reported in the same dashboard as other test results. Failures are treated with the same severity as a failing integration test. The release does not ship until all gates pass.
+
+The integration point must be late enough to test the real artifact, but early enough to block deployment before it reaches users. Testing in development is too early — too many changes happen between development and release. Testing in production is too late — users are already exposed. The right point is immediately after the release candidate is built and before it touches any production traffic. This is the moment when you know exactly what will deploy and can still stop it cleanly.
+
+## Blocking vs Non-Blocking Gates
+
+Not every adversarial test should block a release. Some tests detect critical vulnerabilities that absolutely cannot ship. Other tests detect lower-severity issues that should be tracked but do not justify delaying a release. The distinction must be explicit and automated.
+
+Blocking gates cover high-severity adversarial failures. Prompt injection that leaks credentials. Jailbreaks that generate harmful content. PII exposure. Regulatory violations. Privilege escalation. Any vulnerability that creates immediate user harm or legal exposure is a blocking gate. If the test fails, the pipeline stops. The release does not proceed until the failure is fixed and the test passes.
+
+Non-blocking gates cover lower-severity issues or experimental attacks that are still being validated. A new jailbreak technique that only succeeds in 5% of attempts might be non-blocking while the security team investigates whether it represents real risk. A prompt injection that leaks non-sensitive metadata might be logged and tracked but not block the release. Non-blocking gates produce warnings, create tracking tickets, and surface in security dashboards, but they do not stop deployment.
+
+The classification is not static. A non-blocking test that starts failing at higher rates gets promoted to blocking. A blocking test for a vulnerability that gets fully mitigated across the codebase might be demoted to non-blocking as a monitoring check. The pipeline configuration defines which tests are blocking, and that configuration is version-controlled and reviewed like any other deployment policy.
+
+## Test Timing and Performance
+
+Adversarial suites are often large. Running thousands of prompt injection variants, jailbreak attempts, PII leakage tests, and safety boundary probes can take hours. If the adversarial suite takes six hours to run, and the release pipeline runs multiple times per day, the testing becomes a bottleneck. Teams face a choice: make adversarial testing faster, or make it less comprehensive. The wrong answer is to skip tests or run them less frequently.
+
+The right answer is to parallelize aggressively and prioritize intelligently. Run the most critical blocking tests first. If those fail, you can stop the pipeline immediately without waiting for the full suite. Run lower-priority and non-blocking tests in parallel. Use distributed test execution to run hundreds of adversarial probes simultaneously across multiple workers. Most adversarial tests are stateless and can run independently. A test suite that takes four hours sequentially might complete in 15 minutes when parallelized across 20 workers.
+
+For extremely large suites, consider tiered testing. Run a fast critical subset on every release candidate. Run the full comprehensive suite nightly or on major releases. The critical subset should cover the highest-severity vulnerabilities and the most common attack vectors. If the critical subset passes, the release can proceed while the full suite runs asynchronously. If the full suite later finds a failure, it triggers an incident and a patch release. This is not ideal — you want to catch everything before shipping — but it is better than skipping comprehensive testing entirely because it is too slow.
+
+## Canary and Shadow Deployments
+
+Even with comprehensive pre-deployment testing, some adversarial failures only appear in production. The production traffic distribution is different from test traffic. Production users find edge cases that test data misses. Production scale exposes race conditions and performance degradations that change model behavior. You need a way to test the release against real production traffic before full rollout.
+
+Canary deployments send a small percentage of production traffic to the new release while the majority of traffic stays on the stable version. Start with 1% or 5% of traffic. Monitor adversarial metrics closely. If the canary shows elevated prompt injection success rates, increased jailbreak attempts, or higher PII leakage, you roll back before the majority of users are affected. If the canary metrics stay clean for a defined observation period, you gradually increase traffic to 10%, 25%, 50%, and eventually 100%.
+
+Shadow deployments run the new release in parallel with the stable version, sending it the same traffic but discarding its responses. Users see only the stable version's output. The new release processes requests and generates responses, but those responses are logged and analyzed instead of being returned to users. This lets you observe how the new release behaves on real production traffic without any user exposure. If shadow testing shows adversarial failures, you fix them before the release ever serves real traffic.
+
+Both approaches require instrumentation. You need logging that captures adversarial signals in production: prompt injection attempts detected, jailbreak classifier activations, PII redaction triggers, safety filter interventions. You need monitoring dashboards that compare these signals between canary and stable, or between shadow and stable. And you need automated rollback triggers that revert the deployment if adversarial metrics cross defined thresholds.
+
+## Rollback Triggers
+
+A rollback trigger is a metric threshold that automatically reverts a deployment when crossed. If the canary release shows prompt injection success rate greater than 0.1%, rollback. If PII leakage events increase by more than 50% compared to baseline, rollback. If jailbreak attempts that bypass safety filters exceed 10 in an hour, rollback.
+
+Triggers must be automated. Waiting for humans to notice a dashboard spike and manually trigger rollback adds minutes or hours of exposure. Automated triggers act within seconds. The canary deployment monitors adversarial metrics in real time. When a metric crosses the threshold, the deployment system automatically shifts 100% of traffic back to the stable version and alerts the on-call team. The release is reverted before most users encounter the vulnerability.
+
+Defining thresholds requires historical baseline data. You need to know the normal rate of prompt injection attempts, jailbreak activations, and PII redactions in production. The threshold should be tight enough to catch real increases quickly, but loose enough to avoid false positives from normal traffic variation. A threshold set at two standard deviations above baseline is a reasonable starting point. Refine based on false positive rate and detection speed.
+
+Some teams resist automated rollback because they fear false positives will disrupt the release process. This fear is backward. The risk of shipping a vulnerability is far higher than the cost of a false rollback. If a false positive reverts a good release, you lose an hour investigating and re-deploying. If a true positive goes undetected, you expose thousands of users to a security failure. Optimize for safety, not release velocity.
+
+## Cross-Referencing with Section 19
+
+Section 19 covers deployment infrastructure, release gates, and runtime control in depth. Everything described there applies to adversarial testing. The deployment pipeline architecture from Section 19 is where adversarial tests are integrated. The release gate framework from Section 19 defines how blocking and non-blocking adversarial tests halt or allow deployments. The canary and shadow deployment patterns from Section 19 are the mechanisms that let you observe adversarial behavior in production before full rollout.
+
+The key difference is focus. Section 19 treats adversarial testing as one type of release gate among many. This chapter treats adversarial testing as the lens through which you design the entire release process. The infrastructure is the same. The mindset is different. In Section 19, you build a deployment pipeline and add security gates. Here, you build a security-first pipeline where adversarial testing is the primary blocker, and everything else is secondary.
+
+This is not a conflict. It is layering. Use Section 19 for the deployment architecture. Use this chapter to understand what adversarial testing needs from that architecture and how to configure it for security-first releases.
+
+## Automating Adversarial Gates
+
+Manual adversarial testing does not scale. If a human has to run the adversarial suite, interpret the results, and decide whether to approve the release, the process is too slow and too error-prone. Adversarial gates must be fully automated: tests run automatically, results are evaluated automatically, and the deployment decision is made automatically based on pass or fail.
+
+Automation requires machine-readable test output. Every adversarial test must produce a structured result: pass, fail, or skip. Failures must include severity level, attack category, and failure details. The pipeline ingests these structured results and applies the blocking policy. If any blocking-severity test fails, the deployment stops. If all blocking tests pass, the deployment proceeds, and non-blocking failures are logged for follow-up.
+
+The adversarial suite should be version-controlled alongside the application code. When code changes, the suite version is tagged to match. This creates a historical record: which adversarial tests were active for each release, what the results were, and how the suite evolved over time. If a vulnerability is discovered in production, you can trace back to see whether the adversarial suite at that release version should have caught it, and if not, why not.
+
+Automation does not eliminate human judgment. Humans define the adversarial test suite, set the severity thresholds, and update the blocking policy as threats evolve. Humans investigate failures to determine root cause and validate fixes. But the execution of testing and the initial pass or fail decision must be automated. The release pipeline does not wait for human approval.
+
+## Handling Test Failures
+
+When an adversarial test fails in the pipeline, the release stops. What happens next determines whether the pipeline is an effective security gate or just a compliance checkbox. The failure must be investigated, remediated, and retested before the release proceeds.
+
+Investigation starts with the test failure details. Which attack succeeded? What was the input, what was the output, and what safety mechanism failed to trigger? The red team or security engineering team reviews the failure to determine whether it represents a real vulnerability or a test issue. If it is a real vulnerability, the failure gets routed to the responsible engineering team for remediation. If it is a test issue — the test is overly sensitive, misconfigured, or detecting a false positive — the test is updated or disabled.
+
+Remediation depends on the vulnerability type. A prompt injection vulnerability might require updating the input sanitization logic. A jailbreak might require retraining the safety classifier. A PII leakage failure might require adding redaction rules. The fix is implemented, tested locally, and merged into the release candidate. The release artifact is rebuilt, and the adversarial suite runs again. If the previously failing test now passes, the release moves forward. If it still fails, the cycle repeats.
+
+Some failures reveal vulnerabilities that cannot be fixed quickly. A model-level jailbreak that requires retraining might take weeks to resolve. In these cases, the team must decide whether to block the release until the fix is ready or to deploy with a known vulnerability and mitigate through other controls. This decision should be rare and require executive approval. Most adversarial failures are fixable within hours or days.
+
+The worst outcome is ignoring the failure and shipping anyway. If the team overrides the adversarial gate without remediation, the gate becomes meaningless. Overrides should be logged, tracked, and reviewed. If overrides happen frequently, the problem is not the adversarial tests — the problem is the development process that produces releases with known vulnerabilities.
+
+Adversarial testing in the release pipeline transforms security from a pre-launch audit into a continuous quality gate. Every release is tested. Every vulnerability is caught before production. The pipeline becomes the enforcement mechanism that ensures no adversarial failure reaches users. The next subchapter covers how to monitor for new attack techniques that your current test suite does not yet catch.

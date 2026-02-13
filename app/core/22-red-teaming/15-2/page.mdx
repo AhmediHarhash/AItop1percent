@@ -1,0 +1,75 @@
+# 15.2 — CI/CD Pipeline Attacks — Poisoning the Build Process
+
+In September 2025, a computer vision startup noticed something strange. Their object detection model, fine-tuned on proprietary industrial inspection data, began misclassifying a specific defect type on factory-floor images. The model had passed every evaluation before deployment. The training data was clean. The fine-tuning configuration had not changed. The team spent two weeks investigating the model itself before a junior engineer noticed that the data preprocessing script — the one that ran automatically in the CI/CD pipeline before every training job — had been modified three months earlier. Someone had added sixteen lines that injected subtle label noise into a narrow category of training examples. The modification was buried in a commit that also updated a logging format. The pull request had one approval, from an engineer who had since left the company. The pipeline faithfully executed the poisoned script on every subsequent training run, producing models that looked correct on aggregate metrics but failed silently on the specific defect type that mattered most to the startup's largest customer. The customer discovered the failures before the startup did. The contract was not renewed.
+
+Nobody hacked the model. They hacked the pipeline.
+
+## How AI Deployment Pipelines Work
+
+A modern AI deployment pipeline has stages that traditional software pipelines do not. Traditional CI/CD moves through code compilation, unit tests, integration tests, and deployment. AI pipelines add data preprocessing, training or fine-tuning, evaluation against benchmark suites, model registration, serving infrastructure setup, and post-deployment monitoring checks. Each stage takes input from the previous stage and produces artifacts for the next.
+
+The data preprocessing stage cleans, transforms, and formats training data. The training stage uses that data to produce model weights. The evaluation stage runs the trained model against known test cases and compares results to acceptance thresholds. The registration stage stores the model weights and metadata in a registry. The deployment stage pulls the registered model and configures it in the serving infrastructure — typically vLLM, Triton Inference Server, or TGI behind a load balancer. The monitoring stage validates that the deployed model behaves as expected under real traffic.
+
+Each of these stages is an executable step in a pipeline definition file — a GitHub Actions workflow, a GitLab CI configuration, a Jenkins pipeline, an Argo Workflows DAG, or a managed service like SageMaker Pipelines. Each step runs code. That code can be modified. And if the code is modified maliciously, the pipeline will faithfully execute the malicious version because that is what pipelines do. They run whatever you tell them to run.
+
+## Attack Surfaces at Every Stage
+
+The data preprocessing stage is vulnerable to training data poisoning. An attacker who gains write access to the preprocessing script can inject, modify, or remove training examples. The changes can be subtle — relabeling a fraction of a percent of examples, adding examples that create a specific backdoor trigger, filtering out examples that the model needs for a particular capability. The model trains on the modified data. The evaluation stage may not catch the change because aggregate metrics remain within normal bounds. The poisoning is deployed to production through the normal pipeline.
+
+The training configuration stage is vulnerable to hyperparameter manipulation. An attacker can modify the learning rate, change the number of training epochs, alter the data sampling strategy, or adjust regularization parameters. These changes degrade model quality in ways that are hard to attribute. A slightly higher learning rate causes the model to overfit, which shows up in production as inconsistent behavior on novel inputs. A reduced regularization parameter increases memorization, which creates data leakage risks. The team investigates the model, not the pipeline configuration.
+
+The evaluation stage is the most dangerous target. If the attacker can modify the eval suite, they can make any model pass. They can lower pass thresholds, remove test cases that would detect their specific attack, or add test cases with incorrect expected outputs that normalize the behavior they introduced. A model that would fail a clean eval suite passes the compromised one. The pipeline promotes it to production.
+
+The deployment stage is vulnerable to artifact substitution. Between evaluation and deployment, model weights are stored as files — typically in cloud storage or a model registry. If the attacker can modify those files after evaluation but before deployment, the evaluated model is not the deployed model. The evaluation report says the model is safe. The production model is not. This is the AI equivalent of the classic build artifact tampering attack, and it is effective because most organizations do not cryptographically verify model weights between stages.
+
+## Dependency Confusion and Supply Chain Poisoning
+
+AI pipelines depend on external packages and pretrained artifacts. A fine-tuning pipeline might pull a base model from Hugging Face, install training libraries from PyPI, download a tokenizer configuration from a remote URL, and reference adapter weights from an internal registry. Each dependency is a potential attack vector.
+
+Dependency confusion attacks work the same way in AI pipelines as in traditional software. The attacker registers a malicious package with the same name as an internal package on a public registry. The pipeline resolver, depending on configuration, may prefer the public version over the internal one. The malicious package executes arbitrary code during installation — stealing credentials, modifying configuration files, or injecting itself into the training process. In 2025, Checkmarx researchers demonstrated a variant they called AI Model Confusion, applying the classic dependency confusion pattern to model registries on Hugging Face. An attacker registers a model repository with a name that matches a deleted or renamed internal model. Teams pulling that model by name receive the attacker's version.
+
+The Hugging Face ecosystem has faced repeated supply chain attacks. Researchers from Palo Alto Networks documented a model namespace reuse attack in early 2025, where attackers registered usernames matching deleted accounts and uploaded poisoned versions of previously legitimate models. Organizations with automated pipelines that referenced models by name — without pinning to specific commits or verifying cryptographic hashes — pulled the attacker's weights on their next training run. The attack required no exploitation of any vulnerability. It exploited trust in names.
+
+Base image poisoning targets the container that runs inference. If the serving infrastructure uses a Docker image from a public registry, an attacker who compromises that image can inject code that runs alongside the model. The code could intercept requests, exfiltrate responses, modify outputs, or create a persistent backdoor. Container images for AI workloads are often large, complex, and infrequently audited because teams focus on model behavior, not container behavior. A malicious layer buried in a multi-gigabyte GPU-enabled container image can persist undetected for months.
+
+## Pipeline Credential Theft
+
+AI pipelines need credentials. Lots of them. API keys for OpenAI, Anthropic, or Google to call foundation models. Cloud credentials for AWS, Azure, or GCP to access GPU instances and storage. Tokens for Hugging Face, Weights and Biases, or MLflow to push and pull model artifacts. Database credentials for training data stores. Service tokens for internal APIs. These credentials are stored somewhere — environment variables, secrets files, vault systems, or inline in configuration.
+
+Attackers target pipeline credentials because they provide lateral movement. A stolen Hugging Face token does not just grant access to one model. In November 2025, researchers from Lasso Security found that 65 percent of the Forbes AI 50 companies had leaked verified secrets on GitHub. The most common leak sources were Jupyter notebooks, Python scripts, and .env files. One leaked Hugging Face token belonging to an AI-50 company could have exposed approximately one thousand private models — enough for an attacker to download proprietary weights, inspect training data references, and potentially upload modified versions.
+
+The xAI incident in May 2025, reported by Krebs on Security, illustrates the scale of credential exposure. An engineer inadvertently published a live API key to GitHub in a Python script. That key granted access to more than sixty private and unreleased large language models, including internal Grok variants trained on proprietary SpaceX and Tesla data. The key was live for two months before discovery. Pipeline credentials are not just access tokens — they are keys to the intellectual property, training data, and operational capabilities of the entire AI program.
+
+## Build Artifact Tampering
+
+The period between evaluation and deployment is the most vulnerable moment in any pipeline. The model has been tested and approved. It sits in a registry or storage bucket, waiting to be pulled into production. If an attacker can modify the artifact during this window, the deployed model is different from the evaluated one.
+
+Build artifact tampering is subtle because nothing visibly breaks. The pipeline reports success. The evaluation report shows passing scores. The deployment completes without errors. But the model serving requests is not the model that was evaluated. It might contain a backdoor that activates on a specific trigger phrase. It might have degraded capabilities in a narrow domain that the eval suite did not cover. It might include altered safety behavior that allows outputs the original model would refuse.
+
+Detection requires integrity verification. Every model artifact produced by the training stage should be cryptographically hashed. The hash should be recorded alongside the evaluation results. The deployment stage should verify the hash before serving the model. If the hashes do not match, deployment should fail. This is standard practice in traditional software delivery — build artifacts are signed and verified. In AI pipelines, it is the exception rather than the rule. Most organizations store model weights as files in cloud storage with no integrity chain. The file is the model. Whoever replaces the file replaces the model.
+
+## Detecting Pipeline Compromise
+
+Pipeline compromise is hard to detect because the pipeline continues to function normally. It builds, tests, and deploys. The outputs change, but the process looks identical. Detection requires looking at the right signals.
+
+Monitor pipeline definition changes with the same scrutiny you apply to production code changes. Every modification to a workflow file, a pipeline configuration, a build script, or an evaluation suite should be reviewed by at least two people — one from the AI team and one from security. Changes to preprocessing scripts and evaluation logic deserve extra scrutiny because they affect model behavior without modifying the model directly.
+
+Implement immutable pipeline artifacts. Once a model passes evaluation, the weights should be stored in a content-addressed system where modification is structurally impossible. Instead of overwriting files in a mutable storage bucket, push weights to a registry that indexes by content hash. Any subsequent modification produces a different hash and a different artifact. The deployment stage pulls by hash, not by name.
+
+Compare model behavior between evaluation and post-deployment. Run a subset of your evaluation suite against the live production model, not just the registered artifact. If the live model's behavior diverges from the evaluation results, something changed between evaluation and serving. This is your canary. It catches artifact tampering, configuration drift, and serving-layer modifications that bypass the pipeline entirely.
+
+Audit pipeline credentials regularly. Rotate API keys and tokens on a fixed schedule. Monitor credential usage for anomalies — a Hugging Face token being used from an IP address outside your infrastructure, a cloud credential accessing storage buckets that are not part of the pipeline's normal workflow. Credential monitoring is standard in traditional security. It is rare in AI teams. That gap is exactly what attackers exploit.
+
+## Hardening the Build Process
+
+Hardening AI pipelines requires applying traditional CI/CD security practices and extending them for AI-specific artifacts. Pin all dependencies — base models, training libraries, tokenizer configurations, container images — to specific versions and verify checksums on every download. Never pull latest. Never reference models by name without a commit hash.
+
+Sign model artifacts. Use cryptographic signing to create a verifiable chain from training through evaluation to deployment. The training stage signs the weights. The evaluation stage verifies the signature and appends its own. The deployment stage verifies both. Any break in the chain halts deployment. Tools like Sigstore, originally designed for container image signing, can be adapted for model weights.
+
+Enforce least-privilege access on pipeline credentials. The training stage needs access to training data and compute. It does not need access to production serving infrastructure. The deployment stage needs access to the model registry and the serving cluster. It does not need access to training data. Scope credentials narrowly. Use short-lived tokens instead of long-lived keys. Monitor for privilege escalation.
+
+Run pipeline integrity checks. Periodically verify that the pipeline definition files match the expected state. Use infrastructure-as-code tools that detect drift between the declared pipeline configuration and the running configuration. If someone modifies a GitHub Actions workflow outside of the normal review process, the integrity check flags it.
+
+The pipeline is the foundation of your AI system's integrity. Every model you deploy passes through it. Every training run depends on it. Every evaluation result is produced by it. If the pipeline is compromised, nothing downstream can be trusted. Red team it like your system depends on it — because it does.
+
+The next subchapter examines the target that sits at the end of every pipeline: the model registry where weights and checkpoints are stored, versioned, and served.
