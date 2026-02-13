@@ -18,13 +18,13 @@ export default function Home() {
           <Link className="button primary" href="/core">
             Start the Core Spine
           </Link>
-          <Link className="button ghost" href="/core/01-eval-strategy">
+          <Link className="button ghost" href="/core/01-ai-product-reality">
             Read Section 01
           </Link>
         </div>
         <div className="hero-meta">
           <div className="meta-card">
-            <div className="meta-title">26 Sections</div>
+            <div className="meta-title">30 Sections</div>
             <div className="meta-text">Canonical spine for 2026 mastery</div>
           </div>
           <div className="meta-card">
