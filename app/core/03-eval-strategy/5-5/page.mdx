@@ -1,144 +1,155 @@
-# Chapter 5.5 — Privacy, Sanitization & Data Governance
+# 5.5 — Privacy, Sanitization, and Data Governance in Evaluation
 
-**What we're doing here:**
-Imagine you build a great eval dataset from production logs. You share eval results with leadership. Buried in a sample output is a real customer's name, email, and medical question.
+In March 2025, a healthcare technology company building an AI clinical assistant shared evaluation results with prospective enterprise customers during a sales presentation. The presentation included sample model outputs demonstrating how the system answered patient questions. Buried in one of those outputs was a real patient's full name, email address, and a detailed medical question about a chronic condition. The prospect's chief privacy officer flagged it immediately. The deal died within forty-eight hours. The company faced a HIPAA audit, paid a six-figure settlement to the patient, and spent seven months rebuilding their evaluation pipeline under external legal oversight.
 
-That's not a hypothetical. It happens when teams treat privacy as "legal's problem." In evaluation, privacy is **your** problem — because PII in eval sets creates liability, bias, and compliance risk all at once.
+The root cause was not a data leak or a security breach. It was a conceptual mistake: the team treated privacy as a compliance checkbox, not as an evaluation engineering problem. They pulled production logs, built eval datasets directly from raw data, and never implemented sanitization. They assumed Legal would catch privacy issues before anything went public. But evaluation artifacts move fast. Demo outputs, debug logs, shared reports, and annotator interfaces all carry real data. By the time Legal sees a presentation, the damage is already encoded in your datasets.
 
-This chapter covers how to find PII, remove it safely, control who sees what, and stay compliant with the regulations that matter in 2026.
+Privacy is not a post-processing step. It is a first-class requirement in evaluation architecture. If your eval pipeline cannot prove that every dataset, every sample output, and every shared artifact is free of personally identifiable information, then you cannot evaluate safely. In regulated industries, you cannot evaluate at all.
 
----
+## Privacy Is Not Legal's Problem Alone
 
-## 1) Why privacy is an evaluation problem
+You might assume that privacy governance belongs to your compliance team. That assumption is dangerous. Legal teams define policies, approve contracts, and respond to audits. But they do not write data pipelines. They do not sample production logs. They do not generate synthetic test cases or share eval reports with stakeholders. You do. And every one of those actions creates privacy risk.
 
-**Liability.** If PII leaks into eval reports, demo outputs, or shared datasets, you've violated data protection laws. GDPR, CCPA, HIPAA — each carries real penalties and customer trust damage.
+The risk is not hypothetical. Evaluation datasets aggregate user data from production systems. They contain queries, conversation histories, tool call parameters, and retrieved documents. All of these carry personally identifiable information. PII appears in free-text inputs when users mention names or contact details. It appears in metadata when logs capture user IDs, session tokens, or IP addresses. It appears in retrieved documents when RAG systems pull contracts, emails, or customer records. It appears in agent traces when tool calls include parameters like lookup customer by email or retrieve account by phone number.
 
-**Bias.** PII is not random. Names correlate with ethnicity. Zip codes correlate with income and race. Medical history reveals disability status. If your eval set contains these, your model may overfit to those correlations. Sanitization is not just privacy — it's fairness engineering.
+If you share eval results with your team, you are sharing user data. If you send sample outputs to annotators, you are sharing user data. If you export cases to a third-party labeling platform, you are transferring user data. Each of these actions requires a legal basis under GDPR, compliance with CCPA, adherence to HIPAA for healthcare data, and conformity with SOC 2 controls for enterprise customers. If you cannot demonstrate that your evaluation pipeline implements data minimization, purpose limitation, access controls, and retention policies, then you are creating compliance liability for your organization.
 
-**Compliance blockers.** In 2026, enterprise procurement requires SOC 2 Type II, GDPR processing records, and EU AI Act conformity assessments for high-risk systems. If your evaluation pipeline can't prove data governance, you can't sell to regulated customers.
+This is not paranoia. In 2026, enterprise procurement requires proof of data governance. Customers ask to see your SOC 2 Type II report. They ask how you sanitize eval datasets. They ask whether annotators see real user data. They ask how you honor deletion requests. If your answers are vague or aspirational, you lose the deal. Privacy is not a legal problem. It is a product problem. And it is your problem.
 
----
+## What PII Looks Like in Evaluation Datasets
 
-## 2) What PII looks like in eval datasets
+Direct identifiers are obvious. Names, email addresses, phone numbers, government-issued IDs like Social Security Numbers or passport numbers, financial account numbers, credit card details, and protected health information like diagnoses, medications, or lab results. These are the easy cases. Regex patterns and named entity recognition tools catch most of them. But direct identifiers are not the only threat.
 
-### Direct identifiers (obvious PII)
-Names, email addresses, phone numbers, government IDs (SSN, passport), financial data (credit card numbers, account numbers), and health data (diagnoses, medications, lab results).
+Quasi-identifiers are combinations of seemingly harmless attributes that together uniquely identify an individual. A dataset entry that mentions a VP of Engineering in Boulder who started in January 2025 is often enough to identify one specific person. Research in re-identification attacks shows that three or more quasi-identifiers can re-identify over eighty percent of individuals in datasets marketed as anonymized. A combination of age, occupation, and city is often sufficient. A combination of job title, company size, and industry vertical is often sufficient. Simple redaction of names and emails is not enough if the remaining context still points to one person.
 
-### Quasi-identifiers (the sneaky kind)
-Combinations of seemingly harmless fields that uniquely identify someone. "VP of Engineering in Boulder, started January 2025" is often enough to identify one person. Research shows that three or more quasi-identifiers can re-identify over 80% of people in "anonymized" datasets. Simple redaction is not enough.
+Behavioral traces accumulate identity over time. Multi-turn conversation logs reveal identity through repeated references, personal anecdotes, or consistent preferences. Agent tool call sequences expose identity when parameters include customer IDs, account numbers, or email lookups. Voice transcripts carry direct PII in the text and biometric PII in the audio itself. Voiceprints are biometric identifiers under GDPR and under state laws like the Illinois Biometric Information Privacy Act. If you store audio or voice embeddings, you are storing biometric data and must comply with biometric-specific regulations.
 
-### Behavioral traces
-Multi-turn conversation sequences that reveal identity over time. Tool call parameters in agent logs (database queries with customer IDs). Voice biometrics — voiceprints are biometric PII under GDPR and Illinois BIPA.
+The risk profile varies by channel. Chat interfaces allow users to type names, emails, and phone numbers directly into queries. Multi-turn chat accumulates identity signals across messages. RAG systems retrieve documents that were never intended for evaluation use. Those documents may include contracts with PII, internal emails with employee names, or customer support tickets with sensitive details. Agentic systems log tool calls with parameters like search database where email equals real person at real company dot com. Every parameter in every tool call is a potential PII vector. Voice systems capture not only the transcript but also the audio itself. Background audio may capture third parties who never consented to data collection. Transcripts contain direct PII plus speech patterns that may reveal identity even after names are redacted.
 
-### Channel-specific patterns
-- **Chat:** Users mention names and contact info in free text. Multi-turn dialogs accumulate identity signals.
-- **RAG:** Retrieved documents contain PII (contracts, emails, customer records). Queries reveal internal knowledge.
-- **Agents:** Tool parameters carry PII — things like `lookup_customer(email="real@person.com")`.
-- **Voice:** Audio contains voiceprints. Transcripts contain direct PII plus speech patterns. Background audio may capture third parties.
+You cannot assume that your system does not collect PII. You must audit what your system logs, what your evaluation pipeline samples, and what your datasets actually contain.
 
----
+## The Sanitization Pipeline
 
-## 3) The sanitization pipeline
+Sanitization is not a single operation. It is a pipeline with three stages: detection, redaction, and validation. Each stage is necessary. Skipping any of them creates risk.
 
-Think of sanitization as a three-step assembly line: **detect → redact → validate.**
+Detection means identifying every instance of PII in every eval case. In 2026, the standard approach combines three methods. Named entity recognition uses models like spaCy, Stanford NER, or commercial APIs such as AWS Comprehend or Google Cloud Data Loss Prevention to detect names, locations, organizations, and dates. NER is fast and effective for common entity types, but it misses context-specific PII like nicknames, role-based identifiers, or implied references. Regex patterns match structured PII like email addresses, phone numbers, Social Security Numbers, and credit card numbers. Regex is precise for known formats but fails on obfuscated variants like five five five one two three four or email addresses written as name at domain dot com. LLM-assisted scanning passes text through a language model with a prompt that asks the model to identify all PII, return the type, the span, and a confidence score. This method catches context-dependent PII that rules miss, such as nicknames, implied identifiers, or references like my manager Sarah who started last month.
 
-### Step 1: Detection (finding PII)
+The default approach is to run all three methods. Regex provides high precision for structured PII. NER provides speed and recall for entity-level detection. LLM scanning catches edge cases and context-dependent identifiers. Each method has false negatives. Running all three in parallel minimizes the risk of missed PII.
 
-In 2026, best practice is to combine three methods:
+Detection outputs must be reconciled when methods disagree. If NER detects a name from character 10 to character 25 and LLM scanning detects a name from character 12 to character 30, you have overlapping spans. The reconciliation strategy is to take the union of all detected spans. Mark characters 10 through 30 as PII. This over-detects but ensures that no PII is missed. Under-detection is far more dangerous than over-detection.
 
-**Named entity recognition (NER)** — models like spaCy or commercial APIs (AWS Comprehend, Google DLP) that detect names, locations, organizations. Fast and good at common entities, but misses context-specific PII.
+Detection produces a list of PII spans with type labels and confidence scores. The next stage is redaction. You have three strategies. Replacement swaps PII with realistic synthetic values. Sarah Johnson becomes Jane Doe. An email address becomes example at example dot com. A phone number becomes a valid but non-routable number like five five five zero one zero zero. Replacement preserves sentence structure and semantic realism, which is important for evaluation quality. But replacement introduces a new risk: bias in synthetic values. If you always replace Hispanic names with Anglo names, you erase demographic signal and introduce bias. Synthetic replacement must maintain demographic distribution.
 
-**Regex patterns** — pattern-matching for structured PII like emails, phone numbers, SSNs, credit cards. Precise for known formats, but misses obfuscated variants ("five five five, one two three four").
+Redaction replaces PII with typed placeholders like NAME or EMAIL or PHONE. This approach is the safest option for compliance because it guarantees that no real PII remains. But it loses semantic signal. Multi-turn conversations become unreadable when every name is replaced with NAME. Context is destroyed. Evaluation quality suffers.
 
-**LLM-assisted scanning** — pass text through an LLM and ask it to identify all PII with type, span, and confidence. Catches context-dependent PII that rules miss (nicknames, implied identifiers). Slower, but catches edge cases.
+Generalization replaces specific values with categorical ranges. A thirty-year-old from Boulder becomes a thirty-year-old from CITY 100K to 250K. A VP of Engineering becomes EXECUTIVE ROLE. Generalization reduces re-identification risk while preserving distributional signal for analysis. It is the best choice for quasi-identifiers where you need to retain some information for fairness analysis or slice-based evaluation but cannot retain the exact value.
 
-**Default: run all three.** Regex for structured PII (high precision), NER for entity-level (speed plus recall), LLM for ambiguous cases (catch what the others miss).
+The choice of strategy depends on your risk tolerance, your regulatory environment, and your evaluation use case. For most enterprise evaluation datasets, the recommended approach is replacement for direct identifiers, generalization for quasi-identifiers, and redaction only when replacement and generalization are not feasible.
 
-### Step 2: Redaction (what to do with detected PII)
+Sanitization is fallible. Automated detection misses edge cases. Regex patterns fail on format variations. NER models miss rare entities. LLM scanning hallucinates PII that does not exist or misses PII that is subtly encoded. You cannot trust sanitization without validation.
 
-**Replacement** (recommended for most eval datasets): swap PII with realistic fake values. "Sarah Johnson" becomes "Jane Doe." Preserves sentence structure and realism. Be careful not to introduce bias in replacements — don't always swap Hispanic names with Anglo names.
+Validation has four steps. First, re-run PII detection on the sanitized output. If detection finds any direct identifiers after sanitization, the pipeline failed. Second, human spot-check one to two percent of sanitized examples. Randomly sample cases and have a human reviewer inspect them for missed PII. Third, conduct a re-identification test. Give a sanitized example to a reviewer who has access to the original data and ask whether they can identify the original user. If they can, your sanitization is insufficient. Fourth, perform a utility check. Read the sanitized text and verify that it still makes sense for evaluation. Over-sanitization destroys meaning. If sanitized cases are unreadable or nonsensical, your evaluation quality is compromised.
 
-**Redaction** (safest option): replace with placeholders like `[NAME]` or `[EMAIL]`. Simple and safe, but loses signal for multi-turn consistency.
+Validation is not optional. Sanitization without validation is security theater.
 
-**Generalization** (for quasi-identifiers): replace specific values with categories. "30-year-old from Boulder" becomes "30-year-old from [CITY_100K-250K]." Reduces re-identification risk while preserving distributional signal.
+## Compliance Frameworks for 2026
 
-### Step 3: Validation (always verify)
+You do not need to become a privacy lawyer, but you do need to understand what each major regulation requires and how those requirements affect your evaluation pipeline.
 
-Sanitization is fallible. Always:
-1. Re-run PII detection on sanitized output (should find zero direct identifiers)
-2. Human spot-check 1–2% of sanitized examples for missed PII
-3. Test re-identification: could a reviewer identify the original user from the sanitized version?
-4. Utility check: does the sanitized text still make sense for evaluation?
+GDPR, the General Data Protection Regulation enforced across the European Union, requires a legal basis for processing personal data. Evaluation typically relies on legitimate interest, which means you have a valid business reason to process data and that reason does not override the individual's rights. But legitimate interest is not a free pass. You must document your legitimate interest assessment in writing, and you must demonstrate that you have implemented data minimization, purpose limitation, and security controls. GDPR also grants individuals the right to erasure under Article 17. If a user requests deletion of their data, you have thirty days to locate and delete all instances of their data across your systems, including evaluation datasets. If you cannot locate user data in your eval sets, you cannot honor deletion requests, and you are in violation. GDPR also requires retention limits. You cannot keep data indefinitely. Define retention policies for each dataset tier and enforce them with automated deletion.
 
----
+GDPR penalties are severe. Fines can reach up to four percent of annual global revenue or twenty million euros, whichever is higher. Enforcement has increased since 2020. Data protection authorities across the EU conduct proactive audits and respond to user complaints. If your evaluation pipeline cannot demonstrate compliance, the risk is not hypothetical. It is financial and reputational.
 
-## 4) Compliance frameworks (2026 landscape)
+CCPA and its successor CPRA, the California Consumer Privacy Act and California Privacy Rights Act, grant California residents the right to know what personal information is collected, the right to delete that information, and the right to opt out of the sale of their information. Sale is broadly defined and includes sharing data with third parties for valuable consideration, which may include sharing data with annotation vendors. If your evaluation datasets contain data from California users, you must support deletion requests, and you must disclose data sharing practices to users. Enterprise customers often require proof that you comply with CCPA even if your company is not California-based, because their own users are California residents.
 
-You don't need to be a lawyer, but you need to know what each framework cares about:
+CCPA applies to any business that collects personal information from California residents and meets revenue or data volume thresholds. If you process data from more than one hundred thousand California residents per year, you are likely covered. Compliance requires a privacy policy that discloses what data you collect and how you use it, a mechanism for users to submit deletion requests, and processes to honor those requests within forty-five days. Your evaluation pipeline must support these requirements.
 
-**GDPR (EU):** Legal basis for processing (evaluation typically falls under legitimate interest — document it). Data minimization. Purpose limitation. Right to erasure — if a user requests deletion, you must purge their data from eval sets. Retention limits.
+HIPAA, the Health Insurance Portability and Accountability Act, applies to healthcare data in the United States. Protected Health Information must be de-identified before it can be used for secondary purposes like evaluation. HIPAA defines two de-identification methods. Safe Harbor requires removing eighteen specific identifier types, including names, addresses, dates except year, phone numbers, email addresses, Social Security Numbers, and medical record numbers. Expert Determination requires statistical proof that re-identification risk is very small. Most evaluation pipelines use Safe Harbor because it is rule-based and auditable. If your company processes healthcare data and shares evaluation datasets with third-party vendors like annotation platforms, you need Business Associate Agreements with those vendors. Without a BAA, sharing PHI is a HIPAA violation.
 
-**CCPA/CPRA (California):** Right to know what data is collected. Right to delete. Right to opt out of "sale" (broadly defined). If your eval dataset contains California users' production logs, support deletion requests.
+HIPAA violations carry civil penalties ranging from one hundred dollars to fifty thousand dollars per violation, with an annual cap of 1.5 million dollars per violation category. Criminal penalties for knowing or willful violations can include fines up to two hundred fifty thousand dollars and imprisonment. The stakes are high. If your evaluation pipeline handles healthcare data, compliance is not optional.
 
-**HIPAA (healthcare):** Protected Health Information must be de-identified using Safe Harbor (remove 18 identifier types) or Expert Determination (statistical proof of low re-identification risk). Business Associate Agreements required for third-party eval vendors.
+SOC 2 Type II is an audit framework that evaluates whether your organization implements appropriate access controls, audit logging, data retention policies, and incident response procedures. If you sell to enterprises, your customers will ask for your SOC 2 report. Auditors review how you manage eval datasets. They check access logs to see who accessed which datasets when. They check retention policies to verify that you delete old datasets on schedule. They check sanitization validation logs to confirm that PII detection is running and that you review failures. If your evaluation pipeline has weak access controls, no audit logs, or no documented retention policies, you will fail SOC 2.
 
-**SOC 2 Type II:** Access controls, audit logs, data retention policies, incident response. Your SOC 2 audit will review eval dataset governance. Expect auditors to spot-check access logs and sanitization validation.
+The EU AI Act, fully in force in 2026, applies to high-risk AI systems deployed in the European Union. High-risk systems include those used in healthcare, employment, law enforcement, and critical infrastructure. The AI Act requires that training data and evaluation data be relevant, representative, and free from errors. It requires logging and traceability for all evaluation activities. It requires human oversight of evaluation processes. It requires conformity assessments conducted by notified bodies for the highest-risk categories. Your evaluation pipeline is not just a technical system. It is a compliance artifact. Auditors will review your eval datasets, your sanitization logs, your access controls, and your retention policies. If you cannot prove governance, you cannot deploy in the EU.
 
-**EU AI Act (in effect 2026):** High-risk AI systems need training data governance (relevant, representative, free of errors), logging and traceability, human oversight of evaluation, and conformity assessment. Your eval pipeline itself becomes a compliance artifact.
+The default legal basis for most enterprise evaluation pipelines is legitimate interest, not explicit user consent. But you must document your legitimate interest assessment, have it reviewed by legal counsel, and update it whenever your evaluation practices change.
 
-**Default legal basis:** Most enterprise eval pipelines rely on legitimate interest, not explicit consent. But document your legal basis in writing and get legal counsel to review it.
+## Access Control and Retention
 
----
+Privacy is not only about removing PII. It is also about controlling who can see data, for how long, and under what conditions.
 
-## 5) Access control & retention
+Access control should follow the principle of least privilege. Raw production logs should be accessible only to the data engineering team responsible for sanitization. Retention for raw logs should be thirty to ninety days, with automated deletion after that window. Sanitized eval sets should be accessible to the evaluation team and to approved annotators. Retention for sanitized sets should be one year unless there is a documented reason for longer retention. Gold eval sets, which are high-quality reference datasets used for benchmarking, should be accessible only to the evaluation team and approved researchers. Retention for gold sets should be three years. Aggregate reports, which contain no PII and present only statistical summaries, can be broadly accessible with indefinite retention.
 
-**Access tiers (least-privilege principle):**
-- **Raw production logs** — data engineering team only, 30–90 day retention, auto-delete after
-- **Sanitized eval sets** — eval team plus annotators, 1-year retention
-- **Gold eval sets** — eval team plus approved researchers, 3-year retention, anonymized
-- **Aggregate reports** — broadly accessible, no PII, indefinite retention
+Implement access control through role-based permissions, not individual grants. Define roles like Data Engineer, Eval Team Member, Annotator, Researcher, and Auditor. Assign permissions to roles, not to individual users. When an employee joins the evaluation team, grant them the Eval Team Member role. When they leave, revoke the role. This scales better than managing permissions per user and reduces the risk of orphaned permissions when people change roles or leave the company.
 
-**Audit logging:** Log every access to eval datasets — who, when, what action, which dataset version, success or failure. Retain logs for 1–3 years. You'll need these for SOC 2 audits and incident investigation.
+Every access to an evaluation dataset should be logged. Logs should record who accessed the data, when, what action they performed, which dataset version, and whether the access succeeded or failed. Access logs should be retained for one to three years. You will need these logs for SOC 2 audits, for incident investigations, and for demonstrating compliance during regulatory inquiries.
 
-**Right to erasure (GDPR Article 17):** If a user requests deletion, you need to find all datasets containing their data and delete within 30 days. This requires lineage tracking — a mapping from user IDs to dataset versions. If you can't locate user data across your eval sets, you can't honor deletion requests. Build this mapping early.
+Access logging must be tamper-proof. Store access logs in a separate system from the datasets themselves, use append-only storage, and restrict delete permissions to a small set of administrators. If access logs can be modified or deleted by the people whose access is being logged, the logs are worthless for auditing. Auditors will reject logs that are not tamper-proof.
 
----
+GDPR Article 17 grants individuals the right to erasure. If a user requests deletion, you must find all datasets that contain their data and delete it within thirty days. This requires lineage tracking, which is a mapping from user identifiers to dataset versions. If you cannot locate user data across your eval sets, you cannot honor deletion requests. Build lineage tracking into your evaluation pipeline from the start. One practical approach is to use pseudonymization during sanitization. Replace user IDs with reversible hashes. Store the mapping table separately with strict access controls. When a deletion request arrives, reverse the hash to find which datasets contain that user's data, then delete all matching records and remove the hash mapping.
 
-## 6) Knobs & defaults
+Lineage tracking must account for dataset versioning and archival. You may have ten versions of an eval dataset spanning two years. A deletion request must purge the user's data from all versions, not just the current version. Your lineage mapping must include version information. When you delete records, log the deletion with the user ID, the dataset versions affected, the deletion timestamp, and the person who executed the deletion. Retain deletion logs indefinitely. They prove that you honored the deletion request if the user or a regulator asks for evidence.
 
-**PII detection confidence threshold:** Default 0.75 (balanced). Use 0.50 for aggressive detection (safer, more false positives). Use 0.90 for conservative detection (fewer false positives, may miss PII). Prefer over-detection — a false positive is inconvenient, a missed PII is a compliance violation.
+Retention policies must be automated, not manual. Define retention windows for each dataset tier, tag datasets with creation dates and retention deadlines, and implement automated deletion jobs that run weekly or monthly. Do not rely on engineers to remember to delete old datasets. Automate it.
 
-**Redaction strategy:** Use replacement for direct identifiers (names, emails → synthetic values). Use generalization for quasi-identifiers (rare job titles → role categories). Use session ID hashing for behavioral traces (preserve multi-turn linkage without real user IDs).
+Automated retention enforcement requires metadata discipline. Every dataset must include metadata fields for creation date, retention policy, and deletion deadline. When a dataset is created, these fields are populated automatically based on the dataset tier. A scheduled job queries all datasets, identifies those past their deletion deadline, and deletes them. The deletion is logged. If a dataset must be retained beyond its standard retention window, a human must file a retention extension request with a documented business justification. The request is reviewed by Legal and approved or denied. If approved, the deletion deadline is updated. This process ensures that extended retention is the exception, not the default.
 
-**Retention windows:** Raw logs 90 days, sanitized eval sets 1 year, gold sets 3 years, audit logs 3 years, aggregate reports indefinite.
+## Configuration Knobs and Defaults
 
----
+PII detection tools return confidence scores for each detected entity. You must choose a threshold above which entities are treated as PII and redacted. The default threshold should be 0.75, which balances recall and precision. For high-risk environments like healthcare or financial services, use a threshold of 0.50, which increases recall at the cost of more false positives. False positives are inconvenient but not dangerous. Missed PII is dangerous. For lower-risk environments where over-redaction significantly harms evaluation quality, use a threshold of 0.90. But prefer over-detection. A false positive wastes a few minutes of human review time. A missed PII instance creates compliance liability.
 
-## 7) Failure modes
+Confidence thresholds should be tuned separately for each PII type. Name detection is typically reliable at 0.75. Email detection with regex is deterministic and needs no threshold. Phone number detection can use 0.90 because the patterns are distinctive. Quasi-identifier detection like job titles or rare locations should use 0.50 because context-dependent identifiers are harder to detect reliably. One global threshold does not fit all PII types. Configure thresholds per type.
 
-**"PII leaked into an eval report shared with leadership."**
-Sanitization pipeline missed PII, or report pulled from raw logs instead of sanitized set. Fix: enforce policy that all shared outputs come from sanitized datasets only. Add automated PII scan to report generation.
+Redaction strategy should vary by PII type. Use replacement for direct identifiers. Names become synthetic names. Emails become example addresses. Phone numbers become non-routable numbers. Use generalization for quasi-identifiers. Rare job titles become role categories. Specific locations become population-range buckets. Use session ID hashing for behavioral traces. Replace real user IDs with consistent pseudonymous IDs so that multi-turn conversations remain linked without exposing real identities.
 
-**"Over-redaction destroyed signal — examples are unreadable."**
-Too-aggressive detection (low threshold) plus redaction instead of replacement. Fix: increase threshold, switch to synthetic replacement, add utility check after sanitization.
+Replacement values must be drawn from realistic distributions. If your user base is sixty percent female, forty percent male, and represents diverse ethnic backgrounds, your synthetic names should reflect that distribution. If all synthetic names are Anglo-American male names, you introduce demographic bias. Use a name generation library that samples from diverse name corpora, or maintain a curated list of synthetic names that matches your user demographics.
 
-**"GDPR deletion request can't be fulfilled — we don't know which datasets have this user's data."**
-No lineage tracking. Fix: implement a user_id-to-dataset_version mapping table. Use pseudonymization (reversible hash) during sanitization so you can trace deletion requests.
+Retention windows should be standardized. Raw production logs should be retained for ninety days and then auto-deleted. Sanitized eval sets should be retained for one year. Gold eval sets should be retained for three years. Audit logs should be retained for three years. Aggregate reports with no PII can be retained indefinitely.
 
-**"SOC 2 audit failed — no proof of who accessed eval datasets."**
-Audit logging not enabled on storage. Fix: enable audit logging on all eval dataset buckets, set retention to 3 years, run quarterly access reviews.
+Retention windows must account for regulatory requirements. GDPR does not specify exact retention limits, but it requires that data not be kept longer than necessary. One year for sanitized eval sets is defensible if you can demonstrate that older datasets are no longer used for active evaluation. Three years for audit logs aligns with SOC 2 and most enterprise audit requirements. If you operate in a jurisdiction with stricter requirements, adjust retention windows accordingly and document the regulatory basis.
 
----
+These defaults should be documented in your evaluation playbook, reviewed by Legal, and enforced through automated tooling. The playbook should include the rationale for each threshold and each retention window. When auditors ask why raw logs are retained for ninety days, you should be able to point to a documented policy that explains the business need and the privacy controls.
 
-## 8) Enterprise expectations
+## Common Failure Modes
 
-- They treat eval datasets as **regulated data assets** with the same rigor as production databases
-- They implement **multi-layer detection** (NER + regex + LLM) — not just regex
-- They use **replacement over redaction** to preserve semantic signal
-- They maintain **lineage tracking** (user_id → dataset_version) for deletion requests
-- They enforce **role-based access** with audit logs for every dataset access
-- They document **legal basis and retention policies** for GDPR, CCPA, HIPAA, and SOC 2
-- They run **quarterly audits** of sanitization quality
-- They separate raw, sanitized, and gold datasets with different access and retention rules
+One recurring failure mode is PII leakage into shared reports. The sanitization pipeline missed PII, or someone generated a report directly from raw logs instead of from sanitized datasets. The fix is to enforce a policy that all shared outputs, including reports, demo outputs, and sample cases, must come exclusively from sanitized datasets. Add an automated PII scan to report generation. Before any report is exported or shared, run detection one more time. If PII is found, block the export and alert the user.
 
----
+This failure often occurs when teams create multiple export paths. Engineers build a formal evaluation pipeline with sanitization, but Product creates a side path to export sample outputs for stakeholder demos. Marketing pulls cases for blog posts. Sales pulls cases for pitch decks. Each of these paths bypasses sanitization. The solution is to centralize all export operations through a single API that enforces sanitization and PII scanning. No one should be able to export eval data without triggering automated checks.
+
+Another failure mode is over-redaction that destroys signal. The detection threshold is set too low, or the team uses redaction instead of replacement. Eval cases become unreadable. Names are replaced with NAME, emails with EMAIL, and every sentence becomes a string of placeholders. The fix is to increase the detection threshold, switch from redaction to synthetic replacement, and add a utility check after sanitization. Have a human reviewer read a sample of sanitized cases and confirm that they remain meaningful for evaluation.
+
+Over-redaction is particularly damaging for multi-turn conversations. If every user name becomes NAME and every location becomes LOCATION, the conversation loses coherence. You cannot evaluate whether the system maintains context across turns when all context markers have been erased. Replacement with consistent synthetic values preserves coherence. If the user mentions Boston in turn one and you replace it with Chicago, use Chicago consistently in all subsequent turns. This requires session-level tracking of replacements so that the same real value always maps to the same synthetic value within a session.
+
+A third failure mode is the inability to honor GDPR deletion requests. A user requests erasure, but the team cannot identify which datasets contain that user's data. The fix is to implement lineage tracking. Maintain a mapping from user IDs to dataset versions. Use pseudonymization during sanitization so that you can trace deletion requests back to specific records. When a deletion request arrives, query the mapping table, locate all affected datasets, delete the records, and log the deletion for audit purposes.
+
+This failure becomes critical when datasets are versioned and archived. You may have ten versions of your eval dataset spanning two years. A deletion request arrives. Without lineage tracking, you must manually search every version, every archive, every backup. With lineage tracking, you query the mapping table, identify that user ID 12345 appears in dataset versions 3, 7, and 9, delete those specific records, and log the deletion. The entire process takes minutes instead of days.
+
+A fourth failure mode is SOC 2 audit failure due to missing access logs. The audit team asks for proof of who accessed eval datasets, and the answer is that logging was never enabled. The fix is to enable audit logging on all storage locations where eval datasets are kept. Set retention for access logs to three years. Run quarterly access reviews to identify anomalous access patterns, such as users accessing datasets outside their role or accessing datasets that have been deprecated.
+
+Audit failures are expensive. A failed SOC 2 audit delays enterprise sales by months. Customers will not sign contracts until you pass. Re-auditing costs tens of thousands of dollars. The root cause is always that access logging was treated as optional. It is not optional. Every regulated data asset requires audit logs. Eval datasets are regulated data assets.
+
+## Sanitization in Multi-Party Evaluation Environments
+
+Privacy becomes more complex when evaluation involves third parties. Annotation vendors, research partners, and external auditors all require access to eval data. Each party introduces new risk.
+
+Annotation vendors label your eval cases. They see inputs, outputs, and ground truth. If those cases contain PII, the vendor now has access to user data. Under GDPR, this is data processing. You need a Data Processing Agreement that specifies what the vendor can do with the data, how long they can retain it, and what security controls they must implement. Under HIPAA, you need a Business Associate Agreement if the data includes protected health information. Without these agreements, sharing data is a compliance violation.
+
+The safer approach is to sanitize before sharing. Send vendors only sanitized datasets. They never see raw PII. This eliminates the need for complex contractual controls, reduces your liability, and simplifies compliance. The tradeoff is that sanitization must happen early in the pipeline, before data leaves your infrastructure. You cannot sanitize after the fact.
+
+Research partners present a different challenge. Academic collaborators want access to realistic data for research. But publishing research based on real user data creates re-identification risk. Even if you sanitize direct identifiers, published research may include aggregate statistics, example cases, or distributional details that allow adversaries to infer identities. The solution is differential privacy for aggregate statistics and expert review before publication. Any research output based on your eval data must be reviewed by your privacy team to ensure that it does not enable re-identification.
+
+External auditors for SOC 2, ISO 27001, or EU AI Act conformity assessments need to verify that your evaluation pipeline implements appropriate controls. They will ask to see sanitized datasets, access logs, retention policies, and sanitization validation reports. Prepare these artifacts in advance. Auditors do not care about your evaluation scores. They care about your governance. If you can produce a sanitization validation report showing that you ran PII detection on every dataset version, spot-checked one percent of cases for missed PII, and found a miss rate below one percent, you pass. If you cannot produce that report, you fail.
+
+## What the Top One Percent Do Differently
+
+Elite teams treat evaluation datasets as regulated data assets with the same rigor as production databases. They do not assume that eval data is low-risk or unregulated. They implement multi-layer detection that combines NER, regex, and LLM scanning. They do not rely on a single method. They use replacement over redaction to preserve semantic signal while protecting privacy. They maintain lineage tracking from user IDs to dataset versions so they can honor deletion requests. They enforce role-based access controls with audit logs for every dataset access. They document their legal basis and retention policies in writing and have those documents reviewed by Legal and updated whenever evaluation practices change.
+
+They run quarterly audits of sanitization quality. Once per quarter, they sample one percent of sanitized cases, have a human reviewer inspect them for missed PII, and log the results. If the miss rate is above one percent, they investigate detection pipeline failures and retune thresholds. They separate raw, sanitized, and gold datasets with different access tiers and different retention rules. They do not treat all eval data as equivalent. They recognize that raw logs carry the highest risk and must be tightly controlled and quickly deleted, while gold eval sets carry lower risk and can be retained longer for benchmarking.
+
+They implement automated compliance checks in CI. Before any eval dataset is merged into the main branch, an automated job runs PII detection, checks for cross-split leakage, validates that retention metadata is present, and verifies that access controls are configured. If any check fails, the merge is blocked. Privacy is not a manual review step. It is an automated gate.
+
+They maintain pre-negotiated Data Processing Agreements with annotation vendors and research partners. They do not wait until they need to share data to negotiate contracts. Contracts are in place before the first dataset is shared. They sanitize before sharing with third parties. Vendors receive sanitized data only. This reduces contractual complexity and limits liability.
+
+They prepare compliance artifacts continuously, not only when an audit is scheduled. Every dataset version includes metadata that documents when it was created, who created it, what sanitization methods were applied, what retention policy applies, and when it will be deleted. Access logs are centralized and queryable. Sanitization validation reports are generated automatically after every dataset build. When an auditor arrives, the team produces the required artifacts within minutes.
+
+The next chapter addresses a subtler but equally critical problem: de-duplication and near-duplicate control, which protect your evaluation from inflation, overfitting, and the illusion of coverage that comes from testing the same thing repeatedly under different names.

@@ -1,231 +1,151 @@
-# Chapter 4.2 — Handling Ambiguity and "Multiple Correct Answers"
+# 4.2 — Handling Ambiguity and Multiple Correct Answers
 
-**What we're doing here:**
-In real life, many AI tasks do not have one perfect answer.
-If you treat them like they do, your evals become unfair, noisy, and easy to game.
+In mid-2025, a financial services company launched an AI assistant to help advisors draft client communications. The system performed well in testing: 89% approval from evaluators, strong compliance scores, positive feedback from the pilot group. Three weeks into production, advisors stopped using it. The abandonment wasn't gradual; it was abrupt. One week usage was at 73%, the next week it dropped to 31%, and by week four it was under 10%. Exit interviews revealed the problem: the AI kept asking clarifying questions when advisors expected helpful output, and it kept providing confident answers when advisors expected to be asked for clarification.
 
-This chapter teaches you how to design ground truth and scoring when:
-- the user request is ambiguous,
-- multiple answers are acceptable,
-- or the "best" answer depends on assumptions.
+The root cause was evaluation design. The team had built ground truth assuming every input had sufficient context to generate a single correct response. When inputs were ambiguous, they labeled whichever interpretation seemed most reasonable and scored outputs based on alignment with that interpretation. They never tested whether the system could detect ambiguity or handle it appropriately. They never defined what correct behavior looked like when the user's request was unclear, incomplete, or interpretable multiple ways. Their ground truth treated ambiguity as noise to be normalized away, not as a core scenario requiring explicit handling rules.
 
-**Enterprise goal:**
-Reduce arguments and noise by making ambiguity explicit and scoring it consistently.
+This failure pattern repeats across enterprise AI deployments. Teams design evaluation frameworks for the happy path: clear inputs, sufficient context, unambiguous intent. Then production reveals that most real-world requests are messy. Users omit critical details. They use pronouns without clear referents. They ask questions that depend on unstated assumptions. They provide contradictory constraints. If your ground truth doesn't account for this, you're not evaluating production behavior; you're evaluating an idealized scenario that rarely occurs. Your system will learn to guess confidently when it should ask for clarification, or ask for clarification when it should proceed with reasonable assumptions.
 
----
+## Ambiguity Is Not Noise; It's Signal
 
-## 1) Mechanics: why ambiguity happens
+The first mistake teams make is treating ambiguity as a data quality problem. They believe that if they clean their evaluation dataset thoroughly enough, removing vague prompts and underspecified requests, they'll build a system that works. This is backwards. Ambiguity is not a defect in your test data; it's a core characteristic of production data. Users don't provide perfect inputs. They assume context the system doesn't have. They use shorthand, idioms, and domain-specific references. They describe goals without specifying constraints. If your evaluation dataset contains only well-specified requests, you're training and measuring a system that won't match the real usage distribution.
 
-Ambiguity appears because:
-- the user didn't provide enough info (missing constraints)
-- the question allows multiple interpretations
-- the domain has "it depends" rules
-- the system has limited access to truth (RAG gaps, tool errors)
-- the user's goal is subjective (tone, style, preference)
+Ambiguity appears for structural reasons, not carelessness. Sometimes the user genuinely doesn't know what they need until they see options. Sometimes the domain has legitimate "it depends" answers where correctness varies by context the user hasn't provided. Sometimes the system has limited access to ground truth because the knowledge base is incomplete, the tools return partial results, or the user's account permissions restrict what can be retrieved. These are not edge cases; they're everyday operating conditions. A production-grade evaluation framework must define what correctness means in these scenarios.
 
-In 2026 production systems, ambiguity is normal — so your ground truth must include rules for it.
+The prevalence of ambiguity in production varies by domain, but it's rarely below 20% of requests and often exceeds 40%. An e-commerce assistant sees ambiguous product references, underspecified search criteria, and vague feature requirements constantly. A legal research assistant encounters questions that depend on jurisdiction, case law interpretation, and factual details the user hasn't provided. A customer support system handles requests where the user describes a symptom but not the underlying issue. If your evaluation dataset is 5% ambiguous and production is 35% ambiguous, your system will be optimized for a world that doesn't exist.
 
----
+The financial services assistant failed because it had no concept of appropriate ambiguity handling. When a prompt said "draft a letter for my client," the system needed to decide: should it ask which client, what the letter is about, and what tone to use, or should it generate a template with placeholders and state its assumptions? Both can be correct depending on context. If the advisor is exploring options, asking questions is annoying; they want fast iteration on drafts. If the advisor is finalizing a communication for a specific regulatory scenario, proceeding with assumptions is dangerous; they need precision. The system couldn't distinguish these contexts because the evaluation framework had never taught it to.
 
-## 2) The 4 ambiguity types (and what "correct" means for each)
+What the team should have done is create an ambiguity taxonomy and label correct behavior for each type. Not all ambiguity is equal. Some ambiguity blocks safe progress and requires clarification. Some ambiguity can be resolved with reasonable defaults and stated assumptions. Some ambiguity is acceptable to leave unresolved if the output clearly indicates uncertainty. Your ground truth must distinguish these cases and specify the correct handling for each.
 
-### Type A — Missing critical info (blocking ambiguity)
+## The Four Types of Ambiguity and Their Correct Behaviors
 
-**Example:** "Draft a contract for my client." (no jurisdiction, scope, payment terms)
+Blocking ambiguity occurs when the missing information is critical to producing a safe or useful response. If a user asks "draft a contract for my client" without specifying jurisdiction, payment terms, scope of work, or parties, the system cannot proceed safely. Inventing these details is not helpful; it's dangerous. The output will look professional but contain fabricated specifics that could create legal liability if used without review. The correct behavior is to ask for the critical missing information, either through targeted questions or by providing a template that highlights what needs to be filled in.
 
-**Correct behavior:**
-- Ask **1–2 clarifying questions**, OR
-- Provide a best-effort template **with explicit assumptions** and placeholders
+The key word is critical. Not all missing information blocks progress. If the user asks for a contract and omits the font size preference, the system can safely default to standard formatting. If they omit the jurisdiction, the system cannot safely default; jurisdiction determines which legal framework applies. Your ground truth must define which missing elements are blocking and which are not. This definition is domain-specific. In a low-risk creative writing task, almost nothing is blocking. In a regulated compliance task, many elements are blocking. Your evaluation framework should reflect these risk boundaries.
 
-**What's wrong:**
-- acting confident and inventing details
-- refusing completely when safe help is possible
+Determining what's critical requires you to think through the consequences of getting it wrong. If the system defaults incorrectly on font size, the user notices immediately and fixes it in two seconds. If the system defaults incorrectly on jurisdiction, the user might not notice until months later when they try to enforce the contract and discover it's governed by the wrong legal framework. The cost of the error determines whether the missing information is blocking. This is why you can't define blocking ambiguity generically; you need to define it per domain, per task type, and per risk tier.
 
----
+Blocking ambiguity ground truth should specify that the system must identify the missing critical information, ask for it explicitly, or provide a structured template that forces the user to fill it in. Outputs that proceed confidently without this information are failures, not attempts to be helpful. Outputs that ask clarifying questions about non-critical details are also failures; they waste user time on things that don't matter. Your rubric should penalize both over-confidence and over-caution, rewarding systems that distinguish what's critical from what's not.
 
-### Type B — Multiple valid outputs (open-ended ambiguity)
+The financial services company discovered this distinction the hard way. Their assistant would ask advisors "what format would you like this report in?" when the format was irrelevant, but it wouldn't ask "what is the client's risk tolerance?" when risk tolerance determined whether a recommendation was compliant. Advisors lost trust because the system asked annoying questions about cosmetic details while proceeding confidently on substantive questions that required input. The evaluation framework had never taught the system to distinguish critical from non-critical ambiguity, so it treated all ambiguity the same way.
 
-**Example:** "Write a welcome email" (many good versions)
+Open-ended ambiguity occurs when the request allows multiple valid interpretations or outputs, none of which is uniquely correct. "Write a welcome email" can be done well in dozens of ways: short or detailed, formal or friendly, focused on product education or community building. "Summarize this document" can be done at different lengths, emphasizing different sections, targeting different audiences. These tasks have broad solution spaces, and correctness is not about matching a reference answer; it's about meeting a set of criteria.
 
-**Correct ground truth:**
-- A **rubric** + a **must-include checklist**
-- A set of acceptable variants (anchors), not one expected wording
+The mistake teams make with open-ended ambiguity is defining ground truth as a single example output and scoring based on similarity to that example. This penalizes valid variation. If your reference answer is formal and the model produces a friendly version that meets all other requirements, your eval will score it as wrong, even though it might be better for the user's actual context. This is why open-ended tasks need multi-answer ground truth: a set of acceptable examples spanning the solution space, plus a rubric defining required and forbidden elements.
 
-**What's wrong:**
-- scoring based on personal style preference
-- punishing a good answer because it's "not like the reference"
+Open-ended ambiguity ground truth should include three to five anchor outputs demonstrating acceptable variation: one minimal but complete, one thorough and detailed, one formal in tone, one conversational. These anchors don't constrain the model to those exact outputs; they show raters the boundaries of acceptable. You pair the anchors with a checklist: required elements that must appear, forbidden elements that disqualify an output, and optional enhancements that improve quality. An output is correct if it includes the required elements, avoids the forbidden ones, and falls within the demonstrated range. This structure supports consistent scoring even when outputs differ substantially in style and approach.
 
----
+Domain-dependent ambiguity occurs when the correct answer depends on context or constraints the user hasn't provided, and different assumptions lead to different answers. "Is this transaction allowed under our policy?" might have different answers depending on the customer's account type, transaction history, jurisdiction, or whether they've opted into certain features. If the user doesn't specify these factors and the system can't retrieve them, there is no single correct answer. The system must either ask for the missing context, state its assumptions and provide a conditional answer, or abstain if the stakes are too high to guess.
 
-### Type C — Domain-dependent ambiguity ("it depends")
+This is the most dangerous form of ambiguity in regulated or high-stakes domains. A system that answers confidently based on unstated assumptions can cause compliance violations, financial losses, or safety incidents. The financial services assistant hit this repeatedly. Advisors would ask "can I recommend this product to my client?" and the system would answer yes or no without asking about the client's risk profile, investment goals, or regulatory status. The answer was often technically correct for some client, but wrong for the actual client the advisor had in mind. The advisors lost trust immediately because they couldn't tell when the system was guessing versus when it had enough information to answer reliably.
 
-**Example:** "Is this allowed under policy?" where policy has exceptions
+Domain-dependent ambiguity ground truth should specify decision criteria and define correct behavior when criteria are missing. If the policy depends on account type and the system doesn't know the account type, the correct behavior is to ask for it, retrieve it from available tools, or respond with "this depends on account type; for premium accounts the answer is X, for standard accounts the answer is Y." Outputs that provide a single answer without checking dependencies are failures, even if the answer happens to be correct for one scenario. Your rubric should measure whether the system identified the dependencies, not just whether it got lucky.
 
-**Correct behavior:**
-- Identify the decision criteria
-- Ask for the missing criteria
-- If evidence is missing, **abstain** or **escalate** (especially Tier 2–3)
+Evidence-limited ambiguity occurs when the system's knowledge base, tool access, or retrieval results are incomplete. The user asks "what's our SLA for enterprise customers?" but the retrieved documents don't mention SLAs, or they mention SLAs for some tiers but not others. The information might exist somewhere, but the system doesn't have access to it in this context. The correct behavior is abstention: "I can't find this in the provided sources" or "the available documentation doesn't specify this." Proceeding with a hallucinated answer is not helpful; it's a critical failure.
 
-**What's wrong:**
-- giving a binary yes/no without checking conditions
-- guessing policy outcomes
+Evidence-limited ambiguity is the form most teams get wrong in RAG systems. They optimize for helpfulness and train systems to always provide an answer, even when evidence is missing. This works fine in low-stakes exploratory chat, where users understand the system might speculate. It fails catastrophically in high-stakes decision support, where users assume the system's confidence reflects evidence quality. If your customer support AI says "the warranty covers accidental damage" when the retrieved warranty document doesn't mention accidental damage, you've created a liability.
 
----
+Evidence-limited ambiguity ground truth should include test cases where the correct answer is not in the knowledge base, the retrieved documents, or the tool results. The ground truth label for these cases is abstention, possibly with suggestions for how to find the information. "Not found in available sources; try searching the enterprise SLA document" is correct. "Based on general industry practice, enterprise SLAs are typically 99.9%" is incorrect, even if the statement is true, because it's not grounded in your actual policy. Your rubric should measure groundedness as a hard requirement, not a soft preference. Confident hallucinations in evidence-limited scenarios should be eval failures, not partial credit.
 
-### Type D — Evidence-limited ambiguity (RAG/tool limitations)
+## Defining Ambiguity Handling Policy by Risk Tier
 
-**Example:** "What is our SLA?" but the provided docs don't mention it
+Not all ambiguity handling should be the same. The correct behavior depends on the risk tier of the task and the consequences of being wrong. A creative writing assistant can make reasonable assumptions and proceed; a clinical decision support system cannot. Your ground truth must encode this distinction explicitly, or your system will learn a single ambiguity handling strategy and apply it everywhere, which guarantees failures in high-risk contexts.
 
-**Correct behavior:**
-- Abstain: "Not in provided sources"
-- Suggest retrieval targets ("search SLA doc / contract template")
+For Tier 0 and Tier 1 tasks, where errors are reversible and consequences are minimal, the default should be helpful assumptions. If a user asks for a marketing email without specifying tone, the system should pick a reasonable default, state it if relevant, and provide the output. Asking "would you like this to be formal or casual?" adds friction for minimal benefit. The user can regenerate if they don't like the first result. Your ground truth should reward systems that proceed with sensible defaults and avoid over-clarifying.
 
-**What's wrong:**
-- hallucinating the SLA
-- pretending to have found it
+The key is that assumptions should be reasonable and stated when they materially affect the output. If the system assumes a professional tone because most marketing emails in your domain are professional, that's fine, and it doesn't need to be stated unless the user's context suggests otherwise. If the system assumes the email is for a product launch because that's the most common marketing email type, but the assumption materially affects the content, the system should state it: "I've drafted this as a product launch announcement. Let me know if you need a different type of campaign email."
 
----
+For Tier 2 tasks, where errors create moderate friction or reputational risk, the default should be conditional clarity. The system should state its assumptions, provide the answer, and indicate what would change if assumptions were different. "Assuming you're in the US, the tax treatment is X. If you're in the EU, it would be Y." This keeps the interaction fast while protecting against confident wrong answers. Your ground truth should reward systems that surface their assumptions and explain dependencies, not systems that act certain when they're not.
 
-## 3) Knobs & defaults (what you actually set)
+Conditional clarity works because it provides immediate value while protecting against the consequences of wrong assumptions. The user gets an answer they can use if the assumption is correct, and they get enough information to adjust if the assumption is wrong. This is vastly better than refusing to answer until the user provides every possible qualifier, and it's vastly better than answering confidently with an assumption that might be completely wrong for the user's context.
 
-### 3.1 Ambiguity policy per risk tier
-- **Tier 0–1:** allow reasonable assumptions; proceed with helpful output
-- **Tier 2:** ask clarifiers for critical constraints; avoid strong claims
-- **Tier 3:** strict: require evidence or verified inputs; escalate/abstain more often
+For Tier 3 tasks, where errors create legal liability, safety risk, financial loss, or compliance violations, the default should be strict verification. The system should not proceed without confirmed inputs for critical fields. If jurisdiction affects the legal advice, the system must ask for or verify jurisdiction before answering. If patient allergies affect medication recommendations, the system must confirm allergy status before suggesting drugs. Your ground truth should penalize any output that proceeds confidently without verifying risk-critical information, even if the output happens to be correct. Confident guessing in Tier 3 is professional negligence, and your evals should treat it as such.
 
-### 3.2 Clarifying question limit
-Default:
-- max **2** questions before providing value
-- ask only what changes the answer materially
+The verification requirement isn't about being cautious; it's about being professional. A doctor who prescribes medication without checking allergies hasn't saved time; they've committed malpractice. A lawyer who advises on contract terms without confirming jurisdiction hasn't been helpful; they've created liability. Your AI system is no different. If the task touches legal, medical, financial, or safety domains, verification of critical assumptions is not optional, regardless of how confident the model is.
 
-### 3.3 "Assumptions format"
-Default:
-- state assumptions in 1–3 bullets
-- then proceed with the solution
+The financial services company didn't implement risk-based ambiguity handling. Their system applied the same logic to exploratory brainstorming and regulatory compliance questions. It guessed on details that required verification and asked for clarification on details that could safely default. This destroyed trust because advisors couldn't predict when the system would be cautious versus when it would be confident. Risk-aware ambiguity handling would have fixed this: require verification for regulatory questions, allow helpful defaults for drafting tasks, and always indicate which category the system believes it's in.
 
-This keeps it fast and auditable.
+What made the failure particularly damaging was inconsistency. An advisor would ask a low-stakes question like "suggest a meeting agenda" and the system would ask three clarifying questions about meeting length, attendees, and objectives. Then the same advisor would ask a high-stakes question like "can I recommend this fund to this client?" and the system would answer confidently without asking about the client's risk profile or investment objectives. The advisor learned that the system's caution was inversely correlated with importance, which is exactly backwards. Once that pattern became apparent, trust collapsed completely.
 
----
+## Scoring Ambiguity Handling in Your Rubric
 
-## 4) How to define ground truth when multiple answers are correct
+If your evaluation rubric doesn't include an ambiguity handling dimension, you can't measure whether your system manages uncertainty well. Most teams score outputs on correctness, helpfulness, and tone, but they don't score ambiguity detection or handling. This creates a blind spot. A system can score well on all measured dimensions while catastrophically mishandling ambiguity, and you won't detect it until production.
 
-You have 3 strong enterprise patterns:
+Adding an ambiguity handling score requires defining a scale that distinguishes good and bad behaviors. A simple four-point scale works well. A score of 0 means the system invented details, guessed confidently on ambiguous inputs, or answered the wrong interpretation without acknowledging alternatives. This is active harm. A score of 1 means the system noticed ambiguity but handled it poorly: it asked too many questions, asked non-critical questions, or refused to help when helpful output with stated assumptions was possible. This is unhelpful caution.
 
-### Pattern 1 — "Must-include" checklist truth
-Instead of expecting exact words, define:
-- required elements (must include)
-- forbidden elements (must not include)
-- optional enhancements
+A score of 2 means the system handled ambiguity appropriately for the risk tier. It asked one or two key questions when critical information was missing, or it proceeded with clearly stated assumptions when assumptions were reasonable, or it provided a conditional answer that explained dependencies. This is competent behavior. A score of 3 means the system handled ambiguity expertly: it detected the ambiguity, assessed the risk tier, chose the optimal strategy, provided helpful output, and offered a verification path if needed. This is the target.
 
-**Best for:** emails, summaries, support responses, explanations.
+The hard rule is that confident guessing on high-risk ambiguity must be an automatic failure. It doesn't matter if the system's guess happens to be correct. If the input was ambiguous on a Tier 3 dimension and the system proceeded without verification or conditional framing, it failed, even if the output text is perfect. This rule prevents reward hacking where systems learn to guess and occasionally get lucky. Your ground truth must include enough ambiguous high-risk cases to measure this behavior reliably.
 
----
+Implementing this rule requires you to flag high-risk ambiguity in your test cases explicitly. You can't rely on raters to recognize it in the moment. Each test case should be labeled with its risk tier and whether ambiguity is present on a risk-critical dimension. When the rater sees a test case marked as Tier 3 with blocking ambiguity, they know that any confident answer without verification is an automatic zero on the ambiguity handling dimension, regardless of how good the output text is. This removes subjectivity and ensures consistent enforcement.
 
-### Pattern 2 — Allowed answer sets (variants)
-Create 2–5 "acceptable" example answers:
-- one short
-- one detailed
-- one more formal
-- one more friendly
+Scoring assumption quality as a secondary dimension helps catch systems that state assumptions but make them poorly. A score of 0 means assumptions were hidden or unstated. A score of 1 means assumptions were stated but unrealistic, too numerous, or poorly chosen. A score of 2 means assumptions were clear, reasonable, and minimal. A score of 3 means assumptions were optimal: the minimum necessary set, aligned with the user's likely intent, and clearly communicated. This dimension is optional for low-risk tasks but critical for tasks where assumption quality affects trust and usability.
 
-**Best for:** writing tasks and UX-sensitive responses.
+The distinction between reasonable and optimal assumptions matters more than teams realize. A reasonable assumption is one that's plausible given the context, even if it's not the most likely. An optimal assumption is the one most users would make in that situation. If a user asks for a report without specifying a date range, assuming the past thirty days is reasonable. Assuming the past seven days might be optimal if most users ask for weekly reports. Your ground truth should guide raters on what counts as optimal for your domain, not leave it to their intuition.
 
----
+## Common Failure Modes and How to Fix Them
 
-### Pattern 3 — Behavior-first truth (the safest)
-Define the correct behavior:
-- ask a clarifier
-- abstain
-- refuse and redirect
-- escalate
+The most common failure mode is rater disagreement. Different evaluators score the same output differently, especially on ambiguous inputs, because they interpret ambiguity differently or have different opinions about whether clarification was needed. This is a ground truth design failure, not a rater quality failure. If your ground truth doesn't define correct ambiguity handling explicitly, raters will invent their own standards, and those standards will conflict.
 
-**Best for:** RAG gaps, high-risk policy, account/payment flows, safety.
+The fix is to add an ambiguity-handling rubric with concrete anchors. Create five examples for each major task type: one where the system asks appropriate questions, one where it proceeds with good assumptions, one where it abstains correctly, one where it over-clarifies, and one where it guesses incorrectly. These anchors calibrate raters. When they see a new ambiguous case, they compare it to the anchors and score based on similarity to the correct behaviors. This dramatically reduces disagreement because you've removed the subjective judgment about what counts as appropriate.
 
----
+A payments company implemented this fix after months of inconsistent eval scores. They created an anchor set for their transaction dispute assistant showing exactly what good ambiguity handling looked like: asking for transaction date when it wasn't provided, proceeding with the most recent transaction when context made it obvious, and escalating when multiple transactions matched the description. Rater agreement improved from 62% to 91% within two weeks, not because the raters got better, but because they finally had a shared standard.
 
-## 5) Scoring ambiguity consistently (rubric add-on)
+The second most common failure mode is that the model guesses instead of clarifying. It receives an ambiguous prompt, makes an assumption, and proceeds confidently without indicating uncertainty. This happens because the system was trained or tuned to maximize helpfulness, and asking questions feels less helpful than providing answers. The evaluation dataset didn't penalize confident guessing, so the system learned that guessing is acceptable.
 
-To reduce rater disagreement, add these dimensions when ambiguity exists:
+The fix is to add confident-wrong penalties to your rubric. An output that answers confidently based on an unstated assumption should score worse than an output that asks for clarification or states the assumption explicitly. You need test cases where the correct behavior is asking, and you need to score outputs that skip the question as failures, even if they happen to guess right. This teaches the system that confidence must be earned through verified information, not asserted through bold claims.
 
-### 5.1 Ambiguity Handling (0–3)
-- **0:** invents details or answers the wrong interpretation confidently
-- **1:** notices ambiguity but handles it poorly (too many questions, no help)
-- **2:** asks 1–2 key questions OR proceeds with clear assumptions + helpful output
-- **3:** handles ambiguity perfectly + protects risk tier + offers verification path
+The penalty needs to be substantial enough to change behavior. If confident guessing scores 2 out of 3 when it gets lucky and 0 out of 3 when it doesn't, the expected value might still favor guessing if the system guesses right more than two-thirds of the time. You need confident guessing on ambiguous inputs to be a hard failure, scoring 0 regardless of whether the guess was lucky. This makes the expected value of asking or stating assumptions strictly better than the expected value of guessing, which changes the incentive structure.
 
-### 5.2 Assumption Quality (0–3) (optional)
-- **0:** hidden assumptions
-- **1:** assumptions stated but unrealistic or too many
-- **2:** assumptions clear and reasonable
-- **3:** assumptions minimal, high-quality, aligned to user goal
+The third common failure mode is that the model asks too many questions. It detects ambiguity everywhere and refuses to proceed without exhaustive clarification. Users abandon the system because it's slower and more tedious than doing the task themselves. This happens when the system was tuned to avoid errors at all costs, often in response to early production failures. The team overcorrected from guessing to paralysis.
 
-**Hard rule:**
-If ambiguity touches safety/PII/Tier 3 decisions, incorrect certainty is a fail.
+The fix is to define a maximum question budget and require partial value. The system can ask at most two clarifying questions before providing output. If it needs more information than that, it should proceed with stated assumptions and provide a useful partial solution, not refuse entirely. Your ground truth should include test cases where the correct behavior is helpful output with explicit placeholders, not endless questioning. "I'll draft the contract with standard terms; please review sections 3 and 7 for jurisdiction-specific clauses" is better than "What jurisdiction? What payment terms? What liability caps? What dispute resolution process?" The first is helpful; the second is interrogation.
 
----
+The question budget forces the system to prioritize. If it can only ask two questions, it needs to identify which two pieces of information are most critical. This naturally teaches the system to distinguish blocking ambiguity from non-blocking ambiguity. It also teaches the system to provide value even when it doesn't have complete information, which is a critical production skill. Real users won't answer five questions before they see value; they'll switch to a different tool.
 
-## 6) Failure modes (symptoms + root causes)
+## Building Ambiguity Test Packs
 
-### 6.1 "Raters disagree constantly"
-Root causes:
-- no ambiguity dimension
-- no must-include checklist
-- no anchor examples
+Every major task group needs an ambiguity test pack: a curated set of ambiguous inputs covering the common ambiguity patterns for that domain. These test cases force your system to demonstrate ambiguity handling capability and prevent reward hacking on well-specified prompts. If your eval dataset contains only clear, complete prompts, your system will optimize for those and fail when production throws ambiguity at it.
 
-Fix:
-- add ambiguity-handling rubric + 5 anchors
+Ambiguity packs should include missing constraint cases. The user asks for a report but doesn't specify the date range, the format, the audience, or the level of detail. Some of these are blocking, some are not. Your ground truth labels which details the system must ask for, which it can default, and what those defaults should be. You create variants where different combinations of details are missing to ensure the system handles each independently.
 
----
+The power of missing constraint cases is that they reveal whether your system understands task structure. A well-designed system recognizes that date range affects the data included in the report, so it needs to ask or default intelligently based on context. Format affects presentation but not content, so it's safe to default. Audience affects both content and tone, so it might be worth asking, but only if the task is high-stakes. A poorly-designed system treats all missing information the same way and either asks about everything or assumes everything, neither of which is appropriate.
 
-### 6.2 "Model guesses instead of clarifying"
-Root causes:
-- helpfulness rewarded more than correctness
-- no "confident-wrong" penalty
+Include unclear reference cases. The user says "update that file" without specifying which file, or "send this to my client" without specifying which client or what "this" refers to. The system needs to detect the ambiguous reference and either ask for clarification, retrieve the most likely referent from context, or state its assumption. Your ground truth defines correct behavior based on risk: in a low-risk scenario, assuming the most recent file is fine; in a high-risk scenario, confirmation is required.
 
-Fix:
-- penalize confident guessing
-- add "must clarify" cases to regression suite
+Unclear references are particularly common in conversational systems where users assume the system has access to shared context. They say "check on that order" assuming the system knows which order they mean from previous conversation history. If the system has session context, it should retrieve the most recent order reference. If it doesn't, it should ask. If there are multiple plausible referents, it should either list them and ask the user to choose, or proceed with the most likely one and confirm. "I found three orders from the past week; I'm checking the most recent one from January 28. Let me know if you meant a different order" is better than refusing to proceed until the user provides an order number.
 
----
+Include conflicting constraint cases. The user says "make it short but include everything" or "keep it formal but friendly." These constraints are in tension. The system must either ask which constraint is more important, provide output that balances them and acknowledge the tradeoff, or explain that the constraints conflict and offer alternatives. Your ground truth should reward systems that surface the conflict, not systems that ignore one constraint and proceed.
 
-### 6.3 "Model asks too many questions"
-Root causes:
-- clarify-first prompt bias
-- missing rule: "provide value even while asking"
+Conflicting constraints are common in creative and communication tasks. The user wants a proposal that's "comprehensive but concise," which is contradictory. A naive system picks one constraint and ignores the other. A better system recognizes the conflict and asks for prioritization. The best system provides a balanced solution and explains the tradeoff: "I've created a concise executive summary that hits the key points. For a comprehensive version, I can expand sections two and four, but that will add three pages." This shows the system understands the tension and gives the user control over the resolution.
 
-Fix:
-- max 2 questions
-- require partial solution + placeholders
+Include partial evidence cases. The retrieved documents answer part of the question but not all of it, or they provide conflicting information, or they're out of date. The system must distinguish what it can answer from what it can't, provide the partial answer with appropriate caveats, and indicate what's missing. "The documentation specifies X but doesn't mention Y; you may need to check with your account manager for Y" is correct. "Based on the documentation, X and probably Y" is incorrect.
 
----
+Partial evidence cases are where RAG systems most commonly fail. They retrieve three documents, two of which support one answer and one of which contradicts it, and they need to handle the conflict explicitly. Or they retrieve documents that answer the question for some product tiers but not others, and they need to acknowledge the gap. Or they retrieve documents that are marked as archived or superseded, and they need to flag that the information might be outdated. If your ground truth doesn't include these scenarios, your system will learn to paper over evidence gaps with confident speculation, which destroys trust.
 
-## 7) Debug playbook (how to build ambiguity test cases)
+Include tool failure cases for agent tasks. The agent tries to retrieve information but the tool returns an error, partial results, or stale data. The system must detect the limitation, decide whether to retry, fall back to an alternative tool, proceed with partial information and state the gap, or escalate to a human. Your ground truth specifies the correct decision based on risk tier and the nature of the failure.
 
-Create an "Ambiguity Pack" for every major task group:
+Tool failure cases reveal robustness. When the calendar API returns a timeout, should the agent retry immediately, wait and retry, or tell the user the calendar is unavailable and offer to try again later? When the customer database returns partial results with a warning that some records were filtered due to permissions, should the agent surface that warning, or proceed as if the results were complete? Your ground truth encodes these decisions, and they vary by risk tier. For a low-stakes task, proceeding with partial data and noting the limitation is fine. For a high-stakes task, partial data might be worse than no data, so escalation is correct.
 
-- missing constraints (jurisdiction, region, plan tier)
-- unclear references ("that file", "the last email", "my order")
-- conflicting user goals ("make it short but include everything")
-- partial RAG context (docs missing key section)
-- tool partial failures (agent got half the data)
+For each ambiguity test case, label the expected behavior, the risk tier, a great example response, and a failure example response. The great example shows optimal ambiguity handling: the system detects the issue, assesses the risk, chooses the right strategy, and provides helpful output with appropriate caveats. The failure example shows common mistakes: guessing confidently, asking irrelevant questions, refusing to help when help is possible. These pairs give raters and engineers a clear target.
 
-For each case, label:
-- expected behavior (ask/assume/abstain/escalate)
-- risk tier
-- a great vs fail example
+Building a comprehensive ambiguity pack typically requires fifty to two hundred test cases per major task type, depending on the variety of ambiguity patterns in your domain. This sounds like a lot, but it's a one-time investment that pays off continuously. Once you have the ambiguity pack, you run it with every eval, and you immediately catch regressions in ambiguity handling before they reach production. Teams that skip this step discover ambiguity problems only after users complain, at which point trust is already damaged.
 
----
+## What Serious Teams Do
 
-## 8) Enterprise expectations (what serious teams do)
+Enterprise teams that handle ambiguity well treat it as a first-class design concern, not an afterthought. They define ambiguity handling policies explicitly during product design, before building the first prototype. They specify when the system should ask, when it should assume, when it should abstain, and when it should escalate. These policies are documented, reviewed by legal and compliance, and encoded into ground truth before evaluation begins.
 
-- They explicitly define:
-  - when assumptions are allowed
-  - when clarifying is required
-  - when abstain/escalation is mandatory
-- They track metrics:
-  - confident-wrong rate (especially on ambiguous prompts)
-  - unnecessary clarification rate
-  - abstain correctness rate
-- They add ambiguity packs to regression testing because ambiguity is where trust breaks.
+They track ambiguity-specific metrics. Confident-wrong rate measures how often the system answers confidently when it should have asked or abstained. Unnecessary clarification rate measures how often it asks questions that didn't affect the output. Abstain correctness rate measures how often abstention was appropriate versus how often the system refused when it could have helped. These metrics surface whether the system is over-confident, over-cautious, or well-calibrated.
 
----
+They include ambiguity packs in regression testing because ambiguity is where user trust breaks. A system that handles clear inputs perfectly but guesses wildly on ambiguous inputs will be abandoned. Users can't tell which inputs the system will handle well and which it will botch, so they stop trusting it entirely. Regression suites that only test clear cases miss this. Teams that take ambiguity seriously put it in the core eval set, not in a separate edge case bucket, because in production, ambiguity is not an edge case; it's the baseline.
+
+They version ambiguity handling rules with the same rigor they version ground truth. When the product's risk profile changes, when new regulatory requirements emerge, or when user feedback indicates the current balance is wrong, they update the ambiguity policy, update the ground truth, and re-eval. Ambiguity handling is not set-it-and-forget-it; it's an ongoing calibration that evolves with your system's maturity and your users' expectations.
+
+The teams that get this right build systems users trust in uncertain situations. The teams that ignore it build systems that look great in demos and fail in production, because demos use clean inputs and production never does.
+
+## What Comes Next
+
+With ground truth designed to handle both clear and ambiguous cases, the next step is defining success criteria and getting stakeholder sign-off before building. You've specified what counts as correct, including how to handle uncertainty and multiple valid answers. Now you need to turn that into measurable thresholds and get organizational alignment on what "good enough" means.
+
+Chapter 4.3 will cover how to translate ground truth into concrete success metrics, set thresholds that balance quality and usability, and secure agreement from product, legal, and compliance so you're not re-litigating evaluation standards every sprint.

@@ -1,204 +1,151 @@
-# 2.6 Multi-Turn Conversation Scoring
+# 2.6 — Multi-Turn Conversation Scoring
 
-A customer support agent handled seven turns beautifully — polite acknowledgment, gathered account details, checked history, offered a solution, confirmed understanding, processed the fix, and closed warmly. Then analytics flagged it: the solution offered in turn 4 contradicted information the system had already shared in turn 2. The customer noticed. The conversation failed. **Which turn do you score as broken?**
+In mid-2025, a healthcare technology company deployed a patient intake assistant designed to collect symptoms, medical history, and appointment preferences before routing patients to the right department. The assistant handled an average of nine turns per conversation. Quality assurance reviewed a flagged conversation where the system had been polite, acknowledged each patient response appropriately, gathered all required fields, confirmed the information, scheduled the appointment, and closed warmly. Every individual turn looked competent. The patient escalated to a human anyway and filed a complaint. The intake form showed that the assistant had asked about the patient's current medications in turn two, received the answer "lisinopril and metformin," then asked again in turn six whether the patient was taking any medications. The patient noticed the repetition, lost confidence that the system was actually listening, and demanded a human. Analytics marked the conversation as failed, but attribution was unclear. Which turn broke? Turn six repeated the question, but turn two apparently failed to store the answer. The QA team scored turn six as the failure point and retrained the prompt to improve memory. The problem persisted. The root cause was not in turn six. It was in the context management layer that lost the information between turn two and turn six. Scoring individual turns in isolation missed the systemic failure.
 
-This is the attribution problem in multi-turn conversations. Unlike single exchanges where you evaluate one input and one output, conversations build context across turns. Turn 7's success depends on turns 1 through 6. A mistake in turn 2 might not surface until turn 5. An agent might nail every individual response yet fail the overall goal.
-
-Let me walk you through how to score conversations when context carries across turns, how to decide what to measure at the turn level versus the conversation level, and how to handle the messy reality that quality in multi-turn systems is both local and cumulative.
-
----
+This is the attribution problem in multi-turn conversations. Unlike single-turn exchanges where you evaluate one input and one output and move on, conversations build context across turns. Turn seven's success depends on turns one through six maintaining coherent state. A mistake in turn two might not surface until turn five when the assistant references incorrect information captured earlier. An assistant might produce individually excellent responses yet fail the overall goal because memory degraded, context was lost, or information contradicted across turns. Your scoring architecture needs to handle both turn-level quality and conversation-level success. You need to know which individual turns broke and whether the conversation as a whole accomplished its purpose. This subchapter walks you through how to score conversations when context carries across turns, how to attribute failures to the right turn when cumulative errors hide root causes, and how to structure eval pipelines that measure both local and systemic quality.
 
 ## Why Multi-Turn Scoring Is Different
 
-In Chapter 2.1 we covered task-specific definitions for single exchanges. You evaluate one user message, one assistant response, done. But conversations don't work that way.
+Single-turn evaluation is clean. The user sends a message. The assistant generates a response. You evaluate the response against your rubric, check safety, measure grounding if relevant, and assign a score. Context is limited to that one exchange. You can score it in isolation. Multi-turn conversations do not work that way.
 
-**Turn-level dependencies.** Turn 7 references "the account we discussed earlier." If you score turn 7 in isolation, you miss that it relies on turn 3 successfully capturing the account number. The response quality at turn 7 depends on memory from turn 3.
+Turn-level dependencies mean that later turns rely on earlier ones for context. Turn seven references "the account we discussed earlier." If you score turn seven in isolation, you miss that its quality depends entirely on whether turn three successfully captured the account number. The response at turn seven might be perfectly formatted and polite, but if turn three stored the wrong account number, turn seven propagates that error downstream. Scoring turn seven alone tells you nothing about whether the underlying information is correct.
 
-**Context carryover.** The model doesn't just respond to the current message — it responds to the current message plus the full conversation history. A factually correct answer in turn 4 becomes factually incorrect in turn 6 if the user corrected a detail in turn 5 that the model ignored.
+Context carryover means the model does not just respond to the current user message. It responds to the current message plus the full conversation history. A factually correct answer in turn four becomes factually incorrect in turn six if the user corrected a detail in turn five and the model ignored the correction. The model's response quality at turn six depends not just on the turn six input but on whether it correctly integrated the correction from turn five into its working context.
 
-**Cumulative goals.** A customer service conversation isn't successful because turn 8 was polite. It's successful because by turn 8, the customer's problem was solved, they felt heard, and no contradictory information was given along the way. You need conversation-level success metrics, not just turn-level quality checks.
+Cumulative goals mean that success is not measured turn by turn. A customer service conversation is not successful because turn eight was polite and grammatically correct. It is successful because by turn eight the customer's problem was solved, they felt heard, no contradictory information was provided, and the resolution steps were clear. That is a conversation-level outcome. You cannot evaluate it by averaging the scores of individual turns. A conversation with nine high-quality turns and one catastrophic error is a failed conversation, not a 90 percent success.
 
-This creates a scoring architecture question: do you evaluate each turn independently, evaluate the whole conversation as one unit, or both?
+This creates a fundamental scoring architecture question. Do you evaluate each turn independently, evaluate the whole conversation as a single unit, or maintain both levels of granularity? The answer is both, because they measure different things. Turn-level scoring catches localized failures and enables debugging. Conversation-level scoring measures whether the system accomplished its goal. You need both to run a functional eval pipeline.
 
----
+## Turn-Level Versus Conversation-Level Metrics
 
-## Turn-Level vs Conversation-Level Scoring
+Turn-level scoring evaluates each assistant response against criteria that can be judged in isolation or with minimal context. Tone is turn-level. You can assess whether a single response is polite, professional, and empathetic without reading the entire conversation history. Factual accuracy is often turn-level. If the assistant claims that the return window is 30 days, you can check that claim against your knowledge base without needing prior turns. Format adherence is turn-level. If your system is required to provide structured output with specific fields, you can verify compliance on each turn independently. Safety is turn-level. You check each response for harmful content, jailbreak attempts, or policy violations without waiting for the conversation to finish.
 
-You'll typically need both. They measure different things.
+Turn-level scoring is efficient. You can parallelize evaluation across turns. You can catch problems in real time without waiting for the conversation to end. You can slice by turn number to detect quality degradation in long conversations. If your assistant performs well in turns one through five but starts to drift after turn ten, turn-level slicing will surface that pattern. You can debug specific turns when conversations fail. If a conversation-level eval flags a failure, turn-level scores help you isolate which turn caused the breakdown.
 
-**Turn-level scoring** evaluates each assistant response against criteria that can be judged in isolation or with minimal context. Examples:
+Conversation-level scoring evaluates whether the entire exchange accomplished its goal. Task completion is conversation-level. Did the conversation resolve the customer's issue, answer their question, complete the workflow, or otherwise satisfy the intent they came with? Information consistency is conversation-level. Did the assistant contradict itself across turns, provide conflicting instructions, or lose track of details it previously confirmed? Conversation coherence is conversation-level. Did the dialogue flow logically from start to finish, or did the assistant lose the thread, repeat questions, or fail to build on prior context? User satisfaction is conversation-level. Would a human judge rate this full conversation as helpful, frustrating, confusing, or successful?
 
-- **Tone.** Is this turn polite, professional, empathetic?
-- **Factual accuracy.** Does this specific claim match your knowledge base?
-- **Format adherence.** Did the assistant follow the required response structure?
-- **Safety.** Does this turn contain harmful content or jailbreak attempts?
+Conversation-level scoring requires reading the full context. It is slower. You cannot run it in real time during live conversations. But it is the only way to measure what actually matters, which is whether the conversation succeeded in delivering value to the user. A conversation where every individual turn scores well but the overall task fails is a system failure, not a success. Conversation-level metrics catch that.
 
-Turn-level scoring is efficient. You can parallelize it across turns. You can catch problems early in long conversations. You can slice by turn number (Chapter 3.4) to see if quality degrades after turn 10.
+The default heuristic is to use turn-level scoring for real-time safety and format checks, and conversation-level scoring for quality, coherence, and success metrics. Run both in your eval pipeline. Use turn-level metrics to monitor production traffic and catch issues as they happen. Use conversation-level metrics to evaluate releases, measure task success, and decide whether the system meets launch criteria.
 
-**Conversation-level scoring** evaluates whether the entire exchange accomplished the goal. Examples:
+The division between turn-level and conversation-level is not always clean. Some properties sit in between. Tone consistency across turns is neither purely turn-level nor purely conversation-level. You can check whether each individual turn is polite, but you also need to check whether the tone shifts inappropriately across the conversation. If turn two is formal and professional but turn five is casual and colloquial with no clear reason for the shift, that is a conversation-level coherence issue even though tone itself is evaluated turn by turn. Similarly, factual consistency might be correct within each turn but contradictory across turns. These hybrid properties need both turn-level checks and conversation-level checks.
 
-- **Task completion.** Did the conversation resolve the customer's issue?
-- **Information consistency.** Did the assistant contradict itself across turns?
-- **Conversation coherence.** Did the flow make logical sense start to finish?
-- **User satisfaction.** Would a human judge rate this whole conversation as helpful?
+The practical solution is to run turn-level checks for immediate properties like safety, format, and tone, then run conversation-level checks that explicitly look for cross-turn issues like consistency, coherence, and memory. The turn-level checks run fast and catch localized issues. The conversation-level checks run slower but catch systemic issues that only appear when you read the full context.
 
-Conversation-level scoring requires reading the full context. It's slower. But it's the only way to measure what actually matters: did the conversation succeed?
+One architectural pattern that simplifies multi-turn scoring is to maintain conversation state explicitly rather than relying purely on context windows. If your system tracks key entities, intents, and decisions in structured state, you can check consistency by comparing state updates across turns instead of re-reading the full conversation text. For example, if turn two captures the user's account number in state and turn six references that account number, you can verify consistency by checking whether the account number in state matches the account number mentioned in turn six. This is faster and more reliable than asking a model to read ten turns and assess whether the account numbers are consistent. Explicit state also makes attribution easier. If a conversation fails, you can trace back through state updates to see when bad information entered the system.
 
-**Default heuristic:** score turn-level for real-time safety and format checks. Score conversation-level for quality, coherence, and success metrics. Use both in your eval pipeline.
-
----
+Not all conversation systems maintain explicit state. Pure chat systems often rely entirely on context windows. But for systems that handle complex multi-turn workflows, especially agents and task-oriented assistants, explicit state management is both a system design choice and an eval enabler. It makes your system more reliable and your evals more precise.
 
 ## The Attribution Problem
 
-A seven-turn technical support conversation ends with the user frustrated. Your eval flags it as a failure. Now you need to know: which turn caused the problem?
+A customer contacts your support assistant with a billing question. The conversation runs for seven turns. The assistant asks clarifying questions, retrieves account details, explains the charge, and offers next steps. The user ends the conversation frustrated and escalates to a human. Your eval flags the conversation as a failure. Now you need to know which turn caused the problem.
 
-**Turn 7 might have failed because of turn 2.** The assistant asked for the wrong diagnostic info in turn 2. The user provided it. Turns 3 through 6 built on that incorrect foundation. By turn 7, the assistant is confident but wrong. If you only score turn 7, you'll miss that the root cause was turn 2's bad question.
+Turn seven might have failed because of turn two. The assistant asked the wrong clarifying question in turn two. The user answered it. Turns three through six built on that incorrect foundation. By turn seven, the assistant is confident but wrong because the entire conversation was premised on bad information gathered in turn two. If you score only turn seven, you will conclude that the final response was poorly phrased or insufficiently empathetic. You will miss that the root cause was turn two asking for the wrong account identifier, which led every subsequent turn to reference the wrong account.
 
-**How to handle attribution:**
+How do you handle attribution when failures are systemic and not localized to a single turn? You need strategies that trace failures back to their root causes even when those causes are several turns upstream from where the failure becomes visible.
 
-**1. Track context dependencies.** When scoring turn N, note which prior turns it references. If turn 7 says "as I mentioned earlier," trace back to the earlier turn. If turn 7 fails, check whether the failure was in turn 7's logic or in the earlier turn it relied on.
+First, track context dependencies. When scoring turn N, note which prior turns it references. If turn seven says "as I mentioned earlier," your eval tooling should trace back to identify which earlier turn is being referenced. If turn seven fails, check whether the failure is in turn seven's own logic or in the earlier turn it relied on. If turn seven correctly references a piece of information that was incorrectly captured in turn three, the failure is in turn three, not turn seven.
 
-**2. Score both local and cumulative quality.** For each turn, score:
-   - **Local quality:** is this response good given perfect prior context?
-   - **Cumulative quality:** is this response good given the actual prior context (including any mistakes already made)?
+Second, score both local and cumulative quality for each turn. Local quality asks whether this response is good assuming all prior context is perfect. Cumulative quality asks whether this response is good given the actual prior context, including any mistakes already made. If turn seven has high local quality but low cumulative quality, the problem is upstream. Turn seven did the best it could with bad information. The fix is not to retrain turn seven. The fix is to prevent the upstream turn from providing bad information in the first place.
 
-If turn 7 has high local quality but low cumulative quality, the problem is upstream.
+Third, use conversation-level rubrics that surface root causes instead of just flagging failure. Instead of marking a conversation as "failed" with no additional detail, use rubrics that ask specific diagnostic questions. Did the assistant gather the right information early in the conversation? That checks whether turns one through three collected the necessary context. Did the assistant maintain consistency across turns? That checks whether later turns contradict earlier ones. Did the assistant recover from user corrections? That checks whether the system integrates new information when users correct mistakes. These rubrics give you attribution. If the rubric shows that the assistant failed to gather the right information early, you know the problem is in the first few turns, not in the final response.
 
-**3. Use conversation-level rubrics that surface root causes.** Instead of "conversation failed," use rubrics like:
-   - Did the assistant gather the right information early? (Checks turns 1-3)
-   - Did the assistant maintain consistency across turns? (Checks all turns for contradictions)
-   - Did the assistant recover from user corrections? (Checks if mistakes were fixed)
-
-This gives you attribution: you know which capability broke, which points to which turns.
-
----
+Attribution is not optional. If you cannot trace conversation failures back to the turns that caused them, you cannot fix systemic issues. You will spend cycles retraining prompts for turns that are failing because of upstream context errors, and your evals will not improve.
 
 ## Conversation-Level Success Metrics
 
-Once you've scored individual turns, you still need to answer: did the conversation succeed?
+Once you have scored individual turns, you still need to answer the question that leadership cares about, which is did the conversation succeed? Conversation-level success is not the average of turn-level scores. It is a distinct evaluation of whether the entire exchange delivered value.
 
-**Goal completion.** Did the user's original intent get satisfied? For customer support: was the issue resolved? For a sales assistant: did the user get product recommendations and next steps? For a tutoring agent: did the student understand the concept?
+Goal completion is the foundational conversation-level metric. Did the user's original intent get satisfied? For customer support, that means was the issue resolved. For a sales assistant, that means did the user get product recommendations and clear next steps. For a tutoring agent, that means did the student understand the concept being taught. Define success as a binary or rubric score applied to the full conversation. Do not average turn-level scores and call it conversation success. A conversation with eight excellent turns and one critical failure is a failure. The critical failure broke the goal. The eight excellent turns do not compensate for that.
 
-Define success as a binary or rubric score applied to the full conversation. Don't average turn-level scores and call it conversation success. A conversation with eight great turns and one critical failure is a failure.
+Coherence across turns measures whether the conversation maintained logical flow. Check for consistency, which means no contradictions between turns. If the assistant says the return window is 30 days in turn two and then says it is 14 days in turn six, that is a coherence failure. Check for memory, which means the assistant remembers and references earlier turns appropriately. If the user provides their account number in turn one and the assistant asks for it again in turn four, that is a memory failure. Check for context tracking, which means the assistant stays on topic and does not lose the thread. If the user asks about billing and the assistant starts discussing product features with no clear transition, that is a context tracking failure.
 
-**Coherence across turns.** Did the conversation maintain logical flow? Check:
-   - **Consistency:** no contradictions between turns
-   - **Memory:** the assistant remembers and references earlier turns appropriately
-   - **Context tracking:** the assistant stays on topic and doesn't lose the thread
+Error accumulation is a conversation-level property that turn-level scoring misses. Small mistakes compound. An assistant mishears a name in turn one. It uses the wrong name in turn three. The user corrects it in turn four. The assistant acknowledges the correction but reverts to the wrong name in turn six. Each individual mistake might be minor, but the cumulative effect is that the user perceives the system as not listening. Score for error accumulation by tracking whether mistakes are corrected and stay corrected. If a user corrects the assistant, all subsequent turns should reflect that correction. If they do not, the conversation fails on memory and trust.
 
-These are conversation-level properties. You can't score them turn by turn.
+Conversation-level metrics are the ground truth for whether your system works. Turn-level metrics are diagnostic tools. Use both. Do not confuse one for the other.
 
-**Error accumulation.** Small mistakes compound. An assistant mishears a name in turn 1. Uses the wrong name in turn 3. The user corrects it in turn 4. The assistant reverts to the wrong name in turn 6. Each individual mistake might be minor, but the cumulative effect is "this system doesn't listen."
+## Scoring by Channel: Chat, RAG, Agents, Voice
 
-Score for error accumulation by tracking whether mistakes are corrected and stay corrected. If a user corrects the assistant, all subsequent turns should reflect that correction.
+Different system types have different multi-turn patterns. The scoring strategies you use depend on the architecture you are evaluating. Let me walk through the four most common cases.
 
----
+For chat systems with context carryover, the model receives the full conversation history and generates the next turn. This is the simplest multi-turn case. Score turn-level for tone, safety, and factual accuracy per response. Score conversation-level for consistency, which means no contradictions across turns, context tracking, which means the assistant references earlier turns correctly and builds on them, and goal completion. Watch for long-context degradation. In 2026, models like GPT-5 and Claude Opus 4.5 handle tens of thousands of tokens, but quality can drift subtly after many turns. Slice by turn number to detect whether accuracy, coherence, or relevance drops as conversations lengthen. If turn fifteen is systematically worse than turn five, you have a context management problem.
 
-## Scoring Multi-Turn by Channel
+For RAG systems with multi-hop retrieval, the assistant retrieves documents to answer each turn, but turn seven's query might depend on information retrieved in turn three. Score turn-level for retrieval quality, which means did the system pull the right documents for this specific turn, and grounding, which means did the response cite retrieved content appropriately. Score conversation-level for multi-hop success, which means did the system connect information across multiple retrieval steps, and consistency under updates, which means if turn five retrieved new information that contradicts what was retrieved in turn two, does turn seven use the updated information or revert to stale data. A common failure mode is when a user asks a broad question in turn one, the assistant retrieves and answers, then the user asks a follow-up that requires re-retrieval. If the system retrieves a different document that contradicts the first answer, you have a consistency problem. Your eval needs to catch that.
 
-Different system types have different multi-turn patterns. Let me walk you through chat, RAG, agents, and voice.
+For agents running multi-step workflows, the agent takes actions across turns such as searching, calling tools, or making API requests. A single task might span five or ten turns. Score turn-level for action correctness, which means did this tool call use the right parameters and produce a valid result, and intermediate output quality, which means did this turn's result make sense in context. Score conversation-level for workflow success, which means did the full sequence of actions accomplish the goal, action coherence, which means did the agent's plan make sense step by step, and error recovery, which means if a tool call failed in turn three, did the agent adapt in turn four or blindly retry the same failing action. Agent evals are covered in depth in Section Eight, but for multi-turn scoring the key insight is that individual actions might succeed while the overall plan fails. Do not just check turn-level correctness.
 
-**Chat (context carryover).** The simplest case. The model receives the full conversation history and generates the next turn. Score:
-   - **Turn-level:** tone, safety, factual accuracy per response
-   - **Conversation-level:** consistency (no contradictions across turns), context tracking (references earlier turns correctly), goal completion
+For voice assistants with dialog state and turn-taking, the system must track dialog state across turns and handle interruptions. Score turn-level for transcription accuracy, response latency per turn, and turn-taking appropriateness, which means did the system cut off the user or wait too long to respond. Score conversation-level for dialog state consistency, which means does the system track what has been discussed and maintain coherent state, interruption recovery, which means if the user interrupts the assistant mid-sentence, does the conversation recover gracefully, and conversation flow, which means does it feel natural start to finish. Voice evals are covered in Section Ten, but for multi-turn scoring focus on whether the system maintains state across turns even when interruptions or latency issues disrupt the expected flow.
 
-Watch for long-context degradation. In 2026, models handle thousands of tokens, but quality can drift after many turns. Slice by turn number (Chapter 3.4) to detect this.
+Each channel has its own failure modes. Your scoring strategy needs to account for the specific ways context and state are managed in your architecture.
 
-**RAG (multi-hop retrieval).** The assistant retrieves documents to answer each turn. But turn 7's query might depend on information retrieved in turn 3. Score:
-   - **Turn-level:** retrieval quality (did the system pull the right docs for this turn?), grounding (did the response cite retrieved content?)
-   - **Conversation-level:** multi-hop success (did the system connect information across turns?), no hallucination from outdated context (if turn 5 retrieved updated info, does turn 7 use it or still reference stale data from turn 2?)
+One common mistake is applying the same multi-turn scoring approach across all channels. Chat systems with clean context windows behave differently from RAG systems where retrieval introduces non-determinism at each turn. Agents with stateful workflows behave differently from voice systems where turn-taking and interruptions add temporal complexity. Your eval strategy needs to match the failure modes of your specific architecture. A one-size-fits-all multi-turn eval will miss channel-specific issues.
 
-Example failure mode: user asks "What's the return policy?" in turn 1, assistant retrieves and answers. User asks "Does that apply to electronics?" in turn 3. If the system re-retrieves and gets a different document that contradicts turn 1, you have a consistency failure. Score for this.
+Another common mistake is ignoring the interaction between channels. Many production systems combine multiple architectures. A voice assistant might use RAG for knowledge retrieval and agents for action execution. A chat system might call tools in some turns and retrieve documents in others. Your multi-turn scoring needs to handle these hybrid cases. If turn three is a RAG retrieval and turn five is a tool call, your conversation-level eval needs to check whether information from the retrieved document was correctly used when invoking the tool. Cross-channel dependencies create new failure modes that pure single-channel evals miss.
 
-**Agents (multi-step workflows).** The agent takes actions across turns: search, tool calls, API requests. A task might span five turns. Score:
-   - **Turn-level:** action correctness (did this tool call use the right parameters?), intermediate output quality (did this turn's result make sense?)
-   - **Conversation-level:** workflow success (did the full sequence accomplish the goal?), action coherence (did the agent's plan make sense step by step?), error recovery (if a tool call failed in turn 3, did the agent adapt in turn 4?)
+## Knobs and Defaults: When to Use Each Level
 
-Agent evals (Chapter 8) go deeper here, but for multi-turn scoring the key is: individual actions might succeed while the overall plan fails. Don't just check turn-level action correctness.
+Here is the decision framework for when to use turn-level scoring, conversation-level scoring, or both.
 
-**Voice (dialog state plus turn-taking).** Voice conversations add timing and turn-taking. The system must track dialog state across turns and handle interruptions. Score:
-   - **Turn-level:** transcription accuracy, response latency (per turn), turn-taking appropriateness (did the system cut off the user or wait too long?)
-   - **Conversation-level:** dialog state consistency (does the system track what's been discussed?), interruption recovery (if the user cuts off the assistant, does the conversation recover?), conversation flow (does it feel natural start to finish?)
+Use turn-level scoring when you need real-time monitoring and cannot wait for the conversation to finish. Safety checks, compliance checks, and format validation all happen turn by turn because you need to catch violations as they occur. Use turn-level scoring when you are checking properties that apply per response, such as tone, factual accuracy, or policy adherence. Use turn-level scoring when you want to slice by turn number to detect degradation over long conversations. Use turn-level scoring when you are debugging and need to pinpoint exactly which turn broke.
 
-Voice evals (Chapter 10) cover real-time metrics, but for multi-turn scoring focus on: does the system maintain coherent state across turns, especially after interruptions?
+Use conversation-level scoring when you are measuring task success or goal completion. The only way to know whether a support conversation resolved the issue is to evaluate the entire conversation. Use conversation-level scoring when you are evaluating coherence, consistency, or memory across turns. These are properties of the conversation as a whole, not of individual turns. Use conversation-level scoring when you are assessing user satisfaction or overall conversation quality. Use conversation-level scoring when you are building evals for system-level releases. Release gates depend on whether conversations succeed, not whether individual turns pass format checks.
 
----
+Use both when you are running full eval pipelines, which is most of the time. You need turn-level metrics for debugging and real-time monitoring. You need conversation-level metrics for success tracking and release decisions. Use both when you want attribution. Conversation-level scoring flags that a conversation failed. Turn-level scoring helps you find the cause.
 
-## Knobs and Defaults
+The default setup for multi-turn evals is to run turn-level scoring for safety, tone, and factual accuracy, run conversation-level scoring for goal completion, consistency, and coherence, store both levels of granularity in your eval dataset so you can analyze at either level, and use conversation-level metrics for release gates while using turn-level metrics for debugging and monitoring.
 
-Here's when to use turn-level, conversation-level, or both.
+One practical consideration is eval runtime. Conversation-level scoring is slower than turn-level scoring because it requires reading full conversation context. A turn-level safety check on a single turn might take 200 milliseconds. A conversation-level coherence check on a ten-turn conversation might take 3 seconds because the model needs to read all ten turns to assess consistency. If you are running evals on thousands of conversations, runtime matters. The typical optimization is to run lightweight turn-level checks on all traffic and run heavier conversation-level checks on a sample or on flagged conversations. You might score every turn for safety in real time, but only score completed conversations for coherence once per hour on a 10 percent sample. This keeps eval costs manageable while still surfacing conversation-level issues.
 
-**Use turn-level scoring when:**
-- You need real-time monitoring and can't wait for the conversation to finish
-- You're checking safety, compliance, or format rules that apply per response
-- You want to slice by turn number to detect degradation over long conversations
-- You're debugging and need to pinpoint exactly which turn broke
+Another practical consideration is how to handle incomplete conversations. Users abandon conversations mid-flow. A user starts a support conversation, provides their account number in turn two, then closes the chat without finishing. Do you score that conversation? If you only score completed conversations, you miss patterns where users abandon because the system failed early. If you score all conversations including abandoned ones, your success metrics get polluted by cases where the user left for reasons unrelated to system quality. The typical approach is to track abandonment rate as a separate metric and only run conversation-level success scoring on conversations that reached a natural endpoint or an explicit user escalation. Abandonment rate tells you how often users give up. Success rate on completed conversations tells you whether the system works when users stick around.
 
-**Use conversation-level scoring when:**
-- You're measuring task success or goal completion
-- You're evaluating coherence, consistency, or memory across turns
-- You're assessing user satisfaction or overall conversation quality
-- You're building evals for system-level releases (Chapter 13)
+## Failure Modes in Multi-Turn Scoring
 
-**Use both when:**
-- You're running full eval pipelines (most of the time)
-- You need turn-level metrics for debugging and conversation-level metrics for success tracking
-- You want to attribute failures (conversation-level flags a problem, turn-level helps you find the cause)
+Here are the most common ways multi-turn scoring breaks and how to prevent each one.
 
-**Default setup for multi-turn evals:**
-- Run turn-level scoring for safety, tone, factual accuracy
-- Run conversation-level scoring for goal completion, consistency, coherence
-- Store both in your eval dataset (Chapter 3.3) so you can analyze at both granularities
-- Use conversation-level metrics for release gates (Chapter 13), turn-level metrics for debugging
+Scoring turns in isolation when context matters. You evaluate turn seven and mark it as factually accurate. But turn seven says "yes, that account is active" when turn four already established that the account was closed. If your turn-level eval does not check consistency with prior turns, you miss the contradiction. The fix is to include relevant prior turns in the eval prompt for any turn that references earlier context. Do not score turn seven alone. Score turn seven given turns one through six.
 
----
+Averaging turn-level scores to compute conversation-level quality. You have eight turns that score nine out of ten and one turn that scores one out of ten because it provided the wrong account number. The average is 7.9 out of ten. Leadership sees a B-plus score and approves the release. In production, every conversation with a wrong account number fails catastrophically. The average hid the critical failure. The fix is to use conversation-level rubrics that explicitly check for critical failures instead of averaging turn scores. One critical failure kills the conversation. Your scoring needs to reflect that.
 
-## Failure Modes
+Ignoring error accumulation. Each turn is graded as "mostly fine" individually, but small mistakes compound. By turn ten, the conversation is incoherent even though no single turn was terrible. The fix is to score for cumulative errors. Check whether mistakes are corrected and stay corrected. Track consistency across all turns, not just pairwise between adjacent turns.
 
-Here's what breaks in multi-turn scoring and how to catch it.
+Attributing conversation failure to the wrong turn. You flag turn seven as broken. You retrain the prompt to improve turn seven's accuracy. The conversation still fails because the actual problem was turn two's question, not turn seven's answer. Turn seven was doomed from the start because turn two gathered the wrong information. The fix is to use attribution techniques. When a conversation-level eval fails, trace back through context dependencies to find the root cause turn. Do not assume the last turn is the problem.
 
-**Scoring turns in isolation when context matters.** You evaluate turn 7 and mark it accurate. But turn 7 says "yes that account is active" when turn 4 already established the account was closed. If your turn-level eval doesn't check consistency with prior turns, you miss this.
+Not slicing by turn number. Your multi-turn eval passes on average. Leadership ships. In production, users complain that long conversations become incoherent. You investigate and find that quality degrades significantly after turn twelve. You did not notice because you were only looking at conversation-level averages, which mixed short successful conversations with long failing ones. The fix is to slice by turn number. Check whether accuracy, consistency, or coherence drops as conversations lengthen. This is especially important in 2026 with long-context models where subtle degradation can hide in aggregates.
 
-**Fix:** for turns that reference earlier context, include relevant prior turns in the eval prompt. Don't score turn 7 alone — score turn 7 given turns 1-6.
+These failure modes are all preventable. They happen when teams treat multi-turn conversations as collections of independent turns instead of as coherent sequences where quality depends on cumulative context.
 
-**Averaging turn-level scores to get conversation-level quality.** Eight turns scored 9 out of 10, one turn scored 1 out of 10 (gave the wrong account number). Average: 7.9 out of 10. But the conversation failed because the wrong account number broke everything downstream.
+One additional failure mode worth highlighting is overweighting early turns and underweighting late turns in conversation-level scoring. Teams sometimes assume that if turns one through three succeed, the conversation is on track. But late-turn failures are often more damaging than early-turn failures because they happen after the user has invested time and built expectations. A conversation that runs smoothly for eight turns and then fails in turn nine wastes more user time than a conversation that fails in turn two. Your conversation-level scoring should account for this. A late-turn failure that breaks an otherwise successful conversation is worse than an early-turn failure that gets caught quickly.
 
-**Fix:** use conversation-level rubrics (Chapter 2.2) that explicitly check for critical failures. Don't average turn scores.
+The inverse is also true. Some teams overweight late turns and assume that if the final turn succeeds, the conversation succeeded. But if turns two through seven were confusing, contradictory, or off-topic, a successful final turn does not redeem the conversation. The user experienced a frustrating journey even if the destination was correct. Conversation-level quality depends on the full path, not just the endpoint.
 
-**Ignoring error accumulation.** Each turn is "mostly fine" but small mistakes compound. By turn 10, the conversation is incoherent even though no single turn was terrible.
+## Enterprise Expectations for Multi-Turn Scoring
 
-**Fix:** score for cumulative errors. Check whether mistakes are corrected and stay corrected. Track consistency across all turns, not just pairwise.
+Production systems that handle multi-turn conversations at scale have specific standards for how they score, monitor, and debug conversation quality. Here is what serious teams do.
 
-**Attributing conversation failure to the wrong turn.** You flag turn 7 as broken, retrain the model, improve turn 7's accuracy. The conversation still fails because the problem was turn 2's question, not turn 7's answer.
+They maintain both turn-level and conversation-level metrics in dashboards. Turn-level metrics power real-time monitoring dashboards that alert if safety violations, tone issues, or format failures spike. Conversation-level metrics power weekly quality reviews and release gates. Both run continuously. Both feed into the enterprise scorecard covered in the previous subchapter.
 
-**Fix:** use the attribution techniques from earlier. When a conversation-level eval fails, trace back to find the root cause turn. Check context dependencies.
+The dashboard architecture typically separates real-time turn-level monitoring from batch conversation-level analysis. Real-time dashboards show turn-level safety violations, policy breaches, and format errors as they happen. These dashboards update every few seconds and trigger alerts if thresholds are crossed. Batch dashboards run conversation-level evals on completed conversations every hour or every day, depending on traffic volume. They surface conversation success rates, consistency failures, and goal completion metrics. Teams check real-time dashboards for immediate issues and batch dashboards for trends and systemic problems.
 
-**Not slicing by turn number.** Your multi-turn eval passes on average, but quality degrades significantly after turn 12. You don't notice because you're only looking at conversation-level averages.
+They build attribution tooling that helps them quickly identify which turns cause conversation failures. When a conversation-level metric drops, teams need answers fast. Their tooling surfaces which turn numbers have the most failures, what patterns of turns correlate with conversation failure such as failures after user corrections or after specific tool calls, and which conversation-level failures trace back to which turn-level errors. Attribution tooling turns a vague "conversations are failing" alert into a specific "turn three is capturing the wrong account identifier" diagnosis.
 
-**Fix:** slice by turn number (Chapter 3.4). Check if accuracy, consistency, or coherence drops as conversations lengthen. This is especially important in 2026 with long-context models where subtle degradation can hide in averages.
+Good attribution tooling does not just flag which turn failed. It surfaces patterns across failed conversations. If 40 conversations failed this week and 35 of them failed at turn four, that is signal. If failed conversations consistently involve user corrections in turn five followed by memory failures in turn seven, that is a pattern. If conversations that include tool calls in turn three have a 30 percent higher failure rate than conversations without tool calls, that is actionable. Attribution tooling should make these patterns visible without requiring manual analysis of hundreds of conversation logs.
 
----
+They slice conversations not just by turn number but by conversation length, user segment, and conversation type. Different slices have different failure modes. Short conversations might fail because the assistant refuses to engage. Long conversations might fail because context degrades. New users might need more hand-holding. Returning users might expect the system to remember prior conversations. Simple queries might succeed while multi-step tasks fail. Slicing surfaces these patterns.
 
-## Enterprise Expectations
+Conversation length slicing is especially important for detecting context degradation. If conversations under five turns succeed 92 percent of the time but conversations over fifteen turns succeed only 78 percent, you have a long-context problem. If conversations between six and ten turns succeed at 88 percent, the degradation is not linear. You need to understand where and why quality drops. User segment slicing catches cases where the system works well for one cohort but fails for another. If enterprise customers have 15 percent lower success rates than consumer customers, you need to investigate whether enterprise queries are more complex, whether they hit different intents, or whether they expect higher quality thresholds.
 
-Here's what multi-turn scoring looks like in production systems that need to scale.
+They maintain replay and debugging infrastructure. Every conversation is logged in full. Teams can replay archived conversations through updated models or prompts to see whether a fix would have prevented a historical failure. This requires logging full conversation history, not just final outcomes, eval infrastructure that can score archived conversations instead of only live traffic, and version control for prompts and models so you can attribute changes in multi-turn quality to specific updates.
 
-**Turn-level and conversation-level metrics in dashboards.** Enterprises run both continuously. Turn-level metrics power real-time monitoring dashboards (Chapter 11) that alert if safety or tone violations spike. Conversation-level metrics power weekly quality reviews and release gates (Chapter 13).
+Replay infrastructure is the difference between guessing whether a fix works and knowing whether it works. When you identify a class of failing conversations, you pull the logs, apply your proposed fix, replay the conversations through the updated system, and score the results. If the fix improves success rate from 65 percent to 89 percent on that slice, you ship it. If the fix only moves the needle to 70 percent, you keep iterating. Without replay, you are flying blind. You ship fixes and hope they work. With replay, you validate before you deploy.
 
-**Attribution tooling.** When a conversation-level metric drops, teams need to quickly identify which turns are causing failures. Expect tooling that surfaces:
-   - Which turn numbers have the most failures?
-   - What patterns of turns (e.g., after user corrections, after tool calls) correlate with conversation failure?
-   - Which conversation-level failures trace back to which turn-level errors?
+They run multi-turn regression tests on every release. These are not "does turn seven work" tests. They are "does this ten-turn customer service flow complete successfully" tests. The regression suite includes curated multi-turn scenarios that represent critical workflows. Every release must pass these scenarios before shipping.
 
-**Conversation slicing.** Not just by turn number. Slice by conversation length (short vs long), by user segment (new vs returning), by conversation type (simple query vs multi-step task). Different slices may have different failure modes.
+The regression suite for a multi-turn system is harder to maintain than a single-turn suite because conversations are longer and more variable. A good multi-turn regression suite includes full conversation flows, not just individual exchanges. Each test case is a complete conversation from first turn to resolution. The suite covers critical workflows like account password reset, billing dispute resolution, product recommendation and purchase, technical troubleshooting escalation, and appointment scheduling with multiple constraints. These are the flows that must never break. If a release causes any of these flows to fail, the release is blocked until the regression is fixed.
 
-**Replay and debugging.** Enterprises store full conversation logs and can replay them through updated models or prompts. This requires:
-   - Logging full conversation history, not just final outcomes
-   - Eval infrastructure that can score archived conversations, not just live ones
-   - Version control for prompts and models so you can attribute changes in multi-turn quality to specific updates
+They integrate human eval for conversation-level quality. Automated scoring handles turn-level checks and some conversation-level properties like consistency and memory. But overall conversation quality often requires human judgment. Teams run regular human evals on full conversations, not just individual turns. They use turn-level automated evals to filter which conversations humans should review. If turn-level metrics flag a conversation as risky, a human evaluates it. If turn-level metrics pass, the conversation might skip human review unless it is randomly sampled for quality assurance.
 
-**Multi-turn regression tests.** Every release runs conversation-level evals on a curated set of multi-turn scenarios (Chapter 12). These aren't just "does turn 7 work" tests. They're "does this ten-turn customer service flow complete successfully" tests.
+The filtering strategy saves significant cost. If you run turn-level safety and consistency checks automatically and only send flagged conversations to human raters, you reduce human eval volume by 70 to 90 percent while still catching the conversations that matter. The remaining 10 to 30 percent that get human review are the conversations where automated scoring found a potential issue or where random sampling selected them for quality assurance. This hybrid approach scales better than pure human eval and catches more nuanced issues than pure automated scoring.
 
-**Human eval integration.** Conversation-level quality often requires human judgment. Enterprises run regular human evals (Chapter 6) on full conversations, not just individual turns. Use turn-level automated evals to filter which conversations humans should review.
+Multi-turn scoring is not a nice-to-have. It is foundational infrastructure for any system that handles conversations longer than one exchange. If you cannot score both turn-level and conversation-level quality, attribute failures to root causes, and slice by turn number and conversation length, you cannot run production conversation systems at scale.
 
----
+You have now built the full evaluation strategy stack. You defined what good means, built rubrics, learned patterns, scored uncertainty and safety, created enterprise scorecards, and structured multi-turn conversation scoring. The next step is to understand how human evaluation integrates into this system, when to use human annotators instead of automated scoring, how to structure human eval workflows so they scale, and how to calibrate human raters so their judgments are consistent and trustworthy.
