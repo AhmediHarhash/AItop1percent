@@ -1,0 +1,151 @@
+# 5.2 — Exact-Match Response Caching: When Identical Queries Return Identical Answers
+
+Exact-match response caching is the simplest caching strategy you can implement, and it is the one you should implement first. The concept is almost trivially straightforward: when a request arrives that is byte-for-byte identical to a request you have already processed, return the stored response instead of calling the model again. No embedding models, no similarity thresholds, no fuzzy matching. If the input is the same, the output is the same. This simplicity is its greatest strength — there is zero risk of serving a wrong cached response, because you only serve a cached response when the request matches exactly.
+
+Do not mistake simplicity for insignificance. In customer support systems, exact-match caching alone delivers hit rates of 15 to 40 percent. In internal enterprise tools, hit rates climb to 30 to 55 percent. One B2B SaaS company implemented exact-match caching on their customer-facing AI assistant in a single sprint and saw their monthly inference bill drop from $42,000 to $29,400 within the first week. They changed nothing about their model, their prompts, or their product. They added a Redis instance and a hash function.
+
+## How Exact-Match Caching Works
+
+The mechanism is a key-value lookup. When a request arrives at your AI system, you compute a hash of the full request payload — everything that affects the model's response. You check whether that hash exists as a key in your cache store. If it does, you return the stored response immediately, bypassing the model entirely. If it does not, you forward the request to the model, receive the response, store the response in the cache keyed by the hash, and return it to the user.
+
+The entire caching layer sits between your application logic and your model API call. It adds a single cache lookup on every request, which takes 1 to 5 milliseconds on a well-configured Redis or Memcached instance. That is negligible compared to the 500 milliseconds to 3 seconds a model inference call requires. On a cache hit, the user gets their response in under 10 milliseconds. On a cache miss, the user gets their response in the normal time, plus the 1 to 5 milliseconds of the failed cache lookup, which is imperceptible.
+
+The cache store itself is typically a managed Redis instance or an equivalent in-memory key-value store. Redis is the dominant choice in production AI systems in 2026 because it combines sub-millisecond lookup times with built-in TTL support, persistence options, and cluster scaling. A single managed Redis instance capable of storing millions of cached responses costs $100 to $300 per month on major cloud providers, depending on memory size and replication settings.
+
+## Designing the Cache Key
+
+The cache key is the most important design decision in exact-match caching, and the most common source of bugs. The key must include everything that affects the model's response and exclude everything that does not.
+
+What must be included: the system prompt, the user message, any retrieved context or documents passed to the model, the model identifier, and any generation parameters that affect output like temperature and maximum output tokens. If any of these differ between two requests, the model might produce a different response, and serving a cached response from a different configuration is incorrect.
+
+What must be excluded: request timestamps, unique request identifiers, user session tokens that do not affect the model's behavior, logging metadata, and any fields that change between requests but do not alter what the model receives. Including these in the hash would make every request produce a unique key, which means no request would ever match a cached entry, which means your cache would be useless.
+
+The practical approach is to construct a canonical form of the request — a normalized representation that strips non-deterministic fields and orders the remaining fields consistently — then hash that canonical form with a fast hash function like SHA-256 or xxHash. SHA-256 is the safe default: it produces a 64-character hex string with a collision probability so low that you can ignore it for any practical volume. xxHash is faster but shorter, which is fine for most caching use cases.
+
+One subtle trap: if your system prompt includes dynamic content that changes frequently — a date stamp, a user's name inserted into the greeting, a randomly selected persona — that dynamic content becomes part of the cache key and drastically reduces your hit rate. Every time the date changes or a different name appears, the hash changes, and no previous cache entry matches. If you want high cache hit rates, your system prompt needs to be stable. Dynamic personalization belongs in the user message or in a separate field that you can control independently.
+
+Another common mistake is including the model's temperature setting in the cache key when your application always uses a temperature of zero. If the temperature never changes, it adds no information to the key — but if you accidentally omit it when it does vary, you might serve a response generated with a creative temperature setting in a context that expects deterministic output. The rule is: include everything that can change and does affect the response. If a parameter never changes in your system, including it is harmless but excluding it saves you nothing. If a parameter sometimes changes, it must be in the key.
+
+## Query Normalization: Lifting Your Hit Rate for Free
+
+Before you hash the request, you can normalize it — applying consistent transformations that remove trivial differences between requests that are functionally identical. This is the cheapest hit rate improvement available because it requires no infrastructure, no embedding models, and no additional API calls. It is pure string processing that runs in microseconds.
+
+The most effective normalizations, in order of impact, are these. First, case normalization: convert the user's message to lowercase. "How do I reset my PASSWORD" and "how do i reset my password" should produce the same cache key. Second, whitespace normalization: collapse multiple spaces, strip leading and trailing whitespace, remove extra line breaks. Third, punctuation stripping: "How do I reset my password?" and "How do I reset my password" differ only by a question mark that does not change the model's response. Fourth, unicode normalization: standardize to a single unicode form so that visually identical characters from different encodings produce the same hash.
+
+These four normalizations are safe for almost every product. They do not change meaning. They only remove surface-level variation that creates unnecessary cache misses.
+
+More aggressive normalizations carry more risk. Removing stop words, stemming, or reordering words can change meaning in edge cases. "How do I cancel" and "I do not want to cancel" both contain the word "cancel" but express opposite intents. Teams that apply aggressive normalization need to validate that their normalizations do not create false matches. The safe approach is to start with the four basic normalizations, measure the hit rate improvement, and only add more aggressive transformations if the basic ones leave a significant gap.
+
+The impact of basic normalization is typically a 3 to 8 percentage point lift in exact-match hit rate. A system that saw 18 percent exact matches on raw queries sees 23 to 26 percent after normalization. That five-point lift, on a product with $10,000 in monthly inference spend, translates to $500 per month in additional savings — from a change that takes an hour to implement.
+
+## Where Exact-Match Caching Delivers the Highest Hit Rates
+
+Not every product benefits equally from exact-match caching. The hit rate depends on how much query repetition your product naturally generates. Some categories consistently deliver strong results.
+
+Customer support and FAQ systems are the gold standard for exact-match caching. Users ask the same questions constantly: password resets, billing inquiries, shipping status, return policies, account settings. A support chatbot serving a consumer product with 50,000 daily queries will typically see 15 to 25 percent exact duplicates even without any normalization of the input. With light normalization — lowercasing, trimming whitespace, removing punctuation differences — the exact-match rate climbs to 25 to 40 percent.
+
+Internal enterprise tools produce even higher repetition. When employees use an AI assistant to query internal knowledge bases, answer process questions, or generate standardized reports, the question space is bounded by the company's operations. "What is our expense reimbursement policy?" "How do I request time off?" "What is the approval process for vendor contracts?" These questions cycle through the employee base with minimal variation. One enterprise team found that their internal AI assistant had a 52 percent exact-match rate after simple normalization.
+
+Status checking and monitoring interfaces are nearly perfectly cacheable over short time windows. "What is the status of order 38291?" produces the same answer for minutes or hours at a time, depending on how frequently order statuses change. If you set a TTL of 5 minutes on these responses, you serve hundreds of identical requests from cache while the underlying status remains unchanged.
+
+Developer tools and code assistants have a more nuanced cacheability profile. The exact same code context producing the exact same completion request is less common than in support tools, but within a team working on the same codebase, the overlap in import suggestions, function signatures, and docstring completions is substantial. Teams report exact-match rates of 10 to 20 percent in code completion systems.
+
+Products with highly unique queries — open-ended creative writing tools, unconstrained research assistants, freeform analysis tools — see the lowest exact-match rates, often below 5 percent. For these products, exact-match caching alone is insufficient, and semantic caching becomes essential.
+
+## Setting Time-to-Live: The Staleness Trade-off
+
+Every cached response has a shelf life. The data it references may change. The model may have been updated. The product context may have shifted. Serving a stale cached response is worse than serving a fresh response from the model, because it gives the user incorrect information with high confidence. **Time-to-live**, the duration after which a cached entry expires and must be regenerated, is the control that balances freshness against hit rate.
+
+Short TTLs mean fresher responses but lower hit rates. Long TTLs mean higher hit rates but greater staleness risk. The right TTL depends on how fast the information changes.
+
+For static knowledge — company policies, product documentation, regulatory requirements — TTLs of 24 hours to 7 days are appropriate. This information changes rarely, and when it does change, you can invalidate the cache manually as part of the content update process. A support bot answering "What is your return policy?" does not need to regenerate that response every hour when the policy changes quarterly.
+
+For slowly changing data — inventory levels, aggregate metrics, leaderboards, performance dashboards — TTLs of 1 to 4 hours balance freshness with efficiency. The data drifts but does not swing wildly minute to minute.
+
+For rapidly changing data — real-time order status, live pricing, current availability — TTLs of 1 to 5 minutes are the maximum you can justify. Even here, a 2-minute TTL on a high-volume query can intercept dozens of duplicate requests between refreshes.
+
+For truly real-time data — live stock prices, active auctions, streaming events — caching at the response level is inappropriate. The data changes faster than any reasonable TTL. These queries should bypass the cache entirely.
+
+The most effective approach is category-based TTL, where different types of queries receive different expiration windows. Classify your queries by their data volatility and assign TTLs accordingly. A single system can have policy questions cached for a week, shipping status queries cached for 10 minutes, and pricing queries cached for 60 seconds, all coexisting in the same cache store with different TTL values.
+
+## The Economics in Detail
+
+Let us work through the numbers for a realistic production deployment. A mid-market SaaS company runs a customer-facing AI support assistant handling 50,000 queries per day. The system uses Claude Sonnet 4.5 at $3 per million input tokens and $15 per million output tokens. The average query has 600 input tokens and 350 output tokens, making the average cost per request approximately $0.007 — $0.0018 for input and $0.00525 for output.
+
+At 50,000 queries per day, the daily inference cost is $350, or $10,500 per month, or $127,750 per year. This is the baseline without caching.
+
+The team implements exact-match caching with a managed Redis instance. After one week of operation, the cache hit rate stabilizes at 28 percent. That means 14,000 of the daily 50,000 requests are served from cache, and 36,000 require fresh inference.
+
+The new daily inference cost is 36,000 times $0.007, which is $252 per day. The monthly cost drops from $10,500 to $7,560. The Redis instance costs $150 per month. The net monthly savings is $10,500 minus $7,560 minus $150, which equals $2,790 per month. That is $33,480 per year in savings from a caching layer that took one sprint to implement.
+
+Now consider the same product after six months of growth, handling 150,000 queries per day. The cache hit rate has actually improved to 32 percent because the larger volume means more repeated queries. The daily inference cost without caching would be $1,050. With caching, it is $714. Monthly savings climb to $10,080 minus $150 in Redis costs, netting $9,930 per month. Annual savings reach $119,160. The Redis instance might need a capacity upgrade to $300 per month, but the economics only improve with scale.
+
+These are conservative numbers. The 28 to 32 percent hit rate assumes exact-match only, with no semantic caching, no query normalization beyond basic trimming, and no optimization of system prompts for cache stability. Each of those refinements pushes the hit rate higher and the economics further in your favor.
+
+## Handling Cache Invalidation
+
+The hardest problem in caching is knowing when a cached response is no longer correct. **Cache invalidation** is the process of removing or refreshing cache entries when the underlying data changes. Get it wrong and users receive stale, incorrect responses. Get it right and you capture the full benefit of caching without the quality risk.
+
+There are three approaches to cache invalidation, and mature systems use all three.
+
+TTL-based expiration is the baseline. Every cache entry has an expiration timestamp. When the TTL elapses, the entry is automatically removed, and the next request for that query generates a fresh response. This handles gradual staleness but does not handle sudden changes. If your return policy changes at 2 PM and the cached response has a 24-hour TTL, users will see the old policy until 2 PM tomorrow.
+
+Event-driven invalidation handles sudden changes. When a product update, policy change, or data modification occurs, your system publishes an invalidation event that clears the relevant cache entries. If the support content management system publishes an event when a knowledge article is updated, the caching layer listens for that event and invalidates any cached responses that reference the updated article. This requires knowing the mapping between cached responses and their data sources, which adds complexity but ensures freshness on critical content changes.
+
+Manual invalidation is the safety valve. An operations team member can flush specific cache entries or entire cache categories when they know something has changed. This is imprecise but useful for rare, high-impact changes — a product recall announcement, a regulatory compliance update, a critical correction.
+
+The practical pattern that works for most teams is a three-layer defense: set reasonable TTLs as the default staleness protection, wire event-driven invalidation for the most critical data sources, and keep a manual flush tool available for emergencies. This combination handles the common case automatically, the critical case proactively, and the rare case manually.
+
+## Cache Warming and Cold Start
+
+A new cache is empty. Until queries arrive and populate the cache, every request is a miss. This **cold start** period produces zero savings and can actually be slightly more expensive than no caching at all, because every request pays the small overhead of a failed cache lookup before proceeding to the model.
+
+Cache warming addresses this by pre-populating the cache with responses to the most common queries. If you have historical query logs, you can identify the top 500 or 1,000 most frequent queries, send them to the model in a batch, and store the responses in the cache before the system starts serving traffic. When users arrive, the most common queries are already cached.
+
+The economics of cache warming are favorable. Generating 1,000 warm responses at $0.007 each costs $7. If those 1,000 responses collectively intercept 2,000 requests per day at $0.007 each, the $7 warming cost pays for itself in less than 12 hours.
+
+Cache warming is especially important after deployments, restarts, or cache infrastructure changes that clear the cache. Without warming, your cache hit rate drops to zero and climbs back slowly as organic traffic repopulates the entries. With warming, you restore much of your hit rate immediately.
+
+The warming strategy matters. Warming with the 100 most frequent queries from the previous week captures the most volume. But frequency is not the only criterion. Warming with the most expensive queries — the ones that trigger the longest model responses or use the most input tokens — maximizes the dollar value of each warmed entry. A query that costs $0.04 per inference and gets asked 200 times per day is worth warming more than a query that costs $0.003 and gets asked 500 times per day, because the expensive query saves more per hit. The ideal warming list combines both frequency and per-request cost to maximize the warming ROI.
+
+Some teams automate warming as part of their deployment pipeline. Every time a new version of the application deploys and the cache clears, the pipeline automatically submits the top 2,000 historical queries through the model in batch mode and populates the cache before switching traffic to the new deployment. The batch API reduces the warming cost by 50 percent, and the cache is hot before the first user request arrives. This pattern eliminates the cold start entirely.
+
+## Handling Non-Deterministic Model Output
+
+One nuance that trips up teams implementing exact-match caching for the first time is non-deterministic output. If your model's temperature is set above zero, the same input can produce different outputs on different calls. This raises the question: which response do you cache, and is it acceptable to serve it to all future users who ask the same question?
+
+For most production use cases, the answer is yes. If you send the same question to the model twice at temperature 0.3 and get two slightly different phrasings of the same answer, both are acceptable responses. Caching one and serving it consistently is fine. The user does not know or care whether the response was generated fresh or served from cache, as long as it correctly answers their question.
+
+The exception is products where output variety is part of the value proposition. A creative writing assistant, a brainstorming tool, or a game dialogue system might intentionally produce different responses to the same prompt. For these products, caching undermines the user experience because users expect novelty. Either exclude these query types from caching entirely, or implement a multi-response cache that stores several responses per query and serves them in rotation.
+
+For the vast majority of business applications — support, knowledge bases, analysis, extraction, classification — the correct response to a given query is the correct response regardless of when it was generated. Non-deterministic output is noise, not signal. Caching one correct response and serving it consistently is not a compromise. It is a feature.
+
+## Monitoring and Metrics
+
+Exact-match caching is not a set-and-forget system. Your hit rate, TTL effectiveness, and cost savings need ongoing monitoring to ensure the cache is delivering its expected value.
+
+The essential metrics are four. First, **cache hit rate** — the percentage of requests served from cache. Track this daily and weekly. A sudden drop means something changed in your query patterns, your cache key design, or your system prompts. Second, **cache miss rate by query type** — break your cache miss data down by the categories of queries that miss most often to identify opportunities for optimization. Third, **cost savings per day** — the hit rate multiplied by the average cost per request, minus infrastructure costs. This is the number that justifies the caching infrastructure to your finance team. Fourth, **staleness incidents** — the number of times a user received a cached response that was detectably incorrect. If this number is above zero, your TTLs are too long or your invalidation logic has gaps.
+
+Build a simple dashboard that shows these four metrics over time. When your cache hit rate plateaus or declines, investigate. When your cost savings grow, celebrate. When a staleness incident appears, fix the invalidation gap immediately. The dashboard is not overhead. It is the proof that your cache is earning its keep.
+
+One metric that teams frequently overlook is the cache miss distribution — not just the overall miss rate, but which specific queries are missing. If you sort your cache misses by frequency, you will often find that a small set of queries accounts for a large share of misses. These are the queries that almost repeat but do not quite match. Perhaps they include a session-specific parameter that should not be in the cache key. Perhaps they differ only by capitalization or punctuation that your normalization is not handling. Each of these near-miss patterns is a small hit rate improvement waiting to be captured.
+
+Track the top 50 most frequent cache misses weekly. Investigate each one. If the miss is because the query is genuinely unique, there is nothing to fix. If the miss is because your cache key includes something it should not, or your normalization misses a trivial variation, the fix is straightforward and the hit rate lift is immediate.
+
+## Multi-Tenant Caching: Shared vs Isolated Cache Stores
+
+If your product serves multiple tenants — different companies, different teams, different user groups — you face an architectural decision about whether the cache should be shared or isolated.
+
+A shared cache means all tenants' queries go into the same cache store. When user A from Company X asks "What is the refund policy?" and user B from Company Y asks the same question, Company Y gets the cached response generated for Company X. This works only if all tenants receive the same answer to the same question — which is true for products with a universal knowledge base and false for products where each tenant has custom data, custom policies, or custom model configurations.
+
+An isolated cache means each tenant has a logically separate cache partition. User A's questions from Company X only match against Company X's cache entries. User B from Company Y never sees Company X's cached responses. This is safer but reduces the hit rate because each partition has less historical data to match against.
+
+The hybrid approach is the most effective: cache the tenant-specific context as part of the cache key. When the system prompt and retrieval context are identical between tenants (because they share the same configuration), the cache key matches and they share cache entries. When the context differs (because the tenant has custom data), the key differs and each tenant gets its own entries. This gives you maximum sharing where safe and automatic isolation where necessary.
+
+The economics are significant. A multi-tenant product serving 200 companies with 1,000 queries per day per company handles 200,000 queries daily. With fully isolated caching, each company's cache builds slowly from only 1,000 daily queries, and hit rates might be 15 percent per tenant. With shared caching on the universal portion of queries — company policies that are the same across tenants, product documentation that is identical, general knowledge questions — the shared portion might see a 40 percent hit rate. The blended rate for shared-plus-isolated is typically 10 to 15 percentage points higher than fully isolated, translating directly to thousands of dollars in additional monthly savings.
+
+## The Limits of Exact-Match
+
+Exact-match caching captures the low-hanging fruit — the queries that arrive in identical form. But human language is varied, and most users do not phrase their questions identically. "How do I reset my password?" and "I forgot my password, how do I change it?" and "password reset help" are three different strings that mean the same thing. Exact-match caching treats them as three separate queries, generates three separate responses, and stores three separate cache entries.
+
+This is where exact-match caching hits its ceiling. The gap between your exact-match hit rate and your potential hit rate — the duplication you could catch if you matched on meaning rather than on characters — is the opportunity for semantic caching, which is the subject of the next subchapter.

@@ -1,0 +1,75 @@
+# 9.5 — Alert Correlation and Aggregation: Syndromes, Not Symptoms
+
+The on-call engineer gets paged for five separate alert firings within ten minutes. Accuracy drop on product queries. Latency spike on the eval pipeline. Judge confidence distribution shift. Safety eval coverage drop. Anomaly detection rate increase. Five alerts, five dashboards, five potential investigations. The engineer opens a war room, assigns two colleagues, and starts triaging. Forty minutes later, they discover that all five alerts trace back to a single root cause: the LLM judge API experienced a partial outage that increased latency, caused timeouts on a subset of evaluations, and shifted the score distributions for every dimension that depended on that judge. Five symptoms. One syndrome. Forty minutes wasted on diagnosis that should have taken thirty seconds.
+
+This scenario is not a pathology of poorly designed alerting. It is the natural consequence of monitoring a complex system with independent alerts. Every alert was correct — each metric genuinely degraded. But treating each alert as an independent incident multiplied the investigation burden by five and delayed the actual fix. The problem is not that the alerts were wrong. The problem is that the alerting system treated correlated signals as isolated events.
+
+## Why Correlated Alerts Are the Default, Not the Exception
+
+Eval systems are deeply interconnected. A single upstream event — a model API outage, a data pipeline delay, a configuration change, a judge model update — ripples through dozens of metrics simultaneously. When the eval pipeline slows down because the judge API is throttling, latency metrics spike, throughput metrics drop, coverage metrics fall because queued evaluations time out, and score distributions shift because only the fastest evaluations complete successfully, creating survivorship bias in the reported scores.
+
+These cascading effects mean that most alert storms in eval systems have a small number of root causes generating a large number of symptoms. Industry experience with large-scale cloud monitoring bears this out: Microsoft's research on alert aggregation in cloud systems found that during incidents, the ratio of alerts to root causes routinely exceeds ten to one. In eval systems at scale, that ratio can be even higher because evaluation metrics are more tightly coupled than typical infrastructure metrics. A single judge model regression affects accuracy, confidence distributions, latency, cost, and coverage — all at once.
+
+The failure mode is not that teams receive too many alerts in aggregate. It is that they receive too many alerts per incident. An engineer who gets paged for one well-described incident can diagnose and fix it. An engineer who gets paged for fifteen symptoms of the same incident spends most of their time figuring out that the alerts are related, rather than fixing the underlying problem.
+
+## Syndrome Detection: The Named Pattern
+
+**Syndrome Detection** is the practice of grouping related alerts into a single incident description — a syndrome — rather than treating each alert as an independent event. The name comes from medical diagnostics, where a syndrome is a set of symptoms that consistently co-occur and share a common cause. A doctor who sees fever, cough, chest pain, and elevated white blood cell count does not treat them as four independent problems. They recognize pneumonia — the syndrome — and treat the cause.
+
+Eval systems need the same diagnostic approach. When accuracy drops, latency spikes, and coverage falls simultaneously, the system should recognize the syndrome — "judge API degradation" — and present it as a single incident with a ranked list of affected metrics, rather than firing independent alerts for each metric.
+
+Syndrome detection transforms the on-call experience. Instead of "you have fifteen alerts across seven dashboards," the engineer sees "you have one incident: judge API degradation. Affected metrics: accuracy (minus 4%), latency (plus 340ms), coverage (minus 12%), confidence shift (0.08 standard deviations), anomaly rate (plus 6%). Probable root cause: judge API response time increased from 200ms to 1400ms at 14:23 UTC." That single, contextualized incident description contains more diagnostic value than fifteen separate alert emails ever could.
+
+## Three Types of Alert Correlation
+
+Not all correlated alerts are correlated in the same way. Building an effective syndrome detection system requires understanding the three primary correlation types and using each appropriately.
+
+**Temporal correlation** is the simplest: alerts that fire within a narrow time window are likely related. If five alerts fire within two minutes of each other, they probably share a root cause. Temporal correlation is easy to implement — group alerts by time proximity — but it produces false positives when genuinely independent issues happen to coincide. A judge model update at 14:00 and a data pipeline delay at 14:01 are temporally correlated but causally independent.
+
+**Component correlation** groups alerts based on shared infrastructure dependencies. If your eval pipeline has a dependency graph — judge model A feeds into accuracy scores, latency metrics, and confidence distributions — then any alert on those downstream metrics should be correlated with the health of judge model A. Component correlation is more precise than temporal correlation because it uses structural knowledge about how the system is connected, but it requires maintaining an accurate dependency map of your eval infrastructure.
+
+**Causal correlation** is the strongest but hardest to implement. It identifies alerts where one metric's degradation directly causes another metric's degradation. When the judge API slows down, evaluations time out, which causes coverage to drop, which causes the remaining sample to be non-representative, which causes apparent accuracy shifts. Causal correlation traces this chain and groups the entire cascade under the initiating cause. Building causal correlation requires either explicit causal models of your eval system or enough historical incident data to learn the causal patterns empirically.
+
+The most effective syndrome detection systems use all three correlation types in a layered approach. Temporal correlation provides the initial grouping. Component correlation refines the grouping based on shared dependencies. Causal correlation identifies the root cause within the group and orders the symptoms by their distance from the cause.
+
+## Building the Aggregation Layer
+
+The alert aggregation layer sits between your metric alerting system and your incident management system. Raw alerts flow in. Syndromes flow out. The aggregation layer's job is to reduce N alerts into M syndromes where M is much smaller than N, while preserving enough detail that the engineer receiving the syndrome can understand its scope and start diagnosis immediately.
+
+The simplest implementation uses time-windowed grouping with component tagging. When an alert fires, the aggregation layer checks whether any other alerts have fired on related components within the last five minutes. If yes, it adds the new alert to the existing syndrome. If no, it creates a new syndrome. Related components are defined by a static dependency map that the team maintains — which metrics depend on which infrastructure components, which eval dimensions depend on which judge models, which pipelines depend on which data sources.
+
+More sophisticated implementations use correlation mining — analyzing historical alert data to discover which alerts frequently co-occur during incidents. Microsoft and other cloud providers have invested heavily in this approach, including the COLA framework presented at ICSE 2024, which combines statistical correlation mining with LLM-based reasoning to aggregate alerts in large-scale systems. The correlation mining module identifies alert pairs that frequently co-occur, filtering out high-confidence correlations. Only uncertain pairs are sent to an LLM reasoning module that uses domain knowledge to determine whether the alerts are genuinely related. The hybrid approach achieves F1 scores above 0.90, significantly outperforming purely statistical methods.
+
+For eval systems specifically, the dependency map is often simpler than general cloud infrastructure because the eval pipeline has a more linear structure. Your correlation rules typically follow a pattern: all accuracy metrics that use the same judge model are correlated, all metrics in the same eval pipeline stage are correlated, all metrics that depend on the same data source are correlated, and all metrics that share the same compute infrastructure are correlated.
+
+## Reducing Investigation Burden Without Losing Signal
+
+The risk of aggressive aggregation is that you group alerts that should not be grouped, masking a genuinely independent issue behind an unrelated syndrome. If a judge model degradation and a data pipeline corruption happen at the same time, grouping them into one syndrome means the data pipeline issue might not get investigated until after the judge model is fixed — by which point corrupted data has been flowing for hours.
+
+The mitigation is to build the aggregation layer with explicit confidence scores. Each syndrome has a confidence level indicating how sure the system is that all alerts in the group share a root cause. High-confidence syndromes — where component and causal correlation are strong — get presented as unified incidents. Low-confidence syndromes — where only temporal correlation exists — get presented as "possibly related alerts" with a recommendation to investigate independently if the initial root cause fix doesn't resolve all symptoms.
+
+You should also build a syndrome review process. After every incident, the on-call engineer marks whether the syndrome grouping was correct. Did the grouped alerts actually share a root cause? Were any alerts incorrectly excluded from the group? Were any alerts incorrectly included? This feedback loops back into the correlation rules, improving grouping accuracy over time.
+
+## The Syndrome Dashboard
+
+Once you have syndrome detection, the alert dashboard transforms. Instead of a chronological list of individual alerts, the on-call engineer sees a list of active syndromes, each with a summary, a severity level, a list of affected metrics, a probable root cause hypothesis, and a recommended investigation path.
+
+The syndrome dashboard should show the syndrome's timeline — when the first symptom appeared, how the syndrome evolved as additional alerts fired, and which metrics are still degraded versus which have recovered. It should show the syndrome's blast radius — how many eval dimensions are affected, how many production features depend on those eval dimensions, and what the downstream impact is on quality monitoring coverage.
+
+For teams running large eval systems with hundreds of metrics across dozens of eval dimensions, syndrome detection routinely reduces the number of active incidents by 70 to 85 percent during major events. The engineer who would have faced fifteen separate alert pages now faces two syndromes. The investigation that would have taken ninety minutes now takes twenty. The mean time to resolution drops not because the fix is faster but because the diagnosis is faster — and in most eval incidents, diagnosis consumes more time than remediation.
+
+## When Syndromes Become Chronic
+
+Acute syndromes — a judge API outage, a data pipeline failure — are dramatic but straightforward. The alerts fire, the syndrome is detected, the root cause is fixed, the alerts resolve. More insidious are chronic syndromes — slow-building patterns where multiple metrics drift slightly over weeks, each individually below the alert threshold, but collectively indicating a significant underlying issue.
+
+A judge model gradually becoming less calibrated might cause accuracy scores to drift down by 0.5% per week, confidence distributions to widen slightly, and latency to increase marginally as the model's uncertainty leads to longer inference chains. No single metric trips its alert threshold. But the syndrome — the co-occurring drift across multiple correlated metrics — is detectable if you look for it.
+
+Chronic syndrome detection requires analyzing metric trends rather than metric thresholds. Instead of asking "did this metric cross a threshold?" you ask "are these correlated metrics all trending in the same direction simultaneously?" This is more computationally expensive and produces more false positives than threshold-based alerting, but it catches the slow degradation patterns that threshold-based alerting misses entirely.
+
+## The Organizational Impact
+
+Syndrome detection changes more than the on-call experience. It changes how teams reason about eval system reliability. When every incident is a collection of individual alerts, teams optimize for reducing individual alert frequency — they raise thresholds, add cooldown periods, and suppress noisy metrics. When incidents are syndromes, teams optimize for reducing syndrome frequency — they harden the infrastructure components that generate the most syndromes, invest in redundancy for the judge models that affect the most metrics, and build fallback paths for the data pipelines that cause the widest blast radius when they fail.
+
+This shift — from symptom management to syndrome prevention — is the difference between a team that is constantly fighting alert fires and a team that is systematically reducing the conditions that cause alert fires in the first place.
+
+Alert correlation turns noise into signal. But even well-correlated alerts are only as trustworthy as the underlying eval scores — and when those scores fluctuate between runs for the same model on the same data, the entire alerting system is built on shifting ground. The next subchapter addresses the problem of non-determinism in evaluation and how to build confidence when your measurements refuse to hold still.

@@ -1,0 +1,117 @@
+# 7.5 — Serverless GPU Platforms: When Pay-Per-Inference Beats Reserved Capacity
+
+The economics of GPU inference come down to one variable that most teams never measure: utilization. If your GPU instances are busy 80% of the time, reserved capacity is the obvious choice — you are paying for machines that are doing useful work almost constantly. But if your instances are busy 25% of the time, you are paying full price for hardware that sits idle three-quarters of every hour. **Serverless GPU platforms** eliminate idle cost entirely by charging you only when inference is actually happening. No traffic, no bill. The trade-off is a higher per-request price and a set of latency constraints that make serverless unsuitable for some workloads and perfectly suited for others.
+
+Understanding when serverless beats reserved — and when it does not — is a cost engineering decision worth tens of thousands of dollars per month for most AI teams. Get the math wrong in either direction and you are either overpaying for idle GPUs or overpaying for per-request premiums.
+
+## What Serverless GPU Actually Means
+
+In a serverless GPU model, you deploy your model to a platform — Modal, Replicate, RunPod Serverless, Together AI, Baseten, or one of the growing number of specialized providers — and the platform handles everything downstream. Provisioning GPU instances. Loading model weights into VRAM. Managing request routing and batching. Scaling capacity up and down. Draining instances when traffic subsides. You send an inference request via API. The platform routes it to a warm GPU, runs inference, returns the result, and bills you for the compute time consumed by that single request.
+
+The billing model varies by platform but follows a common structure. You pay for GPU-seconds: the wall-clock time your request occupied a GPU. A request that takes 1.2 seconds on an A100 is billed for 1.2 GPU-seconds at the platform's per-second rate. Some platforms add charges for CPU time, memory, and egress on top of the GPU charge. Others bundle these into a single per-second rate. The critical difference from reserved instances is that billing stops when your request completes. Between requests, you pay nothing. The platform absorbs the idle cost.
+
+This is the fundamental economic proposition: the platform trades a higher per-unit price for zero idle cost, and you decide which side of that trade benefits you based on your utilization pattern.
+
+## The Per-Request Premium
+
+Serverless GPU pricing is more expensive per request than equivalent self-managed GPU instances. The premium exists because the platform must maintain a pool of warm instances, absorb cold start overhead, handle the orchestration complexity, and still make a profit. The premium varies by platform, GPU type, and model size, but a reasonable range in 2026 is 1.5x to 4x the raw GPU-hour cost.
+
+An on-demand A100 instance on a major cloud provider costs roughly $3.00 to $3.70 per GPU-hour in 2026. A serverless A100 on Modal costs approximately $0.0011 to $0.0016 per GPU-second depending on configuration, which translates to roughly $4.00 to $5.75 per GPU-hour of active compute. RunPod Serverless prices A100 compute at around $0.00032 per second for community cloud, or roughly $1.15 per GPU-hour — more competitive but with fewer guarantees on availability and cold start behavior. Replicate charges per-second rates that vary by model and hardware, with A100 inference typically running $0.0012 to $0.0023 per second, or $4.30 to $8.28 per GPU-hour.
+
+The spread is wide, and comparing platforms requires normalizing for what is included in the rate. Some platforms include CPU, memory, and a small amount of idle time in the per-second GPU rate. Others charge CPU and memory separately, meaning your effective per-request cost is 20-40% higher than the headline GPU rate suggests. Always calculate your fully loaded cost per request on each platform by running actual workloads, not by multiplying headline rates.
+
+## The Utilization Crossover Point
+
+The economic question is simple: at what utilization rate does reserved capacity become cheaper than serverless? Below that threshold, serverless wins. Above it, reserved wins.
+
+Work through a concrete scenario. You run a 7-billion-parameter model that requires a single A100 instance. On-demand reserved, the instance costs $3.50 per GPU-hour, or $2,520 per month running continuously. On a serverless platform at $5.50 per GPU-hour of active compute, your monthly cost depends entirely on how many GPU-hours of inference you actually perform.
+
+If your workload generates 20 hours of active GPU compute per day — meaning the GPU is actually running inference for 20 out of 24 hours — your serverless cost is $3,300 per month. The reserved instance costs $2,520. Reserved is cheaper by $780 per month. Your effective utilization is 83%, well above the crossover.
+
+If your workload generates 10 hours of active GPU compute per day — the GPU is active 42% of the time — serverless costs $1,650 per month versus $2,520 for reserved. Serverless saves $870 per month. You are below the crossover.
+
+The crossover point for this scenario is approximately 19 hours of active compute per day, or about 76% utilization. Below 76%, serverless is cheaper. Above 76%, reserved is cheaper. But this is the crossover for on-demand reserved pricing. If you use reserved instances with a one-year commitment at a 30% discount, the reserved cost drops to roughly $1,764 per month, and the crossover shifts down to around 13.4 hours of active compute per day, or 56% utilization. With three-year commitments or spot instances, the crossover shifts even lower.
+
+The general rule: for on-demand pricing, the crossover sits between 40% and 55% utilization depending on the serverless platform's premium. For committed reserved pricing, it drops to 30-45%. For spot instances, the crossover drops to 20-30%, making serverless economical only for genuinely sparse workloads.
+
+These numbers should be calculated for your specific GPU type, model size, and platform choices. The crossover is not a universal constant — it shifts with every variable in the equation.
+
+## The Cold Start Problem on Serverless
+
+The cold start problem that plagues self-managed autoscaling exists on serverless platforms too, but in a different form. When no warm instance is available to serve your request — because traffic has been idle and the platform has deallocated your container — the platform must provision a new instance, load your model into GPU memory, and run your request. This cold start adds latency to the first request after an idle period.
+
+Cold start latencies on serverless GPU platforms have improved dramatically since 2024. In early 2024, cold starts of thirty to sixty seconds were common for large models. By 2026, platform-level optimizations have compressed this window significantly. Modal achieves two to four second cold starts through GPU memory snapshots — the platform captures the fully initialized state of your model in GPU memory and restores it directly, skipping the normal initialization sequence. RunPod's FlashBoot technology delivers sub-two-second cold starts for pre-cached models by maintaining model weights in a high-speed cache layer close to the GPU nodes. Replicate's cold starts for custom model deployments still run longer, typically fifteen to sixty seconds for large models without dedicated hardware, though their optimized hosted models start faster.
+
+The cost implication of cold starts is not the cold start itself — most platforms do not charge for initialization time, only for inference time. The cost is the user experience during the cold start window. If your application serves real-time requests and a user hits a cold instance, they wait five to thirty seconds for a response. If that causes them to abandon the request, retry, or lose trust in your product, the cost is measured in churn and support tickets, not GPU-seconds.
+
+The mitigation is **keep-warm configuration** — most serverless platforms let you specify a minimum number of instances that stay warm at all times. Modal lets you set a minimum replica count. RunPod offers active workers that stay allocated. Together AI supports dedicated endpoints that maintain warm capacity. Keep-warm instances have a cost — typically the platform's per-second rate running continuously — which effectively converts part of your serverless deployment back into reserved capacity. The trick is keeping warm only enough instances to handle your baseline traffic and letting the serverless scaling handle bursts. This hybrid approach captures most of the serverless benefit while eliminating cold starts for your most latency-sensitive requests.
+
+## The Operational Simplicity Dividend
+
+The dollar-per-request comparison between serverless and reserved captures only half the economic picture. The other half is the engineering time you do not spend managing infrastructure.
+
+Running self-managed GPU inference requires a team that understands Kubernetes GPU scheduling, CUDA driver compatibility, model serving frameworks like vLLM or TensorRT-LLM, autoscaling configuration, health checks for GPU instances (which fail in different ways than CPU instances), spot instance interruption handling, rolling model deployments, and GPU monitoring. This is specialized knowledge. A senior ML infrastructure engineer with this skill set commands $180,000 to $280,000 per year in total compensation in 2026. Even a fraction of their time allocated to inference infrastructure management represents $15,000 to $25,000 per month in team cost.
+
+Serverless platforms abstract all of this. You define your model, specify the GPU type, and the platform handles deployment, scaling, monitoring, and hardware management. The engineering team that would have managed GPU infrastructure can instead work on model quality, evaluation pipelines, or product features. For a team of five engineers, reallocating even one engineer's time from infrastructure management to product work can be worth more than the serverless pricing premium.
+
+This operational simplicity dividend is largest for small teams. A startup with three engineers cannot afford to dedicate one of them to GPU infrastructure. The serverless premium of 1.5-3x over raw GPU cost is trivially worth it when the alternative is a $200,000-per-year infrastructure engineer. For a large team with twenty engineers and a dedicated ML platform group, the calculus shifts — the platform team already exists, and the marginal cost of managing one more GPU workload is low.
+
+## When Serverless Is the Right Choice
+
+Serverless GPU wins clearly in several scenarios that share a common characteristic: low or unpredictable utilization.
+
+**Development and staging environments** are the easiest case. Your development environment runs inference for testing, debugging, and experimentation. Traffic is sporadic — a few requests during active development sessions, nothing overnight, nothing on weekends. Reserved GPU instances for dev and staging burn money around the clock for workloads that might run twenty minutes per day. Serverless makes dev environments essentially free during idle periods and costs pennies during active use.
+
+**New products before traffic patterns are established** benefit from serverless because you do not know your utilization yet. Launching on reserved capacity means guessing — and guessing wrong in either direction wastes money. Launching on serverless means your costs scale linearly with actual usage. Once you have three to six months of traffic data, you can calculate the crossover point and decide whether to migrate to reserved capacity.
+
+**Bursty, event-driven workloads** — batch processing triggered by user uploads, scheduled report generation, periodic retraining pipelines — have utilization patterns that cluster around zero and spike to 100% briefly. Reserved capacity for these workloads is almost entirely wasted. Serverless charges you only during the spike.
+
+**Low-volume production workloads** serving fewer than 10,000 requests per day often do not generate enough traffic to justify a dedicated GPU instance. If your workload produces two hours of GPU compute per day, reserving a full instance wastes 91% of its capacity. Serverless costs you two hours of compute at a premium rate, which is still far cheaper than twenty-four hours at the base rate.
+
+**Multi-model deployments** where you serve many different models, each with low individual traffic, benefit enormously from serverless. Loading ten different models onto ten reserved GPU instances — one per model — costs ten times the single-instance rate. On serverless, each model consumes only the compute it actually uses, and the platform handles model loading and unloading dynamically.
+
+## When Reserved Capacity Wins
+
+Reserved capacity wins when utilization is consistently high — above 50-60% for on-demand pricing, above 35-45% for committed pricing.
+
+**High-volume, latency-sensitive production APIs** that handle millions of requests per day with strict latency SLAs need warm, dedicated instances. The cold start risk on serverless, even with keep-warm instances, introduces a reliability variable that latency-critical applications cannot tolerate. Reserved capacity guarantees that every request hits a warm instance with sub-100-millisecond overhead.
+
+**Workloads that require custom hardware configurations** — specific GPU types, high-bandwidth NVLink interconnects, custom CUDA kernels, specialized inference engines — may not be available on serverless platforms. Serverless providers offer a menu of standard GPU types. If your workload requires an H200 with a specific driver version and a custom TensorRT engine, you manage that yourself.
+
+**Workloads where security or compliance requires isolated infrastructure** cannot share GPU hardware with other tenants, which is how serverless platforms reduce cost. Financial services, healthcare, and government workloads often require dedicated, single-tenant hardware. Some serverless platforms offer dedicated instances, but these are priced close to reserved capacity and forfeit the serverless cost advantage.
+
+## The Hybrid Architecture
+
+The most cost-efficient approach for many teams is a hybrid architecture that uses reserved capacity for baseline load and serverless for burst capacity. Your baseline traffic — the minimum number of requests you can reliably expect at any hour — runs on reserved or committed instances. Traffic above the baseline spills over to a serverless platform.
+
+The economics of this approach are favorable because reserved capacity handles the high-utilization, predictable portion of your traffic at the lowest per-unit cost, while serverless handles the low-utilization, unpredictable portion at zero idle cost. You avoid paying the serverless premium on traffic you can predict, and you avoid paying idle capacity costs on traffic you cannot predict.
+
+The implementation requires a routing layer that directs requests to reserved instances when they have capacity and overflows to serverless when they do not. This adds architectural complexity but is well-supported by service mesh tools and load balancers in 2026. The routing logic can be as simple as: if the reserved instance queue depth is below a threshold, route to reserved; otherwise, route to the serverless endpoint.
+
+A practical example: a team running a production chatbot with baseline traffic of 50,000 requests per day and burst traffic up to 200,000 requests per day during marketing campaigns. The baseline runs on two reserved A100 instances at $5,040 per month. Campaign bursts — perhaps 50 hours of elevated traffic per month — spill to serverless at $5.50 per GPU-hour, costing roughly $275 per month in burst compute. Total monthly cost: $5,315. Running enough reserved capacity to handle the peak — five instances — would cost $12,600 per month. The hybrid saves $7,285 per month, a 58% reduction.
+
+## Evaluating Serverless Platforms
+
+Not all serverless GPU platforms are created equal, and the right choice depends on your workload characteristics, model size, and operational requirements.
+
+**Modal** excels in developer experience and flexibility. It supports arbitrary Python workloads, not just inference, meaning you can use the same platform for preprocessing, inference, and post-processing. Cold starts are among the fastest in the market at two to four seconds. The pricing model charges for GPU, CPU, and memory separately, which can make cost estimation complex. Modal is strongest for teams that want a general-purpose cloud compute platform with GPU support, not just an inference-specific service.
+
+**RunPod** offers the most competitive raw GPU pricing, especially through their community cloud tier where rates can be 50-70% below hyperscaler on-demand pricing. FlashBoot delivers fast cold starts for cached models. The trade-off is that community cloud instances have less predictable availability and performance compared to dedicated infrastructure. RunPod is strongest for cost-sensitive workloads where some variability in latency and availability is acceptable.
+
+**Replicate** provides the simplest deployment experience for standard models — you can deploy popular open-source models in minutes with minimal configuration. Custom model deployment is more constrained, with cold starts of fifteen to sixty seconds for non-optimized models. Pricing tends to be on the higher end. Replicate is strongest for teams deploying standard models that want maximum simplicity and are willing to pay a premium for it.
+
+**Together AI** and **Baseten** offer serverless inference with a focus on hosted model endpoints, providing low-latency access to popular open-source models without any deployment step. These are particularly economical for teams that want to use standard open-source models without any infrastructure management at all.
+
+When evaluating platforms, run your actual workload on each for a week. Measure end-to-end latency including cold starts, calculate your fully loaded cost per request including all line items, and assess the operational tooling — logging, monitoring, deployment management. The headline per-second GPU rate is the starting point for comparison, not the ending point.
+
+## The Migration Decision Framework
+
+The decision between serverless and reserved is not permanent. The right strategy changes as your traffic grows. A practical framework for ongoing evaluation works like this.
+
+Measure your actual GPU utilization weekly. Not the utilization reported by your autoscaler, which may measure the wrong thing, but the fraction of total GPU time that was spent serving inference requests versus sitting idle. If your utilization is below 40% for three consecutive weeks, you are almost certainly overpaying for reserved capacity and should evaluate serverless. If your utilization is above 70% for three consecutive weeks, you are getting good value from reserved capacity and serverless would cost more.
+
+The messy middle — 40% to 70% utilization — is where the detailed math matters. Calculate your monthly cost on reserved, your estimated monthly cost on serverless (using actual request volumes and measured per-request GPU-seconds), and your estimated cost on a hybrid architecture. Pick the cheapest option. Recalculate quarterly as traffic patterns evolve.
+
+Do not assume your utilization will stay constant. Product launches, feature changes, model upgrades, and seasonal patterns all shift utilization. A workload that justifies reserved capacity today might drop below the crossover point after a model optimization that cuts inference time in half. A workload on serverless today might justify reserved capacity after a product launch triples traffic. Review the math regularly. The teams that set their infrastructure strategy once and never revisit it are the teams that overpay by 30-50% a year later.
+
+The next subchapter introduces a different cost dimension entirely: the multi-region deployment premium, where regulatory requirements and user latency force you to duplicate infrastructure across geographies, and the economics of that duplication are worse than most teams expect.

@@ -1,0 +1,111 @@
+# 5.2 — Semantic Caching: Matching Similar Queries to Existing Responses
+
+In early 2025, a mid-size travel booking platform launched exact-match caching on their AI concierge — a chatbot that answered destination questions, compared hotel options, and explained booking policies. The engineering team expected a meaningful hit rate because their support logs showed the same questions recurring constantly. After two weeks in production, the exact-match cache was hitting on 4.1 percent of queries. Barely worth the Redis instance.
+
+The problem was obvious in retrospect. "What's the cancellation policy for my Lisbon booking" and "can I cancel my reservation in Lisbon" and "Lisbon trip — how do I cancel" are the same question. But as strings, they share almost nothing. The cache treated each one as novel. So did "best restaurants near my hotel in Barcelona" and "where should I eat in Barcelona close to where I'm staying" and "Barcelona dining recommendations near the hotel." Different words, identical intent, three separate model calls at $0.018 each. Multiply that by 35,000 daily queries and the redundancy was costing roughly $12,000 per month in wasted inference.
+
+The team switched to semantic caching — embedding each incoming query and comparing it against cached query embeddings rather than raw text. Within a week of tuning, their hit rate climbed to 38 percent. Monthly model costs dropped from $19,000 to $11,800. The quality evaluations showed that cached responses were indistinguishable from fresh ones on 96 percent of cache hits. The remaining 4 percent were edge cases where the queries were semantically similar but contextually different — same destination question, different booking circumstances — which the team addressed by incorporating booking metadata into the cache key. The final system achieved a 34 percent effective hit rate with a quality match rate above 99 percent.
+
+## The Mechanism: From Text Matching to Meaning Matching
+
+**Semantic caching** works by comparing what queries mean rather than what they say. The mechanism is a four-step pipeline that sits between your application and your model provider.
+
+Step one: when a query arrives, an embedding model converts it into a dense vector representation — a list of numbers, typically 768 or 1,536 dimensions, that encodes the semantic content of the query. This embedding captures meaning in a way that is invariant to surface-level phrasing. "How do I reset my password" and "I need to change my password, what do I do" produce embeddings that are nearly identical despite sharing few words.
+
+Step two: the system searches a vector store of previously cached query embeddings. This search computes the cosine similarity between the new query's embedding and every cached embedding — or, more practically, uses an approximate nearest-neighbor algorithm to find the closest matches without exhaustive comparison. Modern vector databases like Pinecone, Weaviate, Qdrant, and pgvector with HNSW indexing can perform this search in single-digit milliseconds even across millions of cached entries.
+
+Step three: the system applies a similarity threshold. If the closest cached embedding has a cosine similarity above the threshold — say, 0.93 — the system treats the new query as semantically equivalent to the cached query and returns the cached response. If the similarity is below the threshold, the query passes through to the model as a cache miss, and both the query embedding and the fresh response are stored in the cache for future matches.
+
+Step four: the cached response is returned to the user, bypassing the model call entirely. The total cost of the cache hit is the embedding computation — typically 100 to 1,000 times cheaper than a full model call — plus the vector search, which costs fractions of a cent on managed vector databases. The savings on a single cache hit are the full cost of the model call that was avoided.
+
+## The Architecture: What You Need to Build
+
+A production semantic cache requires five components, and each one has choices that affect performance, cost, and reliability.
+
+The **embedding model** converts queries to vectors. You need a model that is fast, cheap, and produces high-quality semantic representations. In 2026, the standard choices are OpenAI's text-embedding-3-small or text-embedding-3-large, Cohere's embed-v4, or open-source models like BGE-M3 or E5-large-v2 that you can self-host. The key requirement is consistency: you must use the same embedding model for caching that you use for lookup, because different models produce incompatible vector spaces. Self-hosted models eliminate per-query embedding costs and reduce latency, but require GPU infrastructure. Hosted models are simpler to operate but add a per-query cost — typically $0.01 to $0.03 per thousand queries — and an external dependency.
+
+The **vector store** holds cached embeddings and supports fast similarity search. For caches up to a few hundred thousand entries, pgvector or a simple FAISS index is sufficient. For millions of entries, a dedicated vector database — Pinecone, Qdrant, Weaviate, or Milvus — provides better search performance and operational tooling. The vector store must support both fast writes (to add new cache entries after each miss) and fast reads (to search for matches on every request). Latency matters because the cache lookup sits in the critical path of every request. A cache lookup that takes 200 milliseconds defeats the purpose if the model call takes 400 milliseconds. Target single-digit millisecond lookups, which all modern vector databases achieve with proper indexing.
+
+The **response store** holds the actual cached responses, keyed by the embedding ID. This is a standard key-value store — Redis, DynamoDB, or even a relational database. The response store is the simple part. It just needs to be fast enough that retrieving a cached response does not add meaningful latency.
+
+The **threshold configuration** determines when a similarity score is high enough to return a cached response. This is the most important parameter in the system and the one that most directly affects quality. We will discuss threshold tuning in detail below.
+
+The **cache management layer** handles TTL expiration, cache size limits, invalidation triggers, and monitoring. Cached entries need to expire — either on a time basis or when the underlying data changes. The cache needs a size limit to prevent unbounded growth. And you need monitoring to track hit rates, miss rates, false match rates, and the quality of cached responses over time.
+
+## The Threshold Problem: Too High and You Waste Money, Too Low and You Serve Wrong Answers
+
+The similarity threshold is the single most consequential decision in semantic caching. Set it too high — 0.98 or above — and you are effectively doing near-exact matching. The hit rate drops to 5 to 8 percent, barely better than string matching, and you have built expensive vector infrastructure for minimal gain. Set it too low — 0.85 or below — and the cache matches queries that look similar but require different answers. A query about cancellation policy for hotels matches against a cached response about cancellation policy for flights. The response is wrong, the user is confused, and you have traded model cost for user trust.
+
+The optimal threshold depends on your domain, your query distribution, and your tolerance for incorrect cached responses. There is no universal correct value. But there is a universal correct method for finding it.
+
+Start with a labeled dataset of query pairs. Take a sample of your production traffic — at least a few thousand queries — and embed all of them. For each query, find the nearest cached neighbor and record the similarity score. Then manually label a representative sample of these pairs: is the cached response an acceptable answer for the new query? Yes or no. This gives you a dataset of similarity scores mapped to correctness labels.
+
+Plot the relationship. You will see a pattern that is consistent across domains: above some threshold, nearly all cached responses are correct. Below some other threshold, most cached responses are wrong. Between those two thresholds is a transition zone where the accuracy degrades gradually. Your operating threshold should sit in the high-confidence zone — the region where 97 to 99 percent of cached responses are correct.
+
+The exact numbers vary. In customer support — where most queries have well-defined intents and the response space is relatively small — teams commonly find that a threshold of 0.91 to 0.94 achieves both high hit rates and high accuracy. In more nuanced domains — legal advice, medical information, personalized recommendations — the safe threshold is higher, typically 0.94 to 0.97, because the cost of serving a wrong cached answer is greater and the queries have more subtle variation.
+
+Do not set the threshold once and forget it. Monitor the false match rate continuously. As your query distribution shifts — new products, new features, seasonal patterns — the relationship between similarity scores and response correctness changes. A threshold that was safe in January may produce false matches in June. Quarterly re-evaluation of the threshold against fresh production traffic is the minimum cadence for maintaining cache quality.
+
+## Enriching the Cache Key: When Meaning Alone Is Not Enough
+
+Pure semantic similarity on the query text captures a lot of redundancy, but it misses an important class of failures: queries that mean the same thing but require different answers because of different context.
+
+Consider a banking assistant. "What is my account balance" and "show me my balance" are semantically identical. But they require different answers for different users. If the semantic cache matches them and returns User A's balance to User B, the result is not just wrong — it is a privacy violation and a regulatory incident. The query semantics match. The required response does not.
+
+The solution is **composite cache keys** — cache keys that combine the semantic embedding of the query with contextual metadata that determines when two semantically identical queries actually require different responses. In the banking example, the cache key includes both the query embedding and the user ID. Two queries match only if they are semantically similar and from the same user. In an e-commerce context, the cache key might include the product category or the user's geographic region. In a legal context, it might include the jurisdiction.
+
+Composite keys reduce the hit rate because they partition the cache into narrower buckets. A query that would have matched against any similar cached query now only matches against similar queries from the same user or the same context. But the reduction in hit rate is a reduction in false matches, not in valid ones. The overall system is more accurate, even if the hit rate number looks lower.
+
+The decision about which metadata to include in the cache key follows from a simple question: for two queries with identical meaning, under what circumstances would they require different answers? Any circumstance that changes the answer must be part of the cache key. Any circumstance that does not change the answer should be excluded, because including it unnecessarily fragments the cache and reduces hit rates.
+
+## The Economics: What Semantic Caching Actually Costs and Saves
+
+Building semantic caching is not free. You are adding an embedding computation on every request, a vector database lookup on every request, and the infrastructure to support both. The question is whether the savings from avoided model calls exceed these new costs.
+
+Let us work through the math for a concrete scenario. A customer service platform handles 500,000 queries per month. Their model is Claude Sonnet 4.5 at an average cost of $0.015 per query (a mix of short and medium-length interactions). Total monthly model cost: $7,500.
+
+The embedding cost using text-embedding-3-small at $0.02 per million tokens, with an average query length of 30 tokens, is roughly $0.30 per month for embedding all 500,000 queries. The vector database — say, a small Pinecone instance — costs about $70 per month. The response store adds another $20 per month in Redis hosting. Total caching infrastructure cost: approximately $90 per month.
+
+With a 35 percent semantic cache hit rate, 175,000 queries per month are served from cache. That avoids 175,000 model calls at $0.015 each — $2,625 in avoided model costs. Subtract the $90 infrastructure cost, and the net savings are $2,535 per month. The caching infrastructure pays for itself 28 times over.
+
+At higher volumes, the economics get even better. At 5 million queries per month, the embedding cost is $3, the vector database might cost $200 for a larger instance, and the savings from 1.75 million avoided model calls at $0.015 each is $26,250 per month. The caching infrastructure costs perhaps $300 total. Net savings: roughly $26,000 per month. Semantic caching becomes one of the most efficient cost optimizations in the entire system.
+
+The economics break down only in two scenarios. First, when the query distribution has very low redundancy — below 10 percent semantic similarity — the hit rate is too low to justify the infrastructure. This is rare in production systems but can happen in highly personalized or highly novel domains. Second, when the model cost per query is extremely low — below $0.001 — the savings per cache hit are too small to amortize the caching infrastructure. This happens with very small, cheap models on very short queries, where caching infrastructure costs more than just running the model.
+
+## What Semantic Caching Cannot Do: The Limitations
+
+Semantic caching is powerful, but it is not universal. Understanding its limitations prevents you from deploying it in contexts where it will fail and damage user trust.
+
+**Personalized queries** are the primary limitation. Any query whose correct answer depends on user-specific state — account details, purchase history, ongoing conversations, preferences — cannot be semantically cached at the query level alone without including user context in the cache key. And user-specific cache keys partition the cache so aggressively that hit rates for per-user caches are often below 5 percent. If your workload is primarily personalized, semantic caching on the response level delivers minimal value. Component-level caching — caching the shared retrieval and embedding computations that are identical across users — is a better investment.
+
+**Time-sensitive queries** are the second limitation. "What is the stock price of NVIDIA" has a different correct answer every second the market is open. Caching the response for even a minute could serve a stale answer. For workloads where recency is critical, response-level caching is inappropriate. TTLs measured in seconds can help, but at that point the hit rate drops so low that the caching infrastructure is not earning its keep. Again, component-level caching — caching the retrieval of the company's financial profile, which changes slowly — is more appropriate than response-level caching.
+
+**Multi-turn conversations** add complexity because the correct response depends not just on the current query but on the conversation history. "Tell me more" is semantically identical across thousands of conversations, but the correct response depends entirely on what came before. Semantic caching for multi-turn systems requires either incorporating conversation state into the cache key — which fragments the cache heavily — or caching only the first turn of common conversation patterns, which captures less redundancy.
+
+**Queries requiring reasoning** — complex math, multi-step logic, novel analysis — are less suitable for caching because the value to the user is in the reasoning process, not just the final answer. If a user asks a genuinely novel analytical question, a cached response from a similar-but-different question may provide a plausible but incorrect analysis. The similarity threshold must be set very high for these workloads, which reduces hit rates.
+
+The meta-lesson is that semantic caching works best on workloads with high redundancy, low personalization, low time sensitivity, and well-defined answer spaces. Customer support, FAQ-style queries, documentation search, product information, and policy questions are ideal. Real-time analytics, personalized recommendations, and complex reasoning tasks are poor fits for response-level semantic caching but may still benefit from component-level caching.
+
+## Monitoring and Maintaining the Cache
+
+A semantic cache is not a set-and-forget system. It requires ongoing monitoring to ensure that it continues to deliver savings without degrading quality.
+
+Track four metrics continuously. The **hit rate** tells you what percentage of queries are being served from cache. A declining hit rate means your query distribution is shifting away from cached content — perhaps new products, new features, or seasonal changes are introducing queries the cache has not seen. An increasing hit rate might mean the cache is growing stale and matching queries it should not match. Both directions warrant investigation.
+
+The **false match rate** is the most important quality metric. It measures how often the cache returns a response that is incorrect for the matched query. Measuring this requires periodic sampling: take a random sample of cache hits, compare the cached response against a fresh model response, and compute the disagreement rate. If the fresh response and cached response differ materially on more than 2 to 3 percent of sampled hits, your threshold is too low or your cache keys are missing contextual dimensions. This sampling should run continuously as a background process, not as a quarterly audit.
+
+The **cache age distribution** tells you how old your cached entries are. If most cache hits are returning responses that were generated months ago, the risk of staleness increases even for non-time-sensitive content. Models get updated. Product information changes. Policies evolve. A cache entry from three months ago might be technically correct but phrased in a way that reflects an older version of your product. Set maximum TTLs that reflect your domain's change rate — a week for fast-changing content, a month for stable content — and monitor the age distribution to ensure old entries are cycling out.
+
+The **latency overhead** measures the total time added by the caching layer on both hits and misses. On a cache hit, the overhead is the embedding computation plus the vector search — this should be well under 50 milliseconds total. On a cache miss, the overhead is the same embedding and search plus the cache write — still under 100 milliseconds. If the overhead climbs above these targets, your embedding model or vector database needs optimization. A cache that adds 300 milliseconds to every request and only hits 30 percent of the time is making 70 percent of your requests slower for a 30 percent hit rate — the math may still favor caching on cost, but the latency impact on user experience needs to be weighed.
+
+## The Hybrid Approach: Exact-Match Plus Semantic
+
+The best production caching systems do not choose between exact-match and semantic caching. They layer both, using exact-match as the fast first check and semantic caching as the fallback.
+
+The request arrives. First, the system computes a hash of the full input — query text plus any relevant context keys — and checks the exact-match cache. This is a sub-millisecond operation. If it hits, the response is returned instantly with zero quality risk. If it misses, the system falls through to the semantic layer: embed the query, search the vector store, apply the threshold. If the semantic layer hits, return the cached response. If both layers miss, call the model, and store the result in both caches.
+
+This layered approach captures the best of both worlds. Exact-match catches programmatic and repeated queries with zero overhead. Semantic matching catches the human-phrased redundancy that exact-match misses. The combined hit rate is always higher than either layer alone. In the travel platform example from the opening, the combined system achieved a 41 percent total hit rate — 4 percent from exact-match and 37 percent from semantic — while maintaining a quality match rate above 99 percent.
+
+The operational cost of the hybrid approach is only marginally higher than semantic caching alone, because the exact-match layer is trivially cheap. The implementation complexity is also modest — the exact-match layer is a simple hash lookup that sits in front of the semantic layer. Any team building semantic caching should add exact-match as the first layer by default. The engineering cost is an hour. The free hits are free money.
+
+Semantic caching captures redundancy in the final model response. But there is another layer of redundancy deeper in the pipeline — in the embeddings you compute and the documents you retrieve — where caching delivers savings that compound with every request, regardless of whether the final response is cached. That deeper layer is the subject of the next subchapter.

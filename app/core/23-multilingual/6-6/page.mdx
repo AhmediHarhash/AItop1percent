@@ -1,0 +1,107 @@
+# 6.6 — Multilingual Reranking: Calibrating Relevance Across Languages
+
+The retrieval system returns twenty candidate documents. Twelve are in English, five in Korean, three in Japanese. The query was in Korean. The reranker scores each candidate and reorders the list. When the team inspects the final ranking, a pattern emerges: English documents consistently rank higher than Korean documents, even when human annotators judge the Korean documents as more relevant to the Korean query. The most relevant document -- a Korean-language troubleshooting guide that directly answers the user's question -- sits at position eight. An English document that tangentially discusses the same topic sits at position two. The reranker is not broken. It is biased. It was trained on predominantly English query-document pairs, and its internal model of "relevance" is calibrated to English text. When it encounters Korean documents, it under-scores them -- not because they are less relevant, but because its confidence in scoring Korean relevance is lower. The Korean user sees the English document first and cannot read it. They scroll past it, past five more English documents they cannot use, and eventually find their answer at position eight. Or they give up.
+
+This is the reranking bias problem in multilingual retrieval, and it is more pervasive than most teams realize.
+
+## Why Rerankers Develop Language Bias
+
+A reranker is a cross-encoder model. Unlike embedding models, which encode queries and documents independently and compare their vectors, a reranker takes a query-document pair as a joint input and produces a single relevance score. This architecture gives rerankers much finer-grained relevance judgments than embedding-based retrieval, which is why reranking consistently improves search quality. But the fine-grained scoring also means the model's training data distribution directly shapes what it considers relevant.
+
+Most rerankers are trained primarily on English data. The largest publicly available relevance datasets -- MS MARCO, Natural Questions, TriviaQA -- are English-only. Models trained on these datasets learn an excellent model of English relevance: what makes an English document a good match for an English query. They learn English discourse patterns, English topic signals, English keyword overlap patterns, English ways of expressing answers to questions.
+
+When these models encounter Korean text, they are working outside their training distribution. The relevance signals they learned do not transfer cleanly. Korean has different discourse patterns, different ways of structuring information, different keyword overlap characteristics (because Korean is agglutinative, with multiple morphemes packed into single words). The reranker's confidence in its relevance judgments is lower for Korean than for English, and lower confidence typically translates into lower scores -- not because the documents are less relevant, but because the model is less certain.
+
+The result is systematic bias. English documents receive higher scores on average than equivalent non-English documents, not because of relevance but because of the model's training distribution. This bias is strongest for languages far from English in structure and script -- Korean, Japanese, Thai, Arabic -- and weakest for languages close to English -- French, Spanish, German, Portuguese.
+
+## The State of Cross-Lingual Rerankers in 2026
+
+The good news is that purpose-built multilingual rerankers have matured rapidly. By 2026, three families of models offer serious cross-lingual reranking capability.
+
+**Qwen3-Reranker** is available in 0.6B, 4B, and 8B parameter sizes, supporting over 100 languages. The model family was designed from the ground up for multilingual retrieval, with training data that spans dozens of languages including underserved ones. On the MIRACL benchmark, which measures cross-lingual retrieval quality across 18 diverse languages, the Qwen3 reranking models show strong performance across language families -- from Romance languages to CJK to Arabic. The 8B model sits at the top of the MTEB multilingual leaderboard. For teams with GPU budget, the 8B model offers the highest cross-lingual scoring quality. For teams that need efficiency, the 0.6B model provides competitive cross-lingual reranking at a fraction of the compute cost, handling up to 8,192 tokens of context.
+
+**Jina Reranker v3** uses a novel architecture that performs causal self-attention between query and documents within the same context window, extracting contextual embeddings from the last token of each document for scoring. At 0.6B parameters, it is compact enough for production deployment. Its MIRACL evaluation shows consistent cross-lingual performance with minimal degradation across language families: Arabic at 78.69, Thai at 81.06, Russian at 65.20. The progressive multilingual training strategy -- training across stages with increasing multilingual diversity -- is what gives it consistent cross-lingual quality rather than English-dominant quality with multilingual added as an afterthought.
+
+**Cohere Rerank** has evolved through multiple generations, with Rerank 3.5 supporting over 100 languages and Rerank 4 quadrupling the context window to 32,000 tokens. Cohere's managed API approach simplifies deployment -- you do not need to host the model yourself -- but limits control over caching, batching, and latency optimization. Cohere also offers a Nimble variant optimized for speed, with average latency around 600 milliseconds for production workloads.
+
+**Contextual AI Reranker v2** is an open-source alternative that has shown competitive multilingual results. For teams that need full control over their reranking infrastructure, open-source models offer deployment flexibility that API-based services cannot match.
+
+## Score Calibration: The Hidden Requirement
+
+Even with a multilingual reranker, raw scores are not directly comparable across languages. A relevance score of 0.82 for an English query-document pair does not mean the same thing as a score of 0.82 for a Korean query-document pair. The model's score distribution varies by language. English scores tend to cluster higher because the model has more training signal for English relevance. Korean scores tend to cluster lower and tighter because the model is less confident.
+
+Without calibration, this score asymmetry means that mixed-language result sets are implicitly biased toward the language with higher average scores. If your retrieval returns English and Korean candidates and the reranker scores both, the English documents will systematically appear higher in the final ranking -- even when a multilingual reranker significantly narrows the gap compared to an English-only reranker.
+
+**Score calibration** normalizes reranker scores across languages so that equivalent relevance produces equivalent scores regardless of language. The most practical calibration approach is percentile normalization. For each language, collect reranker scores from a large sample of query-document pairs (your evaluation set works well for this). Compute the score distribution per language -- the 25th, 50th, 75th, and 95th percentile scores. Map raw scores to percentile ranks within each language's distribution. A score at the 90th percentile in Korean is treated as equivalent to a score at the 90th percentile in English, regardless of the raw numbers.
+
+A simpler but less robust approach is mean-shift calibration. Compute the mean relevance score per language from your evaluation data. Subtract the per-language mean from each raw score, then add a global mean. This shifts each language's score distribution to the same center point. Documents that score one standard deviation above their language's mean are ranked equally, regardless of whether the raw score was 0.85 in English or 0.72 in Korean.
+
+Calibration requires maintenance. As your document corpus evolves, as your query patterns shift, and as you update your reranking model, the per-language score distributions change. Recalculate your calibration parameters at least quarterly, or whenever you change your reranker.
+
+## Per-Language Relevance Thresholds
+
+Many retrieval systems use a relevance threshold -- a minimum score below which documents are filtered out of results. A document scoring below 0.5 might be considered irrelevant and excluded. In a multilingual system, a single global threshold is dangerous.
+
+If Korean documents have lower average scores than English documents (even after calibration reduces the gap), a global threshold of 0.5 might filter out 15 percent of genuinely relevant Korean documents while filtering only 2 percent of genuinely relevant English documents. The Korean user sees fewer results, misses relevant content, and the system appears broken -- but only for Korean. English users experience a well-functioning search.
+
+The fix is per-language thresholds. Determine the optimal threshold for each language independently using your evaluation data. For English, the threshold that maximizes F1 might be 0.5. For Korean, it might be 0.38. For Thai, 0.35. For French, 0.48. These thresholds reflect the reranker's actual confidence distribution per language, not an arbitrary global standard.
+
+Setting per-language thresholds requires per-language evaluation data -- annotated query-document pairs with relevance judgments for each language you support. This is an investment, but it is the same investment you need for evaluating reranking quality in the first place. You cannot optimize what you do not measure.
+
+## The Language-Match Bonus
+
+A complementary approach to calibration is the language-match bonus: when the query language and the document language match, add a small score boost to the reranker score. This reflects the empirical reality that users generally prefer results in their query language, and that same-language relevance signals are stronger than cross-lingual ones.
+
+The bonus should be small enough that a highly relevant cross-lingual document still outranks a mediocre same-language document. A typical bonus is 0.05 to 0.15 on a 0 to 1 relevance scale. If a Korean document scores 0.65 and an English document scores 0.72 for a Korean query, a language-match bonus of 0.10 brings the Korean document to 0.75 -- ranking it above the English document. If the English document scores 0.90 and is clearly more relevant, the bonus is not enough to override it.
+
+Tuning the bonus requires experimentation with your actual data. Too large a bonus and you suppress valuable cross-lingual results. Too small and it has no effect. Start at 0.10, measure per-language nDCG at 10 with and without the bonus, and adjust based on where the quality improves and where it degrades.
+
+The language-match bonus is not a substitute for score calibration. It addresses user preference (same-language results are more useful) while calibration addresses model bias (scores should mean the same thing across languages). Use both.
+
+## Measuring Reranking Quality Per Language
+
+The standard reranking evaluation -- compute nDCG or MRR before and after reranking and report the improvement -- is insufficient for multilingual systems. You need per-language reranking evaluation.
+
+For each language, measure nDCG at 5 and nDCG at 10 on the initial retrieval results (before reranking) and on the reranked results (after reranking). The reranker should improve both metrics for every language. If it improves English nDCG by 15 percent but improves Korean nDCG by only 3 percent, or -- worse -- degrades Korean nDCG, the reranker is not serving your multilingual users equitably.
+
+**The language equity ratio** is a useful derived metric. Compute the ratio of the best-performing language's nDCG to the worst-performing language's nDCG after reranking. A ratio of 1.0 means all languages receive equal reranking quality. A ratio of 1.5 means the best language's reranking is 50 percent better than the worst. Track this ratio over time. It should decrease (toward 1.0) as you calibrate, adjust thresholds, and refine your reranking pipeline. If it increases, something in your pipeline is widening the language gap rather than narrowing it.
+
+Run this evaluation on a balanced test set. If your evaluation data is 80 percent English and 5 percent Korean, your per-language metrics for Korean are noisy and unreliable. Invest in building evaluation sets with at least 100 query-document pairs per language, annotated for relevance by speakers of that language. The annotators must be fluent in the document language -- a non-Korean speaker cannot reliably judge whether a Korean document answers a Korean query.
+
+## Reranking Latency in Multilingual Pipelines
+
+Reranking adds latency to every query. A cross-encoder model that processes one query-document pair at a time is inherently sequential: if you have 20 candidates, you run 20 forward passes. At 10 to 15 milliseconds per forward pass on a GPU, reranking 20 candidates takes 200 to 300 milliseconds. Reranking 50 candidates takes 500 to 750 milliseconds.
+
+In multilingual systems, the latency pressure is compounded by two factors. First, if you use a hybrid index architecture with query fan-out, your candidate set is larger -- you retrieved candidates from multiple indexes, and the merged set may contain 40 to 60 candidates rather than 20. Reranking 60 candidates doubles the reranking latency.
+
+Second, multilingual rerankers are sometimes larger than English-only rerankers because they need more parameters to model cross-lingual relevance patterns. The 8B Qwen3-Reranker produces the highest quality scores but requires significant GPU resources and adds more latency per candidate than the 0.6B version.
+
+The practical solution is a two-stage approach. First, use a fast, lightweight reranker (the 0.6B Qwen3-Reranker or Jina Reranker v3 at 0.6B) to score all candidates and prune the set to the top 10 or 15. Then, optionally, use a larger model (the 4B or 8B Qwen3-Reranker) for fine-grained scoring of the pruned set. The first stage eliminates the clearly irrelevant candidates quickly. The second stage applies expensive precision scoring to the candidates that matter. Total latency is much lower than applying the large model to all candidates, and quality is close to what the large model would achieve on the full set.
+
+For latency-constrained applications -- real-time search, conversational AI, live customer support -- limit the candidate set to 10 to 15 documents and use the 0.6B model exclusively. The quality trade-off is small relative to the latency savings.
+
+## Common Reranking Failures in Multilingual Systems
+
+Three failure patterns appear repeatedly in multilingual reranking deployments.
+
+**The monolingual reranker mistake.** Teams deploy an English-only reranker in a multilingual pipeline because it was the model they already had. English results improve dramatically. Non-English results degrade because the model assigns near-random scores to documents in languages it was not trained on. The aggregate metrics improve (because English is the majority language), masking the per-language degradation. This failure is invisible until someone checks per-language metrics.
+
+**The calibration drift.** The team calibrates reranker scores at launch. Six months later, the document corpus has grown, the query distribution has shifted, and the calibration parameters are stale. The reranker still produces reasonable English rankings, but Korean and Thai rankings have degraded because the score distributions drifted and the calibration no longer corrects for the bias. Quarterly recalibration prevents this.
+
+**The evaluation gap.** The team evaluates reranking quality on an English test set because that is the evaluation data they have. They report strong nDCG improvements and deploy to production. Korean and Japanese users report poor search quality. Without per-language evaluation data, the team cannot diagnose the problem. The fix is investing in multilingual evaluation data before deploying the reranker, not after users complain.
+
+## Choosing Your Reranker
+
+The choice between reranking models depends on your deployment constraints, your language requirements, and your quality thresholds.
+
+If you need the highest cross-lingual scoring quality and have GPU budget, the Qwen3-Reranker at 8B parameters is the current leader on multilingual benchmarks. It handles 100-plus languages with minimal per-language variance.
+
+If you need production efficiency with strong multilingual performance, Jina Reranker v3 at 0.6B offers an excellent quality-to-cost ratio. Its compact size makes it deployable on modest GPU infrastructure, and its progressive multilingual training produces consistent cross-lingual quality.
+
+If you want managed infrastructure and cannot host your own models, Cohere Rerank 4 provides strong multilingual reranking through an API with 32,000-token context windows. The Nimble variant is the fastest option when latency is the primary constraint.
+
+If you need full control over the model -- custom fine-tuning on your domain data, on-premise deployment, no external API dependencies -- open-source options like Contextual AI Reranker v2 or the open-weight Qwen3 models give you that flexibility.
+
+Regardless of which model you choose, the fundamentals remain the same: measure per-language quality, calibrate scores, set per-language thresholds, and monitor the language equity ratio over time. A reranker that improves English search while leaving Korean, Thai, and Arabic behind is not a multilingual reranker. It is an English reranker with multilingual inputs.
+
+The next subchapter examines what happens before any of this retrieval and reranking logic runs: how do you detect what language the user is querying in? Query language detection sounds simple until you encounter single-word queries, code-switched input, and users whose browser settings do not match their actual language. Get detection wrong, and the entire retrieval pipeline receives the wrong instructions.

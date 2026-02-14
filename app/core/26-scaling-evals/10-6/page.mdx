@@ -1,0 +1,69 @@
+# 10.6 — Platform Integration Patterns: Connecting Eval Tools to Your Existing Stack
+
+The eval platform has been purchased, provisioned, and configured. The team has run a few manual evaluations through it and the dashboards look promising. Now comes the hard part: connecting it to your model serving infrastructure, your data pipeline, your CI/CD system, your monitoring stack, and your incident management workflow. Without these connections, the eval platform is an island — a place where engineers go to manually run evaluations when they remember to, producing results that exist in isolation from the systems that need them. The difference between an eval platform that transforms quality and one that collects dust is integration depth.
+
+## The Five Integration Points
+
+Every eval platform needs to connect to five systems, and the order you integrate them determines how quickly evaluation becomes operational rather than experimental.
+
+The first integration point is **model serving**. Your eval platform needs to receive the outputs your model generates, along with the inputs that triggered them and the metadata that contextualizes them — model version, prompt version, user segment, request parameters. Without this connection, someone has to manually export outputs and import them into the eval platform. That manual step means evaluation happens sporadically, on whatever outputs someone remembers to export, with whatever metadata they remember to include. Automating this connection turns evaluation from a periodic activity into a continuous one.
+
+The second integration point is **data pipelines**. Evaluation datasets — golden sets, regression suites, production samples — live in your data infrastructure. Your eval platform needs to pull from those datasets without requiring manual upload. When your data team updates a golden set with new examples, the eval platform should pick up the changes automatically. When your production sampling pipeline selects outputs for evaluation, the samples should flow into the eval platform through the same pipeline infrastructure that moves every other kind of data through your organization.
+
+The third integration point is **CI/CD**. When a developer pushes a prompt change or a model update, the CI/CD pipeline should trigger evaluation automatically and block deployment if evaluation fails. This is where eval moves from measurement to governance. Without CI/CD integration, eval results inform decisions after the fact. With it, eval results are the decision — the deployment gate that prevents quality regression from reaching users.
+
+The fourth integration point is **observability**. Your eval scores, coverage rates, and judge health metrics need to appear alongside your operational metrics in whatever observability system your team already uses — Datadog, Grafana, your internal dashboards. Engineers should not need to switch to a separate tool to check eval health. Eval metrics are production metrics. They belong in the same place.
+
+The fifth integration point is **incident management**. When eval scores drop below a threshold, the alert should not just appear on a dashboard — it should create an incident in PagerDuty, Opsgenie, or whatever system your on-call rotation uses. Quality degradation detected by the eval system should trigger the same incident response as a latency spike or an error rate increase. Without this connection, eval alerts are informational. With it, they are operational.
+
+## SDK-Based Integration
+
+The most common integration pattern in 2026 is SDK-based: the eval platform provides client libraries that you embed directly into your application code. When your model serving layer generates an output, a few lines of SDK code capture the input, output, and metadata and send them to the eval platform asynchronously. The SDK handles batching, retries, and backpressure so that eval instrumentation doesn't affect your application's latency or reliability.
+
+SDK-based integration is the fastest to implement and the most tightly coupled. You add the SDK to your application's dependencies, instrument the relevant code paths, and evaluation data flows automatically. Platforms like LangSmith, Braintrust, and Langfuse provide SDKs for Python, TypeScript, and other common languages, with framework-specific integrations for LangChain, LlamaIndex, and Vercel AI SDK that reduce instrumentation to a few lines.
+
+The coupling is the trade-off. When you embed a vendor's SDK into your application code, you create a direct dependency on that vendor's data format, API contract, and client library. Upgrading or replacing the eval platform means changing application code — not just configuration. For teams that expect to switch platforms or want to maintain platform independence, SDK coupling is a cost that must be weighed against the speed of implementation.
+
+## Webhook-Based Integration
+
+Webhook integration decouples the eval platform from your application code. Instead of embedding an SDK, your application publishes events to a webhook endpoint — either the eval platform's directly or an intermediary like a message queue. The event contains the same information the SDK would send: input, output, metadata. But the application code doesn't import the eval platform's library, doesn't depend on the platform's API contract, and doesn't need to change if you switch platforms.
+
+The trade-off is operational complexity. Webhooks require you to manage the delivery guarantee yourself. What happens when the webhook endpoint is down? What happens when the payload format changes? What happens when the event volume exceeds the endpoint's capacity? With an SDK, the platform vendor handles these concerns. With webhooks, you handle them — through retry queues, dead letter handling, and capacity management.
+
+Webhook integration works best when you already have event infrastructure — a message bus like Kafka, a queue like SQS, or an event router like EventBridge. In that case, your application publishes eval events to the same infrastructure it uses for everything else, and the eval platform consumes from that infrastructure as one of many subscribers. This pattern is clean, decoupled, and scalable, but it requires event infrastructure that not every team has.
+
+## API-Based Integration
+
+API-based integration is the most flexible and the most work. Instead of the eval platform receiving events passively through SDKs or webhooks, your infrastructure actively calls the eval platform's API to submit evaluation jobs, retrieve results, and manage datasets. This pattern gives you complete control over when and how evaluation happens, but it requires you to build the orchestration logic yourself.
+
+API integration is the right choice when your eval workflow doesn't fit the assumptions embedded in SDKs or webhooks. If your evaluation requires pre-processing steps — anonymizing data before sending it to the platform, enriching outputs with additional context from internal systems, joining production outputs with delayed outcome data — API integration lets you build that pre-processing into your pipeline and call the eval platform at exactly the right point in the workflow.
+
+The maintenance cost of API integration is the highest of the three patterns. API contracts change. Authentication mechanisms evolve. Rate limits shift. Your integration code becomes a surface area that requires ongoing maintenance as the eval platform's API evolves. Teams that choose API integration should budget for ongoing integration maintenance, not just initial implementation.
+
+## The Eval Event Bus Pattern
+
+The most architecturally sound integration pattern is the **eval event bus** — a central event stream that all eval-related components publish to and consume from. Rather than point-to-point integrations between your application and each eval component, the event bus creates a single integration point that decouples publishers from consumers.
+
+Your model serving layer publishes output events to the bus. Your eval orchestrator consumes those events, runs evaluations, and publishes result events back to the bus. Your dashboard service consumes result events to update visualizations. Your alerting service consumes result events to trigger alerts. Your CI/CD system consumes result events to make deployment decisions. Each consumer operates independently, processes events at its own pace, and fails without affecting the others.
+
+The event bus pattern solves three problems that point-to-point integration creates. First, it eliminates fan-out complexity. When your model serving layer needs to send data to five different eval components, point-to-point integration means five integration points to maintain. The event bus reduces that to one: publish to the bus. Second, it provides temporal decoupling. If the eval platform is down for maintenance, events accumulate on the bus and are processed when the platform recovers. No data is lost, no application latency is affected. Third, it enables replay. When you deploy a new judge model and want to re-evaluate last week's outputs, you replay the events from the bus through the new judge. No re-export, no manual data wrangling.
+
+In practice, teams implement the eval event bus on top of existing streaming infrastructure. Kafka is the most common choice for high-volume teams. Managed services like AWS Kinesis or Google Pub/Sub work for teams that don't want to operate Kafka themselves. The bus carries a standard event schema — input, output, metadata, model version, timestamp — that all consumers understand regardless of which component produced the event.
+
+## Integration Testing for Eval Infrastructure
+
+Eval integrations break. The model serving layer changes its output format. The CI/CD pipeline updates its webhook configuration. The data pipeline modifies how it exports golden set samples. Each change is small, each is reasonable, and each can silently break the eval integration without anyone noticing until evaluation stops working.
+
+Integration testing for eval infrastructure means running end-to-end tests that verify the full path from output generation to eval result. A synthetic output enters the system at the model serving layer, flows through the integration to the eval platform, gets evaluated, and produces a result that appears in the dashboard and triggers an alert if the score is below threshold. If any step fails, the test fails. These tests run on a schedule — daily at minimum — and alert the eval platform owner when they break.
+
+The tests should cover the failure modes that matter most. What happens when the output format includes a new field the eval platform doesn't expect? What happens when the eval platform's API returns a 429 rate-limit response? What happens when the message bus has a ten-minute delay? What happens when the golden set dataset is empty because a pipeline bug wiped it? Each of these has happened to real teams. Each caused silent eval failure until someone noticed manually.
+
+## The Hidden Cost: Maintenance as Systems Change
+
+The hardest part of eval integration is not the initial implementation. It is the ongoing maintenance as the systems on both sides of the integration evolve. Your model serving infrastructure will change — new frameworks, new deployment patterns, new metadata fields. The eval platform will change — API updates, schema migrations, new features that require client library upgrades. Your CI/CD system will change — new pipeline stages, new trigger mechanisms, new artifact formats.
+
+Each change on either side of an integration has the potential to break it. The maintenance cost is not the time to fix any individual break — those are usually small. It is the aggregate cost of monitoring every integration point, detecting breaks promptly, and fixing them before they cause extended eval outages. Teams that underestimate this cost end up with integrations that work brilliantly for the first three months and then slowly degrade as upstream and downstream systems evolve without coordinating with the eval integration.
+
+The mitigation is to treat integration points as contracts. Define explicit schemas for the data that crosses each integration boundary. Version those schemas. Test backward compatibility when either side changes. Assign ownership of each integration point to a specific team or individual who is responsible for keeping it working when adjacent systems evolve.
+
+Even with robust integrations, your eval system is only as valuable as the data that flows through it. The next subchapter addresses a different kind of risk: what happens when you lose access to that data because you're locked into a vendor that holds it.

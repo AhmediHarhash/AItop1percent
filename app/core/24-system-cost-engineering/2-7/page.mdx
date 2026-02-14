@@ -1,0 +1,115 @@
+# 2.7 — Multi-Turn Conversation Costs: The Compounding Context Problem
+
+Every turn in a conversation resends the entire history. This is not an implementation choice. It is how stateless API calls to large language models work. The model has no memory between requests. To maintain context, your application must include every previous message — every system prompt, every user query, every assistant response — in the input of each new request. Turn one sends your system prompt and the user's first message. Turn two sends the system prompt, the first user message, the model's first response, and the second user message. By turn ten, you are sending thousands of tokens of accumulated history before the model even begins processing the new question. The cost of each turn is not the cost of the new message. It is the cost of every message that came before it, plus the new one. This is **the Conversation Cost Compounding Problem**, and it is the single largest reason that conversational AI products blow past their cost projections.
+
+The compounding is not linear. It is closer to quadratic. Each turn adds not just the new user message but also the model's previous response, which is often longer than the user's input. If the model generates 200 tokens per response and the user sends 50 tokens per message, each turn adds roughly 250 tokens to the history. By turn five, you are carrying over 1,000 tokens of history. By turn fifteen, over 3,500 tokens of history. And you are paying input token prices on all of it, every single turn.
+
+## The Math of Compounding Context
+
+Let's trace the cost progression for a concrete example. Assume a system prompt of 800 tokens, a model that charges two dollars per million input tokens and eight dollars per million output tokens, an average user message of 60 tokens, and an average model response of 250 tokens.
+
+Turn one sends 860 input tokens and generates 250 output tokens. The input cost is 860 times two divided by one million, which is $0.00172. The output cost is 250 times eight divided by one million, which is $0.002. Total cost for turn one: approximately $0.0037.
+
+Turn five has accumulated history. The input now includes the system prompt at 800 tokens, four previous user messages at 240 tokens, four previous model responses at 1,000 tokens, and the new user message at 60 tokens. That is 2,100 input tokens. Input cost: $0.0042. Output cost remains $0.002. Total cost for turn five: $0.0062. Turn five costs 68% more than turn one, even though the user asked a single question of similar length.
+
+Turn ten sends 800 plus nine times 60 plus nine times 250 plus 60 input tokens — roughly 3,650 tokens. Input cost: $0.0073. Total turn cost: $0.0093. Turn ten costs 2.5 times what turn one costs.
+
+Turn fifteen sends roughly 5,200 input tokens. Input cost: $0.0104. Total turn cost: $0.0124. Turn fifteen costs 3.4 times what turn one costs.
+
+Now scale this to volume. If your product handles 100,000 conversations per day, and the average conversation runs eight turns, the cumulative effect is massive. The naive calculation — multiplying the turn-one cost by eight turns per conversation by 100,000 conversations — underestimates the real bill by 40 to 60 percent. The compounding effect means the later turns in every conversation are significantly more expensive than the early turns, and that difference adds up across millions of conversations.
+
+## Why Most Cost Models Get This Wrong
+
+Most teams estimate conversation costs by multiplying the average cost per request by the number of requests. This treats every turn as equal. It is wrong. A conversation with ten turns does not cost ten times the cost of a single turn — it costs closer to fifteen to twenty times, depending on the response lengths.
+
+The error is even worse when teams measure cost using only the first few days of usage data. In the first week after launch, users are exploring the product with short conversations. Averages look low. By month two, users have built habits. Power users run conversations of twenty or thirty turns. A customer support chatbot might handle routine questions in three turns but complex issues in fifteen. A coding assistant might run a single debugging session across forty turns. The cost model based on early usage dramatically underestimates steady-state costs because it has not yet seen the long-tail conversations that dominate the bill.
+
+A B2B software company launched an AI assistant for their enterprise customers in mid-2025. Their cost model assumed an average of five turns per conversation based on beta testing. The first month's bill was close to projections. By month three, enterprise users were running average conversations of twelve turns, with the top 10% running conversations of twenty-five turns or more. The monthly bill was 2.8 times the projection. The product was technically profitable on short conversations and deeply unprofitable on long ones. The team had not modeled the compounding effect, and they had not accounted for how conversation length grows as users become more comfortable with the tool.
+
+## The Power-User Problem
+
+Not all users cost the same. In most conversational AI products, a small fraction of users generate a disproportionate share of the cost. These are the power users who run long, complex conversations. They are often the most engaged users and the most valuable customers, but they are also the most expensive to serve.
+
+The distribution typically follows a pattern: 20% of users generate 60 to 70% of total token costs. The top 5% of users may generate 30 to 40% of costs. This Pareto distribution means that your average cost per user is misleading. The median user costs far less than the average, and the top users cost many multiples of the average.
+
+This creates a business problem. If you price your product based on average cost, you lose money on power users and overcharge casual users. If you impose conversation length limits to control costs, you frustrate the users who get the most value from your product. If you do nothing, the power users drive your costs up as they discover how useful long conversations can be.
+
+A developer tools company found that 8% of their users accounted for 52% of their total API costs. These were developers using the AI assistant for extended pair-programming sessions, often running thirty to fifty turns in a single session. Each of those sessions cost between one and three dollars, compared to the average session cost of twelve cents. The company had priced their product at twenty dollars per month per seat, and the power users were consuming thirty to fifty dollars per month in API costs. The product was profitable in aggregate only because 70% of users barely used it.
+
+## Mitigation Strategy One: Sliding Window Truncation
+
+The simplest approach to controlling conversation costs is **sliding window truncation**. Instead of sending the entire conversation history with every request, you send only the most recent N turns. A window of five turns means the model sees the system prompt, the last five user messages, and the last five model responses. Everything older is dropped.
+
+The advantage is simplicity. Implementation requires minimal logic — you count turns and slice the array. The cost becomes bounded: no matter how long the conversation runs, the input token count never exceeds the system prompt plus the window size times the average turn length. A five-turn window caps input tokens at roughly the system prompt plus 1,500 tokens of history, regardless of whether the conversation has run five turns or fifty.
+
+The disadvantage is information loss. If the user asked an important question in turn two and the conversation is now at turn twelve, the model has no knowledge of that earlier exchange. The user says "go back to what we discussed about the database schema" and the model has no idea what they are referring to. This creates a frustrating user experience where the model appears to forget context arbitrarily.
+
+Sliding window truncation works well for conversations where each turn is relatively independent — customer support tickets where the user's current question does not depend heavily on the full history, or quick Q-and-A sessions where the user asks unrelated questions in sequence. It works poorly for deep, evolving discussions — debugging sessions, planning conversations, or multi-step problem-solving where every turn builds on what came before.
+
+The window size is a direct cost-quality tradeoff. A larger window preserves more context but costs more. A smaller window is cheaper but loses more information. Most teams start with a window of eight to twelve turns and adjust based on user feedback and quality metrics. Some teams use variable window sizes based on the conversation type: a shorter window for simple queries and a longer window for complex workflows.
+
+## Mitigation Strategy Two: Conversation Summarization
+
+A more sophisticated approach is **conversation summarization**. Instead of sending raw history, you periodically summarize older portions of the conversation and send the summary instead of the full text. For example, after every five turns, you generate a summary of those turns and replace them with the summary in subsequent requests.
+
+This preserves semantic information while reducing token count. A five-turn exchange that spans 1,500 tokens might compress into a 200-token summary that captures the key points, decisions, and context. The model receives the summary plus the recent raw turns, giving it both the high-level context and the detailed recent history.
+
+The implementation requires an extra API call to generate the summary, which adds cost and latency. You are making one request to summarize and another to respond to the user. The summarization call itself consumes tokens. The net savings depend on how aggressively you summarize and how long the conversations run. For short conversations of five turns or fewer, summarization adds cost without benefit. For long conversations of fifteen turns or more, the savings can be significant — reducing input tokens by 40 to 60% compared to sending full history.
+
+The quality risk is information loss in the summary. Summarization is lossy. The summary captures the main points but drops details, nuances, and specific wording. If the user later asks about a specific detail from an earlier turn, the model may not have that detail in the summary. The quality of the summary model matters — a cheap, fast model may produce poor summaries that lose critical context, while a more capable model produces better summaries but at higher cost.
+
+A healthcare technology company implemented conversation summarization for their patient intake chatbot. They summarized every five turns, reducing average input tokens by 45% for conversations longer than ten turns. The monthly savings were approximately $18,000. However, they discovered that the summarization occasionally dropped medication details mentioned in early turns, causing the model to ask patients to repeat information they had already provided. They improved the summarization prompt to explicitly preserve medication names, dosages, and conditions, which reduced the repetition rate from 12% to 3%.
+
+## Mitigation Strategy Three: Selective History Inclusion
+
+The most nuanced approach is **selective history inclusion**. Instead of sending all history or only recent history, you selectively include the turns that are most relevant to the current query. This requires a retrieval step: for each new user message, you determine which previous turns are relevant and include only those turns in the context.
+
+The selection mechanism can be simple or sophisticated. A simple version tags each turn with a topic and includes only turns with topics matching the current query. A more sophisticated version uses embedding-based similarity search over previous turns, retrieving the top three to five most relevant exchanges. The most advanced version uses a lightweight classifier to determine which turns contain information the model will need to answer the current question.
+
+Selective history inclusion preserves the most relevant context while dropping irrelevant history. It is particularly effective for conversations that shift topics. If a user discusses billing for five turns, then switches to a technical question, the billing turns are irrelevant to the technical question and can be excluded. The model gets a focused context window that is both smaller and more relevant than the full history.
+
+The trade-off is implementation complexity. You need infrastructure for turn-level indexing, retrieval, and relevance scoring. You need to handle cases where the relevance assessment is wrong and important context is excluded. You need to decide how many historical turns to include and how to balance recency against relevance. And you need to maintain this infrastructure as your product evolves.
+
+The cost savings can be substantial for long, topic-shifting conversations. A legal research assistant that handles conversations spanning twenty to thirty turns across multiple legal topics reduced input tokens by 55% using selective history inclusion. The monthly savings were approximately $26,000. The quality impact was minimal because the excluded turns were genuinely irrelevant to the current question.
+
+## Hybrid Approaches
+
+Most production systems combine these strategies. A common hybrid approach uses a three-tier context structure. The first tier is the system prompt and the most recent two to three turns, always included in full. The second tier is a summary of the conversation so far, updated every five turns. The third tier is a selective retrieval of relevant older turns, included when the current query references earlier context.
+
+This hybrid gives the model full detail for recent context, a compressed overview of the conversation arc, and targeted retrieval of specific historical details when needed. The token count stays bounded while the model retains access to both recent and relevant historical information.
+
+The complexity of the hybrid approach is higher, but for products with high conversation volumes and long average conversation lengths, the cost savings justify the engineering investment. A team processing 50,000 conversations per day with an average of twelve turns saved $42,000 per month by moving from full-history inclusion to a hybrid approach — a savings that paid for the engineering effort in less than two weeks.
+
+## Measuring Conversation Cost Distribution
+
+To manage conversation costs effectively, you need visibility into the cost distribution across conversations. This means tracking not just the average cost per conversation but the full distribution: the median, the 75th percentile, the 95th percentile, and the maximum.
+
+The distribution reveals where your money goes. If the median conversation costs $0.03 and the 95th percentile costs $0.45, you know that 5% of your conversations are fifteen times more expensive than the median. Those conversations are where your cost optimization efforts should focus.
+
+Track cost by conversation length. Build a curve that shows the average cost per turn as a function of conversation position. Turn one costs X, turn five costs Y, turn fifteen costs Z. This curve reveals the compounding rate and shows you exactly where costs accelerate. Most teams find that costs remain manageable through the first seven to eight turns and then begin compounding steeply. That inflection point is where your mitigation strategies should activate — summarize after turn seven, switch to a cheaper model after turn fifteen, or prompt the user to start a new conversation after turn twenty.
+
+Track cost by user segment. Power users, occasional users, and new users have very different conversation patterns. Understanding which segments drive costs helps you design pricing tiers, usage limits, and optimization strategies that are targeted rather than blanket.
+
+A SaaS company built a cost distribution dashboard that showed real-time conversation costs by user tier, conversation length, and feature. They discovered that their "research mode" feature, which encouraged longer exploratory conversations, was responsible for 38% of total costs despite being used by only 15% of users. They redesigned the feature to include a summarization step after every eight turns, reducing costs for research-mode conversations by 35% without measurable impact on user satisfaction.
+
+## Setting Conversation Length Policies
+
+At some point, you need policies for how long conversations can run. Unlimited conversation length is an unlimited cost commitment. The question is how to set limits that control costs without degrading the user experience.
+
+Hard limits — cutting off the conversation after N turns — are effective but blunt. Users hit the wall and feel frustrated, especially if they are in the middle of a complex task. Hard limits work best when they are generous enough that most users never hit them. Setting the limit at the 95th percentile of conversation length ensures that only 5% of conversations are affected.
+
+Soft limits degrade quality gradually rather than cutting off abruptly. After turn fifteen, the system switches to a cheaper, faster model. After turn twenty, it begins aggressive summarization. After turn twenty-five, it suggests starting a new conversation. The user experience degrades smoothly, and most users naturally end the conversation before the degradation becomes noticeable.
+
+Cost-based limits are the most sophisticated. Instead of limiting turns, you limit the total tokens consumed by a conversation. A budget of 50,000 tokens per conversation allows short, verbose conversations or long, concise ones. The limit is on the resource consumed, not the behavior. This is fairer to users because it does not penalize someone who needs many short exchanges but does constrain the user who sends long messages and expects long responses every turn.
+
+Whatever policy you choose, communicate it transparently. Users who understand the limits can work within them. Users who hit unexpected limits without warning lose trust in the product.
+
+## The Organizational Cost of Ignoring Compounding
+
+Teams that do not account for conversation cost compounding face a predictable sequence of events. The product launches with optimistic cost projections based on short beta conversations. The first month looks fine. By month three, costs are 50 to 100% over projection as users adopt longer conversation patterns. By month six, the finance team is asking why AI costs are growing faster than revenue. The engineering team scrambles to implement truncation or summarization as an emergency measure, introducing bugs and quality regressions in the process.
+
+This sequence is avoidable. Before launching a conversational AI product, model the compounding effect explicitly. Build a spreadsheet that calculates cost per conversation as a function of conversation length, using realistic estimates for message length, response length, and turn count distributions. Stress-test the model with long-tail scenarios: what does a thirty-turn conversation cost? What if 10% of users run conversations that long? What does the monthly bill look like in that scenario?
+
+The best teams build compounding awareness into their architecture from day one. They implement context management strategies before launch, not as an emergency patch after. They instrument their systems to track per-turn costs and conversation length distributions from the first day of production. They set conversation budgets and alerts before the first user signs up. And they design their pricing to account for the reality that some users will cost five to ten times the average.
+
+The next subchapter examines a different source of cost inefficiency: token waste, the tokens you send and generate that add no value to the output quality and represent pure cost with zero return.

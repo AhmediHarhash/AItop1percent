@@ -1,0 +1,73 @@
+# 9.6 — Non-Determinism and Confidence: When Eval Scores Fluctuate Between Runs
+
+You run the same evaluation suite on the same model with the same test set. The pass rate is 87.3%. You run it again. The pass rate is 85.1%. Again: 88.0%. Which number is real? All of them — and none of them. Each run produced a legitimate measurement of the model's behavior under the conditions that happened to exist during that specific execution. But the measurement itself varies, which means any single run is a sample, not a census. If your alerting system triggers a regression alarm when the score drops from 87.3% to 85.1%, and the next run would have shown 88.0%, you just mobilized an engineering team to investigate noise.
+
+This is the fundamental tension of LLM-based evaluation in 2026. The systems being evaluated are non-deterministic. The systems doing the evaluating are often non-deterministic too. And the infrastructure running both introduces its own sources of variance. Building reliable observability on top of inherently variable measurements requires statistical discipline that most engineering teams did not need before they started working with language models.
+
+## Why LLM Evaluation Is Inherently Non-Deterministic
+
+Non-determinism in LLM evaluation comes from at least four distinct sources, and understanding each is necessary for managing the overall variance.
+
+The first source is the model being evaluated. Unless you set the temperature to zero and use greedy decoding, the model's outputs are sampled from a probability distribution. Different samples produce different tokens, which produce different final outputs, which produce different eval scores. Even at temperature zero, most API-based models do not guarantee deterministic outputs — internal batching, floating-point arithmetic, and infrastructure routing can all cause variation. Research published in 2025 confirmed that even with supposedly deterministic settings, production LLM APIs produce measurably different outputs across runs.
+
+The second source is the judge model. If you use an LLM-as-judge evaluation, the judge itself is a language model subject to the same sampling variance. A judge running at temperature 0.3 might score the same output as "meets criteria" on one run and "partially meets criteria" on the next. Even if the evaluated model produced identical output on two runs, the judge might score it differently.
+
+The third source is infrastructure-level variance. In September 2025, Thinking Machines Lab — the AI research lab founded by former OpenAI CTO Mira Murati — published research demonstrating that batch size variations during inference break numerical consistency in normalization, matrix multiplication, and attention operations. They submitted the same prompt one thousand times under identical inference settings: temperature zero, deterministic decoding, no sampling. The only variable was batch context — sometimes the prompt ran alone, sometimes alongside other requests. They recorded eighty structurally distinct completions. Not just rephrased versions of the same answer — different reasoning paths, different token sequences, different factual content. The root cause was that a forward pass lacks what they called **batch invariance**: a request's output depends on the batch size of the forward pass it happens to be part of.
+
+The fourth source is temporal model updates. Cloud-hosted models receive silent updates — providers improve models, patch safety behaviors, or adjust inference infrastructure without changing the model version string. An evaluation suite that ran on Monday and runs again on Thursday might be evaluating a subtly different model, even though the API endpoint and model identifier are identical.
+
+## How Non-Determinism Undermines Eval Confidence
+
+The practical consequence is that every eval score has an invisible error bar around it. When you report "pass rate: 87.3%," the true pass rate might be anywhere from 84% to 90%, depending on how much variance exists in your specific evaluation setup. If your regression threshold is "alert when pass rate drops below 85%," a single run at 84.8% might be noise rather than signal. But a single run at 84.8% might also be the first sign of a genuine regression that will average 83% across multiple runs.
+
+Without understanding the variance in your measurements, you cannot distinguish signal from noise. And if you cannot distinguish signal from noise, your alerting system is unreliable — either too sensitive (triggering on noise) or too lenient (missing real regressions that happen to coincide with a favorable roll of the sampling dice).
+
+This problem compounds at scale. When you monitor hundreds of eval dimensions, statistical inevitability guarantees that some will show score movements purely from variance on every run. If you have two hundred metrics and each has a 2% chance of fluctuating beyond the alert threshold due to noise alone, you expect four false alerts per run. Run evaluations daily and you get twenty-eight false alerts per week — enough to cause the alert fatigue discussed in the previous subchapter, without any actual regression occurring.
+
+## Statistical Approaches to Taming Variance
+
+The solution is not to eliminate non-determinism — in most cases you cannot. The solution is to measure it, account for it, and require statistically significant evidence before declaring a regression.
+
+The most direct approach is repeated evaluation. Instead of running your eval suite once, run it three or five or ten times and report the mean and confidence interval. If the mean pass rate across five runs is 86.8% with a 95% confidence interval of 85.2% to 88.4%, you know that any single run showing 85.1% is within normal variance. If the mean drops to 83.5% across five runs, you have much stronger evidence of a genuine regression.
+
+The cost of repeated evaluation is real — it multiplies your eval compute by the number of repetitions. For teams using expensive judge models like Claude Opus 4.6 or GPT-5 for evaluation, running five repetitions means five times the judge cost. The tradeoff is explicit: how much are you willing to spend on evaluation confidence versus how much risk are you willing to accept from noisy single-run measurements?
+
+A more cost-effective approach uses statistical significance testing for regression detection. Instead of alerting when a score crosses a fixed threshold, you compare the current run's results against a baseline distribution built from recent runs. If the current score is more than two standard deviations below the trailing mean, you alert. This approach adapts to the natural variance of each metric — a metric with high variance requires a larger drop to trigger an alert, while a stable metric triggers on smaller drops. The key is maintaining enough recent history to estimate each metric's variance accurately.
+
+For eval suites with hundreds or thousands of individual test cases, you can use per-test-case agreement analysis. Instead of looking at the aggregate pass rate, look at how many individual test cases changed their pass/fail status between runs. If most test cases produce the same result across runs and only a few flip, the aggregate variance is low and single runs are fairly reliable. If many test cases flip between runs, the aggregate score is unreliable and you need repeated evaluation.
+
+## Judge Model Version Pinning
+
+One practical mitigation for a specific source of non-determinism is **judge model version pinning** — locking the judge model to a specific version and refusing to update it until you deliberately choose to migrate. When your judge is an API-hosted model like GPT-5 or Claude Opus 4.6, provider-side updates can change judge behavior without your knowledge. Pinning to a specific model snapshot, where the provider supports it, eliminates this source of variance.
+
+The limitation is that not all providers offer version pinning with long-term guarantees. Anthropic and OpenAI both provide versioned model endpoints, but older versions are eventually deprecated. Self-hosted judge models provide the strongest version control — you choose when to update and you can run old and new versions side by side during migration — but they require infrastructure investment.
+
+Even with version pinning, the other sources of non-determinism (sampling variance, batch effects, infrastructure routing) remain. Pinning addresses one source, not all of them. It is a valuable partial mitigation, not a complete solution.
+
+## Batch-Invariant Inference: A Deeper Fix
+
+Thinking Machines Lab's research did not just identify the batch invariance problem — they built a solution. They created batch-invariant versions of the three operations that cause variance (normalization, matrix multiplication, attention) and demonstrated that one thousand identical runs with the batch-invariant operators produced one thousand identical outputs. Perfect reproducibility.
+
+As of early 2026, batch-invariant inference is not yet standard in production serving frameworks, though SGLang and other inference engines have begun integrating deterministic execution modes based on this research. For teams that need reproducible evaluations, self-hosted inference with batch-invariant operators offers a path to eliminating infrastructure-level variance entirely. For teams using API-hosted models, the variance from batch effects remains a fact of life that must be managed through statistical methods rather than eliminated at the infrastructure level.
+
+The practical implication is that the achievable level of eval determinism depends on your infrastructure choices. Teams running self-hosted judge models with batch-invariant inference, fixed random seeds, and greedy decoding can achieve near-perfect reproducibility. Teams using API-hosted judge models with default settings may see score fluctuations of several percentage points across runs. Both setups can produce reliable alerting — but they require different statistical approaches.
+
+## When Non-Determinism Helps
+
+Not all non-determinism is harmful. In adversarial evaluation and red-teaming, running the same attack prompts multiple times with different sampling parameters increases the chance of discovering vulnerabilities. A safety eval that runs once at temperature zero might miss a jailbreak that succeeds at temperature 0.7 because the model's safety training is less robust for lower-probability token sequences.
+
+Similarly, diversity-focused evaluations — assessing whether the model produces varied, non-repetitive outputs — require non-determinism to be meaningful. If you want to evaluate whether a creative writing assistant produces diverse story openings, running it at temperature zero defeats the purpose.
+
+The principle is that non-determinism should be a choice, not an accident. When you want reproducibility — regression testing, performance benchmarking, A/B comparison — you minimize variance through every available mechanism. When you want diversity — adversarial testing, creativity evaluation, robustness probing — you deliberately introduce variance and measure the distribution of outcomes rather than individual scores.
+
+## Building Confidence Metrics Into Your Observability
+
+The practical output of managing non-determinism is a confidence layer in your eval observability. Every metric in your dashboard should show not just its current value but its confidence — how certain you are that the reported value reflects the model's true performance rather than measurement noise.
+
+For metrics based on repeated runs, confidence comes from the width of the confidence interval. A metric showing 87.3% with a confidence interval of plus or minus 0.5% is a high-confidence measurement. A metric showing 87.3% with a confidence interval of plus or minus 3.2% is a low-confidence measurement that should not trigger action without further investigation.
+
+For metrics based on single runs, confidence comes from historical variance. If this metric has historically shown run-to-run variance of less than 1%, a single-run score is reasonably trustworthy. If historical variance is 4%, a single-run score is a rough indicator at best.
+
+Displaying confidence alongside values changes how teams interact with eval data. An engineer who sees "accuracy: 84.1% (low confidence, high variance metric)" reacts differently than one who sees "accuracy: 84.1%" with no context. The first knows to investigate further before sounding alarms. The second might waste a day chasing noise.
+
+The measurement challenges of non-determinism affect every audience that consumes eval data — but different audiences need different levels of detail, different metrics, and different interaction patterns with that data. The next subchapter addresses how to design eval dashboards that serve engineering, product, and leadership audiences without forcing everyone to use the same view.

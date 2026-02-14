@@ -1,0 +1,117 @@
+# 10.6 — RAG Failure Modes Under Code-Switched Input
+
+A customer types a message to a support chatbot: half Hindi, half English, asking where their order is and when it will arrive. The RAG system receives this query, embeds it, searches the knowledge base, and returns three English FAQ articles about general order tracking. The relevant Hindi help article -- the one that uses exactly the phrasing common in Hindi customer support, the one that addresses the specific shipping partner used for domestic Indian orders -- sits in the index untouched. The system returned an answer. The answer was technically correct. It was also the wrong answer for this user, because the retrieval step matched the English half of the query and ignored the Hindi half.
+
+This is not a retrieval failure in the traditional sense. The system found documents. It scored them. It returned results. Every metric in the pipeline looks normal. But the user received generic English content instead of the specific Hindi content that addressed their actual situation. The code-switched query created a silent quality degradation that no standard RAG metric would flag.
+
+## The Full Pipeline Problem
+
+The previous subchapter examined how code-switched queries behave in embedding space -- the between-cluster positioning, the diluted relevance signal, the recall drops of 15 to 30 percent. Those findings describe the retrieval stage in isolation. But RAG is a pipeline, and code-switching creates failure modes at every stage. Retrieval is where the damage starts. Reranking amplifies it. Generation compounds it. By the time the user sees the response, the quality gap between a monolingual query and a code-switched query of identical meaning can exceed 40 percent on human evaluation scores.
+
+Understanding where each stage fails is the prerequisite for fixing any of them. A team that improves retrieval but ignores reranking will see modest gains that plateau. A team that fixes generation but ignores retrieval will produce fluent responses grounded in the wrong documents. The failure modes are sequential and cumulative. You must address them in order.
+
+## Failure Mode One: The Chunk Language Mismatch
+
+Most RAG knowledge bases are organized by language. You have English FAQ documents chunked and indexed in one collection, Hindi documents in another, and perhaps a few other language collections depending on your markets. This organization makes sense for monolingual queries: an English query searches the English index, a Hindi query searches the Hindi index.
+
+Code-switched queries break this logic. A Hinglish query belongs in neither index and both indexes simultaneously. If your pipeline routes the query to one index based on detected language, it searches only half the relevant knowledge base. If it routes to both indexes, the query performs poorly in each because of the embedding issues described in subchapter 10.5.
+
+The mismatch goes deeper than routing. Even within a single multilingual index, the chunks themselves are monolingual. A chunk from an English FAQ and a chunk from a Hindi FAQ may describe the same topic but use different vocabulary, different phrasing, and different cultural framing. The code-switched query partially matches both but strongly matches neither. The cosine similarity scores are mediocre across the board, and the retrieval system cannot distinguish between "moderately relevant in the wrong language" and "moderately relevant on the wrong topic."
+
+A logistics company serving the Indian market discovered this pattern when they analyzed support ticket resolution rates by language. Pure English queries resolved in an average of 1.4 exchanges. Pure Hindi queries resolved in 1.6 exchanges. Hinglish queries -- which accounted for 47 percent of their traffic -- resolved in 2.3 exchanges. The extra exchanges were not because the users' questions were harder. They were because the first retrieval consistently returned less relevant documents, and the model had to ask clarifying questions or provide generic answers before eventually finding the right information.
+
+## Failure Mode Two: Reranker Collapse
+
+If your RAG pipeline includes a reranking step -- and in 2026, most production pipelines do -- the reranker is the second point of failure. Cross-encoder rerankers are trained on query-document pairs where both the query and the document are in the same language, or where the query is in one language and the document is in another. They are not trained on pairs where the query is in two languages simultaneously.
+
+The reranker's job is to take the initial retrieval results and re-score them based on deeper semantic analysis. For monolingual input, rerankers are highly effective -- they catch semantic nuances that the initial embedding-based retrieval misses. For code-switched input, the reranker faces the same training data gap that the embedding model faces. It has never seen a Hinglish query paired with a Hindi document labeled as "highly relevant." It does not know how to score this pair.
+
+The result is that the reranker's rescoring adds noise rather than signal for code-switched queries. Documents that were correctly retrieved despite the embedding penalty may be demoted by the reranker because the query-document pair looks unfamiliar. Documents that were incorrectly retrieved -- surface-level token matches without semantic relevance -- may be promoted because the reranker's uncertainty produces scores that cluster around the middle of the range.
+
+In monolingual RAG, the reranker typically improves precision at K by 10 to 20 percent over retrieval alone. For code-switched queries, teams have measured the reranker improving precision by only 2 to 5 percent, and in some configurations actually reducing precision. The reranker becomes a no-op or a negative, and you are paying the latency cost of a cross-encoder inference for no benefit.
+
+## Failure Mode Three: Context Assembly Confusion
+
+After retrieval and reranking, the RAG pipeline assembles the top-K chunks into a context window for the generation model. For monolingual queries, this context is coherent: all chunks are in the same language, describing related aspects of the same topic. For code-switched queries, the assembled context is often a linguistic patchwork.
+
+The top-K results might include two English chunks, one Hindi chunk, and one chunk that is mostly Hindi with some English technical terms. The generation model now faces a context window where the information it needs is distributed across languages and where some chunks are more relevant but in the less-expected language.
+
+This creates a **context coherence problem**. The model must synthesize information across languages in the context, but its attention mechanism was not specifically trained to extract relevant information from a multilingual context window. It tends to weight the language that matches its generation bias -- usually English -- more heavily than the other language's chunks. This means that the Hindi chunk, which might contain the most relevant information for this specific user's question, gets less attention weight than the English chunks, which are more general.
+
+A travel platform serving Southeast Asian markets tested this by manually constructing context windows with varying language mixes and measuring generation quality. When the context window was entirely English, the model extracted and synthesized information accurately. When the context window contained a mix of English and Thai chunks, the model's answers became less precise. It tended to paraphrase the English chunks and ignore or minimally reference the Thai chunks, even when the Thai chunks contained more specific and relevant information.
+
+## Failure Mode Four: Generation Language Confusion
+
+The final stage of the RAG pipeline -- generation -- introduces its own code-switching failure modes, even when the retrieval stage succeeds.
+
+When the model generates a response from a mixed-language context, it must decide what language to produce the output in. This decision is influenced by three competing signals. The system prompt may specify a language. The retrieved context contains information in multiple languages. The user's query was code-switched, suggesting a preference for mixed-language output.
+
+Without explicit instruction, the model defaults to the language dominant in its training data, which for most commercial models is English. A user who wrote in Hinglish receives an English response. The information may be correct -- the retrieval found the right documents and the generation extracted the right facts -- but the response language is wrong. For users in markets where code-switching is the natural register, an English-only response feels like a product built for someone else.
+
+Even when you instruct the model to match the user's language (using the prompt strategies from subchapter 10.4), the RAG context can override those instructions. If the context window is primarily English, the model's generation tends toward English regardless of the system prompt. The grounding in English context pulls the generation language toward English, and the system prompt's instruction to code-switch is not strong enough to overcome this grounding effect.
+
+The result is a phenomenon that teams call **context language bleed**: the language of the retrieved documents bleeds into the generated response, overriding the user's language preference. You instructed the model to respond in the user's language mix. The model responded in the language of its retrieved context instead. Your prompt strategy failed not because of a prompt design flaw but because the RAG context was a stronger signal than the system prompt.
+
+## Failure Mode Five: Confidence Masking
+
+Perhaps the most insidious failure mode is that code-switched RAG failures are invisible to standard quality metrics. The system does not crash. It does not return empty results. It does not produce obviously wrong answers. It produces mediocre answers -- generically correct but not specifically relevant -- and every automated quality signal says the pipeline is working fine.
+
+The retrieval step returned documents with decent similarity scores. The reranker produced a ranked list. The generation model produced a grammatically correct, topically relevant response. The response passes automated checks for relevance, factual accuracy, and coherence. But the user's actual question was about a specific shipping partner and a specific regional delivery timeline, and the response addressed order tracking in general terms without the specifics. The user got a B-minus answer when the knowledge base contained an A-plus answer in the Hindi index.
+
+This is what makes code-switched RAG failure hard to detect and hard to prioritize. It is not a failure that triggers alerts or shows up in error logs. It is a quality degradation distributed across every code-switched query, hidden behind aggregate metrics that average the degradation away. Your overall RAG quality score is 4.1 out of 5. Your code-switched query quality score might be 3.2 out of 5. But you never see 3.2 because you never segment the metric by language pattern.
+
+## Mitigation: Parallel Monolingual Query Expansion for RAG
+
+The most effective short-term mitigation is to extend the query expansion approach from subchapter 10.5 specifically for RAG. When a code-switched query is detected, generate parallel monolingual queries in each component language, run retrieval for each variant, and merge the results before reranking.
+
+For a Hinglish query about order status, you generate three retrieval queries: the original Hinglish query, a pure Hindi translation, and a pure English translation. Each query searches the full index. The original Hinglish query may return mediocre results from both language clusters. The pure Hindi query returns high-quality matches from Hindi documents. The pure English query returns high-quality matches from English documents. You merge all three result sets, deduplicate, and rerank the combined pool.
+
+This approach solves the chunk language mismatch problem by ensuring that relevant documents in both languages have a fair chance of being retrieved. The Hindi help article that the original Hinglish query missed is now retrieved by the Hindi variant query.
+
+The deduplication step matters. If the same information exists in both Hindi and English versions in your knowledge base, you may retrieve both. Including both in the context window creates redundancy that wastes context space. Deduplicate based on document ID or content hash if your knowledge base has parallel documents.
+
+The cost is roughly three times the retrieval computation for code-switched queries. For a system where 40 percent of traffic is code-switched, this is a meaningful increase. But the alternative -- serving 40 percent of your users with measurably worse retrieval quality -- is a higher cost in user satisfaction and resolution rates.
+
+## Mitigation: Language-Aware Context Assembly
+
+Once you have a diverse set of retrieved chunks from multiple languages, how you assemble the context window matters.
+
+The naive approach is to take the top-K chunks by relevance score regardless of language. This often produces context windows dominated by one language, because the expanded monolingual query for that language produced higher scores. The generation model then grounds in that language and ignores the other.
+
+A better approach is **language-balanced context assembly**. Set a target for the language distribution in the context window that roughly matches the language distribution in the user's query. If the user wrote 60 percent Hindi and 40 percent English, assemble a context window that contains roughly 60 percent Hindi chunks and 40 percent English chunks, selected by relevance within each language bucket.
+
+This is not a precise optimization. The point is to prevent one language from dominating the context and causing the language bleed problem in generation. Even approximate balancing improves the generation model's ability to produce responses in the user's code-switched register, because the context itself reflects that register.
+
+## Mitigation: Generation Language Anchoring
+
+To combat context language bleed, you need to anchor the generation language more strongly than a system prompt alone can achieve.
+
+The most effective technique is to place the language instruction at two points in the prompt: at the beginning of the system prompt and immediately before the retrieved context. The instruction before the context serves as a frame that the model applies to the context as it reads it. Instead of absorbing the context language and generating in that language, the model is primed to extract information from the context but generate in the language pattern specified.
+
+Additionally, include a code-switched few-shot example in the system prompt that demonstrates the desired behavior: a code-switched query, multilingual retrieved context, and a code-switched response. This example teaches the model the specific pattern of extracting from multilingual context while generating in a code-switched register.
+
+A customer support platform serving three Indian languages tested this approach and found that language-match accuracy -- the percentage of responses that matched the user's language pattern -- improved from 61 percent with the system prompt alone to 84 percent with the anchoring technique. The remaining 16 percent of mismatches occurred primarily on queries where the user's code-switching pattern was ambiguous or where the relevant information existed in only one language.
+
+## Mitigation: Code-Switch-Aware Chunking
+
+A longer-term mitigation targets the knowledge base itself. If your users code-switch, your knowledge base should contain code-switched content.
+
+This does not mean rewriting your entire knowledge base in Hinglish. It means adding code-switched metadata and alternative phrasings to your existing chunks. For a Hindi FAQ article about order tracking, add a metadata field that contains the key phrases in Hinglish -- the way a Hinglish speaker would actually describe this topic. These metadata phrases improve embedding matches for code-switched queries without requiring you to duplicate entire documents.
+
+You can also create code-switched summary layers. For each topic in your knowledge base, generate a brief summary in the code-switched register common to your market. Index these summaries alongside the original documents. They serve as bridges -- the code-switched query matches the code-switched summary, which links to the full monolingual document that the generation model uses as its source.
+
+This approach requires investment in bilingual content creation but addresses the root cause rather than patching around it. The knowledge base evolves to reflect how your users actually communicate, rather than forcing users to communicate in the way the knowledge base was organized.
+
+## Measuring RAG Quality for Code-Switched Input
+
+Standard RAG evaluation measures answer quality, faithfulness, and relevance. For code-switched input, you must add three additional measurements.
+
+**Retrieval equity.** Compare the recall and precision of your retrieval pipeline for code-switched queries against the same queries expressed monolingually. The gap is your code-switching retrieval penalty. Track this number weekly. If it exceeds 15 percent, your mitigations are insufficient.
+
+**Language-match accuracy.** For each code-switched query, did the response match the user's language pattern? Measure this with bilingual evaluators who can assess whether the response register was appropriate. Automated language detection of the response is a rough proxy but misses naturalness -- a response that is technically code-switched but sounds unnatural will pass the automated check and fail the user experience.
+
+**Context utilization.** When the retrieved context contains information in multiple languages, does the model use information from all languages or only from one? Measure this by comparing which facts from the context appear in the generated response and which language those facts came from. If the model consistently ignores chunks in one language, your context assembly or generation anchoring needs adjustment.
+
+Track these metrics separately from your overall RAG quality score. The overall score hides the code-switching penalty behind an average. The segmented scores tell you whether your code-switching users are receiving the same quality as your monolingual users.
+
+The next subchapter shifts from code-switching to the closely related challenge of dialectal variation -- what happens when users write not just in mixed languages but in non-standard varieties that the model has barely seen in training.

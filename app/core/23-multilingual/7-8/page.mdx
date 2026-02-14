@@ -1,0 +1,123 @@
+# 7.8 — Dynamic Language Routing in Multi-Turn Conversations
+
+The bilingual user opens with a question in English. The system responds in English. In the third turn, she switches to Spanish -- not because she decided to change languages, but because the question is about a document written in Spanish and it is easier to quote it directly. The system responds in English because the system prompt is in English and the conversation started in English. In the fifth turn, she drops in a Portuguese phrase -- a term of art in her industry that has no clean English equivalent. The system responds with a mix of English and Spanish, apparently confused by the language signals accumulating in the conversation history. By the seventh turn, the model is oscillating between English and Spanish within single responses. The user is not confused about what language she wants. The system is confused about what language she is asking for.
+
+This scenario plays out every day in products that serve bilingual and multilingual populations. It is not an edge case. Bilingual speakers switch languages constantly and naturally -- a behavior linguists call code-switching. They mix languages within conversations, within turns, and within sentences. The AI system that cannot handle this behavior delivers a disjointed experience that makes the user feel like the product was not built for someone like them. And for a growing share of the global user base -- bilingual speakers now represent roughly half of the world's population -- that feeling is enough to abandon the product.
+
+## The Multi-Turn Language Problem
+
+In a single-turn system, language management is straightforward. Detect the language of the input. Respond in that language. Done. Multi-turn conversations break this simplicity because the conversation accumulates context across turns, and that context carries language signals from every previous message.
+
+The model sees the entire conversation history when generating a response. If the first five turns are in English and the sixth turn is in Spanish, the model has five English-language signals and one Spanish-language signal competing for influence. The model's tendency -- well-documented in multi-turn interaction research and confirmed by engineering teams shipping multilingual products -- is to favor the language with more representation in the context window. This creates **Language Momentum**: once a conversation establishes itself in a language, the model resists switching, even when the user clearly switches.
+
+Language momentum is not a bug in the model's architecture. It is a reasonable inference from the training data. In most training conversations, the language stays consistent throughout. The model learned that conversations happen in one language, and it applies that prior to every new turn. When a bilingual user violates that prior by switching languages mid-conversation, the model's response depends on the balance between the new language signal from the current turn and the accumulated language signal from the conversation history. In most cases, the history wins, and the model continues in the previous language.
+
+The consequence for your product is predictable. The user switches to Spanish in turn three. The system responds in English. The user tries again in Spanish. The system responds in a mix of English and Spanish. By turn five, the user has either given up on switching or given up on the product.
+
+## Language State Tracking
+
+Solving the multi-turn language problem requires explicit language state tracking -- a subsystem that detects the language of each user turn, maintains a record of the conversation's language history, and makes the language routing decision before the message reaches the model.
+
+The core state consists of three values. First, the **current active language** -- the language of the user's most recent message. This is the strongest signal of what language the user wants the response in right now. Second, the **session dominant language** -- the language used in the majority of turns so far. This provides a fallback when the current-turn signal is ambiguous (as when the user sends a single word or a number that could belong to any language). Third, the **language history** -- a per-turn log of which language was detected in each user message and which language the system responded in. The history enables pattern analysis: is the user consistently switching, or was the last switch a one-time deviation?
+
+Language detection at the per-turn level is technically straightforward. Libraries like fastText's language identification model classify text into 176 languages with high accuracy for messages longer than 20 characters. For shorter messages -- a single word, a yes/no, a number -- detection confidence drops and you need a fallback strategy. The most reliable fallback is to use the session dominant language for ambiguous short messages, on the assumption that a two-word confirmation like "si, gracias" or "yes, thanks" should not override the established conversation language unless the surrounding turns provide supporting context.
+
+The language state tracker runs outside the model. It operates on the raw user message before the message enters the prompt assembly pipeline. Its output -- the current active language and any routing decision -- becomes an input to the prompt assembly layer, which uses it to select the appropriate system prompt variant and to add an explicit language directive to the prompt.
+
+## Response Language Policies
+
+Detecting the user's language is only half the problem. The other half is deciding what language the system should respond in. This is a product decision, not a technical one, and different products make different choices for good reasons.
+
+**Match-Current Policy.** The system always responds in the language of the user's most recent message. If the user switches from English to Spanish in turn three, the response is in Spanish. If the user switches back to English in turn four, the response is in English. This policy respects the user's apparent intent at every turn, but it can produce jarring transitions when the user includes a foreign phrase without intending to switch the entire conversation language. A user who quotes a Spanish document in an otherwise English conversation does not necessarily want the response in Spanish.
+
+**Dominant Language Policy.** The system responds in the session's dominant language regardless of per-turn switches. If the conversation has been 80 percent English, the system stays in English even if the user's latest turn is in Spanish. This policy produces consistent responses but frustrates users who genuinely want to switch languages. They send three Spanish messages and keep getting English responses.
+
+**Explicit Signal Policy.** The system asks the user to confirm language switches. When the language detector identifies a language change, the system responds with a brief confirmation: "I noticed you switched to Spanish. Would you like me to continue in Spanish?" This policy eliminates ambiguity but adds friction. For products where conversational flow matters -- customer support, conversational search, creative collaboration -- the interruption breaks the experience.
+
+**Threshold Policy.** This is the approach that works best for most production systems. The system responds in the language of the current turn if the language detection confidence is above a threshold (typically 80 to 90 percent) and the message is longer than a minimum length (typically 15 to 20 characters). If the current turn is too short or the detection confidence is too low, the system falls back to the session dominant language. If the user sends two or more consecutive turns in a new language, the system updates the session dominant language without asking, because consecutive turns in a new language represent a clear intent to switch.
+
+The threshold policy handles the most common patterns gracefully. A user who quotes a Spanish phrase in an otherwise English conversation gets an English response, because the short quoted phrase does not meet the length and confidence thresholds. A user who sends three full sentences in Spanish gets a Spanish response, because the detection confidence is high and the message is long enough to represent a genuine switch. A user who sends two consecutive turns in French triggers a session-language update, ensuring all subsequent responses default to French.
+
+## Implementing Dynamic System Prompt Adjustment
+
+The language routing decision must reach the model as an explicit instruction, not as an implicit signal. Relying on the model to infer the response language from the conversation context is exactly the pattern that produces language oscillation. Instead, your prompt assembly pipeline should inject a clear language directive into the system prompt based on the routing decision.
+
+The directive should be specific and positioned prominently in the prompt. A directive like "Respond to this message in Spanish. All content, including greetings, explanations, and follow-up questions, must be in Spanish" is more reliable than "respond in the user's language." The specific directive eliminates ambiguity about which language the model should use and reduces the influence of conflicting language signals from the conversation history.
+
+For products that use per-language system prompt variants (as described in subchapter 7.6), the language routing decision selects which variant to use. When the user switches from English to Spanish, the prompt assembly layer swaps the English system prompt for the Spanish system prompt, including the Spanish-appropriate formality directives, persona description, and few-shot examples. This dual adjustment -- the language directive plus the language-appropriate system prompt -- produces responses that are not just in the correct language but in the correct register and tone for that language.
+
+The system prompt swap introduces a subtlety. When the system prompt language changes mid-conversation, the model now has an English system prompt in its history (from earlier turns) and a Spanish system prompt for the current turn. The conflicting system prompts can confuse the model, especially for instructions that differ between languages (formality level, safety constraints, persona). The cleanest solution is to include only the current system prompt in the context window, not the historical ones. Most conversation management systems already do this -- they inject the system prompt once at the beginning of the context window, not repeated per turn. But some implementations include the full conversation history with system prompt changes visible, which creates the conflict. Audit your prompt assembly to ensure the model sees only the current system prompt.
+
+## The Language Momentum Problem in Detail
+
+Language momentum deserves a deeper examination because it is the root cause of most multi-turn language failures, and understanding the mechanism tells you where to intervene.
+
+The model generates tokens sequentially, and each token is influenced by all preceding tokens in the context window. In a conversation where five turns are in English and the current turn is in Spanish, the token probabilities are influenced by thousands of English tokens and dozens of Spanish tokens from the current message. The English tokens exert a gravitational pull -- not because the model "prefers" English, but because the statistical patterns the model learned from training data associate English context with English continuation.
+
+This momentum effect is stronger for some content types than others. Factual content and named entities are particularly sticky: if the conversation has been discussing "customer retention rate" in English, the model may use the English term even in a Spanish response because the English term is more strongly associated with the concept in the model's parameters. Technical vocabulary, product names, and metrics all tend to bleed through from the conversation's primary language into a new language response.
+
+The momentum effect is weaker when you give the model an explicit, recent, and prominent language signal. This is why the system prompt directive works: it places a strong language signal close to the generation point, at the end of the context (right before generation), where it exerts the most influence on the next tokens. Without that explicit directive, the model relies on the implicit signals from the conversation, and those signals favor the historical language.
+
+Teams that do not implement explicit language directives see language oscillation rates of 15 to 25 percent in conversations where the user switches languages. Teams that implement per-turn language directives in the system prompt reduce oscillation to 3 to 7 percent. The remaining oscillation typically occurs in the first sentence of the response, where the model starts in the old language before the new language signal takes full effect, and in technical terms and named entities, which resist language switching because they are stored in the model's parameters primarily in the language where they appeared most often during training.
+
+## The Code-Switching Challenge
+
+Language switches between turns are the simpler case. The harder case is code-switching within a single turn -- when the user mixes two or more languages in one message.
+
+Code-switching is natural for bilingual speakers. A Spanglish speaker might write "Can you check if the factura was already sent to the cliente?" A Hinglish speaker might write "mujhe ek quick summary chahiye of the last meeting." These messages are not confused or lazy -- they are efficient communication in the user's natural register, and for hundreds of millions of bilingual speakers, this is how they actually talk and type every day.
+
+The language detection challenge is immediate: what language is this message in? A message that is 60 percent English and 40 percent Spanish will confuse a simple language detector that expects monolingual input. The detector might return English with low confidence, or Spanish with low confidence, or alternate between the two depending on which sentence fragment it analyzes. None of these results are useful for language routing.
+
+For code-switched messages, the response language policy needs a specialized rule. The most effective approach is **matrix language detection** -- identifying the dominant grammatical structure of the message. In the Spanglish example above, the sentence structure (subject-verb-object, English question syntax) is English, with Spanish nouns inserted. The matrix language is English, and the model should respond in English. In a Hinglish message where the grammar is Hindi and the inserted words are English, the matrix language is Hindi, and the model should respond in Hindi (or Hinglish, if the product supports it).
+
+Matrix language detection is more complex than whole-message detection. It requires at minimum a bilingual tokenizer that can identify which tokens belong to which language, combined with a grammatical analysis that identifies which language provides the sentence structure. In 2026, this capability is available through multilingual NLP models like those in the spaCy ecosystem and through dedicated code-switching detection models trained on mixed-language corpora. The accuracy is imperfect -- around 75 to 85 percent for common language pairs like English-Spanish and English-Hindi -- but it is far better than treating the entire message as one language.
+
+For products that serve bilingual populations heavily (US Hispanic market, Indian urban market, Southeast Asian markets where code-switching is ubiquitous), investing in code-switching detection is not optional. These users will code-switch constantly, and a product that cannot handle it gracefully will feel broken from the first interaction.
+
+## Graceful Language Transitions
+
+When the system switches the response language -- whether because the user switched languages, the threshold policy triggered an update, or the language routing made a new decision -- the transition should feel natural, not mechanical.
+
+An abrupt switch looks like this: the system has been responding in English for five turns, and in turn six, it suddenly responds in Spanish with no acknowledgment of the change. The user may be pleased that the system followed her switch, or she may be disoriented by the sudden change, especially if her code-switch was incidental rather than intentional.
+
+A heavy-handed switch looks like this: the system responds with "I see you've switched to Spanish. I'll respond in Spanish from now on. Here is your answer in Spanish..." This meta-commentary wastes the user's time and draws attention to the machinery rather than the conversation.
+
+The best transitions are invisible. The system simply responds in the new language, matching the user's tone and register, as if it had always been speaking that language. The switch is acknowledged implicitly by the behavior, not explicitly by commentary. The user switches to Spanish, and the system's next response is in natural Spanish. No announcement, no confirmation, no friction.
+
+There is one exception. When the language switch changes the formality level or register (because the per-language system prompt uses a different persona), the transition can feel jarring if the system shifts from casual English to highly formal Japanese mid-conversation. In these cases, a brief natural transition helps: a Japanese greeting or polite opening phrase that signals the shift to Japanese social norms. This is not meta-commentary about the language switch. It is the same thing a bilingual human would do: shift their social register along with their language, and signal the shift through natural linguistic cues rather than explicit statements.
+
+## Language Persistence and Memory
+
+In products with persistent conversation history -- where users return to a conversation days or weeks later -- language state needs to persist too.
+
+When a user opens a conversation that ended in Spanish three days ago and sends a new message in Spanish, the system should recognize the session language as Spanish and respond accordingly. When a user opens the same conversation and sends a new message in English, the system should recognize the switch and update the session language.
+
+This requires storing the language state alongside the conversation history. The minimum viable state is the last active language and the session dominant language. When the user returns, the system loads the state and applies the threshold policy to the new message against the historical state.
+
+A subtler persistence challenge is long conversations with multiple language switches. A conversation that started in English, switched to Spanish for ten turns, switched to French for five turns, and then went idle has a complex language history. When the user returns, the "dominant language" depends on how you weight recency versus frequency. Weighting recency (the last active language was French) is usually more appropriate than weighting frequency (English had the most turns), because the user's most recent choice better reflects their current preference.
+
+## Monitoring Language Routing Quality
+
+Language routing is a system that can fail silently. The user gets a response in the wrong language, shrugs, types the question again, and the team never sees the failure in their dashboards.
+
+Build monitoring for three metrics. First, **language match rate**: what percentage of responses are in the same language as the user's most recent message? This is your primary quality signal. Industry targets for well-implemented routing are 92 to 96 percent. Second, **language oscillation rate**: what percentage of conversations contain two or more language switches by the system within a five-turn window that were not triggered by user language switches? This catches the oscillation problem -- the model bouncing between languages without the user's input changing. Target is below 5 percent. Third, **language detection confidence**: what is the average confidence score from your language detector across all messages? Low average confidence indicates that your users are sending messages that the detector struggles with -- short messages, code-switched messages, or messages in languages the detector was not trained on.
+
+Segment these metrics by language pair. English-Spanish switching may work well because both are high-resource languages with strong detection models. English-Thai switching may have higher failure rates because Thai detection confidence is lower for short messages and the model's Thai generation is less reliable. Per-pair metrics tell you where to invest in better detection and routing.
+
+Track the rate of user corrections. If a user sends a message in a language, gets a response in a different language, and immediately re-sends the same message or sends a follow-up like "in Spanish please" or "respond in Spanish," that is an explicit signal of a routing failure. These corrections should trigger alerts when they exceed a threshold, because each one represents a user who experienced a broken interaction.
+
+## Edge Cases That Break Naive Implementations
+
+Several patterns defeat simple language routing and require specific handling.
+
+Quoted text. The user writes in English but quotes a paragraph from a French document. The language detector sees a mix of English and French and may classify the message as French. The fix is to detect quoted text (by quotation marks, indentation, or other formatting signals) and exclude it from the language detection input, running detection only on the user's original text.
+
+Transliterated text. A Hindi speaker writing in Latin script (romanized Hindi) will be classified as English by most language detectors, because the detector sees Latin characters and English-like token patterns. Romanized Hindi is functionally invisible to detection systems trained on script-based features. Handling this requires either a dedicated romanized-text detector or a user preference setting that declares the user's language pair.
+
+Multilingual proper nouns. A user writing in Japanese who mentions "New York," "McDonald's," or "iPhone" introduces English tokens that can shift detection confidence. Most production detectors handle this well, but very short messages that are mostly proper nouns (like "OK, McDonald's de onegai" -- a Japanese request mentioning McDonald's) can confuse simple detectors.
+
+Shared vocabulary. Some languages share significant vocabulary. Spanish and Portuguese share many words. Norwegian, Swedish, and Danish are mutually intelligible to a high degree. Malay and Indonesian are closely related. For these language pairs, detection confidence is lower, and a user who speaks one language may be classified as speaking the other. The fix is to either combine closely related languages into a single routing category (respond in whichever variant the user seems to prefer) or to ask the user to set a language preference at the start of the session.
+
+Each of these edge cases affects a small percentage of messages, but in a product serving millions of users, "small percentage" means thousands of broken interactions per day. Build handling for the edge cases that your user population is most likely to encounter, prioritized by traffic volume and user impact.
+
+The next subchapter addresses the testing problem that underlies all of multilingual prompt engineering: how do you know your prompts work in every language, when you only wrote and tested them in English?

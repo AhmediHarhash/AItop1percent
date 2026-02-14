@@ -1,0 +1,83 @@
+# 27.35 — Model Replication Strategies: Full Copy, Partial, and On-Demand Loading Across Regions
+
+You do not need a full copy of every model in every region. This is the assumption most teams carry into multi-region design, and it is the assumption that inflates their GPU budget by 40 to 60 percent before they serve a single cross-region request. Full replication is the simplest mental model — every region is a mirror of every other region, every model available everywhere, no routing complexity. It is also the most expensive strategy, and for most organizations running more than a handful of models, it is economically irrational. The right replication strategy depends on three variables: the latency each model must deliver, the size of each model, and the request pattern each model serves. Match the strategy to the model, not the organization to a single strategy, and you can run global AI infrastructure at a fraction of what full replication costs.
+
+## Full Replication: When Every Millisecond Matters
+
+**Full replication** means every model your system serves is loaded and warm in GPU memory in every region you operate. When a request arrives in any region, the model is already loaded, the KV cache is initialized, and the response begins generating immediately. There is no cold start, no loading delay, no routing to a different region. The user gets the lowest possible latency regardless of where they are.
+
+The cost is straightforward to calculate and painful to absorb. If your primary US region runs eight inference GPUs for a given model, full replication to four additional regions means 32 additional GPUs running that model — a five-times multiplier on GPU cost for that model alone. GPU memory is the binding constraint. An H100 with 80 gigabytes of HBM can hold one 70-billion-parameter model in 4-bit quantization or two to three smaller models, and once that memory is committed, the GPU cannot be used for anything else. Full replication locks GPU memory across every region 24 hours a day, whether the model is handling a thousand requests per minute in US-East or two requests per hour in AP-Southeast at 3 AM local time.
+
+Full replication is the correct strategy for a narrow set of models: your highest-traffic model that serves interactive user-facing features in every region. The customer-facing chatbot that handles 80 percent of your inference volume. The real-time fraud detection model where 500 milliseconds of added latency means a transaction completes before the model can block it. The voice AI model where cold-start delays produce seconds of silence that users will not tolerate. For these models, the cost of full replication is justified by the product requirement. For everything else, full replication is waste dressed up as operational simplicity.
+
+## Partial Replication: The Pareto Strategy
+
+**Partial replication** recognizes that most organizations follow a power-law distribution in model usage. A small number of models handle the vast majority of requests, and a long tail of models serves specialized, lower-traffic use cases. The strategy is simple: fully replicate the high-traffic head, and selectively deploy the long tail only where it is actually needed.
+
+Consider an organization running 25 models across five regions. Three models — the main chatbot, the embedding model for search, and the classification model for routing — handle 90 percent of total inference volume. These three models are fully replicated. The remaining 22 models serve specialized functions: a legal document extraction model used primarily by the European team, a sentiment analysis model that runs batch jobs overnight, a code review model used by the engineering team during US business hours, and so on. Each of these is deployed only in the regions where it has meaningful demand.
+
+The savings compound quickly. Instead of 25 models times five regions equaling 125 model deployments, partial replication might require 3 models times five regions plus 22 models times an average of 1.5 regions, totaling 15 plus 33 equals 48 deployments. That is a 62 percent reduction in model deployments, translating directly into GPU memory freed and GPU costs reduced.
+
+The complexity cost is routing intelligence. Your traffic steering layer must know which models are available in which regions and must route requests for partially-replicated models to the regions where they are deployed. If a user in AP-Southeast requests inference from a model that is only deployed in US-East and EU-West, the routing layer must send the request cross-region — accepting the latency penalty — or return a degraded response indicating the model is not available locally. This routing logic is not difficult to build, but it must be correct. A misconfigured route that sends a request to a region where the model is not loaded produces a timeout or error, not a slow response.
+
+The decision of which models to fully replicate and which to partially replicate comes from three data points. First, request volume by region: a model that receives fewer than one request per minute in a given region does not justify a dedicated GPU deployment in that region. Second, latency sensitivity: a batch processing model that returns results in minutes can tolerate cross-region routing while an interactive model cannot. Third, compliance requirements: a model that processes EU personal data must be available in an EU region regardless of request volume. Run this analysis quarterly, because traffic patterns shift as products evolve and user bases grow.
+
+## On-Demand Loading: Trading Cold Start for Cost
+
+**On-demand loading** takes partial replication to its logical extreme. Instead of pre-deploying models in each region, models are loaded into GPU memory only when the first request for that model arrives in that region. After loading, the model stays cached in GPU memory for subsequent requests. If no requests arrive for a configurable idle period — typically 15 to 60 minutes — the model is evicted to free the GPU for other models.
+
+The cost advantage is dramatic. Instead of paying for GPUs to hold idle models around the clock, you pay for GPU time only when models are actively serving or recently served requests. For a long-tail model that handles 50 requests per day concentrated in a two-hour window, on-demand loading means paying for two hours of GPU time instead of 24 — a 92 percent reduction.
+
+The tradeoff is cold-start latency. Loading a 7-billion-parameter model from networked storage to GPU memory takes 15 to 30 seconds depending on storage bandwidth and model format. A 70-billion-parameter model takes 45 to 90 seconds. For quantized models loaded from fast NVMe storage, these times drop to 5 to 15 seconds for smaller models and 20 to 45 seconds for larger ones. During this loading window, the first request either waits (producing unacceptable latency for interactive use cases) or fails with a "model loading" status that the client must handle gracefully.
+
+On-demand loading works for three categories of models. Batch processing models that are not user-facing and can absorb a cold start without product impact. Low-traffic specialized models that serve a handful of requests per day and where the first-request latency penalty is acceptable. Development and staging models that teams use for testing and evaluation but that do not need to be warm at all times.
+
+On-demand loading does not work for any model that serves synchronous user requests, where a 30-second wait would destroy the user experience. It also does not work well in environments where multiple models compete for the same GPU pool, because the constant loading and eviction cycle — known as **thrashing** — can consume so much GPU time on data movement that the GPUs spend more time loading models than running inference.
+
+## The Cache Eviction Problem
+
+When multiple on-demand models share a GPU pool, you face the same problem that operating systems face with virtual memory: more demand than supply, requiring decisions about what to keep and what to discard. When a new model needs to load and all GPUs are occupied, something must be evicted.
+
+**Least Recently Used** eviction is the default strategy and works well when access patterns are distributed. The model that has not received a request for the longest time is evicted first. This naturally keeps popular models warm and evicts truly idle ones. The failure mode is the "scan problem" — a burst of one-off requests for different long-tail models can evict frequently-used models, causing thrashing where popular models are repeatedly evicted and reloaded.
+
+**Frequency-weighted eviction** improves on LRU by considering not just recency but how often a model is accessed. A model that receives steady traffic throughout the day but had a ten-minute gap during a lull is less likely to be evicted than a model that was accessed once yesterday. This approach requires maintaining per-model access counters and adds some complexity to the eviction logic, but it produces better caching behavior for workloads with a mix of steady and bursty traffic.
+
+**Priority-based eviction** assigns explicit priority tiers to models. Models in the highest tier — your revenue-critical production models — are never evicted. Models in middle tiers are evicted only when no lower-tier model is available to displace. Models in the lowest tier — experimental, staging, or batch processing models — are evicted first. This approach requires manual or policy-driven tier assignment but gives you deterministic control over which models stay warm.
+
+The most robust systems combine all three. Priority tiers establish the hard rules. Within each tier, frequency-weighted LRU determines eviction order. This hybrid approach prevents the cache from evicting a production model to make room for a test model while still adapting to changing access patterns within each tier.
+
+## Adapter Replication: The Efficiency Shortcut
+
+**LoRA adapters** change the replication calculus fundamentally. A full model might be 70 gigabytes. A LoRA adapter for that model is typically 50 to 500 megabytes — a hundred to a thousand times smaller. If you have one base model and 40 customer-specific adapters, replicating all 40 adapters to every region costs 2 to 20 gigabytes of storage and transfer per region. Replicating 40 full fine-tuned models would cost 2.8 terabytes per region.
+
+This asymmetry means you can replicate base models using the partial or full strategy based on their traffic profile, and replicate adapters everywhere for negligible cost. The base Llama 4 Maverick model might be partially replicated to three of your five regions. All 40 customer adapters can live in every region because they are small enough that the storage and transfer cost is trivial. When a request arrives, the inference server loads the base model (already warm or loaded on demand) and dynamically swaps the appropriate adapter — a process that takes milliseconds, not seconds, because adapters are small enough to load from local storage into GPU memory almost instantly.
+
+This pattern — broad base model deployment with universal adapter replication — is the most cost-effective approach for organizations that use LoRA-based customization. It delivers customer-specific model behavior in every region without the cost of full model replication for every variant.
+
+## The Warm Standby Trap
+
+There is a named failure pattern that catches teams who believe their multi-region deployment is resilient when it is not. **The Warm Standby Trap** occurs when a secondary region is configured with models that are supposedly ready to serve traffic, but nobody has verified that the failover path actually works under production conditions.
+
+The trap takes several forms. The most common is a secondary region where models are loaded into GPU memory but have not received real traffic in weeks. The inference server process has been running long enough that a slow memory leak has consumed available headroom. The KV cache is empty, so the first burst of traffic after failover causes memory pressure that triggers out-of-memory errors. The model weights are three versions behind because the synchronization pipeline failed silently two weeks ago and nobody noticed because the secondary region was not serving traffic. The GPU driver version in the secondary region is different from the primary because a maintenance update was applied to one but not the other.
+
+Each of these is a failure that only manifests during failover — precisely the moment when you need everything to work. The solution is not to hope the standby is warm. It is to prove it. Route a small percentage of production traffic — one to five percent — to the secondary region continuously. This **canary traffic** keeps models warm, validates the full inference path, surfaces version drift, and exposes environmental differences before a real failover forces you to discover them under pressure.
+
+Some teams resist continuous canary traffic because it increases cost. The secondary region processes real requests, consuming GPU cycles that would otherwise be idle. But the cost of canary traffic is a fraction of the cost of a failed failover. If your secondary region cannot serve traffic cleanly with a one-percent canary load, it will not serve traffic cleanly when the primary goes down and you redirect 100 percent. Better to discover that during a routine Tuesday than during a crisis Saturday night.
+
+## Choosing the Right Strategy Per Model
+
+The decision framework for per-model replication strategy reduces to a two-by-two matrix. On one axis: latency sensitivity (interactive versus batch). On the other axis: traffic volume (high versus low).
+
+High traffic, latency sensitive: full replication. This is your primary chatbot, your real-time scoring model, your voice AI. The cost of full replication is justified by the product requirement and the traffic volume amortizes the cost per request.
+
+High traffic, latency tolerant: full replication or partial replication with smart routing. A batch embedding model that processes millions of documents can tolerate cross-region routing for regions where it is not deployed, as long as the batch completes within the SLA.
+
+Low traffic, latency sensitive: partial replication to regions with meaningful demand, with fallback routing to the nearest available region. A specialized compliance model that serves 100 requests per day but must respond within 500 milliseconds should be deployed in the one or two regions where those requests originate.
+
+Low traffic, latency tolerant: on-demand loading. An experimental model, a staging deployment, a quarterly reporting model — anything that serves infrequent requests and can tolerate cold-start latency.
+
+Map every model in your portfolio to one of these quadrants, assign the corresponding replication strategy, and review the mapping quarterly as traffic patterns shift. The organizations that control their multi-region GPU costs are the ones that resist the urge to treat every model as equally critical and instead match investment to actual demand.
+
+---
+
+Replicating model weights across regions solves the availability problem: the model exists where it needs to exist. But existence is not consistency. When you push a model update to five regions, some regions update faster than others, and for a window of time, different regions are serving different model versions to different users. The next subchapter covers cross-region model synchronization — how to keep model versions consistent across a global deployment without introducing downtime or version skew that your users can detect.

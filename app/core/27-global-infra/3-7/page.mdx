@@ -1,0 +1,79 @@
+# 27.23 — Preemption Policy as Organizational Politics: Who Gets Kicked Off the GPUs
+
+GPU preemption is not a technical decision. It is a political decision implemented in Kubernetes configuration. Every preemption policy encodes an answer to the question "whose work matters more," and that answer has consequences that extend far beyond the scheduler. When a production inference service preempts a researcher's three-day training run two hours before completion, the lost compute is measurable — perhaps $4,000 in wasted GPU-hours. The organizational damage is harder to quantify. The researcher who loses three days of work and has to restart from the last checkpoint does not blame the scheduler. They blame the platform team. They escalate. And the next time GPU capacity is tight, every team lobbies to be the one that never gets preempted.
+
+This is **Preemption Politics** — the organizational reality that priority classes, preemption policies, and queue configurations are not engineering artifacts. They are governance instruments that encode who the organization values, which work it considers expendable, and how it resolves conflicts when demand exceeds supply. Getting the technology right is the easy part. Getting the politics right determines whether your platform survives contact with the rest of the organization.
+
+## What Preemption Means for GPU Workloads
+
+In Kubernetes, **preemption** occurs when a higher-priority pod needs resources that are currently occupied by a lower-priority pod. The scheduler evicts the lower-priority pod to free the resources. For CPU workloads, preemption is routine and relatively painless. The evicted pod loses its current request, its container restarts, and within seconds it is processing again. The impact is a few dropped requests, easily absorbed by load balancers and retry logic.
+
+For GPU workloads, preemption is destructive. A training job that is preempted loses everything since its last checkpoint. If the job checkpoints every thirty minutes, preemption costs up to thirty minutes of compute. If the team configured hourly checkpoints to reduce I/O overhead, preemption costs up to an hour. If the team did not implement checkpointing at all — which is disturbingly common for experimental training runs — preemption costs the entire run. On eight H100 GPUs at cloud pricing, an hour of lost training represents $25 to $35. A full day lost represents $600 to $850. A three-day run with no checkpointing that gets preempted on day two represents over $1,000 in wasted compute and a researcher who will never trust the platform again.
+
+Inference workloads face a different preemption cost. An inference service that is preempted goes offline entirely until Kubernetes reschedules the pod and the model reloads — a process that takes 30 seconds for a small model and five to ten minutes for a large one. During that reload window, every request to that service fails. If the service is production-facing and has no replica to absorb traffic, that is a user-visible outage.
+
+## PriorityClass as Organizational Hierarchy
+
+Kubernetes expresses preemption rules through **PriorityClass** resources. Each PriorityClass has a numeric value — higher numbers mean higher priority — and a preemption policy that determines whether pods in that class can preempt others. When the scheduler cannot find room for a high-priority pod, it looks for lower-priority pods it can evict to make space.
+
+Designing your PriorityClass hierarchy is an act of organizational design disguised as YAML. The hierarchy must answer questions that have nothing to do with Kubernetes: Is production inference more important than training for next quarter's product? Is a VP's demo environment more important than a research experiment? Is a customer-facing model retraining pipeline more important than an internal analytics job?
+
+A proven hierarchy that works for organizations running mixed AI workloads in 2026 uses five tiers. The highest tier — priority value 1000000 — is reserved for system-critical components: the GPU device plugin, the scheduler itself, monitoring agents, and the Kueue controllers. These pods must never be preempted because their absence prevents all other GPU workloads from functioning. The second tier — priority value 900000 — covers production inference services that serve live user traffic. These are the revenue-generating workloads. Downtime here means customer impact. The third tier — priority value 700000 — covers production training pipelines: scheduled retraining, fine-tuning jobs that feed production models, and eval pipelines that gate releases. These are time-sensitive but can tolerate brief delays. The fourth tier — priority value 500000 — covers development and experimentation: ad hoc training runs, hyperparameter sweeps, and research experiments. These are valuable but deferrable. The fifth tier — priority value 100000 — covers batch and backfill: data processing jobs, embedding precomputation, and any work that is valuable but has no deadline.
+
+The gap between tiers matters. You want enough numeric space between tiers to insert sub-priorities later without restructuring the hierarchy. A team that discovers it needs to distinguish between "urgent production retraining" and "routine scheduled retraining" should be able to add a priority value at 800000 without reclassifying every existing PriorityClass.
+
+## Graceful Preemption and the Checkpointing Contract
+
+Preemption does not have to be catastrophic. Kubernetes sends a SIGTERM signal to a pod before killing it, and the **terminationGracePeriodSeconds** setting determines how long the pod has to shut down cleanly before receiving a SIGKILL. For CPU workloads, this grace period is used to finish in-flight requests. For GPU training workloads, it must be long enough to write a checkpoint.
+
+This creates what you should think of as **the checkpointing contract**: an agreement between the platform team and the training teams about how preemption will work. The platform team commits to setting the termination grace period long enough for a clean checkpoint. The training team commits to implementing checkpoint-on-signal logic that saves model state when SIGTERM is received. Without both sides of this contract, preemption is always destructive.
+
+A typical checkpoint for a large model — saving optimizer state, model weights, and the data loader position — takes 60 to 180 seconds depending on model size and storage throughput. Setting the termination grace period to 300 seconds gives a reasonable margin. But 300 seconds means the scheduler must wait five minutes between deciding to preempt and actually freeing the GPUs. During those five minutes, the high-priority workload that triggered the preemption is still waiting. This is the fundamental tension: longer grace periods protect the evicted workload but delay the preempting workload.
+
+The resolution is to make checkpointing fast enough that the grace period can be short. Writing checkpoints to local NVMe storage instead of network-attached storage cuts checkpoint time from minutes to seconds. Asynchronous checkpointing — where the model continues training while a background thread writes the previous checkpoint — allows more frequent saves without throughput loss. Teams that invest in fast checkpointing infrastructure are rewarded with both better preemption resilience and shorter grace periods that make the scheduler more responsive.
+
+## Kueue Preemption Policies
+
+Kueue extends Kubernetes' built-in preemption with queue-aware policies that are more nuanced than raw PriorityClass comparisons.
+
+At the ClusterQueue level, Kueue offers three preemption strategies for reclaiming resources within a cohort — a group of queues that can borrow from each other. The **Never** strategy prohibits preemption entirely within the cohort: no queue can reclaim resources from another, even if the borrowing queue's workloads have lower priority. This is the safest but least flexible option. The **LowerPriority** strategy allows a queue to reclaim its borrowed resources from another queue, but only by preempting workloads with strictly lower priority. The **Any** strategy allows reclaiming regardless of priority — a queue can preempt even higher-priority workloads in other queues if those workloads are running on borrowed capacity.
+
+The LowerPriority strategy is the most common in production because it balances fairness with flexibility. A team that is using its own nominal quota is safe from preemption. A team that has borrowed extra capacity from other queues accepts that the borrowed portion can be reclaimed. This creates a natural incentive structure: teams that stay within their quota have guaranteed resources, while teams that burst beyond their quota get extra capacity with the understanding that it can be taken away.
+
+Kueue also supports **fair sharing preemption**, where the scheduler evaluates which queue is most over-quota and preempts from there first. This prevents the scenario where one aggressive team borrows capacity from every other queue and is never preempted because all its workloads happen to be high-priority. Fair sharing considers not just priority but proportional resource usage relative to each queue's nominal allocation.
+
+## The Escalation Ladder
+
+Even the best preemption policy will produce conflicts that automation cannot resolve. A researcher's training job gets preempted at 95 percent completion. An inference service gets evicted during a customer demo. A critical retraining pipeline is delayed because a lower-priority batch job was not preemptable due to a misconfigured PriorityClass. These are not edge cases. They are Tuesday.
+
+The **escalation ladder** defines how these conflicts are resolved without the platform team becoming a permanent arbitration service. The first rung is self-service: teams can view the preemption logs, see why their workload was evicted, and understand which higher-priority workload caused the preemption. Transparency alone resolves 60 to 70 percent of complaints because the team can see that the preemption was legitimate — a production service genuinely needed the GPUs.
+
+The second rung is team-level adjustment. If a workload is being preempted more often than expected, the owning team can request a priority reclassification. This request goes to the platform team, who evaluates it against the priority taxonomy. If the workload genuinely belongs in a higher tier — the "experimental" training run is actually producing a model that ships to customers next month — the PriorityClass is updated.
+
+The third rung is cross-functional review. When two teams disagree about relative priority — the inference team says their service is more important, the training team says their fine-tuning pipeline feeds that service and should be equal priority — the dispute goes to a quarterly capacity review meeting. Engineering leadership, product leadership, and the platform team review utilization data, preemption logs, and business impact to set priorities for the next quarter.
+
+The fourth rung is executive escalation, reserved for cases where a preemption decision caused measurable business harm — a customer outage, a missed deadline, a compliance violation. These are rare if the first three rungs are functioning, but having a defined path prevents ad-hoc political lobbying that undermines the entire priority system.
+
+## Transparency as a Governance Requirement
+
+Preemption only works as a governance mechanism when everyone can see how it operates. If preemption decisions are opaque — if a team's job disappears and they have no way to understand why — trust in the platform collapses and teams begin gaming the system.
+
+Every preemption event should generate a record that is visible to the affected team. The record should include the timestamp, the preempted workload's name and owner, the preempting workload's name and priority class, the resources freed, and the time lost since the preempted workload's last checkpoint. This data should be available through a self-service dashboard, not locked behind platform team access.
+
+Monthly preemption reports should be published to engineering leadership. The report shows preemption counts by team, by priority tier, and by business impact. It highlights trends — is one team being preempted disproportionately? Is a particular priority tier consuming resources beyond its allocation? Are preemptions increasing overall, suggesting that capacity has fallen behind demand? This data drives the quarterly priority review and the annual capacity planning cycle.
+
+The teams that treat preemption data as confidential — accessible only to the platform team — create an environment where preemption feels arbitrary. The teams that publish preemption data openly create an environment where preemption feels fair, even when it hurts. Fairness is not the absence of preemption. It is the presence of visibility and a credible process for adjusting priorities when they no longer match reality.
+
+## Governance Model: The Quarterly Review
+
+Preemption policies are not permanent. Business priorities shift. Teams grow. New workloads emerge. The priority hierarchy that was correct in January may be wrong by April.
+
+The governance model that sustains preemption policy over time is a quarterly cross-functional review with three inputs: utilization data showing each team's GPU consumption relative to quota, preemption data showing who was preempted and by whom, and a forward-looking capacity plan showing projected demand for the next quarter. The meeting includes the platform team, engineering managers from each team that uses GPU resources, and a product or business representative who can weigh in on which workloads drive the most business value.
+
+The output of the review is an updated priority taxonomy, adjusted quotas, and a capacity procurement recommendation if demand is projected to exceed supply. Teams leave the meeting with clear expectations about their priority tier, their quota, and the conditions under which their workloads will be preempted.
+
+Without this governance cadence, preemption policy becomes stale. The platform team avoids changing priority classes because any change triggers complaints. Teams that were assigned low priority during their experimental phase never get reclassified even after their workloads become production-critical. Quotas that were set for a team of five engineers are never updated when the team grows to twenty. The quarterly review prevents this drift by creating a regular moment where the organization explicitly re-evaluates its GPU priorities rather than letting them calcify.
+
+---
+
+Preemption determines who runs when capacity is scarce. But even when capacity is available and priority is settled, the physical placement of workloads on hardware — which GPUs, on which nodes, in which topology — determines whether performance is acceptable or catastrophic. The next subchapter covers topology-aware scheduling, where placement is not an afterthought but a first-class performance lever.

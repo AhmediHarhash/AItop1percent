@@ -1,0 +1,71 @@
+# 27.45 — Cross-Cloud Networking: Bandwidth, Latency, and Egress Cost
+
+In early 2026, a mid-sized AI company running a split architecture — training on CoreWeave where GPU prices were lowest and inference on AWS where their application stack lived — discovered that their multi-cloud strategy had a hidden cost center nobody had modeled. Every time they trained a new model version, they transferred 140 gigabytes of model weights from CoreWeave's object storage to S3 on AWS. Every model update generated telemetry data flowing back from AWS inference nodes to CoreWeave for evaluation and monitoring. Failover testing pushed replica weights to a standby cluster on Google Cloud. At the end of the first quarter, the cross-cloud data transfer bill came to $47,000 — nearly half what they had saved on GPU costs by using the cheaper provider. Worse, the latency between clouds for their model sync pipeline added 18 minutes to every deployment cycle, meaning production updates that should have taken 5 minutes took 23. The CTO later described it as "saving money on rent and spending it on the commute." Their multi-cloud architecture was sound in principle. Their networking strategy was an afterthought that nearly erased the economic rationale for going multi-cloud in the first place.
+
+This is the core tension of cross-cloud networking. Every byte that crosses a cloud boundary costs money, takes time, and introduces reliability risk. The teams that make multi-cloud work are the teams that treat networking as a first-class architectural constraint, not a detail to figure out after the compute decisions are made.
+
+## Internet Transit: Simple, Slow, and Expensive Per Byte
+
+The simplest way to move data between clouds is over the public internet. No special setup, no dedicated connections, no contracts. Your workload in AWS sends data to a public endpoint on Google Cloud, and it traverses whatever path the internet's BGP routing tables dictate.
+
+The advantage is zero setup cost and universal availability. The disadvantages are significant. Bandwidth is unpredictable — you share capacity with every other internet user on the same backbone links. Latency varies by time of day, routing changes, and congestion. Reliability is best-effort — packet loss rates of 0.1 to 1 percent are normal on long paths, and any packet loss triggers TCP retransmission that further degrades throughput. Security requires TLS encryption on every transfer, which adds CPU overhead and slightly increases latency.
+
+Cost is the most misunderstood aspect of internet transit. The data itself does not have a transit fee in the traditional sense — but the sending cloud provider charges **egress fees** on every byte that leaves their network. AWS charges $0.09 per gigabyte for standard internet egress in most regions. Google Cloud charges $0.08 to $0.12 depending on destination and volume tier. Azure charges $0.087 per gigabyte. CoreWeave has been notably aggressive here, launching a Zero Egress Migration program in 2025 that eliminates egress fees for data leaving CoreWeave — a competitive move specifically targeting teams locked into hyperscalers by egress costs.
+
+For AI workloads, egress costs compound quickly. A 70-billion-parameter model stored in FP16 is approximately 140 gigabytes. Transferring that model once from AWS to Google Cloud costs roughly $12.60 in egress. That sounds trivial until you consider that an active team might push 10 to 20 model updates per week across clouds, maintain three replicas for failover, and transfer evaluation datasets, inference logs, and monitoring telemetry in the reverse direction. At scale, monthly egress bills of $10,000 to $50,000 are common for multi-cloud AI operations.
+
+## Private Interconnects: Dedicated Pipes Between Clouds
+
+When internet transit is too slow, too expensive, or too unreliable, **private interconnects** provide a dedicated physical connection between cloud providers. These are not VPN tunnels over the internet — they are actual circuits provisioned through colocation facilities where multiple cloud providers have network presence.
+
+AWS offers **Direct Connect**, which provides 1, 10, or 100 Gbps dedicated connections between your infrastructure (or another cloud) and AWS. Google Cloud offers **Cloud Interconnect** with Partner Interconnect options that can connect to third-party networks including other clouds. Azure offers **ExpressRoute** with similar capabilities. In 2025, AWS launched **AWS Interconnect - multicloud**, a unified product specifically designed for connecting AWS to other cloud providers through dedicated private links, with Azure support planned for 2026.
+
+The economics of private interconnects favor consistent, high-volume data transfer. A 10 Gbps Direct Connect port costs roughly $2,200 per month for the port fee plus $0.02 per gigabyte for data transfer — compared to $0.09 per gigabyte for internet egress. If you transfer more than about 30 terabytes per month over a single connection, the private interconnect is cheaper than internet transit. For AI workloads that regularly sync model weights, training data, and telemetry across clouds, the breakeven point is often reached within the first month.
+
+Latency on private interconnects is also significantly better than internet transit. A direct connection between AWS us-east-1 and Google Cloud us-east4, both of which have presence in the Ashburn, Virginia data center corridor, delivers round-trip latency of 1 to 3 milliseconds — compared to 5 to 15 milliseconds over the public internet for the same path. The consistency matters as much as the absolute number. Internet latency jitters. Private interconnect latency is stable.
+
+The setup cost and lead time are the primary drawbacks. Provisioning a Direct Connect or ExpressRoute circuit takes two to eight weeks depending on the colocation provider and the port availability. There are monthly recurring charges for the port and cross-connect regardless of how much data you transfer. And you need networking expertise to configure BGP peering, VLAN tagging, and route advertisements between the two cloud environments.
+
+## Third-Party Interconnect Fabrics
+
+For organizations connecting more than two clouds, provisioning individual point-to-point interconnects between every pair becomes expensive and complex. Three clouds require three interconnects. Four clouds require six. This is where **third-party interconnect fabrics** earn their value.
+
+**Megaport** operates a software-defined networking platform with points of presence in over 850 data centers globally. You provision a single physical connection from your cloud to the nearest Megaport point of presence, and from there you can establish virtual cross-connects to any other cloud provider on the Megaport fabric. Adding a connection to a new cloud takes minutes of configuration rather than weeks of circuit provisioning. **Equinix Fabric** provides a similar capability through Equinix's global network of colocation facilities. **PacketFabric** focuses on high-bandwidth, low-latency connections with a self-service provisioning model.
+
+The architecture with a third-party fabric is hub-and-spoke: each cloud connects to the fabric, and the fabric routes traffic between them. This adds one extra hop compared to a direct point-to-point interconnect, which typically adds 0.5 to 2 milliseconds of latency. For most AI workloads — model weight synchronization, batch telemetry transfer, periodic evaluation data movement — this extra millisecond or two is irrelevant. For latency-critical real-time inference traffic, even that small addition may matter, and a direct interconnect between the specific clouds handling that traffic is worth the extra cost.
+
+Pricing on third-party fabrics is typically a combination of port fees (based on the bandwidth of your connection to the fabric) and per-megabit-per-second charges for virtual cross-connects. The total cost is usually comparable to provisioning individual interconnects between clouds, but the operational simplicity of managing one physical connection instead of several makes the fabric approach strongly preferred for three or more cloud providers.
+
+## The Latency Reality of Cross-Cloud Inference
+
+For training workloads, cross-cloud latency is a nuisance. A model weight sync that takes 18 minutes instead of 5 is annoying but does not affect the model itself. For inference workloads, cross-cloud latency is a product quality issue.
+
+When a user sends a request to your application, and your application needs to call an inference endpoint running on a different cloud, every cross-cloud hop adds to the total response time. Within a single cloud region, service-to-service latency is typically 0.5 to 2 milliseconds. Cross-cloud over a private interconnect in the same metro area adds 1 to 3 milliseconds. Cross-cloud over the internet adds 5 to 15 milliseconds in the same geographic region and 50 to 200 milliseconds across continents.
+
+These numbers sound small. They are not. A language model inference call that takes 400 milliseconds server-side delivers in 402 milliseconds within-cloud and 415 milliseconds cross-cloud over a private interconnect. That difference is imperceptible. But if your architecture requires two cross-cloud hops — application on AWS calls a routing service on Google Cloud which calls an inference endpoint on CoreWeave — you are adding 6 to 30 milliseconds before the model even starts processing. For voice AI systems with a 300-millisecond total latency budget, 30 milliseconds of network overhead consumed by cross-cloud routing is 10 percent of your entire budget spent on the commute.
+
+The practical rule is straightforward. Inference traffic should stay within a single cloud whenever possible. Route users to the cloud nearest them. Keep the application layer and the inference layer in the same network. Reserve cross-cloud communication for operations that are not in the user-facing latency path: model weight synchronization, evaluation pipeline coordination, telemetry aggregation, and failover preparation.
+
+## Egress Cost Arbitrage and Data Flow Design
+
+Not all egress costs are equal, and structuring your data flows to minimize the most expensive direction can save significant money. As of early 2026, ingress — data entering a cloud — is free on almost every provider. Egress — data leaving — is where the charges hit. This asymmetry creates a design principle: move data toward the cloud where it will be consumed, and minimize data leaving expensive-egress providers.
+
+Concretely, if you train models on CoreWeave (which charges zero egress) and serve inference on AWS (which charges $0.09 per gigabyte egress), you want model weights flowing from CoreWeave to AWS, not the reverse. Evaluation data generated on AWS should be processed on AWS rather than transferred to CoreWeave for analysis. Monitoring telemetry should be aggregated within each cloud and only summary metrics — measured in kilobytes rather than gigabytes — should cross the boundary.
+
+Object storage replication is your primary tool for cross-cloud model distribution. Configure your training pipeline to write completed model weights to the training cloud's object storage, then use a replication job to copy them to the serving cloud's object storage during off-peak hours. This approach lets you schedule transfers during low-cost windows, compress model weights before transfer (achieving 20 to 40 percent reduction on quantized models), and retry failed transfers without user impact.
+
+For teams running on three or more clouds, centralizing model artifact storage on the provider with the lowest egress costs and replicating outward is the most economical pattern. In 2026, that provider is often CoreWeave or Google Cloud, which have been the most aggressive on egress pricing. The savings compound with scale — a team transferring 10 terabytes per month saves $700 monthly by choosing a zero-egress source provider over a $0.09-per-gigabyte provider.
+
+## VPN Tunnels: Encrypted Connectivity as a Starting Point
+
+For teams not yet ready to invest in private interconnects, **VPN tunnels** provide encrypted connectivity between cloud virtual networks over the public internet. AWS Site-to-Site VPN, Google Cloud VPN, and Azure VPN Gateway all support IPsec tunnels that encrypt traffic between VPCs in different clouds.
+
+VPN tunnels are quick to set up — typically hours rather than weeks — and provide secure communication for sensitive data like model weights trained on proprietary datasets or inference logs containing customer information. The operational overhead is minimal. The cost is low — typically $0.05 per hour per tunnel endpoint plus standard egress charges.
+
+The performance trade-off is encryption overhead. IPsec encryption and decryption consume CPU cycles and add 10 to 20 percent bandwidth overhead compared to unencrypted transfers. Throughput per tunnel is capped — AWS VPN tunnels deliver approximately 1.25 Gbps per tunnel, though you can aggregate multiple tunnels for higher total throughput. For bulk data transfers like model weight synchronization, the bandwidth cap means a 140-gigabyte model takes roughly 15 minutes to transfer over a single tunnel, compared to under 2 minutes over a 10 Gbps private interconnect.
+
+VPN tunnels are the right starting point for teams with modest cross-cloud data transfer needs — fewer than 5 terabytes per month — and a path toward private interconnects as volume grows. Many teams start with VPN tunnels, measure their actual cross-cloud traffic patterns for three to six months, and use that data to justify and size a private interconnect investment.
+
+---
+
+Connecting infrastructure across clouds is a networking problem. Managing that connected infrastructure as a coherent system is an orchestration problem. The next subchapter examines unified control planes — the tools and patterns that let you manage five Kubernetes clusters across three clouds without the operational overhead scaling linearly with the number of environments.

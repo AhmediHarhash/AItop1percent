@@ -1,0 +1,83 @@
+# 27.32 — The Egress Problem: Cross-Region and Cross-Cloud Data Movement Costs
+
+In late 2025, a mid-size SaaS company running multi-region AI inference discovered something alarming during their quarterly cloud cost review. Their egress bill — the charges for moving data between regions and out of the cloud — had grown to $47,000 per month. Their total GPU spend was $41,000. They were paying more to move data than to run models. The culprit was not a single large transfer. It was dozens of small, well-intentioned decisions compounding. Model outputs from five inference regions were streamed to a centralized analytics cluster in US-East. Embedding updates were pushed from the primary vector database to four regional replicas every six hours. Telemetry data from every inference node — request logs, latency metrics, token counts, error traces — flowed to a centralized monitoring stack. Each pipeline was individually reasonable. Together, they created an egress bill that nobody had modeled, nobody had budgeted for, and nobody noticed until it surpassed the compute bill it was supposed to support.
+
+This is the egress problem, and it hits AI infrastructure harder than traditional web infrastructure because AI workloads move heavier payloads more frequently across more boundaries.
+
+## How Cloud Egress Pricing Works
+
+Cloud providers structure data transfer pricing to encourage data flowing in and penalize data flowing out. Understanding this structure is the first step to controlling costs.
+
+**Ingress** — data entering a cloud region — is free across all major providers. AWS, Azure, and Google Cloud charge nothing to receive data. This is deliberate. Free ingress reduces friction for customers sending data to the cloud. Once the data is inside, gravity takes over.
+
+**Intra-region transfer** — data moving between services in the same region — ranges from free to $0.01 per gigabyte depending on the provider and whether the services are in the same availability zone. AWS charges $0.01 per gigabyte for cross-AZ traffic within a region. Google Cloud charges nothing for traffic within the same zone and a small fee for cross-zone. Azure follows a similar pattern. These costs are low individually but add up fast when your inference service, vector database, and monitoring stack all sit in different availability zones within the same region, exchanging data on every request.
+
+**Inter-region transfer** — data moving between regions of the same cloud provider — typically costs $0.01 to $0.02 per gigabyte. This is the rate you pay when replicating model weights from US-East to EU-West, synchronizing embedding databases across regions, or sending telemetry from regional inference clusters to a central monitoring stack.
+
+**Internet egress** — data leaving the cloud entirely, whether to end users, to a different cloud provider, or to on-premises infrastructure — costs $0.05 to $0.09 per gigabyte on the standard tier. This is the most expensive transfer type and the one that creates the sharpest lock-in effect. A company with 100 terabytes of data in AWS faces a $5,000 to $9,000 bill just to move that data out — before paying for the destination infrastructure.
+
+The asymmetry is the point. Free ingress attracts data. Expensive egress retains it. Cloud providers openly acknowledge this dynamic, and in 2024 all three major providers introduced free egress for customers migrating away entirely — a concession to regulatory pressure in the EU and elsewhere. But the free migration egress requires closing your account within 60 days and does not help with ongoing multi-cloud or multi-region architectures where data moves continuously.
+
+## The AI-Specific Egress Multiplier
+
+Traditional web applications move small payloads. A typical API response is kilobytes. A web page is a few megabytes with images. AI infrastructure moves payloads that are orders of magnitude larger, and it moves them repeatedly.
+
+**Model weight replication** is the first multiplier. A 70-billion-parameter model in 16-bit precision occupies roughly 140 gigabytes. A quantized version at 4-bit might be 35 gigabytes. If you serve this model in five regions, every model update requires pushing 35 to 140 gigabytes to each region. Deploy a new model version weekly and your monthly weight replication cost is 700 gigabytes to 2.8 terabytes across five regions. At inter-region rates of $0.02 per gigabyte, that is $14 to $56 per month — manageable. But most teams do not run one model. They run ten to fifty models across multiple product lines, and suddenly the monthly weight replication bill is $500 to $2,500 before anyone notices.
+
+**Embedding synchronization** is the second multiplier. A vector database serving RAG queries must stay current across all regions. If your document corpus generates one million new embeddings per day at 1536 dimensions in 32-bit float, that is approximately six gigabytes of new vectors daily. Replicate to four regions and you transfer 24 gigabytes per day, or 720 gigabytes per month. At inter-region rates, roughly $14 per month — again, manageable in isolation. But add the full re-index that happens weekly when embedding models are updated, where the entire 300-gigabyte vector database is rebuilt and redistributed, and the monthly transfer jumps to over two terabytes.
+
+**Telemetry and observability data** is the third multiplier, and typically the largest one that teams fail to budget for. Every inference request generates telemetry — the prompt, the response, token counts, latency measurements, model metadata, error codes. A system handling one million requests per day with an average telemetry payload of two kilobytes per request generates two gigabytes of telemetry daily per region. Across five regions, that is ten gigabytes per day flowing to a centralized monitoring stack — 300 gigabytes per month. Add detailed request logging for quality evaluation (storing full prompts and responses for a sample of requests) and the volume can reach ten times that.
+
+**Centralized analytics pipelines** are the fourth multiplier. Many teams aggregate model outputs from all regions into a central data warehouse for quality analysis, drift detection, and business reporting. If you store a subset of inference outputs — say, 10 percent of responses for evaluation — and each response averages five kilobytes, a system handling ten million requests per day generates 50 gigabytes of evaluation data daily across all regions. Moving this to a central warehouse costs $1 to $3 per day at inter-region rates, or $30 to $90 per month. Multiply by the number of models and product lines and the cost compounds.
+
+## A Real Cost Scenario
+
+Consider a concrete three-region deployment serving a large language model for a customer support product. Inference runs in US-East, EU-West, and AP-Southeast. A centralized training and analytics cluster sits in US-East.
+
+Monthly transfers: model weight updates to two remote regions at 70 gigabytes each, twice monthly, totaling 280 gigabytes. Embedding sync at 25 gigabytes per week to two regions, totaling 200 gigabytes. Telemetry from two remote regions to US-East at 150 gigabytes per region, totaling 300 gigabytes. Evaluation data from two remote regions at 50 gigabytes per region, totaling 100 gigabytes. Total inter-region transfer: 880 gigabytes per month.
+
+At $0.02 per gigabyte, the monthly egress bill is approximately $18. That sounds negligible. But this is the simplest possible scenario — one model, three regions, moderate traffic. Scale to ten models across five regions with higher traffic volume and you reach 20 to 50 terabytes of monthly inter-region transfer, costing $400 to $1,000 per month in egress alone. Add internet egress for model responses delivered to end users (which travels through CDN and load balancer layers that may incur additional charges) and the numbers climb further.
+
+The real danger is not the absolute dollar amount for any single pipeline. It is the accumulation of pipelines that nobody tracks holistically. Each team launches a new data flow — a new monitoring integration, a new analytics export, a new model sync — and each one adds a small transfer cost. Six months later, the aggregate egress bill is the fastest-growing line item on the cloud invoice, and nobody owns it.
+
+## Mitigation Strategies That Work
+
+The most effective egress reduction strategies share a common principle: move less data less often across fewer boundaries.
+
+**Compress before transfer.** Model weights compress 30 to 50 percent with standard algorithms. Telemetry data with repetitive structures compresses 60 to 80 percent. A 70-gigabyte model weight file compressed to 40 gigabytes saves 43 percent on every replication. The compute cost of compression and decompression is trivial compared to the transfer cost savings, especially for recurring transfers.
+
+**Aggregate before sending.** Instead of streaming every telemetry event in real time from every region to a central collector, aggregate locally first. Compute per-minute statistics — average latency, error rates, token count distributions — in each region and send the aggregates. A million raw telemetry events per day at two kilobytes each is two gigabytes. The same data aggregated into per-minute summaries might be 50 megabytes — a 40x reduction. You lose per-request granularity in the central system, but you can keep the raw data in each region for 30 days and query it on demand when you need to investigate a specific incident.
+
+**Process telemetry locally.** Drift detection, quality scoring, and anomaly detection can run as regional jobs rather than requiring centralized data. Deploy your evaluation pipeline in each region alongside the inference service. Only escalate — send detailed data to the central system — when the local evaluation detects a problem. This pattern reduces steady-state egress to near zero for telemetry, spiking only during investigations.
+
+**Delta synchronization for embeddings.** Instead of replicating the entire vector database on every update, track which embeddings changed and transfer only the deltas. If one percent of your vectors change daily, delta sync reduces your daily transfer from 300 gigabytes (full database) to three gigabytes (changed vectors only). Most mature vector databases support incremental updates that make this straightforward to implement.
+
+**Version-aware model distribution.** When deploying a new model version, use binary diff tools to compute the delta between the old and new weight files. For fine-tuned models where only the adapter weights changed, the delta can be 95 percent smaller than the full weight file. Even for fully retrained models, binary diffs often save 20 to 40 percent because large portions of the weight matrix remain similar between versions.
+
+## Private Interconnects: The Fixed-Cost Alternative
+
+When your inter-region or cross-cloud transfer volume is consistently high, private interconnects replace per-gigabyte pricing with fixed monthly fees.
+
+**AWS Direct Connect** provides dedicated network connections between your infrastructure and AWS. Port fees range from roughly $200 per month for a one-gigabit port to $1,500 per month for a ten-gigabit port. Data transfer over Direct Connect is charged at reduced rates — approximately $0.02 per gigabyte for inter-region traffic, compared to $0.09 for internet egress. For organizations transferring more than 10 to 20 terabytes per month over the internet, Direct Connect pays for itself in egress savings alone.
+
+**Azure ExpressRoute** offers a similar model with metered and unlimited pricing tiers. The unlimited tier provides a fixed monthly fee for uncapped data transfer, which is attractive for workloads with unpredictable or spiky transfer patterns. The metered tier charges per gigabyte but at rates significantly lower than internet egress.
+
+**Google Cloud Interconnect** charges hourly for connection ports and VLAN attachments, with data transfer priced at roughly $0.02 per gigabyte — a substantial discount from the $0.08 to $0.12 per gigabyte charged for standard internet egress.
+
+The breakeven calculation for private interconnects is straightforward. Take your monthly internet egress volume, multiply by the per-gigabyte rate, and compare against the fixed port fee plus the reduced per-gigabyte rate. For AI workloads that transfer tens of terabytes monthly, the savings typically cover the interconnect cost within the first month.
+
+## Architectural Decisions: Centralize Versus Regionalize
+
+The fundamental architecture question behind every egress bill is: what must be centralized, and what can stay regional?
+
+Centralize the things that benefit from a global view and that are queried infrequently: long-term model training, annual compliance audits, cross-region A/B test analysis, and historical trend reporting. These use cases can tolerate batch transfers on a daily or weekly cadence, making their egress costs predictable and budgetable.
+
+Regionalize the things that are generated continuously and consumed locally: inference serving, real-time monitoring, quality evaluation, embedding search, and user-facing analytics. Every piece of data that stays in the region where it was created is a piece of data you do not pay to move.
+
+The messy middle is where most teams struggle. Centralized model training requires data from multiple regions. Centralized drift detection requires inference outputs from every deployment. Centralized cost reporting requires usage telemetry from all clusters. For each of these, the question is not whether to move data but how to minimize what moves. Aggregate before transfer. Sample instead of copying everything. Pre-compute metrics regionally and send summaries. Every optimization that reduces transfer volume reduces your egress bill proportionally.
+
+The egress problem does not have a once-and-done solution. As your model count grows, your region count expands, and your traffic increases, new data flows emerge and old ones grow. The teams that control egress costs treat data transfer as a first-class budget line with an owner, a monitoring dashboard, and a quarterly review — the same rigor they apply to GPU spend.
+
+---
+
+The data plane — networking, storage, data gravity, and egress — sets the physical constraints that every higher layer of your AI infrastructure must respect. The next chapter moves from these foundational constraints to the architecture decisions they drive: how to design multi-region inference deployments that balance latency, cost, data residency, and fault tolerance across a global footprint.

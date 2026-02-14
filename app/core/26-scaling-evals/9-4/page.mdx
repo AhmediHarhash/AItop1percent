@@ -1,0 +1,71 @@
+# 9.4 — Alert Fatigue in Eval Systems: Why Teams Ignore the Signals That Matter
+
+The average AI organization with a mature eval system receives hundreds of alerts per day. Industry surveys from 2025 indicate that roughly 40% of monitoring alerts across engineering teams are never investigated. For eval-specific alerts, the rate is worse — non-determinism in LLM judges, high dimensionality of eval metrics, and weekly traffic patterns create alert volumes that no team can process. The signal you need — the one alert that indicates genuine quality degradation — is buried in noise you have learned to ignore. This is not a tooling problem. It is a system design problem, and solving it requires rethinking what deserves an alert in the first place.
+
+## Why Eval Alerts Are Uniquely Prone to Fatigue
+
+Eval systems generate more noise per dimension than traditional software monitoring systems, and the reasons are structural, not incidental. Understanding why helps you design alerts that actually work.
+
+The first cause is non-determinism. LLM-based judges do not return the same score for the same input every time. Run the same output through the same judge ten times and you will get a distribution of scores, not a single number. This variance is inherent to the technology, not a bug in the implementation. When you set a threshold on a non-deterministic metric, the metric will naturally cross the threshold on some fraction of measurement intervals purely from random variance. Each crossing generates an alert. Each alert is technically correct — the threshold was breached — and completely uninformative, because the underlying quality did not actually change.
+
+The second cause is high dimensionality. An eval system monitoring fifty dimensions generates fifty independent alert streams. Even with well-calibrated thresholds that produce false alerts only 2% of the time per dimension, a fifty-dimension system generates an expected one false alert per measurement cycle. If you measure hourly, that is twenty-four false alerts per day from statistical noise alone — before a single real issue occurs. As the previous subchapter explored, the multi-dimension monitoring problem creates combinatorial alert volume that single-dimension threshold setting cannot control.
+
+The third cause is temporal patterns. Production traffic has daily cycles, weekly cycles, and seasonal patterns. Monday morning traffic looks different from Saturday afternoon traffic. January query patterns differ from July query patterns. If your alert thresholds are calibrated to average behavior, every predictable traffic shift triggers alerts that reflect normal patterns, not actual problems. Teams receive a burst of alerts every Monday morning as weekend patterns give way to weekday patterns, investigate the first few Monday alert batches, discover they are all false alarms, and stop investigating Monday alerts entirely — which means they also stop investigating Monday alerts that happen to be real.
+
+## The Consequences of Ignoring Alerts
+
+Alert fatigue does not just waste engineering time. It creates a systematic vulnerability: the organization loses the ability to respond to genuine quality degradation because the alerting system has trained the team to ignore it.
+
+The pattern is predictable and has played out at organizations of every size. An e-commerce company running AI product recommendations had an eval system that generated approximately three hundred alerts per week across its quality dimensions. The on-call engineer triaged the alerts, found that over 80% were noise — judge variance, weekend traffic patterns, dimension correlations that were within historical norms. After a month, the triage process became perfunctory: scan the alert titles, dismiss anything that looked like a familiar pattern, investigate only completely novel alerts. When the recommendation model's relevance scores genuinely dropped seven points due to a corrupted embedding index, the alert looked identical to the weekly variance alerts the team had been dismissing. It took four days for a product manager to notice the drop in click-through rates, by which point the company had served degraded recommendations to over two million users.
+
+This is the insidious nature of alert fatigue. The team did not decide to ignore real alerts. The volume of false alerts trained them, through operant conditioning, to treat all alerts as low-priority. The alert that mattered was structurally identical to the alerts that didn't. Without a system that distinguishes the two, human judgment becomes the bottleneck — and human judgment under alert fatigue is unreliable.
+
+## Dynamic Thresholds: Letting the Baseline Move
+
+Static thresholds — "alert if relevance drops below 85%" — are the primary source of avoidable alert noise. They ignore the fact that baseline quality shifts over time as production traffic evolves, models are updated, and user behavior changes. A static threshold set six months ago may no longer reflect current operating reality.
+
+**Dynamic thresholds** adjust automatically based on recent historical behavior. Instead of alerting when a metric drops below a fixed number, you alert when a metric deviates significantly from its recent trend. The threshold is computed as the trailing mean plus or minus a multiple of the trailing standard deviation, recalculated daily or weekly. When the baseline shifts — because a model update genuinely improved quality, or because production traffic patterns changed — the threshold shifts with it.
+
+Dynamic thresholds eliminate the class of alerts caused by baseline drift. If relevance scores gradually improve from 85% to 89% over three months due to model improvements, a static threshold at 85% becomes increasingly stale — it would not fire until quality degraded nearly five points, which is far too late. A dynamic threshold tracks the new baseline and alerts on deviation from 89%, catching smaller regressions that the static threshold would miss.
+
+The trade-off is that dynamic thresholds can also mask genuine slow drift. If quality degrades very gradually — half a point per month — the dynamic threshold's trailing mean follows the degradation downward, and the system never alerts because the current value is always close to the (declining) mean. Guard against this with a secondary trend alert that monitors the direction and magnitude of the trailing mean itself. If the mean has been declining for four consecutive periods, alert regardless of whether individual measurements are within the dynamic band.
+
+## Alert Deduplication and Grouping
+
+Many alerts that appear to be separate events are actually the same event observed through multiple dimensions. When a retrieval pipeline degrades, relevance scores drop, accuracy scores drop, completeness scores drop, and specificity scores drop — all because the model is working with worse context. Four alerts fire, but the root cause is one event. Investigating each alert separately wastes time. Worse, it dilutes the apparent severity: four minor alerts feel less urgent than one major alert, even when the four minor alerts represent a more serious problem.
+
+**Alert grouping** clusters related alerts into a single incident. The grouping criteria can be temporal (alerts that fire within the same five-minute window are likely related), dimensional (alerts from dimensions known to be correlated based on historical analysis), or causal (alerts that share a probable root cause based on the component topology of the eval system).
+
+Temporal grouping is the simplest to implement. When the first alert fires, suppress all additional alerts for a defined window — typically five to fifteen minutes. If more alerts arrive during the suppression window, they are attached to the original alert as additional signals rather than treated as separate events. The on-call engineer sees one incident with multiple dimensions affected, not twenty separate alerts arriving in rapid succession.
+
+Dimensional grouping uses the correlation analysis from subchapter 9.3. If historical data shows that relevance, accuracy, and completeness scores are strongly correlated, an alert from any one of these dimensions checks the other two before firing independently. If all three are deviating in the same direction, one grouped alert fires: "Quality cluster alert: relevance, accuracy, and completeness declining." If only one dimension is moving, the individual alert fires. This approach reduces alert volume while preserving signal fidelity.
+
+## Severity Tiers and Escalation Paths
+
+Not all eval degradation is equally urgent. Treating every alert with the same severity is a fast path to fatigue. A well-designed severity system ensures that the alerts most likely to represent real and consequential quality degradation receive the most attention, while routine fluctuations receive proportionally less.
+
+Three severity tiers work well in practice. **Critical** alerts indicate that a safety-related eval dimension has crossed its threshold, that the composite health score has dropped below its minimum, or that eval coverage has fallen below 80%. Critical alerts page the on-call engineer immediately and require acknowledgment within thirty minutes. **Warning** alerts indicate that one or more quality dimensions have crossed their dynamic thresholds, that eval latency has exceeded the SLA, or that cost per eval has spiked. Warning alerts go to a shared channel and require investigation within four hours. **Informational** alerts indicate minor threshold crossings, expected seasonal patterns, or dimensions approaching but not yet crossing thresholds. Informational alerts are logged to a dashboard and reviewed during weekly eval health reviews, not pushed to individuals.
+
+The critical tier should fire rarely — no more than a few times per month. If critical alerts fire daily, either the thresholds are too tight or the eval system has systemic issues that need architectural fixes, not alert tuning. The warning tier should fire a few times per week. The informational tier absorbs the volume that would otherwise create fatigue.
+
+## Alert Budgets: Treating Noise as a Measurable Cost
+
+An **alert budget** sets a maximum number of alerts per tier per week. If the system generates more alerts than the budget allows, it is a signal that the alerting configuration needs recalibration — not that more engineers need to investigate more alerts.
+
+The concept borrows from error budgets in site reliability engineering. An error budget says "we accept that our system will be unavailable for a certain amount of time per quarter, and if we burn through the budget, we slow down feature work to improve reliability." An alert budget says "we accept that our eval system will generate a certain number of alerts per week, and if we consistently exceed the budget, we invest in alert reduction rather than investigation capacity."
+
+A practical alert budget for a fifty-dimension eval system might be five critical alerts per month, twenty warning alerts per week, and two hundred informational entries per week. If warning alerts consistently exceed twenty per week, the team allocates engineering time to identify and eliminate the noisiest alert sources — typically by switching those dimensions to dynamic thresholds, increasing the deduplication window, or removing dimensions that produce alerts without actionable information.
+
+Tracking alert budget burn rate over time provides a meta-metric for the health of the alerting system itself. A rising burn rate means the system is getting noisier, which means alert fatigue is increasing, which means real issues are more likely to be missed. It is an early warning system for the breakdown of your early warning system.
+
+## The Organizational Dimension: Alert Ownership
+
+Technical solutions — dynamic thresholds, grouping, severity tiers, budgets — reduce noise. But they don't solve the ownership problem. An alert that fires to a shared channel belongs to nobody. An alert that belongs to nobody gets investigated by nobody.
+
+Every alert tier needs a named owner — not a team, a person. The critical on-call rotation needs to be explicit and documented. Warning alerts need an assigned investigator for each eval domain. When the safety dimension fires a warning, the safety eval owner investigates. When the retrieval quality dimension fires a warning, the RAG eval owner investigates. Unowned alerts become ignored alerts, regardless of how well you have tuned the thresholds.
+
+The ownership model also determines escalation paths. If the assigned investigator cannot resolve a warning alert within four hours, who does it escalate to? If a critical alert fires and the on-call engineer determines the root cause is in a different team's system, how is the handoff handled? These paths need to be documented before the alert fires, not negotiated in real time while quality is degrading in production.
+
+Alert ownership should be reviewed quarterly. As the eval system evolves — new dimensions added, old dimensions deprecated, team structures reorganized — the ownership map drifts out of date. A quarterly review ensures that every active alert has a current owner and every owner has the context and access to investigate their alerts effectively.
+
+When alert fatigue is under control and individual alerts are firing with purpose, the next challenge is connecting related alerts into coherent incidents. The next subchapter covers alert correlation and aggregation — moving from individual symptoms to system-level syndromes.

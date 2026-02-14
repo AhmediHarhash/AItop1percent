@@ -1,0 +1,109 @@
+# 4.6 — Dynamic Context Allocation: Spending Tokens Where They Matter Most
+
+If you have a 4,000-token budget per request, how do you decide that 1,500 tokens should go to the system prompt, 1,000 to retrieved documents, 500 to conversation history, and 1,000 to the user query? Most teams never make this decision explicitly. The allocation happens by accident — the system prompt is however long the engineer wrote it, the retrieval pipeline returns however many chunks fit, and the conversation history fills whatever space remains. Accidental allocation is always wasteful, because it distributes tokens based on how the system was built rather than what the current request needs.
+
+The waste is not abstract. A first message in a conversation needs zero history tokens but might benefit from extensive retrieval. A follow-up question clarifying the previous answer needs no retrieval at all but requires the recent history to stay coherent. A simple factual query might need only 200 tokens of context, while a complex analytical question might need every token you can give it. When the allocation is static — the same system prompt, the same number of retrieval chunks, the same history window for every request — some requests get too much context and others get too little. The requests that get too much waste money. The requests that get too little produce worse answers. Both are preventable.
+
+**Dynamic context allocation** is the practice of adjusting how tokens are distributed across context components based on the characteristics of each individual request. It is the difference between a fixed monthly budget that allocates the same amount to every department regardless of what they need, and a responsive budget that shifts resources to where the demand is. Teams that implement dynamic allocation typically reduce average token usage by 25 to 40 percent compared to static allocation while simultaneously improving output quality, because tokens go where they are needed rather than where they happen to fit.
+
+## The Four Components Competing for Context
+
+Every request to a language model that involves retrieval or conversation has four components competing for space in the context window: the system prompt, retrieved documents, conversation history, and the user's current input. Understanding what each component contributes — and when each component's contribution is most and least valuable — is the foundation of dynamic allocation.
+
+The **system prompt** defines the model's role, constraints, and output format. Its value is relatively constant across requests. A well-compressed system prompt (as discussed in the previous subchapter) might use 300 to 800 tokens, and those tokens are needed on every request. The system prompt is rarely the target of dynamic allocation because its size should already be optimized through prompt compression. Where it varies is in applications with multiple modes — a customer support system might use a shorter system prompt for simple FAQ lookups and a longer one for complex troubleshooting flows.
+
+**Retrieved documents** provide the model with external knowledge relevant to the query. Their value is highly variable. For questions that require specific factual information — "What is the return policy for electronics?" — retrieved documents are essential, and providing more relevant context improves answer quality. For questions that require reasoning over information already in the conversation — "Based on what you just told me, which option is better?" — retrieved documents add noise and cost without improving the response. The optimal allocation for retrieval ranges from zero tokens for pure-conversational queries to 2,000 or more tokens for knowledge-intensive queries.
+
+**Conversation history** provides continuity across a multi-turn interaction. Its value depends on the turn number and the nature of the current query. On the first turn, history is worth zero tokens. On the tenth turn of a complex troubleshooting session, history is worth a thousand tokens or more because the model needs to reference the user's earlier descriptions, the solutions already tried, and the current state of the issue. On the tenth turn of a shopping conversation where the user has moved on to a completely new product category, the earlier turns about a different product are worth almost nothing.
+
+The **user input** is the one component whose size is determined by the user, not the system. A short query might be 20 tokens. A long, detailed question might be 500 tokens. The system cannot compress the user input without risking misunderstanding the query, so the user input gets whatever tokens it needs, and the budget for the other three components adjusts around it.
+
+## Static Allocation: The Baseline Problem
+
+Most production systems use **static allocation** — a fixed configuration that assigns the same number of tokens to each component on every request. The retrieval pipeline always returns five chunks. The conversation history always includes the last eight turns. The system prompt is always the same 600 tokens. The total prompt is whatever those components add up to.
+
+Static allocation is the default because it is simple. The engineer configures the retrieval pipeline to return five chunks, sets the history window to eight turns, writes the system prompt, and the system runs. There is no per-request decision-making, no classification step, no routing logic. It works, and it ships.
+
+The problem is that static allocation optimizes for the average case and fails on both extremes. For simple queries that need minimal context, static allocation over-fetches — including retrieval chunks and history turns that the model ignores. A customer asking "What are your business hours?" does not need five chunks of retrieved documentation and eight turns of history. The model would produce the same answer with one chunk and zero history turns. The extra context costs tokens without contributing to quality.
+
+For complex queries that need maximum context, static allocation under-fetches — the fixed allocation does not leave enough room for the retrieval or history that the query demands. A customer in the middle of a detailed claims dispute, referencing documents from four turns ago while asking about a specific policy clause, needs extensive history and targeted retrieval. The static five-chunk, eight-turn allocation might not include the right chunks or the right turns.
+
+The economic impact of static allocation is measurable. Take a system where 40 percent of requests are simple queries that would produce identical quality with 800 tokens of context instead of the 2,500 tokens the static allocation provides. That is 1,700 wasted tokens per request on 40 percent of traffic. On a system processing 500,000 requests per day at $3 per million input tokens, the waste on simple queries alone is 1,700 times 200,000 divided by one million, times $3, which equals $1,020 per day — roughly $30,600 per month. Dynamic allocation recovers that waste by right-sizing context for each request.
+
+## Implementing Dynamic Allocation: The Classification Layer
+
+Dynamic context allocation requires a mechanism to determine, before assembling the prompt, what type of request the current query represents and what allocation template to apply. This mechanism is the **classification layer** — a fast, cheap step that categorizes each incoming request and routes it to the appropriate allocation template.
+
+The classification does not need to be sophisticated. Most applications have a small number of request archetypes — between three and eight — that capture the meaningful variation in context needs. A customer support system might have four archetypes: simple FAQ (needs retrieval, no history), follow-up question (needs history, no retrieval), complex troubleshooting (needs both), and greeting or small talk (needs neither). A legal research system might have three: factual lookup (heavy retrieval, light history), document comparison (heavy history, light retrieval), and procedural question (moderate retrieval, no history).
+
+The classifier itself can be a lightweight model — GPT-5-nano or an even simpler intent classifier — running on each incoming message. At inference costs of $0.05 per million tokens, classifying a 100-token message costs $0.000005. That cost is invisible relative to the savings that accurate classification enables. Alternatively, the classifier can be rule-based: keywords, message length, conversation position (first turn versus later turn), and the presence of question marks or references to earlier turns are all signals that a simple rules engine can use to assign an archetype.
+
+The key requirement is speed. The classification step runs before the primary model call, so it adds latency. A classification step that takes 500 milliseconds before a generation step that takes 1,500 milliseconds adds a noticeable 33 percent latency increase. Target classification latency of less than 50 milliseconds — achievable with rule-based classifiers or small locally-hosted models — to keep the overhead negligible.
+
+## Allocation Templates: Defining the Token Budget
+
+Each request archetype maps to an **allocation template** — a predefined distribution of the total token budget across the four context components. The templates encode the team's knowledge about what each request type needs.
+
+For a system with a 4,000-token budget, the templates might look like this. The simple FAQ template allocates 400 tokens to the system prompt, 1,200 tokens to retrieved documents, zero tokens to conversation history, and leaves 2,400 tokens for the user input and generation overhead. The follow-up question template allocates 400 tokens to the system prompt, zero tokens to retrieval, 1,600 tokens to conversation history, and leaves 2,000 tokens for user input and generation. The complex troubleshooting template allocates 400 tokens to the system prompt, 800 tokens to retrieval, 1,200 tokens to history, and leaves 1,600 tokens for user input and generation. The greeting template allocates 300 tokens to a minimal system prompt, zero to retrieval, zero to history, and leaves the rest unused — the response will be short and cheap.
+
+The allocations are not rigid maximums. They are guidelines that inform how many retrieval chunks to fetch, how many history turns to include, and whether to apply summarization. When the template allocates 800 tokens to retrieval, the retrieval pipeline fetches chunks until it reaches approximately 800 tokens rather than always fetching a fixed number of chunks. When the template allocates zero tokens to retrieval, the retrieval pipeline is skipped entirely — saving not just the input tokens but also the latency and compute cost of the retrieval step itself.
+
+Designing the initial templates requires experimentation. Start with educated guesses based on your understanding of each request type. Run your evaluation suite with each template applied to its corresponding request archetype. Measure quality. If quality drops on a particular archetype, the template is under-allocating a component that the model needs. If quality holds while the template allocates tokens to a component, try reducing that allocation further. Iterate until each template is right-sized — enough tokens in each component to maintain quality, and not a token more.
+
+## The Economic Impact of Dynamic Allocation
+
+The savings from dynamic allocation depend on two factors: the distribution of request types and the difference in context size between the static allocation and the dynamic templates.
+
+Consider a system where traffic breaks down as follows: 35 percent simple FAQ queries, 25 percent follow-up questions, 20 percent complex queries, 10 percent greetings and small talk, and 10 percent other. Under static allocation, every request uses the same 3,200-token prompt. Under dynamic allocation, simple FAQ queries use 1,600 tokens, follow-ups use 2,000 tokens, complex queries use 2,400 tokens, greetings use 300 tokens, and the remaining 10 percent use the static 3,200 tokens as a fallback.
+
+The weighted average input tokens under dynamic allocation is: 0.35 times 1,600, plus 0.25 times 2,000, plus 0.20 times 2,400, plus 0.10 times 300, plus 0.10 times 3,200. That equals 560 plus 500 plus 480 plus 30 plus 320, which equals 1,890 tokens. The static average was 3,200 tokens. Dynamic allocation reduces average input tokens by 41 percent.
+
+On a system processing 800,000 requests per day at $3 per million input tokens, the daily savings are 800,000 times 1,310 (the per-request savings) divided by one million, times $3, which equals $3,144 per day — roughly $94,000 per month. The cost of running the classification layer on those same 800,000 requests at $0.05 per million input tokens is approximately $4 per day. The net savings are substantial, and the quality improves because each request gets the context distribution it actually needs.
+
+## Advanced: Request-Level Adaptation
+
+The template-based approach assigns one of a few fixed allocations to each request. A more advanced approach adapts the allocation at the individual request level, using signals from the request itself to fine-tune the distribution.
+
+Request-level adaptation uses features like query length, query complexity (estimated by keyword analysis or a lightweight classifier), conversation turn number, retrieval confidence scores, and topic continuity to adjust the allocation within ranges defined by the template. A complex troubleshooting template might allocate between 600 and 1,200 tokens to retrieval depending on the retrieval system's confidence — if the top retrieved chunks have high relevance scores, the system includes more of them; if scores are low, it includes fewer because the retrieval is unlikely to be helpful and the tokens are better spent elsewhere.
+
+The turn number is a particularly useful signal. Early turns in a conversation have little history to include, so the history allocation can be redirected to retrieval. Late turns in a conversation may have extensive relevant history, so the retrieval allocation can be reduced if the conversation has already established the necessary context. A system that adapts allocation by turn number might allocate 1,500 tokens to retrieval on turn one, 1,000 on turn three, 500 on turn eight, and zero on turn twelve when the conversation is deep into a specific topic that retrieval cannot help with.
+
+The implementation complexity increases with request-level adaptation, but the savings compound. Where template-based allocation might reduce average tokens by 30 to 40 percent, request-level adaptation can push savings to 40 to 55 percent, because it captures within-archetype variation that templates miss. Whether the additional engineering investment is worthwhile depends on your request volume. At 100,000 requests per day, the incremental savings from request-level adaptation over templates might be $10,000 per month — meaningful but not transformative. At one million requests per day, the same incremental improvement is worth $100,000 per month, which justifies significant engineering investment.
+
+## Handling Allocation Failures
+
+Dynamic allocation introduces a new failure mode: misclassification. When the classification layer assigns the wrong archetype to a request, the allocation template under-serves the request, and quality suffers. A complex troubleshooting query misclassified as a simple FAQ gets insufficient retrieval and insufficient history, producing a shallow or incorrect response.
+
+There are three mitigations. First, build a fallback for uncertain classifications. If the classifier's confidence is below a threshold — say, 70 percent — default to the most generous allocation template rather than the cheapest one. Misclassification is cheap when the fallback is "spend more tokens." It is expensive when the fallback is "spend fewer tokens and deliver a bad answer."
+
+Second, monitor classification accuracy using downstream quality signals. If the system's answer quality on requests classified as "simple FAQ" is significantly lower than expected — lower than the quality of actual simple FAQ requests — the classifier is probably mislabeling complex requests as simple. Track quality metrics per archetype and flag archetypes where quality diverges from expectations.
+
+Third, use the model's response as a feedback signal. If the model's response on a "simple FAQ" request is unusually long, involves extensive reasoning, or includes hedging language like "based on the limited context available," the request was probably more complex than the classifier estimated. Use these signals to trigger a retry with a more generous allocation. The retry costs extra tokens, but only on the small fraction of requests where the classifier failed — far cheaper than using the generous allocation on every request.
+
+## The Allocation Dashboard
+
+Visibility into how tokens are distributed across context components is essential for ongoing optimization. Build an allocation dashboard that shows the following.
+
+First, the distribution of request archetypes over time. Are the proportions stable? A sudden increase in complex queries might indicate a product change that is generating harder questions. A decrease in simple FAQ queries might indicate that a self-service feature is deflecting them.
+
+Second, the average token count per component per archetype. Is the retrieval component consistently hitting its allocation limit on complex queries? That might indicate the limit is too low. Is the history component consistently under-utilizing its allocation on follow-up queries? That might indicate the limit is too high.
+
+Third, quality scores per archetype. This is the safety metric. If quality drops on any archetype, the allocation template for that archetype needs adjustment. Quality drops that correlate with allocation changes are the clearest signal that the change was too aggressive.
+
+Fourth, the classification confidence distribution. What percentage of requests are classified with high confidence versus low confidence? A large fraction of low-confidence classifications means the archetype definitions do not capture the diversity of your traffic well. You may need more archetypes or a more capable classifier.
+
+Fifth, the cost savings relative to static allocation. Calculate what each day's traffic would have cost under the old static allocation and compare to the actual cost under dynamic allocation. This number — the daily and monthly savings — is the justification for the system's engineering investment and the metric that keeps the team focused on maintaining and improving the allocation logic.
+
+## Evolving Allocation Over Time
+
+Dynamic context allocation is not a set-and-forget optimization. Request patterns change as your product evolves, as your user base grows, and as the underlying models change. A template that was optimal for your traffic in January may be suboptimal by June because your product added a new feature that generates a new request archetype, or because a model update changed how much context the model needs to produce high-quality responses.
+
+Review your allocation templates quarterly. Pull the allocation dashboard data. Check whether any archetype's quality has drifted. Check whether the traffic distribution has shifted enough to warrant new archetypes. Run your evaluation suite with the current templates and with adjusted templates, measuring both quality and cost. If a template adjustment saves 10 percent of tokens on a high-volume archetype with no quality loss, deploy it. If a new request pattern has emerged that does not fit any existing archetype, create a new template for it.
+
+The compounding benefit of this ongoing practice is that your system becomes more efficient over time, not less. Each quarterly review tightens the allocation, removes waste, and adapts to the current traffic. A system that started with a 30 percent savings over static allocation in its first month might reach 45 percent savings after three quarters of tuning. The savings grow because the team's understanding of request patterns deepens with data, and the allocation templates become more precise reflections of actual context needs.
+
+## From Allocation to Over-Allocation
+
+Dynamic allocation teaches you to spend tokens where they matter. But there is a deeper question lurking behind every allocation decision: is more context actually better? The assumption that filling the context window with relevant information produces better answers is so widespread that most teams never question it. Yet the assumption is often wrong. Beyond a certain point, adding more context — even relevant context — degrades quality rather than improving it. The model loses focus. Attention diffuses. The answer gets worse, and you paid more for it.
+
+This is the stuffing anti-pattern, and it is one of the most expensive mistakes in AI systems engineering. We turn to it next.

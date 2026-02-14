@@ -1,0 +1,113 @@
+# 6.12 — Scaling Multilingual RAG: Cost, Latency, and Infrastructure Patterns
+
+In early 2025, a European insurance company launched a multilingual RAG system serving policyholders in eight languages. At 10,000 queries per day, the system worked beautifully. Retrieval latency sat at 180 milliseconds. Generation was fast. The per-query cost was $0.014, and the finance team approved the budget without pushback. Six months later, the product expanded to three new markets, query volume hit 500,000 per day, and everything broke. Latency tripled to over 500 milliseconds because the unified multilingual index had grown from 2 million to 14 million chunks and every query searched the entire space. Costs quintupled because cross-lingual query expansion generated three to four embedding calls per query instead of one. The cross-lingual retrieval quality for newer languages degraded because the index was dominated by English and German documents, and the embedding similarity scores for Thai and Polish queries were consistently lower. The system that worked at pilot scale became economically and architecturally unsustainable at production scale.
+
+This is the scaling wall that every multilingual RAG system hits. The question is not whether you will hit it, but whether you designed for it.
+
+## Cost Scaling: Where the Money Multiplies
+
+Multilingual RAG costs scale superlinearly with language count. Adding a ninth language to an eight-language system does not increase costs by 12 percent. It increases costs by 20 to 35 percent, depending on your architecture choices, because each new language adds cost at multiple layers simultaneously.
+
+**Embedding costs.** If you translate documents into every supported language at indexing time (the translate-then-embed strategy), your embedding costs multiply by the number of languages. A corpus of 500,000 English documents embedded once costs X. Translated into eight languages and embedded separately, it costs 8X for embeddings alone, plus the translation cost. If you use a multilingual embedding model and index documents in their original language (the embed-once strategy), embedding costs stay constant regardless of language count -- but cross-lingual retrieval quality may be lower, and you may need query-time translation to compensate.
+
+**Storage costs.** Every index replica, every language-specific shard, and every translated document copy consumes storage. A vector database holding 500,000 documents with 1024-dimensional embeddings uses roughly 2 gigabytes. Eight language-specific indexes use 16 gigabytes. Add metadata, inverted indexes for hybrid search, and document text storage, and you are looking at 50 to 100 gigabytes for a mid-size multilingual system. The storage cost itself is modest (cloud storage is cheap), but the memory footprint for serving those indexes is not. Keeping eight language-specific vector indexes in memory for low-latency retrieval requires dedicated infrastructure that scales with language count.
+
+**Inference costs.** The generation step costs the same per token regardless of language, but multilingual systems consume more tokens per query. The system prompt often includes language control instructions that add 50 to 200 tokens. Cross-lingual generation from English sources with a non-English output requires longer responses because the model generates more intermediate reasoning tokens. The token tax -- the additional tokens consumed by multilingual instructions and cross-lingual processing -- adds 15 to 30 percent to per-query generation cost compared to a monolingual English system.
+
+**Reranking costs.** If you use a cross-lingual reranker (and you should, for any system where retrieval quality matters across languages), the reranker runs on every candidate-query pair. A reranker that processes 20 candidate documents per query at 8 languages sees the same volume as a monolingual system, but cross-lingual reranking models are typically larger and slower than monolingual ones. The cost per reranking call is 20 to 40 percent higher, and if you rerank across language boundaries (comparing Japanese query relevance to English documents and Japanese documents simultaneously), the candidate set may be larger because you are pulling from multiple indexes.
+
+## Latency Scaling: Where the Milliseconds Accumulate
+
+In a monolingual RAG system, latency has three components: retrieval, reranking, and generation. In a multilingual system, each component is slower, and you may add new components that do not exist in monolingual pipelines.
+
+**Query language detection** adds 5 to 20 milliseconds. Fast, but it happens before anything else. If detection is wrong, everything downstream is wrong.
+
+**Cross-lingual query expansion** adds 50 to 200 milliseconds. If your system translates the query into other languages to search language-specific indexes, each translation call adds latency. Translating a Japanese query into English for cross-lingual retrieval requires a machine translation call. Translating it into both English and German to search two indexes requires two calls. Running them in parallel helps, but the parallel latency is still the slowest translation, not zero.
+
+**Multi-index federation** adds 30 to 150 milliseconds. If your system searches multiple language-specific indexes and merges the results, the federation step adds latency proportional to the number of indexes queried and the complexity of the merge. Searching three indexes in parallel and merging with a cross-lingual reranker is faster than searching sequentially, but the merge and rerank step itself takes time.
+
+**Cross-lingual reranking** adds 50 to 300 milliseconds depending on the model and the candidate set size. A reranker processing 20 candidates is fast. A reranker processing 60 candidates (20 from each of three indexes) takes three times as long unless you parallelize at the candidate level.
+
+**Translate-before-generate** adds 100 to 400 milliseconds. If your pipeline translates retrieved documents from their source language to the user's language before generation (to improve faithfulness or because the model generates better answers in the user's language with same-language context), the translation step adds significant latency. This is the most expensive latency addition because machine translation of multi-paragraph documents is not instant.
+
+Stack these together and a multilingual query that takes 200 milliseconds in a monolingual system may take 500 to 900 milliseconds. For interactive applications where users expect sub-second responses, this latency budget is dangerously tight. Every architectural decision must weigh the quality improvement against the latency cost.
+
+## Index Architecture at Scale
+
+The index architecture you choose determines your scaling trajectory more than any other decision.
+
+**The unified index** stores all documents in all languages in a single vector space using a multilingual embedding model. This is the simplest architecture: one index, one query path, no federation. It works well at small scale and for language pairs that the embedding model handles well. It breaks at large scale because the index grows linearly with document count across all languages, every query searches the entire space, and the embedding model's cross-lingual accuracy degrades as the index gets noisier. A unified index of 14 million chunks in eight languages produces more false-positive matches than a focused index of 2 million chunks in one language.
+
+**Language-partitioned indexes** store each language in its own index. A Japanese query searches the Japanese index. If cross-lingual retrieval is needed, the query is also translated and run against relevant other-language indexes. This architecture scales better because each index stays focused, queries search a smaller space, and you can optimize each index independently (different chunk sizes for CJK versus Latin scripts, different embedding models per language). The cost is architectural complexity: you need routing logic, query translation for cross-lingual search, and a federation layer to merge results across indexes.
+
+**Hybrid partitioning** uses language-specific indexes for high-volume languages and a shared multilingual index for low-volume languages. English, Japanese, and German each get their own index. Thai, Polish, and Czech share a multilingual "rest of world" index. This balances scaling efficiency with architectural simplicity. The high-volume indexes get dedicated optimization. The low-volume languages get adequate service without the overhead of dedicated infrastructure.
+
+The transition from unified to partitioned typically happens when any of three triggers fires: the unified index exceeds 5 to 10 million chunks and retrieval quality degrades, per-language retrieval metrics diverge by more than 15 percentage points between the best and worst language, or query latency at the 95th percentile exceeds your SLA for any language.
+
+The migration itself is not trivial. Moving from a unified index to language-partitioned indexes while the system is in production requires running both architectures in parallel during the transition. You route a percentage of traffic to the new architecture, compare quality and latency metrics, and gradually shift traffic as you validate performance. A big-bang migration risks downtime and quality regressions that affect every language simultaneously. A gradual migration, language by language, lets you validate each partition independently. Start with your highest-volume language (typically English), partition it into its own index, validate that metrics hold, then move to the next language. The full migration for an eight-language system typically takes four to eight weeks of engineering time, including the monitoring and validation work.
+
+## Caching Strategies for Multilingual Systems
+
+Caching is the highest-leverage cost and latency optimization in any RAG system, and multilingual systems make it harder.
+
+**Language-aware cache keys.** A monolingual cache key is typically the query text (or its hash). A multilingual cache requires the query text plus the query language plus the target response language. The same semantic query in Japanese and Korean should not share a cache entry because the responses are in different languages. This seems obvious, but systems that cache on query embedding (where the multilingual embedding might map "password reset" in Japanese and Korean to similar vectors) can serve a cached Korean response to a Japanese user.
+
+**Lower cache hit rates.** Multilingual systems have inherently lower cache hit rates than monolingual systems because the same query appears in multiple languages, each generating a separate cache entry. If 1,000 users ask "how do I reset my password" and 600 ask in English, 200 in Japanese, 100 in German, and 100 in French, a monolingual system caches one entry and gets 999 hits. A multilingual system caches four entries and gets 996 hits on those specific queries -- but the effective hit rate across the full query distribution is lower because the query space is fragmented by language.
+
+**Semantic caching across languages.** Advanced caching strategies use multilingual embeddings to identify semantically equivalent queries across languages and serve the response in the appropriate language from a shared semantic cache. If the system has already generated an answer about password reset from the same source documents, and a new query in a different language asks the same question, the system can translate the cached response rather than regenerating from scratch. This works for factual queries with stable answers but fails for queries where the response should vary by cultural context or language-specific conventions.
+
+**Cache warming for predictable queries.** If your analytics show that certain queries are common across languages (product FAQ questions, policy explanations, how-to instructions), pre-generate and cache responses in all supported languages during off-peak hours. This eliminates latency for the most common queries and reduces peak-hour compute costs. The trade-off is that cached responses may become stale when source documents update, so you need cache invalidation tied to document updates.
+
+## Infrastructure Patterns
+
+Production multilingual RAG at scale converges on a few proven infrastructure patterns.
+
+**Per-language embedding microservices.** Instead of one embedding endpoint that handles all languages, deploy language-specific embedding services that can be independently scaled. Your Japanese embedding service might handle 3,000 requests per minute while your Polish embedding service handles 200. Independent scaling means you pay for the capacity each language actually needs, not a unified service sized for the peak across all languages.
+
+**Shared versus dedicated reranker instances.** Cross-lingual reranker models are expensive to load and serve. Sharing a single reranker fleet across all languages is simpler and more cost-efficient for low-volume systems. For high-volume systems, dedicated reranker instances per major language pair reduce contention and allow tuning (different batch sizes, different candidate counts) per language. The break-even point is typically around 5,000 to 10,000 reranking calls per minute per language pair -- below that, shared instances are more economical.
+
+**Language-aware load balancing.** Route queries to infrastructure optimized for their language. A Japanese query hits the Japanese index, the Japanese-optimized embedding service, and a reranker instance warmed with Japanese-English cross-lingual weights. This routing adds a small amount of architectural complexity but prevents the performance degradation that occurs when a service instance switches between languages constantly, losing whatever warmth its caches had for the previous language.
+
+**Tiered generation.** Use different generation models for different languages and stakes levels. A frontier model (GPT-5, Claude Opus 4.6) for high-stakes languages with strict quality requirements. A smaller, faster model (GPT-5-mini, Claude Haiku 4.5, Gemini 3 Flash) for lower-stakes languages or for queries where speed matters more than maximum quality. This tiered approach can reduce generation costs by 40 to 60 percent while maintaining quality where it matters most.
+
+## Cost Optimization Strategies
+
+When the finance team asks why multilingual RAG costs four times what monolingual would cost, you need more than architectural explanations. You need a cost optimization plan.
+
+**Prioritize caching for high-volume languages.** Your top two or three languages by query volume account for 60 to 80 percent of total queries. Aggressive caching for these languages -- semantic caching, pre-warmed caches, longer cache TTLs for stable content -- yields the highest absolute cost savings. A 30 percent cache hit rate for your top language saves more money than a 60 percent cache hit rate for your fifth language.
+
+**Use cheaper models for low-stakes languages.** Not every language needs frontier model generation. If your Thai market is a small fraction of revenue and the queries are mostly simple FAQ lookups, a smaller model with lower per-token cost may deliver acceptable quality at a fraction of the price. Test quality with the cheaper model first -- if metrics stay within thresholds, the savings are pure margin.
+
+**Batch embedding generation.** When new documents enter the corpus, generate embeddings for all language-specific indexes in a batch job during off-peak hours rather than real-time. Batch processing is 30 to 50 percent cheaper per embedding on most cloud providers, and document updates rarely need real-time indexing (a few hours of delay is acceptable for most knowledge bases).
+
+**Eliminate redundant cross-lingual retrieval.** If 95 percent of Japanese user queries are answered by Japanese documents, the cross-lingual search against English indexes is wasted compute for those queries. Use query classification to determine when cross-lingual retrieval is likely to help (the Japanese index returned low-confidence results) versus when it adds cost without benefit (the Japanese index returned high-confidence results). Smart routing of this kind reduces cross-lingual retrieval calls by 30 to 45 percent in practice, directly cutting embedding and reranking costs.
+
+**Monitor cost per language per query.** Track not just total cost but cost per query per language. You will discover that some languages cost two to three times more per query than others due to longer prompts, more cross-lingual processing, or lower cache hit rates. These per-language cost profiles inform pricing decisions (if you charge customers per query, languages with higher costs should be priced accordingly) and optimization priorities (the most expensive language per query is the best optimization target).
+
+**Right-size your cross-lingual embedding strategy.** The translate-then-embed approach (translating every document into every language) gives the best same-language retrieval quality but multiplies storage and embedding costs. The embed-once approach (using a multilingual embedding model on documents in their original language) is cheapest but cross-lingual retrieval quality is lower. The hybrid approach -- translate documents into your top three languages and use multilingual embeddings for the rest -- captures 80 to 90 percent of the quality benefit at 40 to 50 percent of the cost. Measure retrieval quality per language under each strategy and choose the approach whose quality-cost trade-off matches your requirements per language.
+
+## Monitoring at Scale
+
+The monitoring infrastructure for multilingual RAG must track three dimensions simultaneously: quality, latency, and cost, all broken down by language.
+
+**Per-language latency percentiles.** Track p50, p95, and p99 latency per language. The p50 tells you the typical experience. The p95 tells you the bad-day experience. The p99 tells you whether tail latency is causing timeouts. A language with a p50 of 300 milliseconds and a p99 of 2,500 milliseconds has a tail latency problem that likely stems from cross-lingual retrieval timeouts or reranker bottlenecks for that specific language pair.
+
+**Per-language cost tracking.** Compute the cost per query per language per day. Plot trends. A sudden cost increase for a specific language often signals a change in query patterns (longer queries, more cross-lingual retrieval needed) or a regression in caching (cache invalidation event, lower hit rates after a corpus update).
+
+**Quality degradation detection.** Run your evaluation pipeline (from subchapter 6.11) on a continuous sample and alert when quality metrics drop below thresholds for any language. The monitoring system should correlate quality drops with infrastructure events: a latency spike, a model update, a corpus change, or a traffic pattern shift. The correlation helps you diagnose root causes faster than investigating quality in isolation.
+
+**Capacity planning by language.** Track query volume per language over time and project growth. If your Korean query volume is growing at 15 percent month over month and your Korean-language infrastructure is at 70 percent capacity, you have four to five months before you need to scale. If you discover this during a capacity crunch rather than in a planning dashboard, you are reacting instead of planning.
+
+**Error rate monitoring per language.** Track error rates -- timeouts, parsing failures, language detection errors, empty retrieval results -- per language. A timeout rate that is 0.5 percent globally may be 0.1 percent for English and 3 percent for Thai, meaning Thai users experience timeouts at 30 times the English rate. Error rates per language reveal infrastructure bottlenecks that global averages hide. When a language's error rate spikes, correlate it with the specific pipeline stage (embedding service latency, index query timeout, reranker failure, generation timeout) to pinpoint the infrastructure component that needs attention.
+
+## The Architecture Decision Framework
+
+When your multilingual RAG system hits the scaling wall, use this framework to decide where to invest.
+
+First, identify the bottleneck. Is the problem latency (users waiting too long), cost (budget exceeded), or quality (metrics degrading for specific languages)? Each bottleneck has different solutions. Latency problems point to caching, index partitioning, and parallel processing. Cost problems point to model tiering, smart routing, and batch processing. Quality problems point to better embeddings, more evaluation, and language-specific tuning.
+
+Second, identify the language. The bottleneck is rarely uniform across languages. English might have a cost problem (high volume, low cache hit rate) while Thai has a quality problem (low retrieval accuracy) and Japanese has a latency problem (complex cross-lingual retrieval paths). Solving each language's specific bottleneck yields better ROI than applying a universal fix.
+
+Third, calculate the ROI of each intervention. A caching improvement that saves $2,000 per month for English is a better investment than a reranker upgrade that improves Thai recall by 3 percentage points if the Thai market generates minimal revenue. But if the Thai market is your growth priority, the quality investment may have higher strategic value despite lower immediate financial return. The framework forces you to make these trade-offs explicitly rather than defaulting to the intervention that is easiest to implement.
+
+This subchapter closes Chapter 6. Multilingual RAG is retrieval, generation, language control, faithfulness, evaluation, and infrastructure -- each layer complicated by the fundamental challenge of serving users in languages the system was not primarily designed for. The next chapter shifts from retrieval to the prompt layer: how do you write system prompts, few-shot examples, and formatting instructions that work across languages, when every assumption baked into an English prompt can fail silently the moment a user writes in Japanese, Arabic, or Thai?

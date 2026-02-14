@@ -1,0 +1,77 @@
+# 27.17 — Cluster Multi-Tenancy for AI: Isolation, Fairness, and Noisy Neighbor Control
+
+In September 2025, a mid-sized autonomous vehicle company consolidated its GPU infrastructure onto a single Kubernetes cluster. Four teams shared the hardware: perception model training, simulation inference, mapping data pipelines, and a research group experimenting with foundation model fine-tuning. For three weeks, everything worked. Then the research group launched an overnight fine-tuning run that requested every available GPU on the cluster. The job had no resource limits. It consumed all sixty-four H100s, including the GPUs that perception model inference was using to serve the real-time safety pipeline. Inference pods were evicted. The perception pipeline went dark for fourteen hours. The incident cost over $200,000 in delayed road-testing schedules, and the root cause was not a software bug or a hardware failure. It was that four teams shared a cluster with no isolation boundaries, no resource limits, and no visibility into who was consuming what. The platform team spent the next quarter building the guardrails that should have existed from the start.
+
+This is the multi-tenancy problem for AI infrastructure, and it is fundamentally different from the multi-tenancy problem that Kubernetes was designed to solve. Traditional multi-tenancy — separating web services for different teams on shared compute — involves workloads that use modest amounts of CPU and memory, fail gracefully under contention, and recover quickly from eviction. AI workloads violate every one of those assumptions.
+
+## The Three Dimensions of Isolation
+
+**Multi-tenancy** in Kubernetes means multiple teams or workloads sharing a single cluster while maintaining separation. That separation operates across three dimensions, and each dimension presents unique challenges for AI workloads.
+
+The first dimension is **resource isolation** — ensuring that one team's workloads cannot consume resources that belong to another team. For CPU workloads, the kernel handles this through time-slicing: if a container tries to use more CPU than its limit, the kernel throttles it. The container slows down, but it does not crash other containers. GPU isolation is fundamentally different. When a pod is allocated a GPU, it has exclusive access to that device's compute cores and memory. If two pods are somehow placed on the same GPU without proper sharing mechanisms like MIG or time-slicing, the result is not graceful degradation. It is a CUDA out-of-memory crash that kills one or both workloads instantly. GPU contention does not slow things down. It breaks things.
+
+The second dimension is **network isolation** — ensuring that workloads from different teams cannot communicate with each other unless explicitly permitted. This matters for AI workloads because distributed training jobs use high-bandwidth GPU-to-GPU communication through NCCL, often over RDMA networks that bypass the kernel network stack entirely. If two different teams run distributed training jobs on the same cluster without network isolation, their NCCL traffic can interfere with each other, causing collective operations to hang or timeout. Standard Kubernetes NetworkPolicies control TCP and UDP traffic at the pod level but have no awareness of RDMA or GPU Direct traffic.
+
+The third dimension is **data isolation** — ensuring that one team's models, datasets, and credentials are not accessible to another team. AI workloads constantly load large datasets from shared storage, write model checkpoints to persistent volumes, and access credentials for model registries and data stores. Without proper access controls, a training job in one namespace can potentially read model weights from another namespace's persistent volume, access another team's Hugging Face token, or overwrite checkpoint files that belong to a different training run.
+
+## Why AI Workloads Make Multi-Tenancy Harder
+
+Traditional Kubernetes workloads are individually small, horizontally scalable, and tolerant of resource pressure. A web service pod using 500 megabytes of memory and 0.5 CPU cores is easy to bin-pack, easy to move, and easy to restart. AI workloads are the opposite on every axis.
+
+A single training pod might request four or eight GPUs, each with 80 gigabytes of high-bandwidth memory. That pod cannot be moved to another node without terminating the training run. It cannot share its GPUs with other pods without explicit configuration of MIG partitions or time-slicing. It often requires specific GPU topology — GPUs connected via NVLink rather than PCIe — which constrains scheduling to specific physical configurations. And when this pod encounters resource contention, the failure mode is not a slow response. It is a crash, followed by the loss of training progress since the last checkpoint, followed by a restart that consumes another thirty minutes just to reload the model and dataset.
+
+The noisy neighbor problem that exists for CPU workloads — one container hogging cycles and slowing others — becomes a noisy neighbor catastrophe for GPU workloads. **The noisy neighbor problem** in GPU clusters is not that workloads slow down. It is that workloads crash, training progress is lost, and inference services go offline. This is why isolation for AI clusters is not a nice-to-have governance feature. It is a production reliability requirement.
+
+## Namespace-Based Isolation
+
+The foundation of multi-tenancy in Kubernetes is namespace separation. Each team gets its own namespace, and Kubernetes resources — pods, services, configmaps, secrets, persistent volume claims — exist within that namespace boundary. Namespaces provide logical isolation: a service in the perception namespace cannot accidentally reference a configmap in the research namespace. They also provide the boundary for applying resource quotas, RBAC policies, and network policies.
+
+For AI clusters, namespace design requires more thought than the typical one-namespace-per-team pattern. You need to separate not just by team but by workload class. A team that runs both production inference and experimental training should ideally have two namespaces — one for production workloads with strict resource guarantees and high-priority scheduling, and one for experimental workloads with lower priority and borrowable quotas. This separation prevents a team's own experiment from starving their own production service, which is a failure mode that single-namespace-per-team designs allow.
+
+ResourceQuotas attached to each namespace enforce hard limits on the total resources that namespace can consume. You set a quota of eight GPUs for the research namespace, and no combination of pods in that namespace can exceed eight. This is the blunt instrument of GPU isolation — it prevents runaway consumption but does not handle fairness or scheduling priority. A team that submits a job requesting all eight of their GPUs blocks every other job in their queue, even if six of those GPUs will sit idle for the first hour while data loads. ResourceQuotas are necessary but not sufficient.
+
+## Network Isolation for Multi-Tenant GPU Clusters
+
+Kubernetes NetworkPolicies are the standard mechanism for controlling pod-to-pod communication. By default, all pods in a Kubernetes cluster can communicate with all other pods. A NetworkPolicy applied to a namespace restricts ingress and egress traffic to only explicitly permitted sources and destinations.
+
+For AI clusters, you need at minimum a default-deny policy on every namespace, followed by specific allow rules. The perception team's inference services should be reachable from the API gateway but not from the research team's training pods. The research team's training pods need to communicate with each other for distributed training but should not be able to reach the perception team's model storage.
+
+The complication arises with high-performance networking. Distributed training jobs that use RDMA for GPU-to-GPU communication operate outside the standard Kubernetes networking model. NCCL traffic over InfiniBand or RoCE does not pass through the CNI plugin, so standard NetworkPolicies have no effect on it. If two teams run NCCL-based training on the same physical nodes, their GPU-to-GPU traffic can collide on the shared network fabric. The mitigation is either physical isolation — dedicating specific nodes to specific teams — or using network QoS mechanisms at the fabric level to allocate bandwidth per tenant. Neither is controlled through Kubernetes APIs. Both require coordination with the network infrastructure team.
+
+## RBAC Design for AI Clusters
+
+**Role-Based Access Control** in Kubernetes determines who can perform which actions on which resources. For AI clusters, the RBAC model must account for roles that do not exist in traditional web-service clusters.
+
+Start by defining the roles specific to AI operations. A **training engineer** needs permission to create and delete training jobs, view logs, and access model storage, but should not be able to modify cluster-level settings like priority classes or resource quotas. An **inference operator** needs permission to deploy and scale inference services, configure autoscalers, and manage routing, but should not be able to submit training jobs that consume GPUs intended for serving. A **platform administrator** manages the cluster-level resources — node pools, priority classes, cluster queues, device plugins — that all teams depend on. And a **read-only observer** — used by management, finance, or compliance — can view resource utilization and costs but cannot modify any workload.
+
+The common RBAC mistake in AI clusters is giving every data scientist cluster-admin privileges because "they need to be unblocked." This collapses the entire multi-tenancy model. A data scientist with cluster-admin can modify resource quotas, change priority classes, evict other teams' pods, and access secrets from any namespace. The initial convenience creates a cluster where one frustrated researcher who modifies a priority class at 11pm can trigger a cascade of preemptions across every production workload.
+
+## Hard Multi-Tenancy Versus Soft Multi-Tenancy
+
+The decision between hard and soft multi-tenancy shapes your entire cluster architecture, and getting it wrong is expensive to reverse.
+
+**Soft multi-tenancy** uses namespace isolation, RBAC, and resource quotas on a shared cluster. All teams share the same control plane, the same node pools, and the same network fabric. Isolation is enforced by Kubernetes policies, not by physical boundaries. This is the right choice when teams trust each other, regulatory requirements do not mandate physical separation, and the priority is maximizing GPU utilization across the organization. Most enterprise AI platforms in 2026 start here.
+
+**Hard multi-tenancy** gives each team its own cluster — or uses virtual cluster technology like vCluster to create fully isolated Kubernetes environments within a shared physical infrastructure. Each virtual cluster has its own control plane, its own CRDs, its own RBAC, and its own API server. Workloads in one virtual cluster cannot see or affect workloads in another, even if they share underlying hardware. This is the right choice when teams operate under different compliance regimes — one team handling healthcare data under HIPAA, another handling financial data under SOX — or when trust between teams is low, or when workload interference has unacceptable business consequences.
+
+The cost of hard multi-tenancy is utilization. Separate clusters mean separate resource pools that cannot share capacity. If the research cluster has idle GPUs and the production cluster is full, those idle GPUs cannot help without manual intervention or a multi-cluster orchestration layer. Virtual clusters mitigate this by sharing the underlying hardware while maintaining control plane isolation, but they add operational complexity and require the platform team to manage both the host cluster and the virtual cluster lifecycle.
+
+## When to Split Clusters
+
+The decision to split into separate physical clusters follows a specific pattern. Teams that share a regulatory boundary, share a trust boundary, and can tolerate mutual scheduling interference should share a cluster. Teams that differ on any of those three axes should be separated.
+
+If you have fewer than five teams and they all operate under the same compliance requirements, a single cluster with namespace isolation, ResourceQuotas, and NetworkPolicies is sufficient and maximizes utilization. If you grow beyond ten teams, or if any team handles data with specific regulatory requirements, splitting becomes necessary — not because Kubernetes cannot handle ten namespaces, but because the governance complexity of ten teams arguing over priority, quotas, and preemption policies in a single cluster exceeds the platform team's ability to mediate fairly.
+
+The pragmatic approach that most mature organizations adopt by 2026 is a tiered model. A shared development and experimentation cluster where GPU utilization is maximized through permissive quotas and preemptible scheduling. A shared production cluster with stricter isolation, guaranteed resource reservations, and higher-priority scheduling. And dedicated clusters for workloads with specific regulatory requirements — healthcare models, financial models, or government contracts that mandate physical isolation. This tiered model balances utilization against isolation, letting each workload class get the tenancy model it needs without forcing the strictest requirements onto the entire organization.
+
+## The Governance Layer That Makes It Work
+
+Multi-tenancy is not a set-and-forget configuration. It is an ongoing governance practice. Resource quotas need periodic review as teams grow and workload patterns shift. RBAC policies need auditing as team members rotate. Network policies need testing as new services are deployed. Priority classes need adjustment as business priorities change.
+
+The platform team that treats multi-tenancy as a one-time setup will find, within six months, that quotas no longer match reality, that three former interns still have cluster-admin access, and that a NetworkPolicy change six weeks ago silently broke cross-namespace monitoring. Multi-tenancy governance requires the same operational discipline as the workloads it protects — regular reviews, automated auditing, and clear escalation paths when teams disagree about resource allocation.
+
+The most effective governance pattern is a monthly capacity review where each team's utilization data, quota usage, and incident history are presented to engineering leadership alongside a forward-looking capacity plan. This meeting is where quota adjustments are approved, priority disputes are resolved, and cluster-split decisions are made. Without it, multi-tenancy degrades into a series of ad-hoc negotiations between the platform team and whichever team is loudest.
+
+---
+
+Isolation boundaries tell teams where their resources end. But boundaries without enforcement are suggestions. The next subchapter covers how to turn organizational governance into infrastructure constraints through ResourceQuotas, PriorityClasses, and the Kueue queuing system that makes quota enforcement automatic rather than manual.

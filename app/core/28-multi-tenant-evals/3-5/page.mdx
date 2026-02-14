@@ -1,0 +1,75 @@
+# 28.5 — The Noisy Neighbor Effect: Resource Contention in Shared Eval Infrastructure
+
+The eval pipeline grinds to a halt on a Tuesday afternoon. Latency for scoring requests jumps from 1.2 seconds to 14 seconds. Three customer success managers ping the platform team within minutes because their per-tenant dashboards show evaluation jobs stuck in a pending state. The on-call engineer checks the compute cluster and finds that a single tenant — a large insurance customer who just uploaded 45,000 new golden set examples — triggered a massive re-evaluation run that consumed every available GPU and saturated the LLM judge API quota for the entire platform. Every other tenant's scheduled evaluation is now starving for resources. The insurance customer's eval run will finish in about ninety minutes. For those ninety minutes, 347 other tenants effectively have no working evaluation infrastructure.
+
+This is the **Noisy Neighbor Effect** applied to evaluation systems. The term originates from cloud computing, where one tenant's workload on shared infrastructure degrades performance for everyone else. In multi-tenant eval, the effect is especially destructive because evaluation is not just a background task — it feeds release gates, triggers alerts, powers customer-facing quality dashboards, and drives automated rollback decisions. When eval stalls, the consequences ripple through every system that depends on quality signals.
+
+## Why Eval Workloads Are Uniquely Susceptible
+
+Traditional SaaS workloads — API calls, database queries, page renders — tend to have predictable resource profiles. A single API call uses a bounded amount of compute, and traffic patterns follow daily cycles that autoscalers handle well. Eval workloads are different. They are bursty, variable, and occasionally enormous.
+
+A single tenant re-running their full regression suite after a model update might submit 20,000 evaluation requests in minutes. A quarterly compliance audit for a regulated customer might trigger exhaustive evaluation of every output produced in the last 90 days. A customer onboarding their first golden set might run calibration loops that execute the same set of examples through multiple judge configurations, multiplying the effective load by five or six. These bursts are legitimate. The tenant has every right to run them. But on shared infrastructure, one tenant's legitimate burst is every other tenant's outage.
+
+The resource consumption profile of LLM-as-judge evaluation makes the problem worse. Each judge call consumes tokens — often thousands of tokens per evaluation, because the judge needs the original prompt, the model output, the scoring rubric, and any reference answers in its context window. A 20,000-example evaluation run at 3,000 tokens per judgment consumes 60 million tokens. At current 2026 pricing for frontier judge models like Claude Opus 4.6 or GPT-5, that single run can consume the platform's entire token budget allocation for the hour. Every other tenant's judge calls queue behind it.
+
+## The Two Contention Vectors
+
+Resource contention in eval infrastructure manifests through two distinct vectors, and you need to defend against both.
+
+The first vector is **compute contention** — GPU cycles, CPU cores, and memory bandwidth consumed by eval jobs. If your eval pipeline runs model inference locally for smaller models or adapters, a tenant who evaluates against a fine-tuned Llama 4 Maverick model is consuming GPU resources that other tenants need. Even if you use external APIs for all inference, the orchestration layer — the code that assembles prompts, parses judge outputs, computes aggregate scores, and writes results — consumes CPU and memory on shared infrastructure. A tenant running 20,000 evaluations generates 20,000 orchestration tasks, each competing for the same worker pool.
+
+The second vector is **API quota contention** — rate limits on the external LLM APIs that power your judge calls. Most LLM providers enforce rate limits at the API key or organization level. If your platform uses a single API key for all judge calls across all tenants, every tenant competes for the same rate limit pool. A tenant who floods the judge API with requests pushes other tenants into rate-limit queues. The insidious part is that API rate limiting often manifests as increased latency rather than hard failures — requests slow down rather than error out — which means affected tenants see their eval jobs take ten times longer without any error message explaining why.
+
+## Token-Based Limiting Versus Request-Based Limiting
+
+The most common mistake in eval resource management is using request-per-second rate limiting when token-based limiting is what you actually need. These are fundamentally different approaches, and choosing the wrong one creates the illusion of fairness while allowing the noisy neighbor effect to persist.
+
+Request-per-second limiting says each tenant can submit a fixed number of evaluation requests per second. At first glance, this seems fair — every tenant gets the same throughput. But eval requests are not uniform in cost. A tenant evaluating short customer service responses against a three-sentence rubric uses 800 tokens per judge call. A tenant evaluating long legal documents against a detailed compliance rubric uses 12,000 tokens per judge call. Under request-per-second limiting, both tenants submit the same number of requests, but the legal tenant consumes fifteen times more tokens, fifteen times more API capacity, and fifteen times more compute. The customer service tenant is subsidizing the legal tenant's resource usage without either party knowing it.
+
+**Token-based limiting** addresses this by allocating each tenant a token budget per time window rather than a request budget. The legal tenant can submit fewer but larger evaluations. The customer service tenant can submit more but smaller evaluations. Both consume proportional resources. Token-based limiting is harder to implement because you need to estimate token usage before submitting each judge call — or track it in real time and throttle when a tenant approaches their budget — but it is the only approach that achieves actual fairness in LLM-as-judge workloads where request size varies by an order of magnitude.
+
+In practice, mature platforms use a hybrid approach. Request-per-second limits provide a coarse safety net against runaway job submission. Token budgets per time window provide fine-grained resource fairness. And total concurrent job limits prevent any single tenant from monopolizing the orchestration worker pool regardless of per-request size.
+
+## Fair-Share Scheduling for Eval Jobs
+
+Rate limiting prevents a tenant from overwhelming the system. **Fair-share scheduling** ensures that when the system is under load, every tenant gets proportional access to whatever capacity is available. These are complementary, not interchangeable.
+
+Fair-share scheduling works by maintaining a per-tenant queue and a weighted round-robin dispatcher. When the eval system has capacity, it pulls work from tenant queues in proportion to each tenant's allocation weight. If the system can process 100 judge calls per second and 10 tenants have pending work, a naive round-robin gives each tenant 10 calls per second. A weighted fair-share scheduler gives higher-tier tenants proportionally more — a premium tenant might get 15 calls per second while a standard-tier tenant gets 7.
+
+The critical detail is what happens when a tenant does not use their share. Good fair-share schedulers redistribute unused capacity to tenants with pending work rather than letting it go idle. If 8 of the 10 tenants have no pending eval jobs, the remaining 2 tenants should split the full 100 calls per second between them, weighted by their allocation. When the other 8 tenants submit work, their queues start receiving their fair share again, and the two heavy tenants naturally throttle back. This work-conserving behavior means the system runs at maximum throughput when load is uneven — which it almost always is — while still guaranteeing minimum throughput when load is high.
+
+Research on GPU cluster scheduling for multi-tenant AI workloads, including systems like ASTRAEA and THEMIS, has established that finish-time fairness — ensuring each tenant's jobs complete in proportionally similar time — produces better outcomes than simple resource-share fairness. The same principle applies to eval scheduling. A tenant who submits a 500-example eval and a tenant who submits a 50,000-example eval should both see their results in proportional time, not see the larger job starve the smaller one.
+
+## Tiered Compute Allocation
+
+Not every tenant should receive equal eval resources. Your pricing tiers, contractual commitments, and customer value should determine eval resource allocation, just as they determine every other resource allocation in your platform.
+
+**Dedicated compute for high-tier tenants** means reserving specific eval workers, GPU partitions, or API key pools for your most important customers. A healthcare customer paying $1.2 million per year with a contractual SLA on evaluation turnaround time should never have their eval jobs waiting behind a free-tier customer's batch run. Dedicated compute is expensive — you are paying for reserved capacity that sits idle during low-load periods — but for high-value customers, the cost of a noisy neighbor incident far exceeds the cost of reserved capacity. Losing a $1.2 million contract because their compliance evaluation stalled for two hours during a critical audit is not a hypothetical scenario. It is the scenario your sales team told you about last quarter.
+
+**Shared pools with guaranteed minimums** serve mid-tier tenants. Each tenant gets a guaranteed minimum allocation — say, 500 judge calls per minute — that is always available regardless of system load. Above that minimum, they compete in the fair-share pool with other mid-tier tenants. This guarantees that routine eval runs always complete in bounded time while allowing bursts when capacity is available.
+
+**Best-effort pools** serve standard-tier tenants. They receive whatever capacity remains after dedicated and guaranteed allocations are served. During low-load periods, they get fast eval turnaround. During peak load, they wait. Best-effort is acceptable when the tenant's eval runs are not time-sensitive — nightly batch evaluations, weekly regression suites — but it is not acceptable when the tenant expects real-time quality signals.
+
+The allocation tiers must be transparent to the customer. If a standard-tier customer expects their eval runs to complete in five minutes and they consistently take forty-five minutes because they are in the best-effort pool, you have a communication problem that will become a trust problem. Either upgrade their allocation to match their expectations or set their expectations to match their allocation.
+
+## Detecting the Noisy Neighbor in Real Time
+
+You cannot prevent every noisy neighbor incident through scheduling and rate limiting alone. You also need detection — the ability to identify when one tenant's workload is degrading the experience for other tenants, in real time, so you can intervene before the impact becomes visible to customers.
+
+The primary detection signal is **per-tenant latency correlation**. When eval latency spikes for multiple tenants simultaneously, check which tenant's job volume increased in the same time window. If Tenant 47's eval submissions jumped from 200 per minute to 8,000 per minute and Tenants 12, 85, and 203 all experienced a threefold latency increase at the same time, the correlation is your signal. Build this correlation into your monitoring system as an automated check — not as something an on-call engineer does manually after three customer success managers ping them.
+
+The second detection signal is **queue depth asymmetry**. In a healthy fair-share system, per-tenant queue depths stay roughly proportional to submission rates. When one tenant's queue depth grows much faster than others — because they are submitting work faster than their fair share can drain it — that tenant is either about to become a noisy neighbor or already is one. An alert on queue depth asymmetry gives you a leading indicator, not a trailing one.
+
+The third detection signal is **API quota consumption velocity**. Track the rate at which each tenant consumes tokens from shared API quotas. If one tenant's consumption rate exceeds their proportional share by more than a configured threshold — say, three times their fair-share allocation — flag it. The tenant might be running a legitimate large job, but the flag ensures someone is watching the impact on other tenants.
+
+When you detect a noisy neighbor, your response options range from gentle to aggressive. The gentlest is dynamic throttling — reduce the noisy tenant's dispatch rate until their resource consumption falls back to their fair-share allocation. More aggressive is job preemption — pause the noisy tenant's eval run, allow other tenants' queues to drain, then resume. The most aggressive is job migration — move the noisy tenant's eval run to a dedicated burst pool where it can consume resources without affecting the shared infrastructure. The right response depends on the tenant's tier, the severity of the impact, and whether the burst was expected. A premium tenant running a pre-announced quarterly audit gets migrated to burst capacity with no disruption. A standard tenant who accidentally submitted their eval three times gets throttled while you sort it out.
+
+## The Organizational Dimension
+
+The noisy neighbor effect is not purely technical. It has an organizational dimension that catches teams off guard. When a high-value customer's eval run slows down because of a noisy neighbor, the customer success manager escalates to the platform team. The platform team identifies the noisy neighbor — another customer — and faces an uncomfortable question: which customer's eval run takes priority?
+
+Without pre-defined policies, this becomes a political decision made under pressure. The CSM for the affected customer argues their customer is more important. The CSM for the noisy neighbor argues their customer has a legitimate need. Engineering is caught in the middle.
+
+The solution is to establish resource allocation policies before incidents occur, tie them to contract tiers and published SLAs, and implement them in the scheduler rather than in Slack threads. When the policy is "dedicated-tier tenants always have reserved capacity, guaranteed-tier tenants always receive their minimum, and best-effort tenants share the remainder," the incident response is mechanical, not political. The engineer does not need to decide which customer matters more. The system already knows.
+
+Audit trails for multi-tenant evaluation — the subject of the next subchapter — provide the evidence that your resource allocation policies were enforced correctly, not just the evidence that evaluation ran at all.

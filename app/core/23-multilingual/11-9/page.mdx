@@ -1,0 +1,119 @@
+# 11.9 — Evaluation Gating for Multilingual Fine-Tuned Models
+
+A multilingual fine-tuned model that passes evaluation in your primary language but has not been tested in every supported language is not ready to ship. It is a liability waiting to deploy. The entire point of multilingual fine-tuning is to serve users across languages, and if your release gate only checks the language you optimized for, you have no idea what happened to the others. You do not get to assume they are fine. You must prove it. Every language, every dimension, every checkpoint. This is the evaluation tax you pay for the privilege of serving a global audience, and teams that refuse to pay it discover the cost through production incidents instead.
+
+The core difficulty is combinatorial. Monolingual evaluation is already expensive. Multilingual evaluation multiplies every dimension by every language, and the interactions between dimensions and languages create failure modes that no single-language eval can detect. A model that passes Japanese task accuracy and passes Japanese fluency might still fail Japanese safety in ways that only surface when you test all three together on the same checkpoint. The gating framework you build must account for this combinatorial reality without becoming so expensive that you can never ship anything.
+
+## The Minimum Eval Matrix
+
+For every supported language, a multilingual fine-tuned model must pass evaluation on at least four dimensions before it can enter production.
+
+The first dimension is **task accuracy** — does the model accomplish the thing you fine-tuned it to do, in that language? If you fine-tuned for legal document summarization, does the model produce correct, complete summaries of legal documents in Korean, in Thai, in Portuguese? Task accuracy is the dimension teams measure most naturally because it is the reason they fine-tuned in the first place. The mistake is stopping here.
+
+The second dimension is **fluency and naturalness** — does the model produce output that a native speaker considers well-formed and natural? A model can achieve high task accuracy while generating stilted, unnatural prose that users find uncomfortable. This matters more in some languages than others. Japanese users are especially sensitive to register mismatches and unnatural phrasing. Arabic users notice when a model defaults to Modern Standard Arabic when the context calls for a regional dialect. Fluency evaluation requires native-speaker judgment or, at scale, an LLM-as-judge calibrated against native-speaker ratings for each language.
+
+The third dimension is **safety** — does the model refuse harmful requests, avoid generating toxic content, and handle sensitive topics appropriately in that language? Safety is the dimension most likely to degrade silently after fine-tuning, because safety alignment is often encoded in English-centric training, and fine-tuning on task-specific data in other languages can partially overwrite those safety behaviors. A model that refuses to generate harmful content in English but complies when the same request arrives in Vietnamese has a safety failure that your English-only safety eval will never catch.
+
+The fourth dimension is **regression against the base model** — on capabilities you did not fine-tune for, is the model at least as good as it was before you touched it? This is the catastrophic forgetting check. If the base model could answer general knowledge questions in Hindi at 82 percent accuracy and your fine-tuned model now scores 71 percent, you have broken something. The fine-tuning improved your target task but degraded the model's general Hindi capability, and users who depend on that general capability will notice immediately.
+
+These four dimensions multiplied by every supported language give you your minimum eval matrix. If you support eight languages and evaluate four dimensions per language, that is thirty-two evaluation gates that must all pass. Not most of them. All of them.
+
+## The Gate Structure
+
+A gate is a threshold below which the model cannot ship for that language. Setting gates correctly requires understanding what "good enough" means for each combination.
+
+The absolute gate sets a minimum quality floor regardless of what the base model could do. If your task accuracy threshold is 75 percent, any language scoring below 75 percent on task accuracy is blocked. This catches the case where the base model was already poor in a language and fine-tuning did not improve it enough.
+
+The regression gate prevents degradation. No language can drop more than a defined threshold from the base model on any dimension. Industry practice as of 2026 typically sets this at two to three percentage points. If the base model scored 85 percent on Hindi general conversation and your fine-tuned model scores 82, that three-point drop is at the edge. A five-point drop is a clear failure. The regression gate catches the scenario where your fine-tuning improved the target task but silently damaged something else.
+
+The combined gate requires both the absolute threshold and the regression threshold to pass simultaneously. A language that meets the absolute floor but regressed significantly from the base model still has a problem — it means fine-tuning moved capability around rather than adding it. A language that shows no regression but sits below the absolute floor was already inadequate and fine-tuning did not fix it. Both failures require different remediation, and the combined gate catches both.
+
+The asymmetric gate recognizes that not all dimensions are equally important for all languages. For a language where your primary deployment is a customer service chatbot, task accuracy and fluency might be weighted more heavily than general knowledge regression. For a language serving a healthcare application, safety gates should be stricter — perhaps zero tolerance for regression. The gating framework must allow per-language, per-dimension thresholds that reflect the actual risk profile of each deployment.
+
+## The Hidden Regression Problem
+
+This is the failure mode that destroys trust in multilingual fine-tuning, and it is the reason per-dimension evaluation matters as much as aggregate scores.
+
+A team fine-tunes a model for Japanese legal summarization. Their task-specific eval shows an eight-point improvement in Japanese legal accuracy. They celebrate. They ship. Within two weeks, Japanese users start complaining that the model's general conversation quality has degraded. It gives awkward, overly formal responses to casual questions. It sometimes drops particles in ways that sound unnatural. It occasionally defaults to English words where Japanese words would be expected.
+
+What happened? The fine-tuning improved one dimension — Japanese legal task accuracy — while degrading another — Japanese general fluency and naturalness. The team's eval suite measured the first dimension but not the second. The aggregate score across all Japanese evaluations might have even improved, because the legal accuracy gain was larger than the fluency loss. But users do not experience aggregate scores. They experience individual interactions, and in those interactions, the model felt worse.
+
+This is the **Hidden Regression Problem**: a model that improves on the dimension you measured while degrading on the dimension you did not. It is invisible to any eval that checks only task-specific performance. It surfaces only when you evaluate every dimension independently and compare each one to the base model's performance.
+
+The detection method is straightforward but requires discipline. For every language affected by fine-tuning, maintain a separate eval set for each dimension. Do not combine them into a single score. Look at each dimension independently. A checkpoint where Japanese legal accuracy goes up eight points but Japanese conversational fluency goes down four points is not a net positive. It is a trade-off that needs explicit authorization from the product team, because you are making Japanese legal users happier while making Japanese general users less satisfied.
+
+## Per-Language Go and No-Go Decisions
+
+The most powerful flexibility in multilingual evaluation gating is the ability to make independent deployment decisions per language.
+
+You do not have to ship the same model to every market at the same time. If your fine-tuned model passes all gates for Japanese and Korean but fails the fluency gate for Thai, you can deploy the fine-tuned model for Japanese and Korean while continuing to serve Thai users from the base model with optimized prompting. This is a per-language release strategy, and it requires your serving infrastructure to support routing by language — a capability that, as discussed in Section 9, should be part of your model routing architecture from the start.
+
+Per-language decisions also give you a prioritization framework for remediation. When three languages fail gates, you address them in order of business impact. If Thai serves 15,000 daily active users and Vietnamese serves 3,000, the Thai remediation is more urgent. You ship the languages that pass, flag the languages that fail, and create specific remediation plans for each failed language rather than holding the entire release hostage to the weakest performer.
+
+The per-language release strategy requires careful communication. If you update the model for Japanese users but not Thai users, you need to track which model version is serving which language. Your monitoring dashboard needs per-language version indicators. Your incident response playbook needs to account for the possibility that a bug report relates to the fine-tuned model in one language and the base model in another. The operational overhead is real, but it is far preferable to the alternative: either shipping a model that degrades Thai quality because Japanese quality passed, or holding back a Japanese improvement indefinitely because Thai is not ready.
+
+## The Eval Cost Multiplier
+
+The arithmetic is uncomfortable but unavoidable. Multilingual evaluation scales multiplicatively, not additively.
+
+If you support eight languages and have 200 evaluation cases per dimension, and you evaluate four dimensions per language, you need 6,400 evaluation runs per checkpoint. If you evaluate three checkpoints per training run to select the best one, that is 19,200 evaluation runs per experiment. If you run five experimental configurations to find the right hyperparameters, you are looking at 96,000 evaluation runs before you have a candidate model.
+
+For automated metrics — task accuracy computed against a reference, fluency scored by a language model, regression measured against stored base model outputs — the computational cost is manageable. Most of these evaluations can run in parallel on a cluster, and a single evaluation run takes seconds to minutes depending on the metric. The bottleneck is not compute. The bottleneck is the evaluation infrastructure that must handle this volume reliably, store the results in a queryable format, and surface per-language, per-dimension trends across checkpoints.
+
+For human evaluation — which you need for fluency validation and safety review, especially in the initial calibration phase — the cost is much higher. If each human evaluation takes two minutes and costs one dollar per judgment, and you need three judges per example for reliability, your 200 fluency examples across eight languages cost 4,800 dollars per checkpoint in human evaluation alone. Multiply by checkpoints and experiments, and human evaluation during multilingual fine-tuning easily reaches five figures per training cycle.
+
+The teams that manage this cost effectively do so through a tiered evaluation strategy. Automated metrics run on every checkpoint for every language. Human evaluation runs only on the final candidate model, and only on the dimensions where automated metrics have shown risk. If automated fluency scoring flags Korean fluency as potentially degraded, Korean fluency gets human evaluation. If automated scoring shows German fluency is stable, German fluency gets a spot-check rather than a full human eval pass. This tiered approach reduces cost by 60 to 70 percent while maintaining coverage where it matters.
+
+## Automating Multilingual Evaluation with LLM-as-Judge
+
+The scalability of multilingual evaluation depends heavily on LLM-as-judge, where a large language model evaluates the outputs of the fine-tuned model instead of a human reviewer. This approach is now standard practice for monolingual evaluation. For multilingual evaluation, it introduces a reliability challenge that most teams underestimate.
+
+Research published in 2025 by Hlavnova and Ruder examined how reliable multilingual LLM-as-judge evaluation actually is. The findings were sobering. State-of-the-art judge models achieve an average cross-lingual consistency — measured by Fleiss' Kappa — of approximately 0.3. For context, a Kappa of 0.3 indicates only fair agreement. The judge model that gives a confident quality score for English output might give a contradictory score for semantically equivalent output in Swahili. Worse, the reliability drops further for low-resource languages, precisely the languages where you most need automated evaluation because human evaluators are scarce and expensive.
+
+The practical implication is that you cannot use a single judge prompt across all languages and trust the results equally. You need language-matched judge prompts — evaluation instructions written in or calibrated for the language being judged. A judge evaluating Korean fluency needs to understand Korean discourse markers, honorific systems, and register conventions. A judge evaluating Arabic safety needs to understand cultural context that differs substantially from English safety norms.
+
+You also need judge calibration per language. Before trusting LLM-as-judge scores for Thai fluency, collect a calibration set of 50 to 100 Thai outputs rated by native Thai speakers. Run your judge on the same outputs. Measure the correlation. If the judge agrees with human raters at 0.85 correlation for English but only 0.55 for Thai, your Thai judge scores are unreliable and you need either a better judge prompt, a different judge model, or continued human evaluation for Thai until you can improve automated reliability.
+
+Ensemble judging — using multiple judge models and aggregating their scores — improves consistency, particularly for low-resource languages. Research has shown that majority-vote or minority-veto strategies across three to five open-source judge models can raise cross-lingual agreement to acceptable levels for many languages. The cost of running three judges instead of one is significant, but it is still far cheaper than human evaluation at scale. For languages where no single judge achieves acceptable reliability, ensemble judging is not optional. It is the minimum bar for trustworthy automated evaluation.
+
+## The Release Checklist
+
+Before a multilingual fine-tuned model goes to production, the following must be verified. This is not a suggestion. This is the list that separates a professional deployment from a hope-based one.
+
+All supported languages have been evaluated on all four dimensions — task accuracy, fluency, safety, and regression. No language has been skipped because "it's probably fine" or "we didn't have eval data for that one." If you support a language, you evaluate it. If you cannot evaluate it, you do not support it with the fine-tuned model.
+
+No language falls below the absolute quality floor on any dimension. The floor varies by dimension and by language based on your product requirements, but every language must clear its floor.
+
+No language has regressed more than the allowed threshold from the base model on any dimension. The regression check covers not just the languages you fine-tuned for but all languages the model supports, because cross-lingual transfer means that fine-tuning on Japanese data can degrade Korean or Chinese performance.
+
+The LLM-as-judge reliability has been verified for every language where automated evaluation is the primary gate. If you have not calibrated the judge for a language, that language's automated scores are informational, not gating.
+
+Per-language deployment decisions have been documented. For each language, the decision is either "deploy fine-tuned model," "continue serving base model," or "block deployment pending remediation." Each decision is accompanied by the evaluation evidence that supports it.
+
+A rollback plan exists for each language. If the fine-tuned model degrades in production in ways the eval suite did not catch, you can revert to the base model for that specific language without affecting other languages. This requires language-level routing in your serving infrastructure.
+
+Monitoring is configured to track per-language quality metrics in production. The eval suite is a pre-launch gate, but production monitoring is the ongoing gate. If Japanese fluency scores start declining three weeks after deployment, your monitoring catches it before users file enough complaints for the product team to notice.
+
+## When the Gate Says No
+
+A failed gate is not a failure of the fine-tuning project. It is the gate doing its job.
+
+When a language fails evaluation, the response is diagnosis, not despair. The first question is which dimension failed. Task accuracy failures suggest insufficient or poor-quality training data for that language. Fluency failures suggest that the training data, while task-correct, contained unnatural or translated-sounding text. Safety failures suggest that safety alignment was eroded by the fine-tuning data mix. Regression failures suggest that the training volume or learning rate was too aggressive, overwriting too much of the base model's existing capability.
+
+Each diagnosis leads to a different remedy. Task accuracy failures are fixed with more or better data. Fluency failures are fixed by replacing translated training data with native-authored data. Safety failures are fixed by interleaving safety-alignment data into the training mix, as discussed in the safety literature for fine-tuning. Regression failures are fixed by reducing the fine-tuning intensity — lower learning rate, fewer epochs, or techniques like LoRA that constrain the magnitude of weight updates.
+
+The worst response to a failed gate is to lower the threshold. Teams under deadline pressure sometimes redefine "acceptable" to match whatever the model produced. This is how you ship a model that your own evaluation said was not ready, and it is how you erode trust — both user trust in the product and organizational trust in the evaluation process. The gate exists to protect your users. If the model does not pass, the model does not ship. You fix the model or you wait.
+
+## Building Evaluation Gating Into the Training Pipeline
+
+The final operational consideration is where evaluation gating lives in your workflow. It should not be a manual process at the end of training. It should be automated and integrated into your training pipeline.
+
+Every training run should automatically trigger evaluation across all languages and all dimensions upon completion. The results should populate a dashboard that shows per-language, per-dimension scores compared to gates. Green means the gate passed. Red means it failed. Yellow means within one point of the threshold — technically passing but worth monitoring.
+
+The dashboard should compare the current checkpoint not just to the gates but to previous training runs, so you can see trends. If Korean fluency has been declining across your last three training experiments, that trend tells you something about your data or training configuration that a single-point pass-fail check would miss.
+
+When a training run produces a checkpoint where all languages pass all gates on the dashboard, that checkpoint is a release candidate. When any language fails any gate, the checkpoint is blocked from deployment automatically. No human needs to make the call. The gate makes the call. The human's job is to investigate why it failed and decide what to fix.
+
+This automation is the only way to sustain multilingual evaluation gating at scale. A team that supports twelve languages and runs multiple training experiments per week cannot afford to manually evaluate every checkpoint. Automation makes the expensive thing — comprehensive multilingual evaluation — the default thing that happens every time, rather than the aspirational thing that happens when someone remembers.
+
+The next subchapter explores distillation for multilingual small models — how to transfer the quality of a frontier model into a model small enough for your production latency and cost constraints, without losing the multilingual capability you need.

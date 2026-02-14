@@ -1,0 +1,73 @@
+# 27.22 — Capacity Fragmentation: Building a Usable Fleet from Uneven GPU Supply
+
+The platform team stares at the capacity dashboard. The numbers look healthy: 340 GPUs across the fleet, 47 percent showing as available. A researcher submits a training job requesting eight H100 GPUs connected by NVLink in a single node. The job sits in the queue for six hours before anyone investigates. The dashboard says 160 GPUs are free. But when they drill into the node-level view, the picture falls apart. Node one has two idle GPUs. Node seven has one. Node twelve has three. Node nineteen has two. The available capacity is real — those GPUs genuinely have no workloads running on them — but it is scattered across nodes in groups of one, two, and three. No single node has eight contiguous GPUs free. The researcher's job cannot run, despite nearly half the fleet sitting idle.
+
+This is **capacity fragmentation**, and it is the silent killer of GPU utilization. It is the gap between the capacity your monitoring says you have and the capacity your scheduler can actually use.
+
+## Why Fragmentation Happens
+
+Fragmentation is not a bug. It is an emergent property of how Kubernetes schedules GPU workloads over time.
+
+Consider a node with eight GPUs. At 9am, a researcher submits a four-GPU training job. The scheduler places it on this node, consuming GPUs zero through three. At 10am, an inference team deploys a service that needs two GPUs. The scheduler places it on the same node, consuming GPUs four and five. At 11am, a second inference workload arrives requesting one GPU. It lands on GPU six. The node now has one GPU free — GPU seven. That single GPU is available but useless for any workload that needs more than one. Meanwhile, the four-GPU training job finishes at 3pm, freeing GPUs zero through three. Now the node has five free GPUs — four contiguous and one isolated. A five-GPU job cannot run here because the contiguous block is four. A four-GPU job can use zero through three, but another request for two GPUs cannot combine GPU seven with GPUs zero and one because the scheduler allocated the original training job as a contiguous block and the remaining GPU sits on the other side of two still-running workloads.
+
+Multiply this by fifty nodes, each accumulating its own pattern of partial allocations over days and weeks, and you get a fleet where aggregate available capacity looks generous while schedulable capacity for any specific request is far smaller. A 2025 analysis by CoreWeave found that GPU clusters running mixed workloads — training and inference combined — typically see 30 to 50 percent of their idle capacity rendered unschedulable by fragmentation. You are paying for GPUs that your scheduler cannot assign.
+
+## The Fragmentation Metric
+
+The first step in managing fragmentation is measuring it. The metric that matters is not utilization or availability. It is **schedulable capacity** — the largest contiguous GPU allocation the scheduler can satisfy on each node, aggregated across the fleet.
+
+To calculate this, walk each node in the cluster. For every node, determine the largest block of GPUs that could be allocated as a single request. A node with eight GPUs total and three occupied at positions two, four, and six has four free GPUs — but the largest contiguous block is one. Its schedulable capacity for a one-GPU job is four (it can place four separate one-GPU jobs), but its schedulable capacity for a two-GPU job is zero, because no two free GPUs are adjacent.
+
+The fleet-level fragmentation ratio compares schedulable capacity against available capacity. If your fleet has 160 available GPUs but only 80 of them can be grouped into blocks of four or more, your fragmentation ratio for four-GPU jobs is 50 percent. Half your available capacity is wasted for that job size. Track this metric by job size — one-GPU, two-GPU, four-GPU, eight-GPU — because fragmentation affects large requests disproportionately. A fleet can be 95 percent schedulable for single-GPU jobs and 20 percent schedulable for eight-GPU jobs simultaneously.
+
+When your fragmentation ratio for your most common large job size drops below 60 percent, you have a problem that manual intervention cannot solve. You need systematic defragmentation.
+
+## Defragmentation Strategies
+
+Defragmentation in a GPU cluster follows the same conceptual principles as disk defragmentation — you move existing allocations to create larger contiguous blocks — but the operational constraints are radically different. You cannot pause a running GPU workload, move it to another set of GPUs, and resume it. GPU memory state, CUDA contexts, and NCCL communication topologies are tied to specific physical devices. Moving a workload means terminating it and restarting it on different hardware.
+
+**Consolidation** is the most effective defragmentation strategy. When a workload finishes and frees GPUs on a partially allocated node, the scheduler evaluates whether small remaining workloads on that node could be migrated elsewhere to free the entire node. If node twelve has one remaining single-GPU inference pod and the rest of its GPUs are free, that inference pod can be evicted and rescheduled onto a node that already has small workloads running. Evicting one pod to free seven GPUs is a favorable trade. The mechanism is Kubernetes pod disruption — the platform team configures PodDisruptionBudgets that allow controlled eviction, and the scheduler (or a custom controller) identifies consolidation opportunities and triggers evictions.
+
+**Preemptive packing** prevents fragmentation before it forms. Instead of spreading workloads across nodes to balance load — which is the default Kubernetes scheduling behavior — you configure the scheduler to prefer nodes that are already partially full. This **bin-packing** strategy fills nodes completely before starting to allocate from empty nodes. The result is that free capacity is concentrated on a smaller number of completely empty nodes rather than spread as fragments across every node. Kubernetes supports bin-packing through the NodeResourcesFit scoring plugin configured with MostAllocated mode, and Kueue reinforces this through its topology-aware admission logic.
+
+**Scheduled defragmentation windows** are necessary for long-running workloads. Training jobs that run for days accumulate fragmentation that consolidation cannot fix without disrupting the job. The pragmatic approach is to define maintenance windows — typically overnight or on weekends — where the scheduler suspends new admissions, waits for short-lived workloads to drain naturally, and then repacks remaining workloads onto fewer nodes before resuming normal scheduling. This is the GPU equivalent of a database compaction window. It costs throughput during the window but recovers schedulable capacity for the week ahead.
+
+## Node-Level vs. Cluster-Level Fragmentation
+
+Fragmentation operates at two scales, and the mitigation strategies differ for each.
+
+**Node-level fragmentation** is what happens when GPUs within a single node are partially allocated. This matters because training jobs that use multi-GPU parallelism need GPUs that can communicate efficiently, which means GPUs on the same node connected by NVLink. Eight free GPUs scattered across eight different nodes cannot substitute for eight free GPUs on a single node for most distributed training patterns. The data parallelism step that synchronizes gradients across GPUs runs orders of magnitude faster over NVLink within a node than over the network across nodes.
+
+**Cluster-level fragmentation** is what happens when free nodes are distributed across availability zones, node pools, or hardware tiers in ways that prevent scheduling. You might have 32 free H100 GPUs — but 16 are in zone A and 16 are in zone B. A 32-GPU training job that requires all GPUs to be in the same zone for acceptable interconnect latency cannot use this capacity. Similarly, 16 free A100 GPUs and 16 free H100 GPUs cannot serve a 32-GPU job that requires homogeneous hardware for consistent training performance.
+
+Node-level fragmentation is addressed through bin-packing and consolidation. Cluster-level fragmentation is addressed through fleet design — how you allocate hardware across zones, pools, and tiers. The principle is to keep identical hardware together. If you order 64 H100 GPUs, deploy them as a single node pool in a single zone rather than distributing them across four zones in groups of 16. The single-zone deployment sacrifices zone-level redundancy but makes the entire 64-GPU block schedulable as a contiguous resource for large training jobs. Use zone distribution for inference workloads that need redundancy. Keep training hardware concentrated for schedulability.
+
+## Hardware Acquisition Strategy
+
+The GPU procurement decisions you make today determine your fragmentation profile for the next two years. This is not just a capacity question. It is a schedulability question.
+
+**Prefer larger nodes.** An eight-GPU node is strictly more flexible than two four-GPU nodes with the same total capacity. The eight-GPU node can run one eight-GPU job, or two four-GPU jobs, or four two-GPU jobs, or eight one-GPU jobs. Two four-GPU nodes can run the same smaller configurations but cannot run a single eight-GPU job. The cost per GPU is typically identical, but the scheduling flexibility is dramatically better. In 2026, the standard AI server form factor has moved toward eight-GPU configurations (like the DGX H100 and its successors) precisely because the industry learned that smaller nodes create fragmentation at scale.
+
+**Standardize GPU types within pools.** Mixing A100s and H100s in the same node pool creates a heterogeneity penalty that goes beyond driver compatibility. A job that needs eight GPUs and gets four A100s and four H100s will train at the speed of the slowest GPU, wasting the H100 capacity. Keep node pools homogeneous by GPU type, and use scheduling constraints to route workloads to the appropriate pool.
+
+**Size the fleet for your dominant job size.** If 70 percent of your training jobs request eight GPUs, size your nodes for eight GPUs and manage your fleet so that eight-GPU jobs always have schedulable capacity. If your dominant job size shifts to 16 or 32 GPUs (common for foundation model fine-tuning in 2026), your fleet design needs to shift toward multi-node scheduling with high-bandwidth interconnects rather than single-node packing.
+
+## Kueue and Gang Scheduling as Fragmentation Prevention
+
+Kueue prevents fragmentation through a mechanism that traditional Kubernetes scheduling lacks: **all-or-nothing admission**. When a training job requests eight GPUs, Kueue does not allow the scheduler to place four pods on one node and then discover that it cannot place the remaining four. It either admits the entire job — confirming that all requested resources are simultaneously available — or holds the job in the queue until they are.
+
+This gang scheduling behavior prevents the worst form of fragmentation: partial admission, where half a job's pods are placed and consume GPUs while the other half waits indefinitely. In traditional Kubernetes scheduling, a job controller creates pods one at a time. Each pod is scheduled independently. Pod one gets placed on node A, pod two on node B, pod three on node C. Pod four discovers that no node has a free GPU. Now three GPUs are consumed by a job that cannot make progress because its fourth pod is unscheduled. Those three GPUs are wasted until someone manually intervenes. Kueue eliminates this by treating the job as an atomic scheduling unit.
+
+Kueue also supports **borrowing** across cluster queues, which is an indirect defragmentation mechanism. If team A's queue has idle capacity and team B's queue is full, Kueue can lend team A's idle quota to team B. This prevents the organizational fragmentation where GPUs sit idle in one team's allocation while another team's jobs wait, all because quota boundaries are treated as walls rather than defaults.
+
+## Living With Fragmentation
+
+Perfect defragmentation is not achievable in a running cluster. Workloads start and stop on different schedules, jobs have different durations, and the scheduler makes locally optimal decisions that create globally suboptimal layouts. The goal is not zero fragmentation. It is keeping fragmentation below the threshold where your most important job sizes are consistently schedulable.
+
+Monitor the fragmentation ratio by job size on a daily basis. Alert when the schedulable capacity for your dominant job size drops below a defined threshold — 70 percent is a reasonable starting point. When the alert fires, investigate whether consolidation, preemption of low-priority workloads, or a scheduled defragmentation window can recover capacity. When fragmentation is chronic rather than episodic, it signals a fleet design problem — your nodes are too small, your hardware is too heterogeneous, or your workload mix has shifted in ways your fleet was not designed for.
+
+The most common mistake is treating fragmentation as a scheduling problem when it is actually a procurement problem. No scheduler can make eight contiguous GPUs appear from a fleet of four-GPU nodes. No bin-packing algorithm can combine A100 fragments with H100 fragments into a homogeneous job. The scheduler works within the constraints the fleet provides. If the fleet is fragmented by design, the scheduler inherits that fragmentation as an immovable constraint.
+
+---
+
+Fragmentation determines who gets to run. But when multiple jobs compete for the same scarce block of contiguous GPUs, someone has to lose. The next subchapter addresses the question that no scheduler can answer on its own: when capacity is constrained, whose workload gets preempted, and who decided that?

@@ -1,0 +1,133 @@
+# 6.5 — Language-Specific Index Design: One Index vs Language-Partitioned Indexes
+
+Should you put all your multilingual documents in one vector index, or create a separate index per language? This question sounds like a simple infrastructure choice. It is not. The answer determines how your system handles cross-lingual discovery, how much noise your users tolerate in search results, how you scale as you add languages, and how much operational complexity your team absorbs for the life of the system. Teams that make this decision casually -- defaulting to whatever their vector database makes easiest -- discover the consequences months later, when retrieval quality for specific languages degrades in ways that are difficult to diagnose and expensive to fix.
+
+There are three architectures, each with real trade-offs: a single unified index, language-partitioned indexes, and a hybrid that combines both. None of them is universally correct. The right choice depends on your corpus composition, your cross-lingual retrieval requirements, your operational capacity, and the specific failure modes your users can tolerate.
+
+## The Unified Index: One Embedding Space for All Languages
+
+A unified index stores every document -- regardless of language -- in a single vector index, embedded by a single multilingual embedding model. A Japanese product manual, an English engineering specification, a German compliance document, and a French customer FAQ all live in the same embedding space, represented as vectors that the model has aligned across languages.
+
+The appeal is simplicity. One index means one retrieval path, one set of infrastructure, one monitoring dashboard, one scaling strategy. When a user searches in any language, the query vector is compared against every document vector in the index. Cross-lingual retrieval happens naturally: a Japanese query finds relevant English documents because the multilingual embedding model placed semantically similar content near each other regardless of language. You do not need query routing. You do not need language detection to decide which index to search. You do not need federation logic to merge results across indexes. The system just works, or at least it appears to.
+
+The unified approach shines when cross-lingual discovery is a core requirement. If your users need to find relevant documents in languages they did not search in -- a researcher querying in English who needs to find relevant Japanese patents, or a support engineer querying in German who needs English troubleshooting guides -- the unified index handles this without any additional infrastructure. The embedding model's cross-lingual alignment, imperfect as it is, provides a baseline level of cross-lingual retrieval that partitioned indexes cannot replicate without explicit federation.
+
+The problems emerge at scale and under scrutiny. A unified index containing documents in ten languages produces results that mix languages freely. A user searching in Korean might receive results ranked Korean, English, English, Korean, Japanese, English, German. For some use cases, this is desirable. For many others, it is confusing. The user wanted Korean documents and is now scrolling past English results they cannot read. Even when the English documents are technically relevant, they are useless to a user who does not read English.
+
+The deeper problem is cross-language noise. Multilingual embedding models are not perfect at cross-lingual alignment. Words with similar surface forms but different meanings across languages -- false cognates -- can cause the model to place unrelated documents near each other. Technical terms that exist in multiple languages with different meanings produce spurious similarities. Industry experience shows that unified indexes produce 5 to 15 percent false positive rates from cross-language interference, where documents surface in results not because they are truly relevant but because the embedding model confused a cross-lingual signal for semantic relevance.
+
+Performance is the third concern. As the index grows, query latency increases. A unified index containing 10 million documents across ten languages is ten times larger than a single-language index of 1 million documents. Every query searches the full space. If 90 percent of your users search in English and your corpus is 60 percent English, those English users are searching through 4 million non-English documents on every query -- documents they will never want, adding latency and increasing the chance of cross-language noise in results.
+
+## Language-Partitioned Indexes: Isolation for Precision
+
+Language-partitioned indexes take the opposite approach. You create a separate vector index for each language: one for English, one for Japanese, one for Korean, one for German. Each index contains only documents in that language. When a user queries, the system detects the query language and routes the query to the corresponding index.
+
+The advantages are clean. Retrieval is monolingual within each index, which means it benefits from the full strength of monolingual embedding performance -- no cross-lingual alignment approximation, no false cognate noise, no mixed-language result sets. Each index is smaller, which means faster query times. You can optimize each index independently: different chunk sizes for CJK versus Latin-script languages, different embedding models per language if needed, different indexing parameters tuned for the vocabulary distribution of each language.
+
+Per-language scaling becomes straightforward. If your Japanese user base grows 300 percent but your German user base is stable, you scale the Japanese index without touching the German infrastructure. If you add Thai as a new supported language, you create a new index without modifying existing ones. If you need to re-embed all Korean documents because you upgraded to a better Korean embedding model, you rebuild the Korean index without affecting the other nine languages.
+
+The cost is architectural complexity and the loss of cross-lingual discovery. With partitioned indexes, a Japanese query only searches the Japanese index. If the most relevant document is in English, the system will never find it -- unless you build explicit cross-lingual retrieval on top of the partitioned architecture. This is the fundamental trade-off: partitioned indexes eliminate cross-language noise but also eliminate cross-language discovery.
+
+The cross-lingual gap is not small. In a corpus where 70 percent of the content is in English and only 10 percent is in Japanese, a Japanese user searching the Japanese index has access to only 10 percent of the knowledge base. The other 90 percent -- which contains documents that might answer their question -- is invisible. Teams that deploy partitioned indexes without addressing this gap systematically under-serve their non-English users, even when retrieval quality within each partition is excellent.
+
+The other cost is the routing dependency. Partitioned indexes require query language detection to route queries correctly. If the detection system misidentifies a Japanese query as Chinese, the query goes to the Chinese index and returns irrelevant Chinese documents. Language detection errors become retrieval failures. Subchapter 6.7 covers detection in detail, but the key point for index design is this: partitioned indexes move some of your retrieval risk from the embedding model (cross-lingual alignment quality) to the language detection system (classification accuracy). You are trading one failure mode for another, and you need to be aware of which one you can tolerate more readily.
+
+## The Hybrid Architecture: Federation Across Partitions
+
+The hybrid approach combines both strategies. You maintain language-partitioned indexes for monolingual retrieval and add a unified cross-lingual index -- or a federation layer that queries multiple partitions -- for cross-lingual discovery.
+
+The most common hybrid pattern is query fan-out. When a user queries in Japanese, the system routes the query to the Japanese index for monolingual retrieval. Simultaneously, it translates the query to English (and optionally to other high-value languages) and routes the translated queries to those language-specific indexes. The results from all indexes are merged using reciprocal rank fusion or a learned merging model.
+
+This pattern gives you monolingual retrieval precision within each partition and cross-lingual coverage across partitions. A Japanese user searching for "network timeout configuration" gets high-quality Japanese results from the Japanese index and also receives relevant English documents that were found through the translated query in the English index.
+
+The trade-off is latency and complexity. Fan-out queries multiply your retrieval calls. If you search three indexes in parallel, you run three retrieval operations, three result sets need merging, and your total latency is bounded by the slowest index response plus merging overhead. In practice, parallel fan-out adds 30 to 80 milliseconds compared to a single-index query, because the queries run concurrently and the merging is lightweight. But the complexity compounds: you need translation infrastructure in the query path, result fusion logic, deduplication for documents that appear in translated form in multiple indexes, and monitoring for each partition independently.
+
+A leaner hybrid pattern avoids fan-out by using a small unified cross-lingual index alongside the partitioned indexes. This cross-lingual index contains representative embeddings -- perhaps document summaries or titles rather than full-text chunks -- from all languages. When a user queries, the system searches both the language-specific partition and the cross-lingual index. The cross-lingual index surfaces candidates from other languages, which are then retrieved from their respective partitions for full scoring. This approach limits the cross-lingual index to a thin discovery layer, keeping it small and fast, while the partitioned indexes handle the heavy retrieval work.
+
+## When Unified Wins
+
+Unified indexes are the right choice when cross-lingual discovery is your primary requirement and mixed-language results are acceptable to your users. Specific scenarios where unified wins clearly:
+
+Research and academic knowledge bases, where a scholar querying in one language needs to discover relevant work published in any language. Patent search systems, where a Japanese engineer needs to find prior art in English, German, and Korean patents. Global customer feedback analysis, where an analyst needs to find similar complaints across markets regardless of language.
+
+Unified also wins when your language count is small -- two to three languages -- and your corpus is modest -- under 1 million documents. At this scale, the cross-language noise is manageable, the performance overhead of searching a slightly larger index is negligible, and the operational simplicity of one index outweighs the benefits of partitioning.
+
+If your embedding model is strong on your specific language pairs -- and you have measured this, not assumed it -- the cross-lingual alignment may be good enough that the noise from a unified index is below your quality threshold. Models like BGE-M3, Qwen3-Embedding at the 8B parameter size, and Cohere Multilingual produce increasingly tight cross-lingual alignment for high-resource language pairs. If your system primarily serves English, French, Spanish, and German, the cross-lingual noise in a unified index may be under 5 percent.
+
+## When Partitioned Wins
+
+Partitioned indexes are the right choice when monolingual precision matters more than cross-lingual discovery, when your corpus is large, or when your users expect results in their query language.
+
+Customer-facing search products where users search in their own language and expect results in that language. Internal knowledge bases where each regional office has its own content and primarily queries its own documents. Compliance and legal search where mixing languages in results creates confusion or risk.
+
+Partitioned wins at scale. Once your corpus exceeds 5 to 10 million documents across many languages, the performance and noise costs of a unified index start to outweigh its simplicity. Partitioning lets you keep each index fast and focused, and the operational cost of managing multiple indexes is offset by the ability to optimize and scale each one independently.
+
+Partitioned also wins when your embedding model performs unevenly across languages. If the model produces strong English embeddings, decent French embeddings, and mediocre Thai embeddings, a unified index pools all of these quality levels into one space. A Thai query searching a unified index is fighting through the noise of mediocre Thai embeddings against strong English embeddings. In a partitioned setup, you could use a different, Thai-optimized embedding model for the Thai index, maximizing retrieval quality per language.
+
+## When Hybrid Wins
+
+Hybrid wins when you need both monolingual precision and cross-lingual discovery, and you have the engineering capacity to operate the more complex architecture. This is the most common scenario for enterprise multilingual RAG systems with more than three languages and more than 1 million documents.
+
+Hybrid is the default recommendation for systems that meet three conditions: the corpus is predominantly in one language but users query in multiple languages, the documents in the dominant language contain information that non-dominant-language users need, and the user base is large enough to justify the additional infrastructure.
+
+A multinational company with 80 percent English documentation and offices in Japan, Germany, Brazil, and India fits this profile perfectly. Japanese users need access to English documentation. German users need access to English documentation. But all of them also have region-specific content in their own language that they query most frequently. The hybrid architecture gives them fast, precise monolingual retrieval for their own-language content and cross-lingual access to the English corpus through query fan-out or a cross-lingual discovery index.
+
+## Scale Thresholds and Performance Boundaries
+
+At what scale does index architecture start to matter for performance?
+
+Below 500,000 total documents, the performance differences between unified and partitioned indexes are negligible for most vector databases. Modern approximate nearest neighbor search handles indexes of this size with sub-100-millisecond latency regardless of partitioning strategy. At this scale, choose based on your cross-lingual requirements, not performance.
+
+Between 500,000 and 5 million documents, partitioned indexes start showing performance advantages. Each partition is smaller, which means faster query times and more efficient memory utilization. A 5-million-document unified index requires more RAM for the HNSW graph than five 1-million-document partitioned indexes, because the graph connectivity in a larger index is higher. The latency difference is typically 10 to 30 milliseconds -- noticeable in aggregate but not dramatic.
+
+Above 5 million documents, partitioning becomes strongly recommended for performance reasons alone. A 20-million-document unified index in Qdrant, Pinecone, or Weaviate requires careful tuning of index parameters, significant memory allocation, and may still produce query latencies above 200 milliseconds for complex queries. Splitting that into ten 2-million-document partitioned indexes brings each partition's latency back under 50 milliseconds and makes the infrastructure far more manageable.
+
+These thresholds are approximate and depend on your vector database, hardware, and query patterns. The specific numbers matter less than the principle: performance costs of unified indexes grow nonlinearly with corpus size, while partitioned indexes grow linearly per partition.
+
+## Metadata Filtering as a Middle Ground
+
+Before committing to full partitioning, consider metadata filtering as a simpler alternative. Instead of creating separate indexes, store all documents in a unified index but attach a language metadata field to each document. At query time, apply a filter to restrict retrieval to documents in the user's language.
+
+This approach gives you the operational simplicity of a unified index with some of the precision benefits of partitioning. The retrieval engine searches only the relevant language subset, eliminating cross-language noise in results. Modern vector databases like Qdrant, Milvus, and Pinecone support efficient pre-filtering, where the metadata filter is applied before the vector similarity search rather than after, which means you get the performance benefit of searching a smaller effective index.
+
+The limitation is that metadata filtering within a unified index does not solve the embedding quality problem. All documents are still embedded by the same model, in the same embedding space. The model's weaker performance on Thai or Arabic still affects the quality of Thai or Arabic embeddings, even if the search is filtered to Thai-only or Arabic-only documents. And you lose cross-lingual discovery unless you explicitly run a second, unfiltered query.
+
+Metadata filtering is the right first step for teams that want monolingual precision without the operational overhead of partitioned indexes. If filtered retrieval quality meets your thresholds, you may never need full partitioning. If it does not, metadata filtering was the quick experiment that taught you partitioning is necessary.
+
+## Migration Path: Unified to Partitioned
+
+Teams rarely start with partitioned indexes. They start with a unified index because it is simpler, and they migrate to partitioned indexes as their corpus grows, their language count increases, or their users report quality problems.
+
+The migration path matters because re-indexing millions of documents is expensive and disruptive. A clean migration has four phases.
+
+First, add language metadata to every document in your existing unified index. If your ingestion pipeline does not already detect and tag document language, add detection now. Backfill language tags for existing documents. This is the prerequisite for everything else.
+
+Second, implement metadata-filtered retrieval. Switch from unfiltered queries to language-filtered queries where appropriate. Measure the impact on retrieval quality per language. This gives you immediate quality improvements without infrastructure changes.
+
+Third, begin building partitioned indexes in parallel with the unified index. Start with one or two languages where quality is lowest or user volume is highest. Index those languages into their own partitions while keeping the unified index operational. Run queries against both and compare results.
+
+Fourth, once partitioned indexes are validated and performing well, cut over traffic for those languages to the partitioned indexes. Repeat for additional languages as needed. Keep the unified index alive as a fallback or as the cross-lingual discovery layer in a hybrid architecture.
+
+This phased approach lets you improve quality incrementally without a risky big-bang migration. Each phase is independently valuable and independently reversible.
+
+## The Routing Layer
+
+Partitioned and hybrid architectures require a routing layer: the component that decides which index to search for each query. The routing layer is a thin but critical piece of infrastructure.
+
+At minimum, the routing layer performs language detection on the incoming query and maps the detected language to the corresponding index. For a three-language system with English, Japanese, and German indexes, the router detects "Japanese" and sends the query to the Japanese index.
+
+For hybrid architectures, the router is more sophisticated. It detects the query language, routes to the primary language index, and simultaneously fans out translated queries to other indexes or to the cross-lingual discovery layer. It manages the parallel query lifecycle, collects results, performs fusion, and returns the merged result set.
+
+Routing failures cascade. If the language detector misclassifies a query, the router sends it to the wrong index, and the user gets irrelevant results. If the translation service in a fan-out architecture is slow or unavailable, the cross-lingual results are delayed or missing. If one partition is down, the router must handle the partial failure gracefully -- returning results from available partitions rather than failing the entire query.
+
+Build the routing layer with the same reliability standards you apply to any production service: health checks on each partition, timeouts on fan-out queries, graceful degradation when components are unavailable, and monitoring on routing accuracy and latency.
+
+## Making the Decision
+
+The index design decision is one of the few architectural choices in multilingual RAG that is genuinely difficult to change later. Re-indexing a large corpus is expensive. Switching from unified to partitioned requires building routing infrastructure. Switching from partitioned to unified requires re-embedding everything in a single model's space. Choose deliberately.
+
+Start with three questions. Do your users need cross-lingual discovery, or do they primarily search within their own language? Is your corpus large enough that performance differences matter? Does your team have the operational capacity to manage multiple indexes, a routing layer, and potentially a federation system?
+
+If cross-lingual discovery is critical and your corpus is under 2 million documents, start unified. If monolingual precision is paramount and you have the operational capacity, start partitioned. If you need both and have the engineering bandwidth, start with a metadata-filtered unified index and evolve toward hybrid as your scale and quality requirements demand it.
+
+The next subchapter addresses a different layer of multilingual retrieval: what happens after the initial retrieval returns candidates. Reranking -- the process of re-scoring candidate documents for relevance -- behaves differently across languages, and models trained primarily on English data can systematically disadvantage non-English content in ways that are invisible unless you measure per language.

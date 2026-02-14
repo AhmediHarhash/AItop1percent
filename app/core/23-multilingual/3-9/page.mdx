@@ -1,0 +1,107 @@
+# 3.9 — Script Robustness: Homoglyphs, Zero-Width Characters, and Token Boundary Errors
+
+Your model can be fooled by characters that are invisible to the human eye. Not approximately invisible. Completely invisible — zero pixels rendered on screen, zero width occupied in the text flow, zero indication to any human reader that the characters exist. And yet the tokenizer sees them. The embedding model encodes them. The safety filter processes them. The output changes because of them. In 2025, researchers demonstrated that inserting a handful of zero-width characters into a prompt could bypass safety classifiers with success rates exceeding 50%. Homoglyph substitution — replacing Latin characters with visually identical Cyrillic or Greek equivalents — evaded content filters at rates between 44 and 76% depending on the technique. These are not theoretical attacks. They are documented, reproducible, and actively exploited. Any multilingual system that processes text from external sources without script-level robustness checks is running an open door that attackers have already learned to walk through.
+
+## Homoglyphs: When Different Characters Look the Same
+
+A **homoglyph** is a character from one Unicode script that is visually identical or nearly identical to a character from another script. The Latin lowercase "a" at code point U+0061 and the Cyrillic lowercase "a" at code point U+0430 render as the same glyph in most fonts. A human reading text cannot tell them apart. A computer comparing their code points sees two entirely different characters.
+
+Unicode contains thousands of homoglyph pairs. Latin "o" and Cyrillic "о." Latin "p" and Cyrillic "р." Latin "c" and Cyrillic "с." Greek "ο" and Latin "o" and Cyrillic "о" — three different code points, three different scripts, one visual appearance. Beyond simple letter substitution, some homoglyphs span entire words. The word "apple" can be written entirely in Latin characters or with Cyrillic substitutions for three of its five letters. Both versions display identically. Neither version is the same string.
+
+For phishing, homoglyphs have been a problem for decades — fake domain names that look like real ones but use Cyrillic or Greek substitutions. For AI systems, the problem is newer but equally dangerous.
+
+## How Homoglyphs Break Multilingual AI Systems
+
+The damage manifests in three ways: silent processing failures, safety filter evasion, and data quality corruption.
+
+**Silent processing failures** occur when text matching depends on code point identity rather than visual identity. A customer name stored in a database with Latin characters will not match a search query that contains Cyrillic homoglyph substitutions, even though the name looks identical on screen. In a RAG pipeline, a document containing the Cyrillic version of a keyword will not match a query containing the Latin version. The retrieval system returns no results, and the user sees a failure that looks like a coverage gap rather than an encoding problem.
+
+**Safety filter evasion** is the more dangerous consequence. Content classifiers and safety filters are trained on specific token sequences. The word "harm" in Latin characters maps to known token IDs that trigger safety checks. The same visual word with one or two Cyrillic substitutions maps to entirely different token IDs. The safety classifier has never seen this token sequence during training and does not flag it. Research published in 2025 showed that cross-script homoglyph substitution achieved an average 58.7% success rate at evading content filters across multiple commercial guardrail systems. Diacritical homoglyphs — adding or substituting combining marks — achieved similar results. These attacks are trivially easy to execute. A script that replaces select Latin characters with Cyrillic equivalents takes minutes to write and works against systems that cost millions to build.
+
+**Data quality corruption** happens during scraping and data ingestion. Web pages authored in multilingual environments sometimes contain accidental homoglyph substitutions — a Russian-speaking author switches keyboard layouts and types a Cyrillic character in the middle of an English word without noticing. Your scraper ingests the text faithfully. Your deduplication pipeline sees two versions of the "same" document that differ by a few code points and marks them as duplicates, keeping one and discarding the other. Or worse, it treats them as different documents, inflating your corpus with near-duplicates that waste storage and degrade retrieval precision.
+
+## Zero-Width Characters: The Invisible Saboteurs
+
+Zero-width characters occupy no visual space in rendered text. They are invisible in every font, in every browser, in every text editor that does not specifically reveal hidden characters. But they are real Unicode code points that the tokenizer processes like any other character.
+
+The most consequential zero-width characters for AI systems are three. **Zero-width space** at U+200B is a word break opportunity that takes up no space. It tells renderers that a line break can occur at this position, but it adds no visible mark. **Zero-width non-joiner** at U+200C prevents two adjacent characters from forming a ligature or joined form. It is semantically meaningful in Persian, Arabic, and Indic scripts, where it controls whether characters connect. **Zero-width joiner** at U+200D forces adjacent characters to form a connected or combined glyph. It is used legitimately in emoji sequences — the family emoji is constructed from multiple person and joiner characters — and in Arabic and Indic scripts to control glyph shaping.
+
+These characters have legitimate uses. The problem is that they can be inserted anywhere in any text, invisibly, and they alter how the tokenizer segments the surrounding text.
+
+## How Zero-Width Characters Corrupt Tokenization
+
+When a tokenizer encounters a zero-width character, it treats it as a real character that occupies a position in the token sequence. A zero-width space inserted between the letters of a word forces the tokenizer to treat the word as two separate tokens instead of one. The word itself looks unchanged to a human reader — the zero-width space is invisible. But the token sequence is different, the embedding is different, and any downstream processing that depends on token identity produces different results.
+
+Consider a safety filter trained to detect a specific prohibited phrase. The phrase in normal text tokenizes to a specific sequence of token IDs that the filter recognizes. Now insert a zero-width space between the second and third characters of the first word. The phrase still looks identical on screen. But the tokenizer splits the first word differently — instead of one or two tokens, it becomes three or four. The safety filter has never seen this particular token sequence. It does not flag the input. The prohibited content passes through.
+
+Research from 2025 measured the attack success rate of zero-width character injection across multiple commercial and open-source guardrail systems. Zero-width injection achieved a 54.2% average success rate at bypassing prompt injection detection. Bidirectional override attacks — using Unicode characters that change the apparent direction of text — succeeded 52.8% of the time. These are not edge cases. These are reliable attack vectors with better-than-coin-flip success rates against production systems.
+
+The legitimate use of zero-width characters in languages like Persian and Hindi complicates the defense. You cannot simply strip all zero-width characters without breaking the rendering of those scripts. A zero-width non-joiner in Persian controls whether two letters connect, and removing it changes the visual appearance and sometimes the meaning of the word. The mitigation must be context-aware: strip zero-width characters from contexts where they serve no legitimate purpose — the middle of Latin text, the interior of known English keywords — while preserving them where they carry semantic or rendering meaning.
+
+## Bidirectional Control Characters: Text That Lies About Its Direction
+
+Unicode includes explicit directional control characters that override the default text direction. The right-to-left override character forces subsequent text to display right-to-left, regardless of the characters' intrinsic direction. The left-to-right override does the reverse. These exist for legitimate formatting of complex multilingual text — a Hebrew paragraph that contains an English product name needs explicit directionality to render correctly.
+
+The attack potential is severe. A string that contains hidden bidirectional overrides can display one thing while actually containing another. A filename that appears to end in ".txt" might actually end in ".exe" when the bidirectional override is removed. A prompt that appears to ask a benign question might contain hidden instructions that the model processes but the human reviewer misses.
+
+For AI systems, bidirectional control characters create a gap between what the human sees and what the model processes. A human reviewer approving prompts in a moderation queue sees the rendered text — with bidirectional overrides applied — and judges it as harmless. The model receives the raw character sequence, including the override characters, and processes text that differs from what the reviewer saw. This creates a blind spot in any human-in-the-loop safety process that relies on visual inspection of input text.
+
+## Token Boundary Manipulation
+
+Beyond specific invisible characters, a broader class of attacks manipulates token boundaries to alter how text is segmented. Any character that the tokenizer treats as a boundary — a space, a punctuation mark, a special Unicode character — can be inserted to force the tokenizer to split text differently.
+
+Inserting a soft hyphen between characters of a word does not change the visual rendering — soft hyphens are invisible unless the renderer uses them for line breaking. But the tokenizer treats the soft hyphen as a real character, potentially splitting the word at that point. The result is different tokens for the same visual text, which downstream systems process differently.
+
+Non-breaking spaces, thin spaces, hair spaces, and other Unicode space variants all look like regular spaces to a human but may tokenize differently. Replacing a regular space with a non-breaking space in a prompt can change the token sequence without any visual change. If the safety filter or content classifier is sensitive to specific token patterns, these substitutions can alter the classification result.
+
+The pattern across all of these attacks is the same: exploit the gap between visual representation and machine representation. Humans see rendered text. Machines see code points. When those two views diverge, the system is vulnerable.
+
+## The Impact on Training Data and Model Behavior
+
+Homoglyphs and zero-width characters are not just attack vectors. They are data quality problems that affect model training, fine-tuning, and evaluation.
+
+Web-scraped training data routinely contains zero-width characters. Copy-paste artifacts, content management system quirks, and multilingual authoring environments all inject invisible characters into text. If your fine-tuning dataset contains zero-width characters in 3% of its examples, the model learns to process inputs that contain these characters. This does not improve the model — it wastes training compute on artifacts. Worse, it can create inconsistent behavior where the model responds differently to the same visual text depending on whether invisible characters are present.
+
+Homoglyph contamination in training data creates vocabulary confusion. If your labeled dataset contains some examples where "data" is spelled with a Cyrillic "а" and others where it is spelled with a Latin "a," the model sees two different tokens where one concept exists. The embedding for the Cyrillic-contaminated version drifts away from the embedding for the clean version. Over enough examples, this creates subtle inconsistencies in model behavior that are nearly impossible to diagnose through standard evaluation.
+
+Clean your training data before fine-tuning. Clean your eval data before scoring. Clean your knowledge base before embedding. The cleanup is the same defense applied at a different stage: normalize Unicode, strip illegitimate zero-width characters, detect and resolve homoglyphs.
+
+## Detection and Prevention
+
+A robust defense against script-level attacks requires multiple layers, because no single technique catches every variant.
+
+**Unicode normalization** is the foundation. Normalize all text to NFC at ingestion, as described in the previous subchapter. This resolves canonical equivalences and collapses some homoglyph variants, though it does not catch cross-script homoglyphs.
+
+**Zero-width character filtering** strips zero-width spaces, joiners, and non-joiners from contexts where they serve no legitimate purpose. For Latin, Cyrillic, and Greek text, zero-width characters are almost never semantically necessary. For Arabic, Persian, Hindi, and other scripts that use joiners for glyph shaping, the filtering must be more selective — preserve joiners between characters of those scripts and strip them everywhere else.
+
+**Homoglyph detection** identifies characters from unexpected scripts within otherwise single-script text. If a word appears to be English but contains a Cyrillic code point, that code point is either a homoglyph substitution or a data quality error. Both should be resolved. Confusables libraries — implementations of Unicode Technical Standard number 39, which defines the list of visually similar characters across scripts — provide the mapping needed to detect and resolve homoglyphs.
+
+**Mixed-script detection** flags text that contains characters from multiple scripts within a single word or token. Legitimate multilingual text typically switches scripts at word boundaries, not within words. A word that contains both Latin and Cyrillic characters is almost certainly either a homoglyph attack or a data quality error. Flagging mixed-script tokens and resolving them to a single script catches a wide range of homoglyph substitutions.
+
+**Bidirectional control character stripping** removes explicit directional overrides from all user input. In most AI applications, the text renderer handles directionality automatically based on the characters' intrinsic direction. Explicit override characters are unnecessary for legitimate input and should be stripped as a default.
+
+**Tokenizer-aware validation** goes one level deeper. After text preprocessing, tokenize the input and compare the token sequence against expected patterns. If a common word tokenizes into an unusual number of fragments, something in the text is disrupting normal tokenization — possibly an invisible character, possibly a homoglyph. This validation catches attacks that bypass the character-level filters.
+
+## Building the Defense Pipeline
+
+The practical implementation is a text preprocessing pipeline that runs before any AI component touches the input. The pipeline operates in stages.
+
+First stage: strip all bidirectional control characters, paragraph separators, and line separators that are not standard newlines. These characters serve no legitimate purpose in AI system inputs.
+
+Second stage: normalize to NFC. This resolves canonical decomposition mismatches and collapses some visual equivalences.
+
+Third stage: strip zero-width characters from scripts that do not require them. Maintain a whitelist of scripts where zero-width joiners are semantically meaningful and strip them from all others.
+
+Fourth stage: run homoglyph detection on the resulting text. Flag any token that contains characters from mixed scripts. Resolve flagged tokens by mapping all characters to the majority script using a confusables table.
+
+Fifth stage: validate that the preprocessed text tokenizes as expected. Compare token count and token identity against known baselines for the detected language. Anomalous token counts trigger a review flag.
+
+This pipeline adds single-digit milliseconds of latency per request. At scale, the compute cost is negligible compared to the cost of a safety bypass or a data quality failure. The pipeline should run on every text input — user queries, uploaded documents, API requests, and scraped content — before the text reaches any model, any embedding function, or any safety classifier.
+
+## Cross-Reference: Security and Red-Teaming
+
+Script robustness is fundamentally a security concern. The homoglyph and zero-width character attacks described here are specific instances of the broader class of adversarial input attacks covered in Section 16 on AI Security and Section 22 on Red-Teaming and Adversarial Testing. If your team includes a red-teaming practice, script-level attacks should be part of your adversarial test suite. If your system is deployed in a high-stakes domain — healthcare, finance, legal — script robustness is not a polish item. It is a security requirement on the same tier as prompt injection defense and access control.
+
+The defense is not glamorous. It is text preprocessing — a function that runs before the interesting parts of your system do anything. But that preprocessing is the perimeter. Everything inside the perimeter assumes the text is clean. If the perimeter fails, every component downstream inherits the vulnerability.
+
+The next subchapter shifts from defense to optimization, covering the practical mitigation strategies — prompt compression, language-aware preprocessing, and transliteration techniques — that reduce the token tax while maintaining quality across languages.

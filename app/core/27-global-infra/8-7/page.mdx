@@ -1,0 +1,73 @@
+# 27.62 — Continuous Fine-Tuning Pipelines: Infrastructure for Recurring Model Updates
+
+Fine-tuning is not a one-time event. In production, models degrade as the world changes. Data drifts, user behavior shifts, new edge cases appear, and the distribution the model learned during training diverges from the distribution it encounters in production. A customer support model trained on January's ticket data gives increasingly poor answers by June because products have changed, policies have updated, and customers are asking about features that did not exist when the training data was collected. A content moderation model trained on 2025 patterns misses emerging manipulation techniques in 2026. The infrastructure must support recurring fine-tuning -- on a schedule, triggered by quality degradation, or both.
+
+The teams that treat fine-tuning as a one-shot project discover the degradation through customer complaints, not through monitoring. The teams that build continuous fine-tuning into their infrastructure discover it through automated quality signals and correct it before users notice. The difference is not the model or the data -- it is the pipeline.
+
+## The Continuous Fine-Tuning Loop
+
+The core abstraction is a closed loop with five stages: monitor, detect, retrain, validate, deploy. Each stage feeds the next, and the loop repeats on a cadence that matches the rate at which your domain changes.
+
+**Monitor** means measuring production model quality continuously. This is the observability infrastructure from Section 17 -- tracking output quality metrics, user feedback signals, confidence distributions, and task-specific evaluation scores. The monitoring system provides the signal that tells you whether the current production model is still good enough.
+
+**Detect** means identifying when quality has degraded below an acceptable threshold. This is not the same as monitoring. Monitoring tells you the current metric values. Detection applies a decision function: has the seven-day rolling average of user-reported quality dropped below 4.2 out of 5? Has the automated eval suite's accuracy on a held-out test set dropped below 85 percent? Has the rate of low-confidence outputs increased by more than 15 percent from the baseline? Detection converts continuous metrics into binary decisions: retrain or do not retrain.
+
+**Retrain** means assembling a fresh dataset, submitting a training job with defined hyperparameters, and producing a new set of model weights. This stage is where the training infrastructure from earlier in this chapter -- cluster scheduling, distributed training, checkpointing -- does its work. The key requirement is that retraining is parameterized and reproducible. The same pipeline that ran last month's fine-tuning run should run this month's with the only differences being the dataset version and the timestamp.
+
+**Validate** means running the full evaluation suite against the newly fine-tuned model before it is allowed anywhere near production traffic. The validation must demonstrate that the new model improves on the degraded metric that triggered the retraining AND does not regress on other metrics that were previously acceptable. This is the regression testing infrastructure from Section 18 -- the eval gate that prevents a model that fixes one problem while creating three others from reaching production.
+
+**Deploy** means promoting the validated model through the deployment pipeline -- staging, canary, progressive rollout -- using the patterns from Section 19. Deployment can be fully automated for routine fine-tuning cycles where the changes are incremental, or it can require human approval for larger retraining events that change the model's behavior in significant ways.
+
+## Scheduling: How Often to Retrain
+
+The retraining cadence depends on how fast your domain moves, and getting it wrong in either direction is expensive.
+
+**Weekly fine-tuning** is appropriate for fast-moving domains where the input distribution shifts noticeably within days. E-commerce recommendation models see distribution shifts driven by seasonal trends, promotional events, and inventory changes. News summarization models encounter entirely new topics and framing patterns each week. Customer support models that serve products with frequent feature releases see new question categories emerge between weekly retraining cycles. Weekly fine-tuning is operationally demanding -- the pipeline must be fully automated because manual intervention once per week does not scale.
+
+**Monthly fine-tuning** suits domains where the underlying distribution is more stable but still evolves. Medical coding models see changes driven by quarterly regulatory updates, new procedure codes, and evolving documentation standards. Legal document analysis models see shifts as case law develops and regulatory guidance is published. Contract review models see changes as business practices and standard clause language evolve. Monthly retraining gives teams more time to curate training data and review results, but the one-month gap means the model may be noticeably degraded during the final week of each cycle.
+
+**On-demand fine-tuning** triggered by quality signals fills the gaps between scheduled runs. If the monitoring system detects a sudden quality drop -- a new product launch generates a flood of support tickets the model cannot handle, a regulatory change invalidates a class of the model's outputs, a competitor's new feature shifts user expectations -- the on-demand trigger fires a retraining job immediately rather than waiting for the next scheduled cycle. On-demand retraining requires that the entire pipeline can execute without human intervention: data assembly, training, evaluation, and deployment must be automated end to end.
+
+Most mature teams run a hybrid: scheduled retraining on a fixed cadence plus on-demand retraining triggered by quality alerts. The scheduled cadence handles gradual drift. The on-demand triggers handle sudden shifts.
+
+## Dataset Versioning: The Foundation of Reproducibility
+
+Every fine-tuning run must use a specific, versioned dataset. This is non-negotiable. Without dataset versioning, you cannot reproduce a previous training run, you cannot compare two runs that used different data, and you cannot determine whether a quality change was caused by a model change or a data change.
+
+**Dataset versioning** means that every dataset used for fine-tuning receives a unique identifier -- a version hash or a version number -- that pins the exact contents of the dataset at the time the training run used it. If the same dataset is updated with new examples next week, it gets a new version. The previous version remains immutable and accessible. Tools like DVC, LakeFS, and custom solutions built on object storage with immutable paths handle this versioning.
+
+The dataset version is recorded in the experiment tracker alongside the training configuration. When you need to debug a production model's behavior, you can retrieve the exact dataset that trained it and examine the examples it learned from. When you need to retrain a model and compare the result to the previous version, you can use the same dataset to isolate the effect of configuration changes, or use a different dataset to isolate the effect of data changes.
+
+Dataset assembly itself is a pipeline: collect production examples, collect human labels, filter for quality, balance for class distribution, split into train and validation sets, version the result. The assembly pipeline runs before each training job and produces the versioned dataset that the training job consumes. Cross-reference Section 12 for dataset engineering practices and Section 13 for the labeling operations that produce the human labels.
+
+## The Quality Gate: Nothing Ships Without Evidence
+
+The most critical component of the continuous fine-tuning pipeline is the quality gate between training and deployment. The gate answers one question: is the new model better than the current production model? If yes, proceed to deployment. If no, discard the new model, keep the current one, and investigate why retraining did not improve quality.
+
+The quality gate is not a single metric comparison. It is a suite of evaluations that cover the full range of the model's expected behavior. A customer support model's quality gate might check overall response quality, topic coverage across the twenty most common question categories, response latency, safety filter pass rate, and regression on a curated set of previously-difficult examples that the current production model handles correctly. The new model must improve on the target metric (the one that triggered retraining) AND maintain performance on every other metric within acceptable tolerances.
+
+The tolerance is defined per metric, and the tolerances are set before the retraining cycle begins -- not after seeing the results. Setting tolerances after seeing results introduces the temptation to relax a tolerance to let the new model pass. For instance, you might define that overall quality must improve by at least 2 percent, topic coverage must not decrease for any category by more than 3 percent, latency must not increase by more than 10 percent, and zero previously-passing safety cases may start failing. These thresholds are written into the pipeline configuration and evaluated automatically.
+
+When the quality gate fails, the pipeline halts and sends an alert. Failed quality gates are valuable diagnostic signals -- they indicate that either the training data was insufficient, the hyperparameters need adjustment, or the degradation is caused by something that fine-tuning cannot fix (a prompt issue, a retrieval pipeline problem, a change in user expectations that requires a product-level response). The investigation often reveals that the root cause is not the model at all.
+
+## Resource Allocation and Budget Planning
+
+Continuous fine-tuning consumes GPU hours on a predictable schedule, which means it should be budgeted and planned like any other recurring infrastructure cost. A weekly fine-tuning cycle that runs for four hours on eight A100 GPUs consumes 32 GPU hours per run, or roughly 1,600 GPU hours per year. At current cloud pricing of approximately $2 to $3 per A100 GPU hour, that is $3,200 to $4,800 per year for a single model's retraining pipeline. An organization with ten models on weekly retraining cycles spends $32,000 to $48,000 annually on fine-tuning compute alone.
+
+These costs are predictable, which means they can be reserved. Cloud providers offer significant discounts -- 30 to 60 percent -- for reserved or committed-use GPU instances. If your fine-tuning pipeline runs every week at the same time, reserved instances for the training window are a straightforward cost optimization. Spot or preemptible instances are also viable for fine-tuning jobs that can tolerate interruption and restart from checkpoints, though the reliability concerns discussed earlier in this chapter apply.
+
+The budget should also include the human cost of the pipeline: the engineering time to maintain the automation, the data team's time to curate and label new training data, and the eval team's time to review quality gate results when they fail. Fully automated pipelines with robust quality gates minimize the human cost during normal operation, but pipeline failures, quality gate failures, and infrastructure changes require engineering attention that should be planned for.
+
+## The Adapter Strategy: LoRA and the Economics of Continuous Fine-Tuning
+
+Full fine-tuning updates every parameter in the model. For a seven-billion-parameter model, that means loading, updating, and saving seven billion parameters every retraining cycle. For a seventy-billion-parameter model, the compute and storage costs scale accordingly. **LoRA** (Low-Rank Adaptation) and its variants change the economics fundamentally.
+
+With LoRA, only the small adapter weights are trained -- typically less than one percent of the model's total parameters. The base model weights remain frozen. This reduces training time, GPU memory requirements, and storage costs for each fine-tuning run. A LoRA fine-tuning run that takes one hour on four GPUs might take eight hours on sixteen GPUs as a full fine-tuning run. The adapter weights are typically a few hundred megabytes rather than the tens of gigabytes for a full model checkpoint. Storing a history of adapters for rollback and comparison costs a fraction of what storing full model checkpoints costs.
+
+The adapter strategy also simplifies deployment for continuous fine-tuning. When a new adapter is ready, you do not redeploy the entire model. You deploy only the new adapter weights, which can be hot-swapped on the serving infrastructure without restarting the inference server. Some serving frameworks -- vLLM with LoRA support, for instance -- can serve multiple adapters simultaneously from a single base model, which enables A/B testing between the current production adapter and the candidate adapter without doubling the serving infrastructure.
+
+The trade-off is that LoRA fine-tuning has a lower capacity to shift the model's behavior compared to full fine-tuning. If the quality degradation requires a significant change in model behavior -- supporting an entirely new domain, correcting deeply ingrained patterns, or adapting to a major shift in input distribution -- a full fine-tuning cycle may be necessary. The adapter strategy is ideal for incremental quality maintenance, which is exactly the use case that continuous fine-tuning pipelines serve most often.
+
+---
+
+A trained and validated model, whether from a full fine-tuning run or a LoRA adapter update, is still just a checkpoint sitting in object storage. Getting it from that checkpoint to a production endpoint serving user traffic requires a handoff process with more steps than most teams anticipate. The next subchapter examines the training-to-serving handoff -- the pipeline that converts a training artifact into a production service.

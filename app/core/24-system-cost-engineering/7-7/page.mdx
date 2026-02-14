@@ -1,0 +1,157 @@
+# 7.7 — Quantization as Cost Reduction: Smaller Models on Cheaper Hardware
+
+Quantization trades a small amount of quality for a large reduction in cost. For most production tasks, that trade is worth making. A 70-billion-parameter model that requires two high-end GPUs at full precision fits on a single GPU after quantization, cutting your hardware bill in half. The quality loss is often so small that your users cannot detect it, your eval suite barely registers it, and your finance team celebrates the savings. Yet many teams run full-precision models in production for months or years without ever testing whether a quantized version would meet their quality bar at a fraction of the cost. This is not a technical oversight. It is a cost engineering failure.
+
+The reason quantization belongs in a cost engineering chapter rather than a model optimization chapter is that its primary value in production is economic, not technical. Researchers care about quantization because it enables new architectures and pushes the frontier of what fits on consumer hardware. You should care about quantization because it directly reduces the number of GPUs you rent, the size of instances you provision, and the monthly bill your infrastructure team defends in budget reviews.
+
+## The Mechanism: What Quantization Actually Does
+
+Every neural network stores its knowledge as numerical weights — millions or billions of floating-point numbers that encode everything the model learned during training. At full precision, these weights are stored as 16-bit floating-point numbers, meaning each weight occupies 16 bits of memory. A 70-billion-parameter model at 16-bit precision requires roughly 140 gigabytes of GPU memory just to hold the weights, before accounting for the additional memory needed for attention caches, activations, and serving overhead.
+
+**Quantization** reduces the numerical precision of these weights. Instead of storing each weight as a 16-bit float, you store it as an 8-bit integer, a 4-bit integer, or even a mixed-precision format that uses different precisions for different parts of the model. The core insight is that most weights in a trained model do not need 16 bits of precision. The difference between a weight value of 0.73241 and 0.734 is usually irrelevant to the model's output. Quantization exploits this by mapping the full range of weight values to a smaller set of representable numbers, then storing each weight using fewer bits.
+
+The memory savings are roughly proportional to the precision reduction. Going from 16-bit to 8-bit cuts memory by half. Going from 16-bit to 4-bit cuts memory by four times. That 70-billion-parameter model requiring 140 gigabytes at full precision needs approximately 70 gigabytes at 8-bit precision and 35 gigabytes at 4-bit precision. These are not minor savings. They determine how many GPUs you need, which GPU type you can use, and whether a model fits on your existing infrastructure at all.
+
+## The Cost Impact: Real Numbers
+
+The cost savings from quantization come from two sources: fitting the model on fewer GPUs, and fitting the model on cheaper GPUs. Both are significant.
+
+Consider a concrete scenario. You are running a 70-billion-parameter model for production inference. At 16-bit precision, the model requires roughly 140 gigabytes of GPU memory. An NVIDIA H100 has 80 gigabytes of memory. You need at least two H100s to serve the model, and in practice you need headroom for the KV cache and batch processing, so you provision a two-GPU instance. As of early 2026, on-demand H100 pricing from competitive cloud providers runs approximately $2.50 to $3.00 per GPU per hour. Two GPUs cost you $5.00 to $6.00 per hour, or roughly $3,600 to $4,320 per month for always-on inference.
+
+Quantize that same model to 4-bit precision and it requires roughly 35 gigabytes of GPU memory. That fits on a single H100 with 45 gigabytes of headroom for the KV cache and batch serving. Your infrastructure cost drops to $2.50 to $3.00 per hour, or roughly $1,800 to $2,160 per month. You have cut your GPU bill by 50% without changing your model architecture, your prompt, or your serving code.
+
+But the savings can go further. At 35 gigabytes, your model also fits on older, cheaper hardware. An A100 with 80 gigabytes of memory is more than sufficient, and A100 pricing in 2026 has dropped below $1.00 per hour from many providers as the market shifts to H100 and H200 hardware. Running your 4-bit quantized 70B model on a single A100 at $0.80 per hour costs approximately $576 per month — an 85% reduction from the original two-H100 setup. The model is the same. The quality is nearly the same. The bill is dramatically different.
+
+For smaller models, the savings change shape but remain compelling. A 13-billion-parameter model at full precision needs roughly 26 gigabytes and fits on a single A100 comfortably. Quantizing to 4-bit drops the requirement to about 7 gigabytes, which fits on a consumer-grade GPU or a much cheaper cloud instance. Teams running Llama 4 Scout class models for internal tools or low-stakes classification tasks can serve quantized versions on instances costing $0.30 to $0.50 per hour instead of $2.00 to $3.00 per hour.
+
+## The Quality Trade-Off: What You Actually Lose
+
+Quantization is not free compression. It loses information. The question is how much information matters for your specific task. The answer, for most production workloads, is "not much."
+
+**8-bit quantization** — formats like INT8 and FP8 — typically loses less than 1% of quality on standard benchmarks. NVIDIA's H100 and H200 GPUs include dedicated FP8 tensor cores that make this format particularly efficient. FP8 has become the default inference format for most production deployments in 2026 because it is essentially lossless for practical purposes while halving memory requirements. If you are running any self-hosted model at 16-bit precision on modern hardware, switching to FP8 is the closest thing to a free lunch in AI infrastructure.
+
+**4-bit quantization** — formats like GPTQ, AWQ, and GGUF — loses more but is still surprisingly effective. Benchmark studies from 2025 and 2026 consistently show 4-bit quantized models retaining 95% to 98% of their full-precision quality on standard tasks. AWQ in particular has demonstrated strong quality retention, achieving over 98% accuracy on coding benchmarks compared to the unquantized baseline. The quality loss is real but small, and it tends to appear on edge cases rather than common inputs.
+
+The practical implication is that quantization quality loss is not uniform across tasks. Simple classification tasks, sentiment analysis, entity extraction, and summarization are highly tolerant of quantization. The model has strong signal for these tasks, and the small precision reduction does not push correct answers over the decision boundary. Complex reasoning tasks, nuanced generation tasks, and tasks requiring precise numerical computation are more sensitive. A 4-bit quantized model might produce slightly less coherent long-form arguments or make more errors on multi-step arithmetic.
+
+This is why testing matters more than benchmarks. Benchmark quality loss of 2% does not mean your specific task loses 2%. It might lose 0.5% or it might lose 5%, depending on how your task's difficulty distribution intersects with the quality degradation pattern. The only way to know is to run your eval suite against both the full-precision and quantized versions, on your actual data, for your actual task.
+
+There is also a subtlety around how quality loss manifests in production. A 4-bit quantized model does not produce outputs that are uniformly 2% worse than the full-precision version. It produces identical outputs on 95% to 97% of inputs and noticeably degraded outputs on the remaining 3% to 5%. The degradation clusters around inputs that sit near decision boundaries — ambiguous classifications, nuanced phrasing, edge cases where the model's confidence is already low. If your production traffic is dominated by clear-cut inputs, quantization quality loss is effectively invisible. If your traffic includes a high proportion of difficult cases — which is common in domains like medical triage, legal analysis, or financial risk scoring — the quality loss concentrates exactly where it matters most.
+
+A healthcare AI company discovered this pattern in early 2026 when they tested 4-bit quantization on their symptom classification model. Overall accuracy dropped by 1.8% — well within their tolerance. But when they segmented by severity, accuracy on critical symptom combinations dropped by 7.2%, while accuracy on routine inquiries was unchanged. The aggregate benchmark masked a concentrated failure pattern. They moved to FP8 for the classification pipeline and kept 4-bit quantization for their lower-stakes summarization pipeline, achieving savings where they were safe and avoiding risk where they were not.
+
+## The Quantization Landscape in 2026
+
+The quantization ecosystem has matured significantly. In 2024, quantization required specialized tooling, careful calibration, and significant engineering effort. By 2026, it is a standard part of the model serving pipeline with well-established tools and formats.
+
+**FP8** is the standard for datacenter inference. Every major serving framework — vLLM, TensorRT-LLM, SGLang — supports FP8 quantization natively. Modern GPUs have dedicated FP8 tensor cores. The throughput improvement over 16-bit inference is roughly 30% to 50% in addition to the memory savings, because the GPU processes more data per cycle at lower precision. If you are self-hosting on H100 or H200 hardware, FP8 should be your default inference format unless you have a specific reason to run at higher precision.
+
+**AWQ** (Activation-Aware Weight Quantization) has emerged as the preferred 4-bit method for GPU-based inference in production. AWQ identifies the small fraction of weights that are most important to model quality — determined by analyzing activation patterns rather than weight magnitudes alone — and preserves those weights at higher precision while aggressively quantizing the rest. This activation-aware approach produces consistently better quality than uniform quantization at the same bit width. AWQ quantization is fast, typically taking 10 to 30 minutes for a 7-billion-parameter model, and the resulting models serve efficiently through vLLM and TensorRT-LLM.
+
+**GPTQ** (GPT-Quantized) remains widely used, particularly for community-quantized models on Hugging Face. GPTQ uses a second-order error minimization approach that calibrates quantization parameters against a small dataset. It supports aggressive quantization down to 2-bit and 3-bit, which AWQ does not. For teams that need extreme compression — fitting large models on minimal hardware — GPTQ at 3-bit offers a path, though quality loss at that level becomes material for most production tasks.
+
+**GGUF** is the standard format for CPU and hybrid CPU-GPU inference, primarily through the llama.cpp ecosystem and tools like Ollama. GGUF is not a quantization algorithm but a file format that supports multiple quantization levels, from Q2 through Q8 and various mixed-precision variants. The Q4_K_M variant has become the community standard for local deployment, offering approximately 92% quality retention with efficient inference on consumer hardware. For teams deploying models on edge devices, developer machines, or CPU-only servers, GGUF is the practical choice.
+
+**Mixed-precision quantization** is the emerging frontier. Rather than quantizing the entire model to a single precision, mixed-precision approaches use different precisions for different layers or components. Attention layers might stay at 8-bit while feed-forward layers drop to 4-bit. The INT4 plus FP8 variant — 4-bit weights with 8-bit activations — is gaining traction because it captures most of the memory savings of pure 4-bit while preserving quality much better than uniform 4-bit. NVIDIA's Model Optimizer toolkit supports automated mixed-precision quantization that finds the optimal precision allocation for a given quality target.
+
+## When Quantization Is Not Acceptable
+
+Quantization has limits, and those limits matter in high-stakes domains.
+
+Medical applications where the model assists with diagnosis, treatment recommendations, or patient record analysis have a low tolerance for any quality degradation. If your eval suite shows that a 4-bit quantized model misclassifies 2% more edge-case symptoms than the full-precision version, that 2% represents real patients receiving incorrect guidance. In these contexts, FP8 may be acceptable because the quality loss is negligible, but 4-bit quantization requires extensive validation against clinical accuracy benchmarks before deployment.
+
+Legal analysis and contract review face similar constraints. A model that loses precision on nuanced language interpretation — missing double negatives, misinterpreting conditional clauses, conflating related but distinct legal concepts — creates liability. The cost savings from quantization are meaningless if the quantized model produces output that exposes your client to legal risk.
+
+Financial modeling and numerical reasoning tasks are particularly vulnerable because quantization affects numerical precision directly. A model that rounds intermediate computations differently at lower precision may produce subtly different financial projections. For tasks where the output is consumed as a number rather than as text, even small precision changes matter.
+
+The decision framework is straightforward. Run your eval suite against the quantized model. If quality on your specific task and data is within your acceptable threshold, quantize. If quality drops below your threshold on any critical metric, either move to a less aggressive quantization level — 8-bit instead of 4-bit — or stay at full precision for that specific task while quantizing everything else.
+
+## The Throughput Bonus
+
+Quantization does not only save memory. It also increases inference speed, which has its own cost implications.
+
+Lower precision means the GPU processes more data per compute cycle. FP8 inference on H100 hardware is roughly 30% to 50% faster than FP16 inference for the same model. 4-bit inference can be 2 to 3 times faster than 16-bit, depending on the serving framework and model architecture. This throughput increase means each GPU serves more requests per second, which means you need fewer GPUs for the same traffic volume.
+
+Consider a system that handles 100 requests per second at 16-bit precision using four H100 GPUs. If 4-bit quantization doubles the throughput per GPU, that same traffic can be served by two GPUs. You have cut your GPU count from four to two — not because the model is smaller (though it is), but because each GPU processes requests faster. The cost savings from throughput improvement stack on top of the savings from memory reduction. In this scenario, you went from four GPUs at $3.00 per hour each — $12.00 per hour — to two GPUs at $3.00 per hour each — $6.00 per hour. That is a 50% reduction from throughput alone, on top of any savings from using smaller or cheaper instances.
+
+The throughput benefit also affects autoscaling economics. If each GPU serves more requests per second, your autoscaler triggers fewer scale-up events, provisions fewer additional instances, and settles back to baseline faster. Over a month, the reduced autoscaling activity can save 10% to 20% on top of the base GPU cost reduction, depending on your traffic pattern.
+
+## The Quantization Decision Matrix
+
+Not every model needs the same quantization strategy. The right choice depends on the model's role in your system, the quality sensitivity of the task, and the hardware you have available.
+
+For models serving high-volume, low-stakes tasks — classification, routing, intent detection, basic extraction — 4-bit quantization using AWQ is almost always the right choice. The quality loss is negligible for these tasks, the cost savings are substantial, and the throughput improvement reduces latency.
+
+For models serving medium-stakes tasks — customer-facing generation, content summarization, RAG-based question answering — FP8 is the safe default. It preserves essentially all quality while still providing meaningful memory and throughput benefits. If cost pressure is severe, test 4-bit on your specific eval suite and move there if quality holds.
+
+For models serving high-stakes tasks — medical, legal, financial analysis — start with FP8 and validate thoroughly. Move to 4-bit only if your domain-specific eval suite confirms acceptable quality. If it does not, stay at FP8 and accept the smaller savings.
+
+For edge deployment and on-device inference — developer tools, local assistants, offline-capable applications — GGUF Q4_K_M is the practical standard. The quality-to-size ratio is the best available for consumer hardware, and the llama.cpp ecosystem makes deployment straightforward.
+
+## Implementing Quantization in Your Cost Stack
+
+The implementation path for quantization is simpler than most teams expect. If you are using a major serving framework — vLLM, TensorRT-LLM, or SGLang — quantized model loading is a configuration option, not a code change. You download or generate the quantized model weights, point your serving framework at them, and deploy. The API contract does not change. Your application code does not change. Only the model files and the GPU requirements change.
+
+For FP8 quantization on modern hardware, most frameworks support on-the-fly quantization at load time. You load the full-precision model and the framework automatically converts to FP8 for inference, with no pre-processing step required. This is the lowest-effort path to quantization savings and the one you should try first.
+
+For 4-bit quantization, you typically need a pre-processing step to generate the quantized model weights. Tools like AutoAWQ and AutoGPTQ handle this in a single command, using a small calibration dataset — usually 128 to 512 samples — to optimize the quantization parameters. The calibration takes 10 to 30 minutes for a 7B model and one to three hours for a 70B model. The resulting quantized weights are saved as standard model files that any compatible serving framework can load.
+
+The key operational consideration is tracking quantization as a variable in your cost monitoring. Your infrastructure dashboard should show which models are running at which precision, the quality metrics for each precision level, and the cost per request at each precision. This lets you make informed decisions about pushing more workloads to lower precision when cost pressure increases, or pulling workloads back to higher precision when quality metrics dip.
+
+## The Calibration Dataset Matters More Than You Think
+
+For 4-bit quantization methods like AWQ and GPTQ, the quality of your calibration dataset directly affects the quality of the quantized model. The calibration dataset is a small set of examples — typically 128 to 512 samples — that the quantization algorithm uses to determine which weights are most important and how to map the full-precision weight values to lower-precision representations.
+
+The default calibration dataset that most tools use is a random sample from a general-purpose corpus. This works well enough for general-purpose inference, but it can produce suboptimal quantization for specialized tasks. If your model primarily processes financial documents and the calibration dataset is general web text, the quantization algorithm may not preserve the weights that are most important for financial reasoning. It optimizes for the average case, not your case.
+
+The fix is simple: calibrate with your own data. Take 256 representative examples from your production traffic, format them as the model would see them in inference, and use that as your calibration dataset. The quantization algorithm then optimizes specifically for the weight patterns that matter for your workload. Teams that switch from the default calibration dataset to a domain-specific one routinely see 0.5% to 1.5% quality improvement on their task-specific benchmarks, with no change to the quantization level or method. That is free quality — same compression, same cost savings, better output.
+
+The calibration step takes minutes to run and hours to set up the first time. After that, it should be part of your standard quantization pipeline. Every time you quantize a model for production, calibrate with fresh examples from your production data.
+
+## Quantization and Fine-Tuned Models
+
+Fine-tuned models add a wrinkle to the quantization story. When you fine-tune a base model on your domain data and then quantize the result, the quality loss pattern can differ from quantizing the base model directly. Fine-tuning adjusts a relatively small number of weights from their pre-trained values. If quantization rounds those adjusted weights back toward their pre-trained values, it can partially undo the fine-tuning. The more aggressively you quantize, the higher the risk.
+
+In practice, this means fine-tuned models are slightly more sensitive to quantization than base models. A base model that loses 1.5% quality at 4-bit quantization might lose 2.5% when fine-tuned and then quantized, because the fine-tuning-specific weight adjustments are disproportionately affected. This is particularly true for LoRA-merged models, where the fine-tuning modifications are concentrated in low-rank adapter matrices that were merged into the base weights. The merged weights have a different distribution than the original weights, and quantization algorithms that were not designed with this in mind can produce suboptimal results.
+
+The mitigation is to quantize after merging and to validate with your task-specific eval suite rather than relying on general benchmarks. Some teams have found success with quantization-aware fine-tuning, where the model is fine-tuned with simulated quantization noise, making it more robust to post-training quantization. This adds complexity to the fine-tuning pipeline but produces models that tolerate aggressive quantization with less quality loss.
+
+## The Compounding Math
+
+Quantization savings compound with other cost optimizations. A model that is quantized to 4-bit AND served on spot instances AND benefits from prompt caching AND is deployed in a single region stacks four independent cost reductions. If quantization saves 50%, spot pricing saves 60%, prompt caching saves 30% of input costs, and single-region deployment eliminates cross-region transfer fees, the combined savings can exceed 80% compared to the naive baseline of full-precision, on-demand, uncached, multi-region deployment.
+
+This compounding is why quantization should not be evaluated in isolation. When you build your cost model, include quantization as one layer in the stack. Calculate the savings from quantization, then calculate what those savings become when combined with your other optimizations. The total is always larger than any individual lever would suggest.
+
+A logistics company ran exactly this analysis in late 2025. Their baseline cost for a 70B model serving route optimization queries was $8,400 per month on two on-demand H100 GPUs at full precision. They applied four optimizations: 4-bit AWQ quantization moved them to a single H100 at $2,160 per month. Switching to reserved instances dropped that to $1,512 per month. Prompt caching reduced their input token overhead for self-hosted inference by 25%, freeing capacity that reduced their peak GPU needs. Autoscaling during off-hours cut average utilization cost by another 20%. Final monthly cost: approximately $1,210. Total savings: 85%. No single optimization achieved that. The stack achieved it.
+
+## What Quantization Does Not Fix
+
+Quantization reduces the cost of running a model. It does not reduce the cost of choosing the wrong model. If your task can be handled by a 7-billion-parameter model and you are running a 70-billion-parameter model quantized to 4-bit, you are still overspending. The quantized 70B model uses one H100. The full-precision 7B model uses a fraction of one A100. Quantization makes an oversized model cheaper, but it does not make it the right size.
+
+This is the **quantization trap**: teams discover quantization, apply it to their current model, celebrate the savings, and never revisit whether a smaller model at full precision would serve even better. A 7B model at 16-bit often outperforms a 70B model at 2-bit for specific tasks because 2-bit quantization degrades quality substantially. The cost-optimal path is not always "take the biggest model and quantize it as aggressively as possible." Sometimes it is "choose the smallest model that meets your quality bar and quantize it moderately."
+
+The right sequence is: first, find the smallest model that meets your quality requirements. Second, quantize that model to the most aggressive level that maintains acceptable quality. Third, deploy on the cheapest hardware that can serve the quantized model at your required throughput. Each step independently reduces cost. Together, they find the true minimum.
+
+## A Worked Example: From $8,400 to $576
+
+A concrete walkthrough makes the full impact clear. A mid-sized e-commerce company runs a product description generation pipeline using a self-hosted 70-billion-parameter model. Their original deployment: two A100 80GB GPUs at full 16-bit precision, on-demand pricing at $2.80 per GPU per hour, always-on for 24 hours per day. Monthly cost: $4,032. They also maintain a second pair of A100s for redundancy. Total GPU spend: $8,064 per month.
+
+Step one: they quantize the model to FP8 using their serving framework's built-in FP8 support. The model now fits on a single A100 with headroom. They reduce to one A100 for primary serving and one for redundancy. Monthly GPU cost drops to $4,032. That alone is a 50% savings with essentially zero quality loss — their eval suite shows less than 0.3% degradation on any metric.
+
+Step two: they test 4-bit AWQ quantization using 256 calibration examples from their production traffic. Quality loss on their eval suite: 1.1% on their primary accuracy metric, well within their 3% tolerance. The model now requires only 35 gigabytes, fitting easily on a single A100 with massive headroom. But more importantly, the smaller memory footprint means they can batch more requests per GPU, increasing throughput by 2.4 times.
+
+Step three: with the throughput increase, their single primary A100 handles their entire production load plus a 40% traffic buffer. They drop the redundancy GPU entirely and rely on autoscaling to provision a backup if the primary fails — their serving framework restarts on a new instance within 90 seconds. Monthly GPU cost: $2,016.
+
+Step four: since A100 prices have dropped dramatically in 2026 with the market shift to H100 and H200 hardware, they switch to a cheaper GPU cloud provider offering A100s at $0.80 per hour. Same model, same quantization, same serving framework. Monthly GPU cost: $576.
+
+From $8,064 to $576 per month. A 93% reduction. The product description quality, as measured by their A/B testing against the original full-precision output, shows no statistically significant difference in user engagement metrics. The finance team asks why they did not do this a year ago. The honest answer: nobody ran the numbers.
+
+## Monitoring Quantization Quality Over Time
+
+Quantization is not a set-and-forget optimization. Model quality can drift after quantization for reasons that are not immediately obvious. The most common cause is distributional shift in your input data. Your quantization was calibrated on examples from three months ago. Your production traffic has shifted — new product categories, different user phrasing patterns, seasonal variations in query complexity. The calibration-optimized quantization may no longer be optimal for the current traffic.
+
+Build a quality monitoring loop that compares quantized model output against full-precision output on a sampled subset of production traffic. Run 1% to 5% of your daily requests through both the quantized model and a full-precision reference model, and compare outputs using your standard quality metrics. If the quality gap between quantized and full-precision widens beyond your threshold — say, from 1% to 3% — that is a signal to recalibrate with fresh production data. The recalibration process takes minutes. The monitoring infrastructure takes a day to set up. The alternative is discovering quality degradation when users complain, which costs far more.
+
+Track the quality gap as a metric on your infrastructure dashboard, right alongside GPU utilization and latency. When the quantization quality gap exceeds your threshold, trigger an alert. Recalibrate, validate, and redeploy the quantized model. This closed loop ensures that quantization savings persist without quality erosion, and it turns quantization from a one-time optimization into a continuously managed cost lever.
+
+The next subchapter turns to a cost category that most teams discover only after they have committed to their infrastructure architecture: networking and egress charges, the expense that never appears in GPU pricing calculators but always appears on the monthly bill.

@@ -1,0 +1,99 @@
+# 3.4 — Generation Quality Degradation from Token Fragmentation
+
+When a tokenizer fragments a word into many subword tokens, the model must reconstruct meaning across those fragments, and this reconstruction is lossy. Each fragment is a prediction step. Each prediction step carries a probability of error. A word that maps to a single token gives the model the full meaning in one step — one forward pass, one attention computation, one clean semantic unit. The same word fragmented into four tokens requires the model to maintain coherence across four sequential predictions, each one conditioned on the fragments that came before. The model is no longer predicting meaning. It is predicting byte sequences and hoping they assemble into meaning. That hope fails more often than most teams realize, and the failures are subtle enough that they pass automated checks while eroding trust with native speakers.
+
+## The Fragmentation-Error Pipeline
+
+To understand why fragmentation degrades generation quality, you need to trace the path from tokens to text.
+
+During generation, the model predicts one token at a time. At each step, it computes a probability distribution over the entire vocabulary and selects the next token. When the next token is a complete word — "understanding" as a single vocabulary entry — the model's attention mechanism can draw on the full context to select the right word. The prediction is semantic: the model is choosing a meaning.
+
+When the next token is a fragment — the first two bytes of an Arabic word, for instance — the prediction is no longer purely semantic. The model is choosing a byte pattern that must combine with subsequent byte patterns to form a valid word. The model has learned statistical associations between these byte patterns during pretraining, but those associations are weaker than word-level associations. The model has seen "the" followed by "understanding" millions of times and has strong associations for that sequence. It has seen the byte fragment representing the first half of an Arabic verb form followed by the byte fragment representing the second half far fewer times, and the association is correspondingly weaker.
+
+The result is a cascade of small errors. Each fragmented token introduces a small probability of selecting a byte sequence that is statistically plausible but linguistically wrong. Across a full sentence, these small probabilities compound. A sentence generated from fifteen single-token words has fifteen chances for error. The same sentence generated from forty-five fragmented tokens has forty-five chances for error, and each error has a higher base probability because the model is predicting byte patterns rather than semantic units. The overall error rate for the fragmented sentence is not three times higher. It is substantially more than three times higher, because errors in early fragments propagate — a wrong byte in position two makes the correct byte in position three less likely.
+
+## Morphological Errors in Agglutinative Languages
+
+The most visible quality degradation appears in languages with rich morphology — languages where grammatical information is encoded within the structure of individual words rather than through separate function words.
+
+Turkish is the canonical example. Turkish is agglutinative: you build meaning by stacking suffixes onto a root. The word for "as if you were one of those who could not be made to civilize" is a single word in Turkish, roughly twenty characters long, built from a root and seven or eight suffixes. A tokenizer that fragments this word into five or six subword tokens creates a generation challenge: the model must produce the correct root, then the correct first suffix that agrees with the root's vowel harmony, then the correct second suffix that agrees with both the root and the first suffix, and so on through the entire chain.
+
+Vowel harmony is the specific mechanism that breaks. Turkish has a phonological rule where vowels in suffixes must match the frontness and roundness of vowels in the root. If the root contains a back vowel, every suffix must use back vowels. When the tokenizer fragments a word across the vowel harmony boundary, the model loses track of the harmonic pattern. The first fragment might contain the root with its back vowels. The second fragment starts fresh, and the model — predicting based on local byte statistics rather than the phonological rule — sometimes selects a suffix with front vowels. The resulting word is not Turkish. It looks almost right to a non-speaker. A native Turkish speaker recognizes it instantly as garbled.
+
+Research published in early 2025 using Turkish as a benchmark found that tokenization strategy alone could swing downstream task accuracy by ten to fifteen percentage points. The study tested the same model with different tokenizers on the same Turkish evaluation set. Tokenizers that preserved morpheme boundaries — splitting between the root and suffixes rather than within them — produced significantly fewer morphological errors than tokenizers that split arbitrarily. The model's linguistic knowledge was the same in both cases. Only the tokenizer differed. The quality gap came entirely from fragmentation.
+
+Finnish presents a parallel problem. Finnish has fifteen grammatical cases, each expressed through suffixes. A noun in the partitive case with a possessive suffix and a clitic particle becomes a single word of twelve to fifteen characters. Fragment it into four tokens, and the model must maintain case agreement, possessive agreement, and clitic placement across all four prediction steps. The error rate on Finnish case endings in generated text is measurably higher than the error rate in languages where case is expressed through separate words.
+
+Hungarian, Estonian, Kazakh, and other agglutinative languages face the same fundamental problem. The more grammatical information a language packs into individual words, the more damage fragmentation does to generation quality.
+
+## Arabic: Broken Plurals and Root Extraction Failures
+
+Arabic morphology creates a different class of fragmentation error. Arabic uses a root-and-pattern system where a three-consonant root — for example, k-t-b meaning "write" — combines with vowel patterns and affixes to create different word forms. "He wrote" is a different pattern from "book" which is different from "writer" which is different from "desk" — but all share the root k-t-b.
+
+When the tokenizer fragments an Arabic word, it often splits the root from the pattern. The model must then reconstruct which root was intended and which pattern was applied — information that was explicit in the unfragmented word but is now distributed across disconnected byte sequences. The failure mode is that the model generates a valid-looking sequence of Arabic bytes that does not correspond to any real Arabic word. It looks like Arabic. It uses the right script. The letters are properly connected. But the root-pattern combination is nonsensical — a word that no Arabic speaker has ever produced.
+
+Broken plurals are a particularly vulnerable category. Arabic has two plural systems: sound plurals that follow regular suffix rules, and broken plurals where the vowel pattern inside the word changes. The plural of "book" does not add a suffix — it changes the internal vowels. Tokenizers fragment these internal changes, and the model often generates the sound plural pattern (adding a suffix) when the broken plural pattern (changing internal vowels) is correct, or vice versa. This error is immediately obvious to any literate Arabic speaker and signals that the system does not understand Arabic — even if the model actually does understand Arabic when given unfragmented tokens.
+
+## Diacritical Mark Errors
+
+Many writing systems use diacritical marks — small symbols above, below, or beside characters that change pronunciation, meaning, or grammatical function. When tokenizers fragment text, diacritical marks are among the first casualties.
+
+Vietnamese is written in the Latin alphabet but uses an extensive system of tone marks and vowel quality marks. Six different tones, each marked with a different diacritical symbol, distinguish words that are otherwise identical. The word "ma" with no mark means "ghost." With one type of mark it means "mother." With another it means "horse." With another it means "rice seedling." With another it means "tomb." With another it means "but." The tone mark is not decorative. It is the entire meaning.
+
+When a tokenizer fragments a Vietnamese word, the byte representation of the diacritical mark may end up in a different token than the base character it modifies. The model, predicting tokens sequentially, sometimes drops the diacritical mark, applies the wrong mark, or places the mark on the wrong vowel. Each of these errors changes the word's meaning. A customer support response that uses the wrong tone mark on a key word does not just look unprofessional — it says something the model did not intend.
+
+Arabic tashkeel — the short vowel marks used in formal, religious, and educational text — faces the same problem. These marks indicate pronunciation and grammatical role, and they are essential in contexts like Quranic text, children's education, and formal legal language. Tokenizers that fragment Arabic text often separate the tashkeel marks from the consonants they modify. The model generates the consonant skeleton correctly but drops or misplaces the vowel marks, producing text that is ambiguous or incorrect in formal registers.
+
+French accents, while less critical than Arabic or Vietnamese diacritics, still create occasional errors. The difference between "ou" meaning "or" and the accented form meaning "where" is a single diacritical mark. Fragment the word, and the model occasionally drops the accent. In casual text, this is a minor annoyance. In legal or medical text, it can change the meaning of a clause.
+
+## Compound Word Fragmentation
+
+Languages that build meaning through compound words face a different fragmentation problem. The compound word is a single semantic unit, but the tokenizer sees it as a sequence of subwords that happen to be adjacent.
+
+German is the most discussed case. German freely compounds nouns to create new words. A regulatory term might be a single word of forty characters describing a specific legal concept. The tokenizer fragments it into six or eight subword tokens. During generation, the model must produce these subwords in exactly the right order, with the right connecting elements between compound parts, and without inserting spaces. Any error — a wrong subword, a missing connecting element, an inserted space — produces a non-word.
+
+The failure mode is often partial success. The model generates a compound word that contains the right components but in the wrong order, or with the wrong connecting element, or with one component replaced by a semantically related but incorrect alternative. The resulting word looks plausible. It might even be understandable from context. But it is not the correct technical term, and in domains like law, medicine, or engineering where compound words are precise technical vocabulary, using the wrong compound is a substantive error.
+
+Dutch, Swedish, Norwegian, and Finnish share this compound word system with German and face similar fragmentation problems. Icelandic, with its archaic vocabulary and small training data presence, is particularly affected — its compound words are rarely seen in training corpora, so the tokenizer has no dedicated merge rules for them.
+
+## Consistency Degradation Within a Single Response
+
+Token fragmentation does not just produce one-off errors. It produces inconsistency — the same concept tokenized differently in different positions within a single response, leading to variations in terminology, spelling, or phrasing that undermine the coherence of the text.
+
+This happens because BPE tokenization is context-dependent. The exact sequence of bytes surrounding a word affects how the tokenizer segments it. The same Arabic word at the beginning of a sentence, where it follows a newline or space, might tokenize into three fragments. The same word in the middle of a sentence, where it follows different preceding bytes, might tokenize into four fragments — a different fragmentation of the same word. The model has learned slightly different statistical patterns for each fragmentation. So the first instance might be generated correctly, and the second instance — with a different fragmentation pattern — might have a subtle error.
+
+The result is a response where the same technical term appears three times but is spelled slightly differently each time, or where the same name is rendered with different diacritical marks in different paragraphs. Native speakers notice this immediately. It creates a sense that the system is unreliable — not because any single error is severe, but because the inconsistency signals that the system does not have stable knowledge of the language.
+
+## Measuring Fragmentation-Driven Quality Degradation
+
+Detecting fragmentation errors requires evaluation methods specifically designed to catch them. Standard automated metrics — BLEU, ROUGE, and even model-based quality scores — often miss fragmentation errors because they operate at the sequence level and the errors are at the word level.
+
+The most reliable detection method is to compare generation quality across different fertility levels within the same language. Take a set of prompts, generate responses, and group them by the fertility of the generated text. Responses where the average fertility per word is high — indicating heavy fragmentation — should be compared against responses where fertility is low. If quality metrics correlate negatively with fertility, you have evidence that fragmentation is driving degradation.
+
+A second method is morphological validation. For languages with well-defined morphological rules — Turkish vowel harmony, Arabic root-pattern validity, Finnish case agreement — you can build automated checkers that flag generated words violating these rules. The violation rate per thousand generated words is a direct measure of fragmentation-driven morphological error. Track this metric across tokenizers and model versions. It tells you exactly how much the tokenizer is hurting your output quality.
+
+A third method is native speaker annotation with targeted error categories. Standard quality annotation asks "is this response good?" Fragmentation-targeted annotation asks specific questions: "Are all diacritical marks correct?" "Are compound words formed correctly?" "Are morphological endings consistent with the grammatical context?" "Is the same term spelled consistently throughout?" These targeted questions catch errors that general quality ratings smooth over because the overall response sounds acceptable even when individual words are wrong.
+
+## Partial Mitigations
+
+No mitigation fully eliminates fragmentation-driven quality loss. But several techniques reduce it to manageable levels.
+
+**Language-optimized tokenizers** are the most effective intervention. If your primary non-English language is one of the major languages with dedicated tokenizer support — Chinese through Qwen, Japanese through models with explicit Japanese vocabulary investment, Korean through multilingual-focused tokenizers — selecting the right tokenizer can reduce fertility by 20 to 40% and produce a proportional reduction in fragmentation errors. The previous subchapter's tokenizer comparison table is not just a cost tool. It is a quality tool.
+
+**Constrained decoding** limits the model's output vocabulary to tokens that form valid words in the target language. Instead of allowing the model to generate any byte sequence and hoping it assembles into a valid word, constrained decoding enforces that each generated sequence must match a word in a language-specific dictionary or pass a morphological validity check. This eliminates the class of errors where the model produces fluent-looking but invalid words. The trade-off is increased generation latency — checking constraints at each step adds computational overhead — and reduced creativity, since the model cannot generate novel words or transliterations that are not in the dictionary.
+
+**Post-processing spell-check and morphological correction** catches errors after generation. A language-specific spell-checker scans the output, identifies words that are not in the dictionary or that violate morphological rules, and suggests corrections. This works well for isolated errors but struggles when the generated text is so fragmented that the intended word is ambiguous. If the model generated a word that could be a misspelling of three different valid words, the spell-checker cannot reliably choose the correct one without understanding the full semantic context.
+
+**Hybrid approaches** combine constrained decoding with post-processing. The constrained decoder prevents the worst errors during generation, and the post-processor catches the remaining ones. This layered defense is more robust than either technique alone and is the approach most production multilingual systems in 2026 adopt for high-stakes applications like medical, legal, and financial text generation.
+
+**Model selection based on target language** is an underused strategy. Different models have different strengths for different languages, and those strengths are only partially explained by tokenizer differences. A model that was pretrained on more Arabic text will produce better Arabic output even with the same tokenizer, because its internal representations are richer. Evaluating three or four candidate models specifically on your target language's morphological error rate — not just on general quality scores — often reveals large differences that justify running different models for different languages.
+
+## The Quality Gap Is Not Fixed by Prompt Engineering
+
+Teams that discover their multilingual output quality is worse than English often attempt to fix it with prompt engineering — adding instructions like "generate grammatically correct text" or "ensure all diacritical marks are properly placed." These instructions do not work because the problem is not that the model lacks knowledge of the language's rules. The problem is that the tokenizer fragments the language's text into pieces that make rule-following mechanically harder.
+
+Telling the model to follow Turkish vowel harmony when it is generating fragments that split across harmony boundaries is like telling a pianist to play smoothly while wearing boxing gloves. The knowledge is there. The mechanism of execution makes it difficult to apply. The fix is not better instructions to the pianist. The fix is removing the gloves — which in this context means selecting a tokenizer that fragments Turkish words less aggressively, using constrained decoding that enforces harmony, or post-processing with a morphological corrector.
+
+This distinction matters for how you allocate engineering effort. If your team is spending weeks on prompt engineering to improve Japanese output quality but has never evaluated whether a different tokenizer would reduce Japanese fertility by 30%, you are optimizing the wrong variable. The token tax drives quality degradation at a level below the prompt. You must address it at that level.
+
+The next subchapter examines what happens when the token tax scales to production volumes — where a fertility ratio of 2.5 does not just mean slightly worse answers but means tens of thousands of dollars in additional monthly cost and measurable impacts on your product's economic viability.

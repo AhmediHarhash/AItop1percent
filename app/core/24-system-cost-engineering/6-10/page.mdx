@@ -1,0 +1,105 @@
+# 6.10 — Batching External Calls: Amortizing API Costs Across Requests
+
+If you are making the same API call once per request when you could make it once per hundred requests, you are paying a hundred times more than you need to. This is not an exaggeration. It is arithmetic. Every external API call carries overhead — network round-trip latency, per-request minimum charges, connection setup, authentication handshakes, and the compute cost on the provider's side that gets passed through in per-call pricing. When you make one call per user request, you pay that overhead every time. When you batch a hundred user requests into a single API call, you pay the overhead once and amortize it across all hundred. The per-request cost drops by a factor that directly tracks the batch size. Teams that understand this build batching into their architecture from the start. Teams that don't discover it only when their API bills become impossible to ignore.
+
+Batching is not a new concept. Database engineers have been batching writes for decades. Network engineers batch packets. Payment processors batch transactions. But AI engineering teams routinely ignore batching because the individual API calls feel cheap — a fraction of a cent each — and because the real-time, request-response paradigm of web services makes per-request processing feel natural. The cost of that paradigm only becomes visible at scale, when the cumulative overhead of millions of individual calls dwarfs the actual compute cost of the work being done.
+
+## Where Batching Applies in AI Systems
+
+Not every API call can be batched. Batching requires that multiple independent requests need the same type of operation and that a small delay in processing is acceptable. In AI systems, four categories of external calls are natural candidates for batching.
+
+**Embedding generation** is the highest-value batching target. When your system needs to embed text — for indexing new documents, for computing query embeddings, for generating embeddings for evaluation — each text can be embedded independently of the others. OpenAI's embedding API accepts up to 2,048 texts in a single request. Cohere's embed API supports batches of up to 96 texts per call. Sending 100 texts in one call instead of 100 separate calls eliminates 99 round trips, 99 authentication handshakes, and 99 separate per-request overhead charges. The tokens processed are identical. The overhead is not.
+
+**Classification and moderation** are the second natural fit. Content moderation APIs, sentiment classifiers, and intent detection models often support batch inputs. OpenAI's moderation endpoint accepts multiple inputs per call. Custom classification models deployed on batch inference endpoints can process thousands of items in a single request. If your system classifies every incoming message for intent routing, batching those classification calls across a window of incoming messages cuts the per-message classification cost dramatically.
+
+**Data enrichment and external lookups** are the third category. If your AI system enriches model outputs with data from external APIs — looking up product details, verifying addresses, checking inventory, pulling financial data — many of those external APIs support batch queries. A single batch call to a geocoding API that resolves 50 addresses costs a fraction of 50 individual calls, both in API fees and in network overhead.
+
+**Asynchronous model inference** is the fourth and increasingly important category. By 2026, every major model provider offers a batch inference API alongside their real-time endpoint. OpenAI's Batch API processes requests at a 50% discount with a 24-hour completion window. Anthropic's Message Batches API offers similar economics. Google's Gemini Batch API provides 50% discounts on both standard and embedding inference. Together AI's batch endpoint delivers significant discounts with enhanced rate limits. For any workload where the result is not needed in real time — evaluation runs, bulk content generation, nightly summarization jobs, training data preprocessing — batch inference is the single largest cost lever available.
+
+## The Economics of Per-Call Overhead
+
+To understand why batching saves money, you need to understand the overhead structure of API calls. The cost of an API call is not just the compute cost of processing your input. It includes fixed costs that are the same whether you send 10 tokens or 10,000.
+
+Network latency is the most visible fixed cost. A round trip to an API endpoint takes 20 to 100 milliseconds depending on geography and provider. For a batch of 100 items, 100 individual calls burn 2 to 10 seconds of cumulative network time. One batch call burns 20 to 100 milliseconds. The compute saved is not directly billed, but the freed-up connection capacity and reduced contention against rate limits have real economic value.
+
+Per-request minimum charges are the more directly financial overhead. Some APIs charge a minimum per call regardless of payload size. Others structure their pricing so that small payloads are disproportionately expensive relative to large ones. An embedding API that charges per million tokens but processes each call as a separate inference operation may allocate GPU resources per call, making 100 calls of 20 tokens each more expensive to serve (and sometimes more expensive to bill) than one call of 2,000 tokens. Even when the token price is identical, the provider's operational cost favors larger payloads, and that preference often shows up in batch-specific pricing tiers.
+
+Rate limit consumption is the hidden overhead that batching addresses. Most API providers set rate limits in requests per minute, not tokens per minute. If your rate limit is 3,000 requests per minute and you are making individual embedding calls, you can process 3,000 texts per minute. If you batch 100 texts per call, you can process 300,000 texts per minute within the same rate limit. Batching does not just reduce cost. It increases throughput within your existing rate limit allocation, which can eliminate the need to request — and pay for — a higher rate limit tier.
+
+## Micro-Batching: The Latency-Cost Balance
+
+The obvious objection to batching is latency. If a user sends a query and the system needs to embed it for retrieval, you cannot wait for 99 more users to show up before processing the first query. The user expects a response in under a second, not in a minute. This is where **micro-batching** resolves the tension between cost optimization and user experience.
+
+Micro-batching collects incoming requests into small windows — typically 50 to 200 milliseconds — and processes them as a batch. Instead of sending each embedding request individually as it arrives, the system holds it in a queue for up to 100 milliseconds, collects however many other requests arrive during that window, and sends them all to the embedding API as a single batch call. The maximum added latency is the window duration — 100 milliseconds in this example. The actual added latency is typically half that, since on average a request arrives midway through the window.
+
+For most user-facing applications, 50 to 100 milliseconds of added latency is invisible. The user will not notice the difference between a 350-millisecond response and a 400-millisecond response. But the cost savings are significant. A system that receives 500 embedding requests per second and micro-batches with a 100-millisecond window creates batches of approximately 50 requests each. That reduces the number of API calls by a factor of 50, cuts per-call overhead by the same factor, and may qualify for batch pricing tiers that offer 20% to 40% discounts on top of the overhead savings.
+
+The micro-batching window is a tunable parameter, and the optimal value depends on traffic volume and latency sensitivity. At 50 requests per second, a 100-millisecond window creates batches of 5 — modest savings. At 1,000 requests per second, the same window creates batches of 100 — substantial savings. For low-traffic systems, a longer window of 200 to 500 milliseconds may be needed to accumulate meaningful batches. For high-traffic systems, a shorter window of 20 to 50 milliseconds may be sufficient. The goal is to find the window duration that creates batch sizes large enough to amortize overhead without adding enough latency to affect user experience.
+
+## Implementing a Batching Pipeline
+
+A production batching pipeline has four components: a request queue, a trigger mechanism, a batch processor, and a result router.
+
+The **request queue** collects incoming API calls as they arrive. Instead of immediately forwarding each call to the external API, the calling service pushes the call parameters — the text to embed, the content to classify, the data to enrich — into an in-memory queue along with a callback handle that will receive the result.
+
+The **trigger mechanism** determines when to flush the queue and send a batch. Two triggers operate simultaneously: a size threshold and a time threshold. The size threshold fires when the queue reaches a maximum batch size — say, 100 items for an embedding API that supports batches of up to 2,048. The time threshold fires when the oldest item in the queue has been waiting for the maximum acceptable time — say, 100 milliseconds. Whichever trigger fires first initiates the batch. Under high load, the size threshold fires before the time threshold, creating full batches. Under low load, the time threshold fires before the size threshold, creating smaller batches that prevent any request from waiting too long.
+
+The **batch processor** takes the queued items, constructs a single API call, sends it, and handles the response. This component must handle partial failures — some items in the batch may fail while others succeed — and must implement retry logic at the batch level, not the individual-item level. If the batch call fails entirely, the entire batch is retried once with exponential backoff. If it fails again, the items are returned to the queue for the next batch. If individual items within a successful batch response indicate errors, only those items are re-queued.
+
+The **result router** matches batch response items back to their original callers. Each item in the batch response must be paired with the callback handle from the request queue so the result reaches the correct waiting request. This is straightforward with indexed arrays — item zero in the response corresponds to item zero in the request — but requires careful implementation to handle edge cases like response items arriving out of order or responses with fewer items than the request.
+
+## Batch Pricing: The Explicit Discount
+
+Beyond the implicit savings from overhead amortization, several major providers now offer explicit batch pricing that discounts the per-token cost itself.
+
+OpenAI's Batch API charges 50% less per token than real-time endpoints. A GPT-5 call that costs $1.25 per million input tokens in real time costs $0.625 per million in batch mode. The trade-off is a 24-hour completion window — you submit the batch and get results within 24 hours, not in seconds. For evaluation runs, content generation pipelines, bulk classification, and any other workload where results are not needed in real time, this is a straightforward 50% cost reduction with no quality difference.
+
+Anthropic's Message Batches API provides similar batch economics, processing up to 10,000 requests per batch with recommended batch sizes around 5,000 for optimal throughput. Google's Gemini Batch API charges half the standard per-token rate, with support for both inference and embedding batch operations. Together AI's batch inference endpoint offers discounts alongside dramatically increased rate limits — up to 3,000 times the standard rate limit — enabling bulk processing that would be prohibitively slow at real-time rate limits.
+
+The combination of explicit batch pricing and implicit overhead savings creates a compound discount. A team that batches embedding calls to eliminate per-call overhead and uses the Batch API's 50% token discount reduces their embedding costs by more than 50% total. A team that indexed 100,000 documents individually through OpenAI's real-time embedding endpoint and then switched to batched calls through the Batch API reported a 60% total cost reduction — 50% from the batch pricing discount and an additional effective 10% from overhead amortization and reduced rate limit contention.
+
+## Where Batching Does Not Work
+
+Batching is not universally applicable, and forcing it where it does not fit wastes engineering effort without saving money.
+
+**Single-user, latency-critical paths** are the primary exception. When a user asks a question and the system must generate a response immediately, the generation call cannot be batched because there is only one prompt and the user is waiting. The query embedding might be micro-batchable if traffic is high enough to accumulate meaningful batches within a sub-100-millisecond window. But the final generation call is inherently single-request.
+
+**Low-volume operations** are the second exception. If your system processes 50 embedding calls per hour, micro-batching with a 100-millisecond window produces batches of one. There is nothing to amortize. The engineering complexity of the batching pipeline costs more to maintain than the overhead it saves. A simple heuristic: if your traffic is below 10 operations per second for a given API, batching delivers negligible savings and is not worth implementing.
+
+**APIs with no batch support or per-item overhead** are the third exception. Some external APIs charge a flat per-query fee regardless of payload size and do not support multiple items per call. Batching is architecturally impossible in this case. The optimization lever for these APIs is caching — reducing the number of calls by serving repeated queries from a local cache — not batching.
+
+**Order-dependent operations** are the fourth exception. If operations must be processed in strict sequence — each call's output is the input to the next — batching is structurally impossible because the batch items are not independent. Pipeline-structured workflows where Step B depends on Step A's output must process sequentially. The optimization lever here is pipelining (starting Step B for request one while Step A processes request two), not batching.
+
+## Measuring Batching Effectiveness
+
+Once you implement batching, you need to know whether it is working and how much it saves. Three metrics tell the story.
+
+**Average batch size** measures how effectively your batching pipeline is collecting requests. If your target batch size is 100 and your average is 8, either traffic is too low for the batch window you configured or the trigger thresholds need adjustment. Track this metric over time and by time of day. Batch sizes during peak traffic should be much larger than during off-peak hours, confirming that the pipeline scales with load.
+
+**Overhead reduction ratio** measures the cost savings from overhead amortization. Calculate it as 1 minus 1 divided by average batch size. An average batch size of 50 yields an overhead reduction of 98% — you are paying per-call overhead on 2% of the calls you would have made without batching. An average batch size of 5 yields a 80% reduction. The ratio gives you a single number to report on whether the batching pipeline is earning its complexity cost.
+
+**Cost-per-operation before and after batching** is the definitive measure. Take the total API cost for a given operation type — embedding, classification, moderation — and divide by the number of items processed. Compare the per-item cost before batching was implemented to the per-item cost after. The difference is the realized savings. Track this monthly. If the savings are shrinking, investigate whether traffic patterns have changed, batch sizes have dropped, or the API provider has restructured pricing.
+
+A real-world example brings these numbers together. A mid-size e-commerce company generating embeddings for product search was making individual embedding API calls for each product update. At 80,000 product updates per day using OpenAI's text-embedding-3-small, the per-call overhead and rate limit contention were significant. The team implemented micro-batching with a 200-millisecond window and a maximum batch size of 100. Average batch sizes during business hours reached 65. The embedding API cost dropped from $4.20 per day to $2.50 per day — a 40% reduction. Adding the Batch API's 50% discount for nightly bulk re-indexing jobs brought the total embedding cost down to $1.60 per day. Annual savings: approximately $950. Modest for a single API, but the team applied the same batching pattern to their classification, moderation, and enrichment calls. Total annual savings across all batched operations: $14,200. The engineering effort to implement the batching pipeline was three engineer-weeks, approximately $9,000 in engineering cost. The payback period was under eight months.
+
+## The Batching Maturity Ladder
+
+Teams evolve through stages of batching sophistication. Knowing where you are helps you prioritize the next step.
+
+**Stage one: no batching.** Every external API call is made individually, synchronously, in the request path. This is where most teams start. The cost overhead is invisible because nobody is measuring it.
+
+**Stage two: synchronous batching for offline jobs.** The team collects items for batch processing in offline pipelines — nightly re-indexing, evaluation runs, bulk content generation — and submits them through batch APIs at discounted rates. Real-time requests remain unbatched. This is the easiest win because it requires no changes to the real-time serving path.
+
+**Stage three: micro-batching in the serving path.** The team implements micro-batching for high-volume API calls in the real-time path — embedding generation, classification, moderation. This requires the queuing and triggering infrastructure described above but delivers the most consistent daily savings because it affects every request, not just offline jobs.
+
+**Stage four: adaptive batching.** The batching parameters — window duration, maximum batch size, trigger thresholds — adjust automatically based on traffic volume and latency targets. During peak hours, windows shrink to maintain latency while batch sizes grow naturally from higher traffic. During off-peak hours, windows extend slightly to compensate for lower traffic. The system continuously optimizes the cost-latency trade-off without manual tuning.
+
+Most teams should aim for stage two within the first month of production and stage three within the first quarter. Stage four is a refinement that delivers marginal improvement over a well-tuned stage three and is worth pursuing only for high-volume systems where the marginal savings are large in absolute terms.
+
+## Batching as a Cost Culture Signal
+
+Batching is one of those optimizations that reveals a team's cost maturity. A team that batches is a team that has thought about per-request economics, measured their API overhead, and built infrastructure to reduce it. A team that has not batched is a team that either has not looked at their costs at the operation level or has decided the savings are not worth the effort.
+
+For most production AI systems processing more than 1,000 API calls per hour, batching is worth the effort. The engineering investment is moderate — a few weeks to build a reusable batching service that works across multiple API types. The savings are permanent and grow with traffic. And the infrastructure, once built, applies to every new API integration the team adds in the future. The batch queue, the trigger mechanism, the result router — these are reusable components. The first API you batch costs three weeks of engineering. The second costs a day. The third costs an hour of configuration.
+
+The next chapter moves from the tools, APIs, and retrieval costs explored throughout Chapter 6 into a deeper layer of the cost stack: the infrastructure and compute costs that underpin everything — GPU provisioning, cluster management, autoscaling economics, and the build-versus-buy decisions that determine whether your infrastructure budget serves your product or consumes it.

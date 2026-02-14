@@ -1,0 +1,103 @@
+# 5.9 — Embedding Deduplication: Avoiding Redundant Embedding Generation
+
+Every time your system generates an embedding, it spends money. The cost per embedding is small, a fraction of a cent, but fractions of a cent at scale become real budget lines. And the dirty secret of most embedding pipelines is that they generate the same embeddings over and over again. The same document gets re-embedded when you rebuild an index. The same user query generates a fresh embedding on every search, even if an identical query was searched five minutes ago. The same text chunks get embedded again when a document is updated with a minor typo fix that changed nothing about the content's meaning. **Embedding deduplication** is the practice of recognizing when you are about to generate an embedding you already have, and serving the cached version instead. It is one of the simplest cost optimizations in the AI infrastructure stack, and one of the most consistently overlooked.
+
+## How Duplication Creeps In
+
+Embedding duplication does not happen because engineers are careless. It happens because embedding pipelines are designed for correctness, not efficiency. The pipeline's job is to produce embeddings for the content it is given. It has no memory of what it has embedded before.
+
+The most expensive source of duplication is **full index rebuilds**. When teams update their vector database, many rebuild the entire index from scratch rather than patching individual entries. Every document in the corpus gets chunked and embedded, even if ninety percent of the documents have not changed since the last build. A knowledge base with 500,000 chunks that rebuilds weekly generates 500,000 embedding calls per rebuild, even though only 10,000 to 50,000 chunks may have actually changed. At OpenAI's text-embedding-3-large pricing of $0.13 per million tokens, embedding 500,000 chunks of 500 tokens each costs approximately $32.50 per rebuild. That seems modest, but at weekly frequency it is $1,690 per year. Scale up to a corpus of five million chunks, common for enterprise knowledge bases, and the annual rebuild cost reaches $16,900 for an operation that is ninety percent redundant.
+
+The second source is **query embedding duplication**. Every time a user searches your RAG system, the query is embedded to generate a vector for similarity search. Popular queries repeat frequently. "How do I reset my password" might be searched fifty times per day across your user base. Each search generates a fresh embedding call. At fifty queries per day for one popular query, that is 18,250 unnecessary embedding calls per year for a single query. Multiply by the hundreds or thousands of queries that repeat across your user population, and query embedding duplication easily accounts for thirty to forty percent of your total query embedding spend.
+
+The third source is **re-embedding on minor updates**. A document is updated to fix a typo, update a date, or add a single sentence. The standard pipeline treats the updated document as new: it re-chunks the entire document and re-embeds every chunk. If the document has forty chunks and only one chunk actually changed, thirty-nine embedding calls were wasted. Teams that update documents frequently, daily content refreshes, weekly policy updates, regular catalog changes, accumulate significant waste from this pattern.
+
+The fourth source is **pipeline re-runs after failures**. When an embedding pipeline crashes halfway through a batch, most teams restart it from the beginning rather than from the point of failure. The embeddings generated before the crash are thrown away and regenerated. This is pure waste. A pipeline processing 200,000 chunks that fails at chunk 150,000 and restarts from zero generates 150,000 redundant embeddings. If the pipeline has a reliability issue and fails once per week, the redundant cost accumulates fast.
+
+## The Cost at Scale
+
+At small scale, embedding costs barely register. Embedding a thousand documents costs pennies. But AI systems do not stay small, and embedding costs compound in ways that are easy to underestimate.
+
+Consider a mid-size e-commerce platform with 200,000 products. Each product listing generates an average of six chunks, product description, specifications, reviews summary, FAQ, shipping information, and compatibility details, for 1.2 million total chunks. The average chunk is 400 tokens. Using a high-quality model like text-embedding-3-large at $0.13 per million tokens, the initial full embedding costs about $62.40. Manageable.
+
+Now add the ongoing operations. The product catalog updates 5,000 products per week, adding new items, changing descriptions, adjusting prices. The standard pipeline re-embeds all chunks for every updated product, generating 30,000 embedding calls per week even though only an average of two chunks per product actually changed in meaning. That is 20,000 redundant embedding calls per week, or over a million redundant calls per year. Weekly index rebuilds add another 1.2 million calls each time, of which roughly 1.14 million are duplicates of chunks that have not changed. Query embedding duplication adds another layer: 50,000 searches per day with a 35% repeat rate means 17,500 redundant query embeddings daily, or 6.4 million per year.
+
+Sum it up. The platform generates approximately eight million redundant embedding calls per year. At $0.13 per million tokens with an average of 400 tokens per call, the token volume is 3.2 billion tokens, costing roughly $416 annually in embedding fees alone. Switch to a more expensive model or a larger corpus, and the numbers climb. An enterprise with ten million chunks, multiple embedding models, and hourly index updates can easily spend $5,000 to $15,000 per year on redundant embeddings, money that buys exactly nothing because the embeddings already exist.
+
+The cost is not only financial. Redundant embedding generation consumes API quota. If your embedding provider rate-limits you at 3,000 requests per minute, and forty percent of your requests are duplicates, you are wasting 1,200 requests per minute of your quota on work that has already been done. Removing the duplicates effectively increases your throughput capacity by forty percent without upgrading your API tier.
+
+## Content-Hash Keyed Embedding Cache
+
+The most effective deduplication strategy is also the simplest: hash the input text and use the hash as a cache key. Before generating any embedding, compute a hash of the text that would be embedded. Look up that hash in your cache. If the hash exists, return the cached embedding vector. If it does not, call the embedding API, store the result keyed by the hash, and return it.
+
+The hash function must be deterministic and collision-resistant. SHA-256 is the standard choice. It produces a fixed-length key regardless of input size, and the probability of two different texts producing the same hash is negligible for any practical corpus size. The hash should be computed on the normalized text, after whitespace trimming, consistent encoding, and any preprocessing your pipeline applies before embedding. If your pipeline strips HTML tags or lowercases text before embedding, apply those same transformations before hashing. Otherwise, the raw text hash and the preprocessed text hash will not match, and you will miss cache hits on content that would have produced identical embeddings.
+
+The cache storage is straightforward. Each entry is a key-value pair: the content hash as the key and the embedding vector as the value. A 1536-dimensional embedding vector using 32-bit floats occupies approximately 6 kilobytes. A cache of one million embeddings requires about 6 gigabytes of storage. At cloud storage pricing, this costs $1 to $3 per month. Even at ten million entries, the storage cost is $10 to $30 per month, a trivial amount compared to the embedding generation cost it eliminates.
+
+For the lookup itself, a key-value store like Redis provides sub-millisecond retrieval. The cache lookup adds negligible latency to the embedding pipeline, far less than the 50 to 200 milliseconds an API call to an embedding endpoint would take. The cache actually improves latency for repeated content while reducing cost, a rare case where the optimization has no meaningful trade-off.
+
+## Incremental Embedding on Document Updates
+
+Full document re-embedding on any change is the brute-force approach. Incremental embedding is the smart approach: detect which chunks actually changed and only re-embed those.
+
+The implementation works by maintaining a mapping from each document to its chunks, and from each chunk to its content hash and embedding vector. When a document is updated, the pipeline re-chunks the document, computes the content hash for each new chunk, and compares hashes against the stored hashes for the previous version. Chunks whose hashes match have not changed and do not need re-embedding. Only chunks with new or changed hashes are sent to the embedding API.
+
+For the e-commerce platform example, a product listing update that changes the price but not the description would re-chunk the document and find that five of six chunks produce the same hash as before. Only the one chunk containing the price information has a new hash, so only one embedding call is made instead of six. Across 5,000 product updates per week with an average of one to two changed chunks out of six, this reduces embedding calls from 30,000 per week to approximately 7,500, a 75% reduction.
+
+Incremental embedding requires maintaining the chunk-to-hash mapping, which adds a small amount of bookkeeping to your pipeline. But the mapping is lightweight, typically stored as a database table or a JSON document per source file, and the engineering effort to implement it is a day or two of work. The savings begin immediately and compound as your corpus grows.
+
+One subtlety: when your chunking strategy changes, for example when you adjust chunk size or overlap, all chunks produce new hashes even if the underlying content has not changed. This triggers a full re-embedding, which is correct behavior because different chunking parameters produce different text inputs that require genuinely different embeddings. The deduplication protects you from redundant work within a stable pipeline configuration, not across configuration changes.
+
+## Query Embedding Caching
+
+Query embedding caching applies the same hash-based approach to user search queries. Before embedding a query, hash it, check the cache, and return the cached embedding if available.
+
+The hit rates on query embedding caches are often surprisingly high. User search behavior follows a power-law distribution: a small number of popular queries account for a large share of total search volume. "Reset password," "refund policy," "pricing," "cancel subscription," these queries repeat hundreds of times per day across your user base. Caching the embedding for each unique query and serving it on repeat appearances eliminates the embedding API call entirely.
+
+The cache should use an exact-match strategy based on the normalized query text. Normalization includes lowercasing, stripping extra whitespace, and removing punctuation variations. "Reset my password" and "reset my password" should produce the same hash. "Reset my password?" and "reset my password" should also match after punctuation stripping. This normalization is important because user queries are messy, and small formatting differences should not prevent cache hits for semantically identical queries.
+
+TTL on query embedding caches should be generous. Unlike document content, user queries do not change meaning over time. "Reset my password" means the same thing today as it did last month. The embedding for that query is valid indefinitely unless you change your embedding model. Set the TTL to thirty days or longer, and evict based on least-recently-used when the cache reaches its size limit. A query embedding cache with a thirty-day TTL and a two-million-entry limit covers the vast majority of repeated queries for most applications.
+
+The savings from query embedding caching are proportional to your query repetition rate. If 35% of your daily queries are repeats of queries seen within the past thirty days, you eliminate 35% of your query embedding costs. For a system processing 100,000 queries per day at an average query length of 50 tokens, the daily embedding cost without caching is approximately 5 million tokens times $0.13 per million, or $0.65 per day. With a 35% hit rate, you save $0.23 per day. That is only $84 per year, negligible on its own. But query embedding caching is almost free to implement if you already have a content-hash embedding cache for your documents. The same infrastructure serves both purposes. And for systems with higher query volumes, 500,000 or a million queries per day, the savings scale proportionally to $420 to $840 per year from query caching alone.
+
+## Handling Model Changes
+
+One edge case that trips up teams implementing embedding deduplication: the cache must be invalidated when you change your embedding model. An embedding generated by text-embedding-3-small and an embedding generated by text-embedding-3-large for the same text are completely different vectors. They live in different vector spaces with different dimensionalities. Serving a cached embedding from the old model after switching to a new model would produce garbage search results.
+
+The solution is to include the model identifier in the cache key. Instead of hashing just the text, hash the combination of the text and the model name. When you switch models, every cache lookup misses because the model component of the key has changed. The cache gradually repopulates with embeddings from the new model as they are generated. The old model's embeddings sit in cache until they expire or are evicted.
+
+This approach also supports running multiple embedding models simultaneously, which is common during model migration or when different use cases require different embedding models. Each model's embeddings are cached independently under their own key namespace, preventing cross-contamination.
+
+## Pipeline Checkpointing
+
+For batch embedding pipelines that process large corpora, **pipeline checkpointing** prevents the redundant work caused by pipeline failures. Instead of tracking progress only in memory, the pipeline writes a checkpoint after every batch of successfully embedded chunks. The checkpoint records which chunks have been processed and where their embeddings are stored. If the pipeline crashes, it reads the checkpoint on restart and resumes from the last completed batch rather than starting over.
+
+Checkpointing is especially valuable for large re-indexing jobs. Re-indexing a five-million-chunk corpus might take eight to twelve hours. Without checkpointing, a failure at hour ten means restarting the entire job. With checkpointing, you resume from the last successful batch, losing perhaps ten minutes of work instead of ten hours. The saved cost is the embedding fee for all the chunks that would have been re-embedded, plus the compute time for the pipeline itself.
+
+Implementing checkpointing requires a small amount of state management: a database table or file that tracks chunk IDs and their processing status. The engineering effort is modest, typically a few hours of work, and the protection it provides against wasted embedding spend during pipeline failures is well worth the investment. Teams processing large embedding batches without checkpointing discover its value the first time a pipeline fails at seventy percent completion and they watch hours of work and hundreds of dollars in embedding fees evaporate.
+
+## Measuring Your Deduplication Rate
+
+You cannot optimize what you do not measure. Before implementing deduplication, and continuously after, track these metrics.
+
+**Document-level duplication rate** is the percentage of embedding calls that target content already in your cache. Measure this by running a dry-run pass over your pipeline: hash every chunk, check the cache, and count how many hits you get without actually calling the embedding API. This gives you the theoretical maximum savings from content-hash caching. For most systems with weekly index rebuilds and moderate document update rates, this number is between 60 and 85%.
+
+**Query duplication rate** is the percentage of query embedding calls that match a previously cached query embedding. Sample your query logs over thirty days, normalize and hash each query, and count unique versus total. A 30 to 40% duplication rate is typical for consumer-facing search. Enterprise internal search with a smaller, more focused user base often sees 40 to 55%.
+
+**Pipeline redundancy rate** is the percentage of embedding calls in your batch pipeline that could have been avoided with checkpointing and incremental updates. Calculate this by comparing the total chunks embedded per pipeline run to the number of chunks that actually changed since the last run. If you embed 500,000 chunks and only 50,000 changed, your pipeline redundancy rate is 90%.
+
+Multiply each rate by the corresponding embedding cost to get the dollar value of deduplication. If your document-level duplication costs $300 per month, your query duplication costs $50 per month, and your pipeline redundancy costs $200 per month, your total deduplication opportunity is $550 per month, or $6,600 per year. The cache infrastructure to capture those savings costs $10 to $50 per month. That is a 10x to 50x return on infrastructure investment.
+
+## Putting It Together: The Deduplication Stack
+
+A complete embedding deduplication system has four layers. The first layer is the content-hash cache, the key-value store mapping text hashes to embedding vectors. This handles exact-match deduplication for both documents and queries.
+
+The second layer is incremental document processing, the pipeline logic that compares chunk hashes before and after document updates to identify which chunks need re-embedding. This eliminates redundant embedding on document updates.
+
+The third layer is pipeline checkpointing, the state management system that tracks progress through batch embedding jobs and enables resumption after failures. This eliminates redundant embedding from pipeline re-runs.
+
+The fourth layer is monitoring, the metrics that track duplication rates, cache hit rates, and the dollar value of avoided embedding calls. This ensures the deduplication system continues to deliver value as your corpus and usage patterns evolve.
+
+Together, these four layers typically reduce embedding generation costs by 40 to 70% for systems with regular index rebuilds and moderate query repetition. The implementation effort is measured in days, not weeks. The infrastructure cost is measured in tens of dollars per month, not hundreds. And the savings scale with your corpus size and query volume, meaning the ROI improves as your system grows.
+
+Deduplication ensures you do not pay twice for the same computation. But how do you know your entire caching and deduplication investment is actually profitable? That requires a dashboard, and building one is the subject of the next subchapter.

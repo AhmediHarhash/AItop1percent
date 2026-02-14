@@ -1,0 +1,69 @@
+# 27.58 — Training Job Scheduling: Priority, Preemption, and Fair-Share Across Teams
+
+Training job scheduling is where technical infrastructure meets organizational politics. Who gets the GPUs, for how long, and at what priority is a question that determines which models get built and which teams spend days waiting. A $2 million GPU cluster shared by five teams is not five times $400,000 in value -- it is $2 million in value only if the scheduling layer allocates resources intelligently. Without a scheduling policy, the team with the most aggressive engineers submits the largest jobs at midnight, monopolizes the cluster for 48 hours, and the other four teams learn to hoard spare GPUs defensively instead of collaborating. That organizational failure is an infrastructure failure. The scheduler is not a technical convenience. It is the mechanism that turns a shared cluster into a shared asset.
+
+## The Training Scheduling Problem
+
+Training workloads are structurally different from the workloads that most Kubernetes schedulers were designed for. An inference deployment runs dozens of identical, independent pods. Each pod needs one or two GPUs, starts in seconds, runs indefinitely, and can be restarted on any available node without coordination. A training job runs a fixed number of tightly-coupled pods -- often 32, 64, or 256 -- that must all start at the same time, communicate with each other continuously, and run for hours or days as a single unit.
+
+This difference breaks the default Kubernetes scheduling model in specific ways. The default scheduler places pods one at a time as resources become available. If a training job needs 32 pods but only 31 can be placed because one node has insufficient memory, the default scheduler places the 31 available pods and leaves the 32nd in a pending state. Those 31 pods each hold 4 or 8 GPUs, consuming over 100 GPUs total, doing absolutely nothing while they wait for their 32nd sibling. At on-demand cloud pricing for H100 GPUs, those 31 idle pods cost upwards of $300 per hour. If the 32nd pod's node does not free up for six hours, the organization has spent $1,800 on idle GPUs before training even begins. This is the **partial scheduling problem**, and it is the most expensive failure mode in shared training clusters.
+
+The solution is **gang scheduling** -- the requirement that all pods of a job must be schedulable before any of them are placed. If the cluster cannot accommodate all 32 pods simultaneously, none of them start. This prevents partial allocation waste. But gang scheduling introduces its own challenge: large jobs are harder to schedule because they need a larger contiguous block of resources. A cluster with 200 GPUs scattered across 25 nodes, each with a few GPUs already occupied by smaller jobs, may have 120 GPUs "available" but no way to place a 64-GPU training job because the available GPUs are fragmented across too many nodes with insufficient per-node availability.
+
+## Kueue: Kubernetes-Native Job Admission
+
+**Kueue** is the Kubernetes-native job queueing system that has become the standard admission controller for training workloads in 2026. Unlike traditional schedulers that place pods directly, Kueue works at a higher level. It decides whether a job should be admitted to the cluster at all, and only admitted jobs get passed to the underlying Kubernetes scheduler for actual pod placement.
+
+This separation of admission from placement is what makes Kueue effective for training. You define ClusterQueues that represent resource pools -- "the training GPU pool has 256 A100 GPUs" -- and LocalQueues that represent teams -- "the NLP team's queue draws from the training GPU pool." Each ClusterQueue has a resource quota and a fair-share policy. When a team submits a training job, Kueue checks whether the job fits within the team's current allocation, whether admitting the job would violate the fair-share policy, and whether the cluster has enough contiguous resources for the job. If all conditions are met, Kueue admits the job. If not, the job waits in the queue.
+
+Kueue provides **cohort borrowing**, which is one of its most practically valuable features. When the NLP team is not using their full GPU allocation, the Computer Vision team can borrow those idle GPUs -- but with the guarantee that if the NLP team submits a job, borrowed resources are reclaimed through preemption. This eliminates the "use it or lose it" dynamic that causes teams to submit dummy jobs just to hold their allocation. Teams can let their quota sit idle when they do not need it, knowing they can reclaim it when they do.
+
+The limitation of Kueue is that it handles admission, not placement. It tells the cluster "this job should run" but relies on the default Kubernetes scheduler to place the pods on specific nodes. For training jobs that need topology-aware placement -- GPUs within the same NVLink domain, nodes connected by the same InfiniBand switch -- Kueue alone is not sufficient. This is where a dedicated training scheduler adds value.
+
+## Volcano: HPC-Style Gang Scheduling
+
+**Volcano** is a batch scheduling framework for Kubernetes that provides the gang scheduling, topology-aware placement, and advanced scheduling policies that training workloads demand. While Kueue focuses on admission control, Volcano replaces or augments the Kubernetes scheduler itself for batch workloads.
+
+Volcano's **PodGroup** abstraction is the direct answer to the partial scheduling problem. A training job is defined as a PodGroup with a minimum member count. Volcano guarantees that either all members of the PodGroup can be scheduled, or none are. If the cluster does not have 64 GPUs available for your 64-GPU training job, Volcano holds the entire PodGroup in pending state without consuming any resources. When 64 GPUs become available -- perhaps because another job completes -- Volcano places all 64 pods simultaneously.
+
+Topology-aware scheduling is Volcano's other critical capability. For a distributed training job, the placement of pods on specific nodes materially affects performance. Pods that are placed on nodes connected by the same top-of-rack switch communicate faster than pods on nodes connected through spine switches. Pods that share a node use NVLink instead of InfiniBand. Volcano can place a 64-GPU training job so that the 8 GPUs within each tensor-parallel group land on the same node, the 4 nodes in each pipeline stage are under the same switch, and the data-parallel replicas are spread across different failure domains. This topology-aware placement can improve training throughput by 15 to 30 percent compared to random placement, without changing a single line of training code.
+
+The practical recommendation for most organizations in 2026 is to run Kueue for admission control and fair-share policy alongside Volcano for gang scheduling and topology-aware placement. Kueue decides when a job should run. Volcano decides where it should run. This layered approach gives you the organizational policy enforcement of Kueue with the workload-specific scheduling intelligence of Volcano.
+
+## Fair-Share Policies: Preventing Monopolization
+
+A shared training cluster without a fair-share policy devolves into a tragedy of the commons. The team with the most urgent deadline submits a massive job that consumes the entire cluster for three days. Other teams, burned by that experience, start submitting preemptive reservations -- jobs that exist only to hold GPUs. Within weeks, the cluster is fully allocated on paper but running at 40 percent actual utilization because half the "jobs" are reservation placeholders.
+
+**Fair-share scheduling** prevents this by tracking each team's historical GPU usage and adjusting priorities accordingly. A team that has consumed more than its share of resources over the past week sees its new jobs scheduled at lower priority. A team that has used less than its share gets a priority boost. Over time, every team converges toward their designated share of the cluster, regardless of how aggressively they submit jobs.
+
+The share itself is a policy decision, not a technical one. Some organizations allocate shares proportional to team headcount. Others allocate proportional to business unit revenue contribution. Others negotiate shares annually as part of the infrastructure budgeting process. The scheduling system enforces whatever policy the organization decides on, but it cannot make the policy decision for you. The most common source of conflict is not the scheduling algorithm -- it is disagreement about what the shares should be.
+
+Effective fair-share also requires a **borrowing and lending model**. When Team A has a 25-percent share but is only using 10 percent, the remaining 15 percent should be available to other teams. But when Team A needs their full share, they should be able to reclaim it without waiting for other teams' jobs to finish naturally. This requires preemption -- the ability to stop a lower-priority job to make room for a higher-priority one. Preemption without checkpointing destroys the preempted job's progress. Preemption with checkpointing is a pause, not a kill. The infrastructure investment in reliable checkpointing, covered in the next subchapter, directly enables the preemption capability that makes fair-share scheduling practical.
+
+## Job Priority Tiers
+
+Not all training jobs are equal, and the scheduling system needs a priority framework that reflects this reality. Four tiers cover most organizational needs.
+
+**Tier 1: Urgent production retraining.** A model in production is showing degraded performance. The retraining job to fix it gets the highest priority and can preempt any lower-tier job. This tier should be used rarely -- if more than one Tier 1 job per week is the norm, the root cause is not scheduling but a fragile production pipeline.
+
+**Tier 2: Scheduled fine-tuning and model updates.** Regular retraining cycles that are part of the production roadmap. These jobs have committed delivery dates and known resource requirements. They get second priority and predictable scheduling windows.
+
+**Tier 3: Research experiments and feature development.** The exploratory work that generates most training jobs by count. These jobs are important but flexible on timing. They run when capacity is available and yield to Tier 1 and Tier 2 jobs through preemption.
+
+**Tier 4: Hyperparameter sweeps and automated search.** These jobs are inherently parallelizable and interruptible. A hyperparameter sweep of 100 configurations can run 10 at a time, pause when higher-priority work preempts some of them, and resume when resources free up. Tier 4 jobs are the ideal "backfill" workload that keeps the cluster utilized during gaps between higher-priority jobs.
+
+The priority system only works when it is enforced automatically. If an engineer can manually override priorities to make their research experiment run at Tier 1, the entire system collapses into the same political negotiation that the scheduler was built to replace. Priority tiers should be set by the team's allocated tier permissions, audited by the platform team, and escalated through a defined process -- not through command-line flags.
+
+## The Checkpoint-and-Yield Pattern
+
+Long-running training jobs and preemption-based scheduling create a natural tension. A 72-hour training job at Tier 3 will be preempted multiple times over its lifetime as Tier 1 and Tier 2 jobs come and go. Without checkpointing, each preemption restarts training from scratch -- turning a 72-hour job into a 200-hour job as it repeatedly loses and re-does work.
+
+The **checkpoint-and-yield** pattern resolves this. Training jobs checkpoint their state at regular intervals -- every 30 to 60 minutes for large runs. When preempted, the job saves one final checkpoint and releases its GPUs. When resources become available again, the job resumes from its most recent checkpoint rather than starting over. The lost work is limited to the progress since the last checkpoint -- at most 30 to 60 minutes of training, not 30 to 60 hours.
+
+This pattern requires infrastructure support at multiple levels. The training code must support saving and restoring full training state -- not just model weights but also optimizer state, learning rate schedule position, data loader position, and random number generator states. The checkpoint storage must be accessible to any node in the cluster, because the resumed job may be placed on different nodes than the original. The scheduler must signal preemption with enough lead time for the job to write a checkpoint before GPUs are forcibly reclaimed -- typically a 60 to 120 second grace period. And the job management system must track the checkpoint location and automatically resume from it when restarting a preempted job.
+
+When all these pieces work together, preemption changes from a destructive event to a routine pause. Teams stop fearing preemption because it costs them minutes, not days. The cluster runs at higher utilization because the scheduler can freely move workloads to accommodate changing priorities. Fair-share becomes enforceable because reclaiming resources has a known, bounded cost.
+
+---
+
+The checkpoint-and-yield pattern depends entirely on having reliable checkpointing infrastructure -- the ability to save and restore training state quickly, correctly, and without consuming an unreasonable fraction of training time. The next subchapter dives into checkpointing architecture: what gets saved, where it goes, how to minimize the overhead, and what happens when a checkpoint is corrupted.

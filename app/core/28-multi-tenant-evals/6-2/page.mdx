@@ -1,0 +1,85 @@
+# 28.2 — The Blast Radius Map: Predicting Per-Tenant Impact Before You Ship
+
+No multi-tenant platform should deploy a change without knowing which customers it will hurt. That statement sounds obvious. In practice, most platforms deploy based on aggregate quality metrics and discover per-tenant damage after the fact — through support tickets, escalations, and contract disputes. The Blast Radius Map is the discipline that ends this pattern. It is a per-tenant impact prediction, generated before every release, that tells you exactly which customers will be affected, how severely, and what the business consequence of each effect would be. It replaces the binary pass-fail gate with an informed risk decision. It does not make the decision for you. It makes the decision possible.
+
+## What the Blast Radius Map Contains
+
+**The Blast Radius Map** is a structured artifact — not a single metric, not a dashboard, not a report — that maps every active tenant to an impact category for a proposed release. For each customer, the map contains four elements.
+
+The first element is the **quality delta** — the projected change in the customer's composite quality score and per-dimension scores if the release ships. This is computed by running the customer's eval suite against the release candidate in a staging environment using the customer's actual configuration, including their adapter weights, prompt templates, retrieval settings, and any custom tool configurations. The delta compares the release candidate's scores to the customer's current production baseline. A positive delta means the customer's quality is projected to improve. A negative delta means degradation. A zero or near-zero delta means no meaningful change.
+
+The second element is the **margin status** — the relationship between the customer's projected post-release quality and their contractual quality floor. If the customer's contract specifies an accuracy floor of 85 percent and their current accuracy is 91 percent, a release that degrades accuracy by 3 points leaves them at 88 percent with a 3-point margin. A release that degrades accuracy by 8 points leaves them at 83 percent, below their floor. The margin status answers the question that matters most: will this release cause a contract breach for this customer?
+
+The third element is the **impact category** — a classification that translates the quality delta and margin status into an operational decision. The standard categories are improved, neutral, degraded, and critical. We will define each of these in detail below.
+
+The fourth element is the **revenue weight** — the customer's annual contract value as a proportion of total platform revenue. This is not used to decide whether a customer matters — every customer matters. It is used to compute the total revenue at risk and the total revenue that benefits, which frames the release decision in terms the business can evaluate.
+
+## The Four Impact Categories
+
+Each tenant on the Blast Radius Map is assigned to exactly one of four impact categories based on the quality delta and margin status.
+
+**Improved** means the customer's quality scores are projected to increase by a meaningful amount — typically more than 1 point on the composite score or more than 2 points on any individual dimension. These customers benefit from the release. No action is required.
+
+**Neutral** means the customer's quality scores change by less than the meaningful threshold in either direction. These customers are unaffected. No action is required. In most releases, neutral is the largest category — 40 to 60 percent of customers see no meaningful quality change from any given platform update, because the update addresses capabilities or domains that do not overlap with their specific use case.
+
+**Degraded** means the customer's quality scores drop by more than the meaningful threshold but remain above their contractual quality floor. These customers experience a real quality decrease, but the decrease does not trigger contractual or operational consequences. Degraded customers require monitoring — enhanced alerting for the first two weeks after deployment, proactive customer success outreach, and a plan for remediation if the degradation persists. The degraded category is the trickiest because it contains customers who are harmed but not critically harmed. Letting too many customers accumulate in degraded without remediation erodes trust over time even when no contract is breached.
+
+**Critical** means the customer's quality scores drop below their contractual quality floor, or drop by more than a catastrophic threshold — typically 10 or more points on any dimension — regardless of margin status. Critical customers must not receive the release without mitigation. This may mean holding them on the current version, retraining their adapter against the new base model, negotiating a transition timeline, or implementing a customer-specific override that preserves their current behavior while the rest of the platform upgrades.
+
+## How to Build the Map
+
+Building the Blast Radius Map requires three inputs and a staging pipeline.
+
+The first input is the **release candidate** — the specific model version, prompt template set, retrieval configuration, or adapter update that the platform intends to deploy. The release candidate must be deployable to a staging environment that mirrors production. Partial staging — testing the new model without the customer's adapter, or testing the adapter without the customer's retrieval pipeline — produces misleading results. The staging environment must replicate each customer's full configuration stack.
+
+The second input is the **per-tenant eval suites** — the golden set, rubric, and quality dimensions specific to each customer. These are the eval suites built during onboarding and maintained through steady-state operations as described in Chapter 5. A customer without a maintained eval suite cannot be mapped, which means they ship blind. This is one of the strongest arguments for investing in per-tenant eval infrastructure: without it, the Blast Radius Map has gaps, and gaps become unpleasant surprises.
+
+The third input is the **current baseline** — each customer's most recent production quality scores, computed from their last eval run against the current production version. The quality delta is meaningful only relative to a current baseline. If the baseline is stale — last computed three months ago — the delta may not reflect the customer's actual experience. Freshness of baseline scores matters. Platforms that run continuous eval have fresh baselines for every customer. Platforms that run periodic eval may need to trigger a fresh baseline run before computing the Blast Radius Map, adding 24 to 48 hours to the pre-release process.
+
+The staging pipeline works in three phases. In the first phase, the pipeline loads the release candidate into a staging environment and iterates through each active tenant. For each tenant, it configures the staging environment with the tenant's full configuration — adapter weights, prompt templates, retrieval settings, tool access — and runs the tenant's eval suite against the release candidate. This produces per-tenant quality scores for the release candidate.
+
+In the second phase, the pipeline computes the quality delta by comparing the release candidate scores to the current baseline scores for each tenant. It computes per-metric deltas and the composite delta. It retrieves the tenant's contractual quality floor from the Quality Contract registry and computes the margin status — whether the projected post-release score would remain above or fall below the floor.
+
+In the third phase, the pipeline assigns impact categories based on the deltas and margin status, attaches revenue weights, and produces the final Blast Radius Map as a structured document that the release decision team can review.
+
+## Compute Cost and Shortcuts
+
+Running the full eval suite for every active tenant against every release candidate is the gold standard, and it is expensive. A platform with 400 tenants, each with an eval suite of 200 examples, is running 80,000 evaluations per release. If each evaluation involves an LLM-as-judge call — which most rubric-based evaluations do in 2026 — the compute cost for a single Blast Radius Map is approximately $800 to $2,400 depending on the judge model used. If the platform ships bi-weekly, that is $20,000 to $62,000 per year just for pre-release impact assessment.
+
+That cost is trivial compared to the $2.7 million in contract risk from the writing platform failure described in the previous subchapter. But for smaller platforms or platforms with tight margins, it may feel burdensome. Several strategies reduce the cost without eliminating the map.
+
+**Tier-based sampling** runs the full eval suite for all enterprise and high-value customers and a sampled eval suite for mid-tier and self-serve customers. If 50 enterprise customers represent 70 percent of revenue, running full evals for those 50 and sampled evals for the remaining 350 reduces compute by 60 percent while covering the highest-risk tenants comprehensively. The trade-off is that critical impacts among mid-tier customers may not be detected until after deployment. Whether that trade-off is acceptable depends on the mid-tier customer's contractual terms and your platform's risk tolerance.
+
+**Cluster-based sampling** groups tenants by configuration similarity — same adapter family, same model version, same prompt template category — and runs full evals for one representative tenant per cluster plus all tenants in high-revenue or high-risk clusters. This leverages the insight from Section 26 on scaling evals that tenants with similar configurations tend to have similar responses to the same change. The risk is that cluster representatives may not capture the outlier within a cluster — the one tenant whose subtle configuration difference makes them vulnerable when the others are not.
+
+**Differential evaluation** only tests tenants whose configurations overlap with the components being changed. If the release updates the retrieval pipeline but not the base model, tenants using a custom retrieval configuration need testing but tenants using the default retrieval may not. This requires a dependency map linking release components to tenant configurations, which adds engineering complexity but dramatically reduces eval scope for targeted releases.
+
+## The Map as a Decision Artifact
+
+The Blast Radius Map does not make the release decision. It informs the decision. The decision itself involves trade-offs that only a human — typically the release manager or a cross-functional release committee — can evaluate.
+
+Consider a map that shows 310 improved, 70 neutral, 15 degraded, and 5 critical. The 5 critical customers represent $1.8 million in annual revenue. The 310 improved customers represent $12 million. Holding the release to protect the 5 critical customers delays the improvement for the 310. Shipping the release and holding the 5 critical customers on the current version protects the 5 but adds operational complexity. Shipping the release for everyone and relying on rapid remediation for the 5 critical customers risks contract breaches.
+
+The Blast Radius Map does not tell you which option to choose. It tells you the options exist and quantifies the stakes. Without the map, the team would not even know the 5 critical customers exist until after they escalate. With the map, the team can make a deliberate choice — hold, ship-with-holdback, or ship-with-remediation — based on the specific customers affected, the severity of the impact, and the business context.
+
+The map also serves as a communication artifact. When the release decision involves holding specific customers on an older version, the customer success team needs to know which customers are held and why. When the decision involves shipping with enhanced monitoring, the operations team needs to know which customers to watch. When the decision involves a customer-specific mitigation — retraining an adapter, adjusting a prompt template — the engineering team needs to know the scope. The Blast Radius Map is the single document that coordinates all of these teams around the same understanding of per-tenant impact.
+
+## Freshness and Cadence
+
+A Blast Radius Map computed once per release is the minimum. Some platforms compute the map continuously, running a shadow eval pipeline that tests the next release candidate against all tenant configurations on a rolling basis. This continuous mapping has two advantages.
+
+First, it provides early warning. If a change under development — not yet scheduled for release — shows critical impact for high-value tenants, the engineering team can investigate and potentially resolve the issue before the release is finalized. Finding a critical impact during development costs hours. Finding it during the pre-release map computation costs days. Finding it after deployment costs weeks.
+
+Second, it accumulates trend data. A single Blast Radius Map is a snapshot. A series of maps computed across multiple release candidates shows patterns — which customers are consistently vulnerable to change, which configurations are brittle, which dimensions degrade most frequently. These patterns feed back into engineering decisions about adapter retraining priorities, configuration robustness testing, and customer onboarding quality.
+
+The cadence of map computation depends on your release cadence and the size of your tenant base. Platforms with fewer than 100 tenants can often compute the full map in a few hours and run it for every release candidate, including pre-release builds. Platforms with more than 500 tenants may need to use tier-based or cluster-based sampling for daily builds and reserve the full map for final release candidates.
+
+## When the Map Has Gaps
+
+The Blast Radius Map is only as complete as the per-tenant eval infrastructure it depends on. If 30 percent of your customers do not have a maintained eval suite — because they were onboarded through the compressed process, because their golden set was never expanded, because their rubric was never calibrated — those customers cannot be mapped. They ship blind.
+
+The most dangerous customers in a multi-tenant release are not the ones classified as critical on the Blast Radius Map. Those customers are visible, and the team can make deliberate decisions about them. The most dangerous customers are the ones who are not on the map at all — the customers whose eval infrastructure is too thin to produce reliable impact predictions. Those customers can only tell you about the release's impact after they experience it in production.
+
+If your Blast Radius Map covers 70 percent of tenants but misses the 30 percent with the weakest eval infrastructure, you have covered 70 percent of the risk surface and left 30 percent to chance. The gap analysis — which customers are unmapped and what would it take to add them — should be a standing item in every release planning meeting. Closing the gaps is not just an eval investment. It is a risk reduction investment that pays for itself the first time it prevents a contract-threatening regression from reaching a customer who would otherwise have been blind.
+
+The Blast Radius Map tells you who will be affected. The next subchapter covers what you do with that information — how staged rollouts, canary groups, opt-in waves, and holdback tiers let you deploy changes progressively rather than all at once.

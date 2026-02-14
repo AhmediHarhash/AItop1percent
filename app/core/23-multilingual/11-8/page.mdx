@@ -1,0 +1,101 @@
+# 11.8 — Multilingual Training Data Balancing: Ratios, Curricula, and Sampling
+
+The **equal-ratio trap** is the most common mistake in multilingual fine-tuning: teams split their training data evenly across languages and wonder why every language performs worse than single-language training. A fifty-fifty English-Japanese split feels fair. It feels balanced. And it produces a model that underperforms the English-only model on English and underperforms the Japanese-only model on Japanese.
+
+The reason is deceptively simple. Equal data allocation does not produce equal learning. The base model already handles English well because English dominates its pretraining corpus. English examples in your fine-tuning dataset are largely redundant -- they reinforce patterns the model already knows. Japanese examples, by contrast, are filling gaps. The model's Japanese capabilities are weaker, and every Japanese example teaches it something new. When you split fifty-fifty, you waste half your training budget on reinforcement the model does not need and give only half to the language that actually benefits from adaptation.
+
+The equal-ratio trap is one instance of a broader principle: multilingual data balancing is not about fairness to languages. It is about efficiency of learning. You allocate data where learning is happening, not where data is abundant.
+
+## Why Equal Ratios Fail
+
+To understand why equal ratios fail, you need to understand how gradient updates work in multilingual training. During each training step, the model processes a batch of examples and updates its parameters based on the gradient of the loss. If the batch contains half English and half Japanese examples, roughly half the gradient signal comes from English and half from Japanese.
+
+The English gradient signal is small because the model already handles English well. The loss on English examples is low. The gradients are small. The parameter updates they drive are incremental refinements. The Japanese gradient signal is large because the model is still learning Japanese. The loss on Japanese examples is higher. The gradients are larger. The parameter updates they drive are more substantial.
+
+When these gradients are averaged within a batch, the large Japanese gradients dominate. This might sound beneficial for Japanese learning, but the English gradients are not zero -- they are small and pointing in a different direction. The averaged gradient is a compromise that moves the parameters in a direction that is not optimal for either language. Over thousands of training steps, this compromise accumulates into a model that has partially adapted to both languages and fully adapted to neither.
+
+The problem intensifies with more languages. A five-way equal split among English, Japanese, Thai, Vietnamese, and Arabic means each language contributes 20 percent of the gradient signal. The model's parameter updates at each step are pulled in five different directions. The resulting model is a compromise among five languages, and for each individual language it performs worse than a model that was fine-tuned on that language alone.
+
+## Temperature-Based Sampling
+
+The standard solution to multilingual data imbalance is **temperature-based sampling**, a technique borrowed from multilingual pretraining that adjusts the probability of sampling examples from each language.
+
+In a naive setup, you sample from each language proportional to the amount of data you have. If 60 percent of your training data is English and 10 percent is Thai, then 60 percent of your training batches are English and 10 percent are Thai. This means the model sees six English examples for every Thai example, which amplifies the problem described above -- English gets more gradient influence despite needing less.
+
+Temperature-based sampling reweights the probabilities. You apply a temperature parameter T to the sampling distribution. When T equals 1, sampling is proportional to data quantity -- the naive approach. As T decreases toward 0, sampling becomes more uniform -- every language gets equal representation regardless of data quantity. A temperature of around 0.3 to 0.5 is the sweet spot for most multilingual fine-tuning tasks. At T equals 0.3, a language with 10 percent of the data might be sampled at 18 percent frequency, while a language with 60 percent of the data might be sampled at only 25 percent frequency.
+
+The effect is that low-resource languages are upsampled -- each example is seen multiple times -- and high-resource languages are downsampled -- many examples are never seen during training. This creates a more balanced gradient signal where each language contributes a more equal share of the learning, regardless of how much data you started with.
+
+The risk of temperature sampling is overfitting on low-resource languages. When you upsample Thai from 500 examples to an effective training frequency equivalent to 1,500 examples, the model sees each Thai example three times on average. By the second epoch, it has seen each Thai example six times. The model starts memorizing specific Thai training examples rather than learning general Thai patterns. You catch this by monitoring per-language validation loss during training. If Thai training loss keeps decreasing but Thai validation loss plateaus or increases, you have overfit on your Thai data and need to reduce the upsampling factor for Thai.
+
+## Practical Ratios for Multilingual Fine-Tuning
+
+Specific ratios depend on your base model's pretraining distribution, your task complexity, and your quality requirements per language. But patterns from practitioner experience provide useful starting points.
+
+For a model being adapted to serve five languages where one is the primary target, a common configuration allocates roughly 40 percent of training examples to the primary target language, 25 percent to English as a cross-lingual anchor, and 10 to 15 percent each to three secondary languages. This prioritizes the language you care about most while maintaining English as a stabilizing force. English examples serve a dual purpose -- they reinforce the task pattern in the model's strongest language, and they provide cross-lingual transfer that benefits the other languages because the model's English representations are the most robust bridge between language-specific knowledge.
+
+For a model serving ten or more languages with no single primary target, the ratio calculation becomes an optimization problem. You are trying to maximize the minimum quality across all languages. The optimal allocation gives more data to languages where the model has the most room to improve -- typically the low-resource languages -- and less data to languages where the model already performs well. In practice, this means high-resource languages like English and French might each receive 5 to 8 percent of training data, mid-resource languages like Vietnamese and Turkish might receive 8 to 12 percent each, and low-resource languages like Amharic and Khmer might receive 12 to 18 percent each.
+
+These ratios are starting points, not answers. The right allocation depends entirely on your base model's per-language capabilities, which vary across models. Llama 4 has stronger Southeast Asian language support than its predecessors. Gemini 3 has stronger South Asian language coverage than most competitors. The base model's existing per-language capabilities determine how much additional data each language needs, and the only way to know is to evaluate the base model on your task across all target languages before you decide your training ratios.
+
+## Curriculum Learning for Multilingual Training
+
+Curriculum learning -- presenting training examples in a deliberate order rather than randomly -- offers another lever for multilingual fine-tuning. The core insight is that the order in which the model encounters languages during training affects how well it learns each one.
+
+The standard curriculum starts with the model's strongest languages and gradually introduces weaker ones. You train for the first epoch exclusively on English and other high-resource languages. During the second epoch, you introduce mid-resource languages alongside continued high-resource training. By the third epoch, you add low-resource languages while reducing the high-resource proportion. The rationale is that the model first establishes the task pattern in languages it understands well, then transfers that pattern to progressively harder languages. The task pattern -- the structure of good responses, the style of output, the types of reasoning required -- is easier to learn in a language the model already speaks fluently. Once the pattern is established, the model can generalize it to new languages with less data.
+
+Research on code-switching curriculum learning, presented at ACL 2025, formalized a three-stage approach for multilingual training. The first stage uses clean monolingual data to establish baseline task competence in each language. The second stage introduces mildly code-switched data -- sentences with occasional language mixing -- to build cross-lingual connections. The third stage introduces heavily code-switched data to develop robust performance on mixed-language input. This progression mirrors how multilingual humans learn -- starting with separation, then building bridges, then handling full integration.
+
+The alternative curriculum -- starting with low-resource languages -- also has advocates. The argument is that the model needs the most training time for its weakest languages, so those should come first while the model's capacity for new learning is highest. By the time high-resource languages are introduced, the model has already internalized the low-resource patterns, and the high-resource data reinforces rather than overwrites them. In practice, the effectiveness of this reverse curriculum depends heavily on the base model. If the base model has almost no knowledge of the low-resource language, starting training there can produce noisy early gradients that destabilize the model before it has established any useful task pattern.
+
+## Data Quality Versus Data Quantity Per Language
+
+Five hundred high-quality Vietnamese examples will outperform five thousand noisy ones. This is true for monolingual fine-tuning. It is even more true for multilingual fine-tuning, because low-quality data in one language does not just hurt that language -- it leaks noise into the shared parameter space and subtly degrades other languages.
+
+Quality in this context means four things. First, linguistic correctness -- the examples use natural grammar, vocabulary, and phrasing that a native speaker would produce. Second, task alignment -- the examples accurately demonstrate the task pattern you want the model to learn. Third, diversity -- the examples cover a range of inputs rather than repeating the same patterns. Fourth, cultural appropriateness -- the examples reflect genuine cultural norms rather than translated assumptions.
+
+When any of these quality dimensions fails, the model learns the wrong patterns. Linguistically incorrect examples teach the model to produce unnatural output. Task-misaligned examples teach the model the wrong behavior. Low-diversity examples cause the model to overfit on a narrow slice of the language. Culturally inappropriate examples train a model that produces output users find jarring or offensive.
+
+The practical implication is that your data budget should prioritize quality verification per language over raw volume. For low-resource languages, it is better to invest in rigorous verification of five hundred examples than to generate three thousand synthetic examples with no quality control. The verified five hundred will train a model that sounds natural in production. The unverified three thousand will train a model that produces output your users do not trust.
+
+## Batch Composition: Monolingual or Mixed
+
+Should each training batch contain examples from a single language, or should batches mix examples from multiple languages? This question sounds academic. In practice, it determines whether your model develops strong cross-lingual transfer or treats each language as an isolated task.
+
+**Mixed batches** -- batches containing examples from multiple languages -- generally produce better cross-lingual transfer. When the model sees a Thai customer support example and an English customer support example in the same batch, the gradient update must find parameter changes that help both. The update naturally gravitates toward language-agnostic task patterns -- the structural elements of customer support responses that are common across languages. Over thousands of mixed batches, the model develops robust task representations that transfer across languages even when the training data is skewed.
+
+**Monolingual batches** -- batches where all examples are in the same language -- produce stronger per-language specialization but weaker transfer. The gradient update for a Thai-only batch optimizes specifically for Thai without any pressure to remain useful for other languages. This can produce better Thai performance in isolation but worse generalization. The model learns Thai-specific patterns rather than cross-lingual patterns.
+
+The optimal approach for most multilingual fine-tuning tasks is mixed batches with controlled language distribution. Each batch contains examples from two to four languages, sampled according to your temperature-based ratios. This provides the cross-lingual transfer benefit of mixed batches while the temperature sampling ensures each language gets appropriate representation. The batch size should be large enough -- typically 32 or above as the effective batch size after gradient accumulation -- to ensure each language has meaningful representation in each batch. A batch of 8 with four languages means only two examples per language per batch, which produces noisy gradient estimates for each language.
+
+## Dynamic Rebalancing During Training
+
+Static ratios assume you know the optimal allocation before training begins. You do not. The optimal allocation shifts during training as the model improves at different rates for different languages.
+
+**Dynamic rebalancing** monitors per-language loss during training and adjusts sampling rates to equalize learning speed across languages. If Thai loss is decreasing rapidly and Amharic loss has plateaued, the dynamic scheduler reduces the Thai sampling rate and increases the Amharic rate. The goal is not equal loss across languages -- the base model's per-language capabilities mean that absolute loss levels will always differ -- but equal rate of loss decrease. Every language should be learning at a similar speed.
+
+The implementation uses a simple feedback loop. Every N training steps -- typically every 100 to 500 steps -- compute the average loss per language from the most recent batch window. Compare each language's loss trajectory to its moving average. Languages whose loss is decreasing faster than average get their sampling probability reduced. Languages whose loss is stagnating get their sampling probability increased. Cap the adjustment to prevent any language from dominating more than 30 percent of the training data in any single window, which prevents oscillation.
+
+Dynamic rebalancing addresses a problem that static ratios cannot: the model's learning curve is not linear. In the first epoch, the model learns fast for all languages because it is learning the basic task pattern. By the third epoch, high-resource languages have converged -- further examples provide diminishing returns. Low-resource languages are still improving because they started from a weaker baseline. Static ratios continue allocating the same proportion to high-resource languages long after the model has stopped learning from them. Dynamic rebalancing shifts budget to the languages that are still benefiting from additional examples.
+
+The risk is instability. If the rebalancing is too aggressive -- large adjustments every 50 steps -- the sampling distribution oscillates and the model never settles into stable learning. If too conservative -- small adjustments every 1,000 steps -- the rebalancing cannot keep pace with the model's learning dynamics. The sweet spot is moderate adjustments every 200 to 500 steps, with maximum per-step change capped at 2 to 3 percentage points per language.
+
+## The Interaction Between Balancing and Merging
+
+Data balancing and model merging are complementary strategies, not alternatives. Understanding how they interact gives you a more powerful toolkit.
+
+If you plan to train separate per-language models and merge them, your per-language data ratios are simpler: each model gets 100 percent of its own language's data plus some English data for cross-lingual anchoring. The balancing problem only exists within each model's training run, not across the full language portfolio.
+
+If you plan to train a single multilingual model, data balancing is your primary lever for controlling per-language quality. Get the ratios wrong and no amount of post-training adjustment will fix the per-language quality gaps.
+
+The hybrid approach -- training a multilingual model with careful balancing, then merging it with language-specific experts for your weakest languages -- captures the benefits of both. The multilingual training establishes broad cross-lingual transfer. The per-language experts fill quality gaps for specific languages. The merge combines them without retraining. This is operationally more complex than either approach alone, but it consistently produces the strongest per-language quality across a diverse language portfolio.
+
+## Monitoring Your Balance Through Training
+
+Without per-language metrics, you are flying blind. Total training loss across all languages can decrease even while individual languages deteriorate, because improvements in high-resource languages mask regressions in low-resource ones.
+
+Every training run should track loss per language, accuracy per language on a held-out validation set, and the ratio of per-language learning rate to overall learning rate. Plot these curves throughout training. You are looking for three warning signals. First, a language whose validation loss stops decreasing while other languages continue improving -- this language has either overfit on its training data or is receiving too little representation to continue learning. Second, a language whose validation loss increases while training loss continues decreasing -- the classic overfit signal, meaning the model is memorizing rather than generalizing for that language. Third, a sudden divergence between two related languages -- if Spanish performance jumps while Portuguese performance drops, the gradient updates are creating interference between related languages that need to be addressed.
+
+When you see any of these signals, act immediately. Adjust ratios. Switch from monolingual to mixed batches or vice versa. Reduce the learning rate for the overfit language's adapter if you are using per-language LoRA. Add data augmentation for the stagnating language. Do not wait until training completes to diagnose balance problems -- by then the model has already learned from a badly balanced dataset and the damage is baked in.
+
+The next subchapter addresses the final gate in the multilingual fine-tuning pipeline: how to evaluate your fine-tuned model across all target languages before it reaches production, and how to set quality thresholds that prevent per-language regressions from shipping to users.

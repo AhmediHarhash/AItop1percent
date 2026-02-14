@@ -1,0 +1,81 @@
+# 27.47 — GitOps and Infrastructure-as-Code for AI Platforms
+
+A platform engineer pushes a commit to a Git repository. Within minutes, three Kubernetes clusters across two clouds update their configurations. New node pools are provisioned, Kueue quotas are adjusted, a new model serving configuration is deployed to the inference namespace, and updated network policies restrict traffic between the training and serving tiers. No one logged into a cloud console. No one ran kubectl against a production cluster. No one sent a Slack message asking "can you apply this change to cluster 3?" The commit is the change. The controllers make it real. And if anything goes wrong, git revert undoes it.
+
+This is the GitOps model applied to AI infrastructure, and it solves a problem that most AI teams discover the hard way: manual infrastructure management does not scale past three clusters, two team members, or one late-night incident where someone applies the wrong configuration to the wrong cluster because they had the wrong terminal tab focused.
+
+## The GitOps Model: Git as the Single Source of Truth
+
+**GitOps** is a practice where the desired state of your entire infrastructure is declared in a Git repository and continuously reconciled by automated controllers running inside your clusters. The core principle is simple: if it is not in Git, it does not exist. If it is in Git, it must exist in the cluster. The controllers watch the repository, compare the declared state to the actual state, and make whatever changes are necessary to eliminate the difference.
+
+This is not a deployment tool. It is an operating model. The distinction matters. A deployment tool pushes changes when you tell it to. A GitOps controller pulls the desired state continuously and corrects any drift, whether that drift came from a deliberate deployment, a manual change someone made during an incident, or an infrastructure failure that reset a configuration. The system is self-healing by design.
+
+For AI infrastructure, this self-healing property is especially valuable because GPU clusters have more configuration surface area than typical application infrastructure. A model serving deployment involves not just the pod specification but also GPU resource requests, topology spread constraints, priority class assignments, horizontal pod autoscaler settings, model weight volume mounts, readiness probe configurations that verify model loading, and environment variables that control batch sizes and concurrency limits. Any of these can be changed manually during a debugging session and forgotten. GitOps ensures that the next reconciliation cycle restores the intended configuration.
+
+## Argo CD Versus Flux: Both Mature, Choose Your Preference
+
+The two dominant GitOps controllers for Kubernetes are **Argo CD** and **Flux**, and in 2026 both are production-grade CNCF projects used by thousands of organizations. The choice between them is a matter of operational preference, not capability.
+
+Argo CD provides a web-based dashboard that visualizes the state of every application across every cluster. You can see which applications are synced, which are out of sync, what the diff is between the declared state and the actual state, and the health of every resource in the application graph. For multi-cluster AI infrastructure where your platform team needs to see the state of model serving deployments across five clusters at a glance, Argo CD's UI is a significant productivity tool. It also supports application sets — templates that generate multiple applications from a single definition — which is valuable when you deploy the same model serving stack to twelve clusters with per-cluster parameter overrides.
+
+Flux is lighter weight. It runs as a set of controllers inside the cluster with no separate server or database. Configuration is done through Kubernetes custom resources — you create a GitRepository resource pointing at your repo and a Kustomization resource describing what to deploy. Flux integrates natively with Helm for chart-based deployments and Kustomize for overlay-based configurations. Recent releases have added custom health checks, GitHub App authentication for private repositories, and support for ephemeral preview environments that create temporary deployments for pull request validation. For teams that prefer managing infrastructure through Kubernetes resources rather than through a separate UI, Flux aligns more naturally with their workflow.
+
+A growing number of organizations use both: Flux for cluster bootstrapping and foundational infrastructure (CNI, GPU operator, monitoring stack), and Argo CD for application-layer deployments (model serving, evaluation pipelines, training job configurations). This two-layer approach is not redundant — it reflects the reality that infrastructure components and application components have different change cadences, different approval processes, and different blast radii when something goes wrong.
+
+## What Goes in Git for AI Infrastructure
+
+The Git repository for an AI platform is broader than most teams initially expect. Standard application GitOps covers pod specifications, services, and ingress. AI platform GitOps covers the full stack.
+
+**Kubernetes manifests** for all workloads: model serving deployments, evaluation pipeline jobs, training job templates, data preprocessing workers. Each manifest includes the full specification — resource requests, GPU counts, node selectors, tolerations, anti-affinity rules, and any scheduling constraints.
+
+**Kueue configurations** for GPU job scheduling: cluster queues, local queues, resource flavors, and workload priority classes. When your scheduling policy changes — raising the priority of inference workloads over batch training, for example — the change is a commit to the Kueue configuration files, reviewed and approved like any other code change.
+
+**Node pool definitions** expressed as Kubernetes resources (if using a cluster API provider) or as references to the IaC layer that provisions them. The relationship between node pools and workloads must be traceable — when you add a new pool of H200 nodes, the corresponding resource flavor, queue configuration, and scheduling constraints should appear in the same commit or in a linked chain of commits.
+
+**Network policies** that control traffic between namespaces and workloads. Training namespaces should not accept ingress from the public internet. Inference namespaces should only accept traffic from the load balancer. Evaluation namespaces should only communicate with the model serving tier and the metrics store.
+
+**RBAC definitions** for all teams: which team can deploy to which namespace, who can modify GPU quotas, who has read access to training logs. These are Kubernetes Role and RoleBinding resources that belong in Git alongside the workloads they govern.
+
+**Model serving configurations** that define which models are deployed, which versions are active, what the autoscaling parameters are, and what the rollout strategy is. A model promotion from staging to production is a commit that changes the version tag in the production overlay.
+
+## What Does Not Go in Git
+
+Not everything belongs in the repository. **Secrets** — API keys, model registry credentials, database passwords — must never be committed to Git, not even in encrypted form within the manifest files themselves. Use the External Secrets Operator to reference secrets stored in a dedicated secrets manager (AWS Secrets Manager, Google Secret Manager, Azure Key Vault, HashiCorp Vault) and inject them into pods at runtime. The External Secrets resource definition goes in Git. The secret value does not.
+
+**Model weights** are too large for Git. A 70-billion-parameter model is 140 gigabytes. Git is designed for text files measured in kilobytes. Model weights belong in object storage (S3, GCS, Azure Blob) with versioning enabled. The Git-managed configuration references the model by version identifier, and the serving infrastructure pulls the weights from object storage at deployment time.
+
+**Ephemeral state** — Kueue job statuses, autoscaler decisions, pod scheduling events — is runtime state that changes constantly. Attempting to track it in Git would create thousands of meaningless commits per hour. GitOps manages the desired state. Monitoring tools track the actual state. The two complement each other but do not overlap.
+
+## The Two-Layer Model: IaC Below, GitOps Above
+
+A complete AI platform has two distinct layers of infrastructure, and they are managed by different tools for good reason.
+
+The **infrastructure layer** includes cloud resources that exist outside Kubernetes: VPCs, subnets, load balancers, DNS records, IAM roles, node pools, GPU instance reservations, object storage buckets, and private interconnect configurations. These are provisioned by **infrastructure-as-code tools** — Terraform (which holds over 32 percent market share in 2026), Pulumi (which has been gaining ground rapidly with its general-purpose language approach), or OpenTofu (the open-source Terraform fork). IaC tools communicate with cloud provider APIs to create and manage these resources. The state file tracking what exists is stored in a remote backend (S3, GCS, Terraform Cloud, Pulumi Cloud).
+
+The **platform layer** includes everything inside Kubernetes: workloads, configurations, policies, RBAC, service mesh settings, monitoring agents. These are managed by GitOps controllers that communicate with the Kubernetes API server.
+
+The two-layer model works like this. Terraform creates the EKS cluster, provisions the H100 node pool, configures the VPC networking, and outputs the cluster endpoint and credentials. Argo CD connects to that cluster endpoint and deploys everything inside it — the GPU operator, the model serving stack, the evaluation pipeline, the monitoring agents, the network policies, the Kueue configuration. When you need a new cluster, you add a Terraform module invocation. When you need a new workload on an existing cluster, you add a Kubernetes manifest to the GitOps repository.
+
+Keeping these layers separate prevents a common failure mode: trying to manage cloud resources through Kubernetes (using tools like Crossplane) or trying to manage Kubernetes resources through Terraform. Both are technically possible. Neither works well at scale. Cloud resources have long lifecycles, require careful state management, and benefit from plan-and-apply workflows. Kubernetes resources have short lifecycles, are naturally declarative, and benefit from continuous reconciliation. Different tools for different domains, connected by references rather than merged into a single system.
+
+## Drift Detection and Automatic Reconciliation
+
+The defining feature of GitOps is drift correction. When someone manually changes a configuration on a cluster — adds an environment variable to a deployment, modifies a resource limit, changes a network policy rule — the GitOps controller detects that the actual state no longer matches the declared state in Git and reverts the change. This behavior, called **auto-sync** in Argo CD and **auto-reconciliation** in Flux, is what transforms Git from a deployment source into an enforcement mechanism.
+
+For AI infrastructure, drift correction prevents a category of incidents that manual management creates. A team member increases the GPU memory request on a serving deployment during debugging, forgets to revert it, and the next scaling event fails because the cluster cannot fit the larger request. An on-call engineer adds a permissive network policy during an incident to restore connectivity, forgets to remove it, and the serving tier is now exposed to traffic it should not receive. A training engineer modifies a Kueue priority class to jump the queue for an urgent experiment, forgets to revert it, and production training jobs are deprioritized for a week. GitOps catches all of these within minutes — the reconciliation interval is typically 30 seconds to 5 minutes — and restores the declared state without human intervention.
+
+The reconciliation loop also provides an audit trail. Every intentional change goes through Git: it has a commit message explaining why, a pull request with review approvals, and a timestamp. Every manual change gets reverted, and the revert event is logged. If your compliance framework requires evidence that infrastructure changes are reviewed and approved — and most frameworks do — GitOps provides that evidence automatically.
+
+## Testing Infrastructure Changes Before They Land
+
+Treating infrastructure as code means you can test it like code. For the IaC layer, Terraform's plan command and Pulumi's preview command show exactly what changes will be made before any resource is created, modified, or destroyed. A pull request that modifies a node pool configuration triggers a plan run in CI, and the plan output is posted as a comment on the pull request. Reviewers see "this change will add 8 H200 nodes to the us-east-1 cluster" rather than approving a change and hoping it does what the description claims.
+
+For the GitOps layer, preview environments and diff-based validation serve the same purpose. Argo CD's app diff feature shows the difference between the current cluster state and the proposed change. Some teams run a separate preview cluster — a small, non-production Kubernetes cluster — where every pull request to the GitOps repository is automatically deployed. The CI pipeline validates that the deployment succeeds, runs smoke tests against the preview cluster, and reports the results on the pull request. If the deployment fails in preview, it never reaches production.
+
+Canary deployments for infrastructure configuration extend this further. Instead of applying a new Kueue configuration to all clusters simultaneously, you apply it to one cluster, verify that scheduling behavior matches expectations for 24 hours, then roll it to the remaining clusters. This staged rollout mirrors canary deployments for application code but applies the same principle to the platform layer. A misconfigured resource quota that starves inference workloads of GPU capacity is caught on one cluster rather than causing a fleet-wide outage.
+
+The testing discipline for infrastructure changes is harder to maintain than for application changes because infrastructure changes feel less risky — "I'm just changing a quota, not deploying new code." But a misconfigured GPU quota can halt every training job in the cluster. A misconfigured network policy can expose your inference endpoints to unauthorized traffic. A misconfigured node pool can provision the wrong GPU type and burn budget on hardware your workloads cannot use. Infrastructure changes deserve the same review rigor, the same preview validation, and the same staged rollout as application changes. GitOps makes that rigor possible by making every change a reviewable, testable, revertable commit.
+
+---
+
+Multi-cloud strategies, networking, control planes, and GitOps are the tools for managing AI infrastructure at the data center and cloud tier. But not every inference request needs a full data center. The next chapter examines edge AI and distributed inference — pushing model serving to the locations closest to users, from regional edge nodes to on-device deployment, and the unique infrastructure challenges that come with running models outside the safety of a well-provisioned cloud region.

@@ -1,0 +1,75 @@
+# 27.54 — Device Fleet Observability and OTA Rollback
+
+The most dangerous anti-pattern in edge AI operations has a name: **The Blind Fleet**. It looks like this. A team deploys a model to eight thousand devices. The deployment pipeline reports success -- the update was pushed, the devices acknowledged receipt, the dashboard turns green. The team moves on to the next feature. Two weeks later, customer support tickets surge. Users report incorrect predictions, slow responses, and crashes on certain device models. The engineering team scrambles to diagnose the issue but has no device-level telemetry, no inference quality metrics, and no way to determine whether the problem is the new model, a specific hardware variant, an OS update that rolled out concurrently, or something else entirely. They discover the problem through customer complaints, not through their monitoring. By the time they identify the root cause -- a memory leak in the new model's preprocessing pipeline that only manifests on devices with less than 4 gigabytes of RAM -- the bad model has been running on thousands of devices for fourteen days.
+
+The Blind Fleet anti-pattern is endemic in edge AI because teams apply cloud observability assumptions to edge environments. In the cloud, you can stream full telemetry from every pod in real time. At the edge, you cannot. Bandwidth, battery, privacy, and cost constraints make raw telemetry streaming impossible at fleet scale. Edge observability requires a fundamentally different approach: aggregate locally, transmit summaries, detect anomalies statistically, and act on cohort-level signals rather than individual device traces.
+
+## The Observability Constraints at the Edge
+
+Cloud observability tools assume abundant bandwidth, always-on connectivity, and centralized log aggregation. Edge environments violate all three assumptions. A fleet of ten thousand devices, each generating even modest telemetry -- inference latency per request, confidence scores, error counts, hardware utilization snapshots -- would produce gigabytes of raw data per hour if streamed to a central collector. On cellular connections, that volume would cost thousands of dollars per month in data charges alone and drain device batteries measurably.
+
+Privacy constraints add another dimension. In healthcare, retail, and consumer applications, the inputs to edge models -- medical images, shopping behavior, voice recordings -- must not leave the device. Even aggregated telemetry must be designed carefully to avoid leaking individual user information. A histogram of confidence scores is safe. A log of individual inference results with timestamps is not, because it can be correlated with user activity patterns.
+
+These constraints do not mean you fly blind. They mean you design an observability pipeline that operates within the constraints rather than ignoring them. The principle is **local aggregation, remote analysis**. Each device computes summary statistics locally and transmits compact telemetry bundles on a schedule that respects bandwidth and battery budgets.
+
+## Metrics Worth Collecting
+
+Not all metrics justify the bandwidth they consume. The goal is to collect the minimum set of signals that let you detect model quality degradation, hardware problems, and deployment failures across the fleet. Experience across edge deployments has converged on a core set.
+
+**Model inference latency** -- the P50 and P95 latency per inference request, aggregated into hourly buckets. Latency increases can indicate model performance issues, thermal throttling, memory pressure, or hardware degradation. A device whose P95 latency doubles overnight while the rest of the fleet remains stable likely has a device-specific problem. A cohort of devices whose latency increases simultaneously after a model update likely has a model problem.
+
+**Confidence score distribution** -- the histogram of output confidence scores, bucketed into ranges. A model that is performing well produces a distribution weighted toward high confidence with a predictable tail of low-confidence outputs. If the distribution shifts -- more outputs in the low-confidence range, the median dropping, or the distribution becoming bimodal -- something has changed in either the model or the input data it encounters.
+
+**Error and crash rates** -- the count of inference failures, runtime exceptions, and process crashes per hour. An individual device with an elevated crash rate may have a corrupted model file or a hardware fault. A fleet-wide increase in crash rates after a model update signals a deployment-level problem.
+
+**Hardware utilization** -- CPU, NPU, and memory usage averaged over reporting intervals. Peak memory usage is especially important because it predicts out-of-memory crashes before they happen. If peak memory usage on a device cohort is trending upward after a model update, the new model or its runtime has a memory growth pattern that will eventually cause failures.
+
+**Model version and OS version** -- not a metric but essential context. Every telemetry report must include the active model version and the device's operating system version. Without this context, you cannot determine whether a quality degradation is caused by the model, the OS, or an interaction between the two.
+
+## Local Aggregation: Computing Summaries on Device
+
+The device agent computes all aggregation locally before transmitting anything. Raw inference logs stay on the device -- they are never sent to the cloud unless explicitly requested for a specific debugging investigation. What the device sends is a structured telemetry bundle: the aggregated metrics for the past reporting period, the device's hardware and software profile, and any flagged anomalies that exceeded local thresholds.
+
+The reporting interval is a tunable parameter that trades freshness for bandwidth. Hourly reporting is appropriate for stable fleets in steady state -- it provides enough resolution to detect trends within a day while consuming minimal bandwidth. For devices in the canary group during a model rollout, fifteen-minute reporting provides faster feedback at higher bandwidth cost. For devices flagged as anomalous, five-minute reporting or even continuous streaming may be justified temporarily to diagnose the issue.
+
+Local aggregation also includes **local anomaly detection**. The device agent maintains a rolling baseline of its own metrics -- average latency, typical confidence distribution, normal memory usage -- and flags deviations that exceed a configurable threshold. A device that detects its own anomaly can include a flag in its next telemetry report, allowing the central monitoring system to prioritize investigation without waiting for fleet-level statistical analysis to identify the outlier.
+
+## Fleet-Level Anomaly Detection
+
+Individual device telemetry is useful for debugging. Fleet-level analysis is where you detect systemic problems. The central monitoring system ingests telemetry bundles from all devices and applies statistical methods to identify patterns that no individual device can see.
+
+**Cohort comparison** is the most powerful technique. Group devices by relevant attributes -- hardware model, OS version, model version, geographic region, deployment tier -- and compare metrics across cohorts. If devices running model version 4.2 on Android 15 show a 40 percent increase in P95 latency while devices running the same model version on Android 14 show no change, you have isolated the interaction between the model update and the OS version. Without cohort comparison, this would look like a random latency increase affecting some devices and not others.
+
+**Drift detection** monitors metrics over time within each cohort. A gradual increase in low-confidence outputs across all devices in a geographic region may indicate that the input distribution in that region is shifting -- seasonal changes, new user demographics, or environmental factors affecting sensor input. A sudden step change in error rates across all devices running a specific hardware variant after a firmware update points to a hardware-software interaction.
+
+**Outlier identification** flags individual devices or small groups whose metrics deviate significantly from their cohort peers. A single device with ten times the average crash rate likely has a hardware fault. A cluster of five devices in the same location with elevated latency may share an environmental factor -- high ambient temperature causing thermal throttling, for instance.
+
+The fleet monitoring system must present these analyses in a way that operations teams can act on. A dashboard showing ten thousand individual device metrics is noise. A dashboard showing fleet health by cohort, with automatic flagging of anomalous cohorts and specific devices, is actionable intelligence.
+
+## OTA Rollback Triggers
+
+Automated rollback is the safety net that prevents a bad model update from degrading the entire fleet. The monitoring system evaluates rollback conditions continuously during staged rollouts and triggers a rollback when the evidence exceeds a defined threshold.
+
+The standard rollback triggers are metric thresholds applied to the cohort that received the update. If the canary group's error rate exceeds 1.5 times the pre-update baseline for more than two consecutive reporting periods, halt the rollout and roll back the canary group. If P95 latency increases by more than 30 percent. If crash rate increases by any statistically significant amount. If confidence score distribution shifts downward beyond a defined tolerance. Each trigger has a threshold and a duration -- the metric must exceed the threshold for a sustained period, not just a single spike, to avoid false-positive rollbacks caused by transient conditions.
+
+The triggers must be defined before the rollout begins, not during it. Defining rollback criteria in the heat of a rollout introduces bias -- the team that just spent two weeks preparing a model update is psychologically reluctant to roll it back and will unconsciously set lenient thresholds. Pre-defined criteria, approved as part of the release review, remove this bias. The monitoring system evaluates them mechanically.
+
+## Staged Rollback Execution
+
+Rollback follows the inverse of the staged rollout. If the canary group triggered the rollback, only the canary group reverts. The early adopter and full fleet groups never received the update, so they are unaffected. If the problem is detected during the early adopter phase, both the canary and early adopter groups roll back. Full fleet rollback is the worst case and indicates that the problem was subtle enough to escape canary and early adopter detection.
+
+The rollback mechanism uses the dual-slot approach described in the previous subchapter. The device agent receives a rollback command (or triggers one autonomously based on local anomaly detection), swaps the active model slot to the previous version, and reports the swap. The rollback is instantaneous from the user's perspective -- it is a pointer change, not a download.
+
+After a rollback, the engineering team must diagnose the root cause before attempting another rollout. A common mistake is tweaking the model slightly and immediately re-deploying. Without understanding why the previous version failed -- was it a data quality issue in the fine-tuning set, a quantization artifact that affected specific hardware, an interaction with a concurrent OS update -- the next deployment may fail for the same reason.
+
+## The Device Health Score
+
+Managing thousands of devices individually is impossible. Managing them through a single aggregate metric is too coarse. The middle ground is a **device health score** -- a composite metric per device that distills multiple signals into a single number indicating whether the device needs attention.
+
+A typical health score combines model inference quality (error rate and confidence distribution relative to the cohort), hardware health (memory usage trend, thermal state, storage availability), software currency (model version, OS version, time since last successful update), and connectivity reliability (successful telemetry uploads as a percentage of expected uploads). Each component is normalized and weighted based on operational priority. The composite score maps to a traffic-light status: green (healthy, no action needed), yellow (degraded, investigate when convenient), red (critical, investigate immediately).
+
+The health score serves two purposes. For the operations dashboard, it provides a fleet-wide summary -- "7,842 green, 134 yellow, 24 red" -- that tells you in three seconds whether the fleet is healthy. For the individual device view, it provides a starting point for diagnosis -- a red device's health score breakdown shows which component is driving the degradation, directing the investigation to the right subsystem without requiring the engineer to manually analyze every metric.
+
+---
+
+Observability tells you what is happening across your fleet. But one critical category of signal -- user data, inference inputs, behavioral patterns -- raises questions that go beyond operational monitoring into legal and ethical territory. The next subchapter examines the privacy and data sovereignty implications of edge AI, where the promise that "data never leaves the device" is both the strongest selling point and the most nuanced compliance challenge.

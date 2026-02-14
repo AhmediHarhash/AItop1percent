@@ -1,0 +1,93 @@
+# 6.5 — Progressive Evaluation: Starting Cheap and Escalating on Signal
+
+The best eval pipeline is not the most thorough. It is the one that catches problems at the cheapest layer and only escalates when cheaper checks cannot provide a verdict.
+
+Most evaluation pipelines are flat. Every response passes through the same set of checks at the same cost, regardless of whether the response is obviously good, obviously bad, or ambiguously somewhere in between. This design wastes money on the majority of responses that are unambiguously acceptable. It treats a perfectly formatted, clearly relevant, factually grounded response the same as a borderline hallucination that needs careful expert review. **Progressive evaluation** replaces this flat architecture with a layered one, where each layer is cheaper than the next and only the responses that cannot be resolved at one layer escalate to the next.
+
+## The Four-Layer Architecture
+
+The progressive evaluation stack has four layers, ordered from cheapest to most expensive.
+
+**Layer 1: Rule-based checks.** These are deterministic, nearly free, and infinitely scalable. They check structural requirements — did the response stay within the character limit, is it in the correct language, does it include required sections, does it avoid forbidden patterns. Rule-based checks cost effectively nothing because they run as simple string operations without any model call. On a well-tuned system, 70-85% of responses pass all rule-based checks cleanly. The remaining 15-30% either fail a rule (and can be flagged immediately) or pass with signals that suggest closer inspection is needed.
+
+**Layer 2: Cheap LLM judge.** Responses that pass Layer 1 reach a lightweight model judge — Claude Haiku 4.5, GPT-5-nano, or Gemini 3 Flash — that evaluates basic quality dimensions: relevance to the query, coherence of the response, appropriate tone. This layer costs roughly $0.001 to $0.003 per evaluation. Of the responses reaching this layer, 85-95% receive clear pass or fail judgments. Only the ambiguous cases — where the cheap judge's confidence is low — escalate further.
+
+**Layer 3: Expensive LLM judge.** The ambiguous cases from Layer 2 reach a frontier model — Claude Opus 4.6, GPT-5 — that evaluates nuanced dimensions: factual accuracy, reasoning quality, safety compliance, and domain-specific correctness. This layer costs $0.02 to $0.05 per evaluation but handles only the 2-5% of total responses that cheaper layers could not resolve. Of these, 90-95% receive a definitive judgment.
+
+**Layer 4: Human review.** The handful of cases that even the expensive judge cannot resolve — typically 0.1-0.5% of total volume — escalate to human domain experts. These are the genuinely ambiguous cases where reasonable people might disagree, or where the stakes are high enough that a human judgment is required for compliance or liability reasons.
+
+## The Funnel Economics
+
+The power of progressive evaluation comes from the funnel math. Consider a system processing 100,000 responses per day.
+
+If every response goes through the expensive judge at $0.03 each, the daily evaluation cost is $3,000 — or $90,000 per month. With progressive evaluation, the math changes dramatically. All 100,000 responses pass through Layer 1 at effectively zero cost. Roughly 85,000 pass cleanly. The remaining 15,000 reach Layer 2 at $0.002 each, costing $30. Of those, 13,500 resolve at Layer 2. The remaining 1,500 reach Layer 3 at $0.03 each, costing $45. Of those, 1,425 resolve. The remaining 75 reach Layer 4 at roughly $15 each (human review), costing $1,125. Total daily evaluation cost: approximately $1,200 — versus $3,000 for the flat approach. Monthly savings: roughly $54,000.
+
+The numbers vary by system, but the pattern is consistent. Progressive evaluation typically reduces eval costs by 60-80% compared to running the most expensive evaluation on every response.
+
+## Designing Escalation Triggers
+
+The critical design decision is what triggers escalation from one layer to the next. Get this wrong and you either escalate too much (negating the cost savings) or too little (letting quality problems slip through).
+
+Layer 1 to Layer 2 escalation is straightforward: every response that passes the rule checks proceeds to the cheap judge. The rule checks are so inexpensive that there is no economic reason to skip them.
+
+Layer 2 to Layer 3 escalation requires a confidence threshold. When the cheap judge assigns a quality score, you need to define the range of scores that are ambiguous enough to warrant a second opinion. The right threshold depends on your quality requirements and your tolerance for false negatives. A conservative threshold — escalating anything below a 4.5 on a 5-point scale — catches more issues but sends more traffic to the expensive layer. A permissive threshold — escalating only scores below 3.0 — saves money but risks missing moderate quality issues.
+
+The best approach is to calibrate your threshold empirically. Take a sample of 500 responses where you have both cheap-judge and expensive-judge scores. Find the cheap-judge score below which the expensive judge frequently disagrees. That is your escalation threshold.
+
+Layer 3 to Layer 4 escalation should be reserved for specific triggers: the expensive judge flags a potential safety issue, the expensive judge's confidence is low, the response involves a high-risk category (medical, legal, financial), or the query comes from a high-value customer segment.
+
+## The False Negative Risk
+
+The primary risk of progressive evaluation is false negatives at the early layers — bad responses that cheap checks score as acceptable and that never reach the expensive layers that would have caught them.
+
+This risk is real but manageable. The mitigation is **periodic shadow evaluation**: run a random 1-2% sample of all responses through the full evaluation stack, regardless of what the progressive layers decided. Compare the full-stack judgment against the progressive judgment. If the disagreement rate exceeds your threshold — typically 2-5% — your early-layer thresholds need tightening.
+
+Setting up shadow evaluation requires three components. First, a sampling mechanism that randomly selects responses after the progressive pipeline has rendered its verdict but before that verdict is acted upon. The sample must be truly random — not biased toward responses that already look suspicious. Second, a comparison engine that runs the sampled responses through every layer of the evaluation stack and records both the progressive verdict and the full-stack verdict. Third, a disagreement tracker that calculates the rate at which the progressive pipeline would have passed a response that the full stack would have failed.
+
+The disagreement rate is your primary health metric for the progressive pipeline. When you first deploy progressive evaluation, expect a disagreement rate of 3-8% as you calibrate thresholds. Over the first two to four weeks, tighten the escalation thresholds at each layer until disagreement drops below your target — typically 2% for high-stakes dimensions and 5% for moderate dimensions. Once calibrated, the disagreement rate should remain stable. If it starts climbing, something has changed: either the underlying model behavior shifted, the input distribution changed, or the cheap judge's accuracy degraded due to a model update.
+
+The response protocol for rising disagreement depends on the magnitude. A disagreement rate that climbs from 2% to 3% warrants investigation within the week — check whether the cheap judge's model was updated, whether the input distribution shifted, or whether the evaluation rubric needs adjustment. A disagreement rate that jumps from 2% to 7% warrants immediate action — temporarily route all traffic through the full stack until you identify and fix the cause.
+
+Shadow evaluation costs very little because the sample is small. On a 100,000-response-per-day system, shadow-evaluating 1% means running 1,000 responses through the full stack at $0.03 each — $30 per day, or $900 per month. That is cheap insurance against false negative drift. The cost of not running shadow evaluation is invisible until a quality incident reveals that your progressive pipeline has been passing bad responses for weeks.
+
+## Building the Progressive Pipeline in Practice
+
+Start with what you have. If you currently run an expensive judge on everything, add a cheap judge in front of it and route clear passes away from the expensive judge. Measure the disagreement rate. If it is below your threshold, you have your first cost savings.
+
+The implementation sequence matters. In the first week, instrument your existing pipeline to log the expensive judge's confidence scores alongside its verdicts. Analyze the distribution. You will likely find that 60-80% of verdicts are high-confidence — scores of 4.5 or above on a 5-point scale, or pass/fail with confidence above 90%. These are the responses that a cheap judge would almost certainly agree on. That percentage is your theoretical savings ceiling.
+
+In the second week, add a cheap judge — Claude Haiku 4.5 or GPT-5-nano — in front of your expensive judge, but run both on every response. Do not use the cheap judge's verdict yet. Instead, collect both verdicts and calculate agreement. This parallel-run period is critical. It gives you real data on where the cheap judge agrees and where it diverges, without any risk to your actual evaluation quality.
+
+In the third week, analyze the parallel-run data and set your escalation thresholds. Find the cheap judge's score ranges where it agrees with the expensive judge above 95% of the time. Those ranges become your "resolved at Layer 2" zones. Responses outside those ranges escalate. Deploy the threshold and stop running the expensive judge on responses that resolve at the cheap tier. Your cost savings start immediately.
+
+Then add rule-based checks in front of the cheap judge. These are easy to implement and immediately reduce the volume hitting any model-based evaluation. Common rules include minimum and maximum response length, language detection, presence of required structural elements, and absence of known failure patterns like apologies for being an AI. A B2B document analysis company that followed this sequence found that rule-based checks alone resolved 22% of their volume, reducing the load on their cheap judge and compounding the savings from each subsequent layer.
+
+Build the human review layer last, because it requires the most operational infrastructure — review interfaces, assignment logic, quality control for the reviewers themselves. Start by simply flagging the cases that would escalate to humans, review them yourself, and use that experience to design the human review workflow. Most teams discover that the cases reaching Layer 4 cluster around a small number of recurring ambiguity patterns — which often suggests that the evaluation rubric itself needs clarification rather than that more human reviewers are needed.
+
+The entire progressive pipeline can be built incrementally over weeks, with each layer generating measurable cost savings from the day it goes live.
+
+## Tuning the Pipeline for Different Quality Dimensions
+
+Not every quality dimension should flow through the same progressive layers. Safety-related dimensions — toxicity, PII exposure, dangerous advice — might bypass the cheap judge entirely and go straight to the expensive judge or human review, because the cost of a false negative on safety is asymmetric. Format and structural dimensions might stop at Layer 1, because rule-based checks are perfectly sufficient and model-based evaluation adds cost without adding accuracy.
+
+Consider a concrete example. A legal document analysis platform evaluates five dimensions: format compliance, relevance to the query, citation accuracy, reasoning quality, and safety (no disclosure of privileged information). With a uniform progressive pipeline, every dimension passes through all four layers. With dimension-specific routing, the architecture looks different. Format compliance stops at Layer 1 — rule-based checks verify section headings, citation format, and length requirements with perfect accuracy. Relevance passes through Layers 1 and 2 — the cheap judge handles relevance scoring reliably because the rubric is clear. Citation accuracy skips directly to Layer 3 — checking whether cited cases and statutes actually exist requires the reasoning capability of a frontier model, and a cheap judge would produce unacceptable false negative rates on this dimension. Reasoning quality passes through Layers 2 and 3 — the cheap judge screens for obviously sound or obviously flawed reasoning, escalating only the ambiguous middle. Safety goes through Layers 3 and 4 — every response gets an expensive-judge safety check, and any flagged response escalates to human review with no exceptions.
+
+This dimension-specific routing reduced the platform's eval cost by an additional 28% compared to running the same progressive pipeline for all dimensions, because format checking stopped consuming cheap-judge capacity and relevance scoring stopped consuming expensive-judge capacity.
+
+The most efficient progressive pipelines are dimension-specific. They route each quality dimension through only the layers that are relevant and effective for that dimension. This dimension-specific routing adds implementation complexity — you need a routing configuration for each dimension rather than a single pipeline definition — but the savings compound across every dimension you optimize.
+
+The design principle is straightforward: the minimum number of layers needed to achieve your required detection accuracy for each dimension. More layers than that waste money. Fewer layers than that miss problems.
+
+## Monitoring the Progressive Pipeline
+
+A progressive pipeline needs different monitoring than a flat pipeline. Track these metrics at each layer: volume entering the layer, volume resolved at the layer, volume escalated, and cost at the layer. These metrics tell you whether each layer is pulling its weight.
+
+The most important derived metric is the **resolution rate** at each layer — the percentage of incoming volume that the layer resolves without escalation. Layer 1 should resolve 70-85% of total volume. Layer 2 should resolve 85-95% of the volume it receives. Layer 3 should resolve 90-95% of its incoming volume. If any layer's resolution rate drops below these ranges, it is either not discriminating effectively or the input quality has shifted.
+
+Watch for layer volume shifts over time. If the percentage of responses reaching Layer 3 starts climbing, something has changed — either your system quality has degraded (generating more ambiguous responses) or your cheap judge thresholds need recalibration. Either signal requires investigation. A healthcare AI company noticed their Layer 3 volume climbing from 4% to 11% over three weeks. Investigation revealed that a prompt template change had introduced more hedging language into responses, which the cheap judge interpreted as low confidence and escalated. The fix was not to adjust the escalation threshold — the cheap judge was correctly identifying a change — but to refine the prompt template to produce clearer responses.
+
+Set up alerts for three conditions. First, alert when any layer's resolution rate drops more than 5 percentage points below its trailing 30-day average — this indicates a sudden shift that needs investigation. Second, alert when the shadow evaluation disagreement rate exceeds your threshold — this indicates the progressive pipeline is making incorrect decisions. Third, alert when the total daily eval cost exceeds 120% of the expected baseline — this catches situations where escalation volume has increased enough to erode the cost savings that justified the progressive architecture.
+
+Track the total cost savings compared to the flat-pipeline baseline. This number should remain stable or improve over time as you refine thresholds and improve the cheap judge's accuracy. If savings decline, your pipeline is losing efficiency and needs an audit. Present the savings as a concrete dollar figure in your monthly cost review — "$47,000 saved this month through progressive evaluation" is more compelling than an abstract percentage and keeps organizational support for the pipeline's operational complexity.
+
+Progressive evaluation turns the eval tax from a linear cost into a funnel, and funnels are the most powerful economic structure in AI operations. The next step is ensuring that funnel itself does not contain redundant or wasteful stages — which brings us to eval pipeline efficiency.

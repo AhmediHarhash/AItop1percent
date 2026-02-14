@@ -1,0 +1,75 @@
+# 10.2 — How Code-Switching Breaks Models: Detection, Embeddings, and Generation
+
+Code-switched input breaks three layers of a multilingual system: language detection, semantic representation, and output generation. Each failure is damaging on its own. Together, they compound into a cascade where the first error amplifies every subsequent one, and the system's final output bears little resemblance to what the user needed.
+
+Most teams discover this cascade in production, from user complaints they cannot reproduce because their test environment uses monolingual input. By the time the complaints are numerous enough to trigger investigation, the damage to user trust is already done. Understanding the three-layer failure is the first step toward building systems that survive real multilingual traffic.
+
+## Layer One: Language Detection Collapses
+
+Language identification is the first processing step in most multilingual pipelines. The system needs to know what language the input is in before it can select the right model, route to the right pipeline, or apply the right safety classifier. For monolingual input, this works well. FastText-based classifiers, Google's CLD3, and more recent models like GlotLID and OpenLID achieve accuracy above 98 percent on clean, single-language text in well-resourced languages.
+
+Code-switched input destroys this accuracy. These classifiers are designed to return a single language label per input. When a sentence contains 55 percent Hindi tokens and 45 percent English tokens, the classifier must choose. It picks Hindi, or it picks English, or -- when the statistical signal is too ambiguous -- it picks "unknown" or a third language entirely. Whichever it picks, it is wrong, because the input is not in one language. It is in two.
+
+The DIVERS-Bench evaluation, published in September 2025, tested eight state-of-the-art language identification models across diverse conditions including code-switched text. The findings were stark. Models that achieved high accuracy on curated monolingual datasets showed sharp performance degradation on noisy, informal, and code-switched inputs. The benchmark introduced DIVERS-CS, a code-switching evaluation set spanning ten language pairs, and demonstrated that existing models struggle to detect multiple languages within the same sentence. The gap between clean-text accuracy and code-switched accuracy was not a few percentage points. It was a structural failure mode.
+
+The practical consequences cascade immediately. If your pipeline routes Hindi-detected input to a Hindi-specific retrieval index, and the classifier labels a Hinglish message as Hindi, the English portions of the query will not match against the Hindi index. If your pipeline routes to an English-specific index instead, the Hindi portions miss. Either way, retrieval quality drops because the routing decision was wrong from the start.
+
+For systems that use language detection to select a language-specific model or prompt template, the failure is different but equally damaging. A Taglish input classified as English gets processed by an English prompt template that does not account for Filipino vocabulary or grammar. The model may not understand the Filipino tokens at all, or may hallucinate meanings for them based on superficial similarity to English words.
+
+## Layer Two: Embeddings Fall Between Clusters
+
+Multilingual embedding models -- BGE-M3, Qwen3 Embedding, multilingual E5, Cohere Embed v3 -- are trained to create a shared semantic space where similar meanings cluster together regardless of language. The aspiration is that "how do I open a bank account" in English and its Hindi equivalent land near each other in embedding space.
+
+This works reasonably well for monolingual text. But the training data for these models is overwhelmingly monolingual. Each training example is in one language. The model learns to create clusters for English text, clusters for Hindi text, and cross-lingual alignment between them. It does not learn what to do with text that is simultaneously in both languages.
+
+Code-switched text produces embeddings that fall in the gaps between language clusters. A Hinglish query does not land cleanly in the Hindi cluster or the English cluster. It lands somewhere in the space between them, pulled toward Hindi by its Hindi tokens and toward English by its English tokens. The resulting embedding is a compromise that strongly matches neither language's documents.
+
+The impact on retrieval is measurable. Teams that have benchmarked code-switched queries against monolingual queries of equivalent semantic content consistently find recall drops of 15 to 30 percent. The exact magnitude depends on the language pair, the ratio of languages in the query, and the specific embedding model. Language pairs that the embedding model has seen some code-switched training data for -- Hindi-English and Spanish-English being the most common -- perform better than pairs with little or no representation in training data.
+
+The damage is worse for language pairs that use different scripts. A query mixing Devanagari Hindi and Latin-script English forces the tokenizer to handle two entirely different character sets within a single input. The resulting token sequence is unlike anything the model saw during training. The embedding it produces is correspondingly unreliable.
+
+## Layer Three: Generation Language Confusion
+
+When the model receives code-switched input and must produce a response, it faces a decision that monolingual input never requires: what language should the output be in?
+
+This decision is harder than it appears. The user wrote in a mix of Hindi and English. Should the model respond in Hindi? In English? In the same Hinglish mix? The "right" answer depends on the user's expectation, which the model must infer from context. Research from KAIST published in January 2026 introduced the OLA benchmark -- Output Language Alignment -- to evaluate exactly this problem. The findings revealed that even frontier models systematically fail to align their output language with user expectations in code-switched contexts. Models exhibited strong asymmetric biases, consistently defaulting to certain languages regardless of contextual cues that would be obvious to a human conversation partner.
+
+The practical failure takes several forms. The most common is **English defaulting** -- the model receives code-switched input and responds entirely in English, regardless of the user's language pattern. This happens because English dominates the model's training data and its alignment tuning. For a Hinglish-speaking user in India, receiving an English-only response feels like the system does not understand them or does not respect their communication style.
+
+The second form is **awkward code-switching** -- the model attempts to mirror the user's mixed-language pattern but produces unnatural output that no real bilingual speaker would use. The model might insert Hindi words at random rather than at the syntactically appropriate points where a Hinglish speaker would place them. The result reads like a parody of code-switching rather than natural communication.
+
+The third form is **language oscillation** -- the model switches its response language unpredictably across turns in a multi-turn conversation. Turn one is in English, turn two is in Hindi, turn three is in Hinglish, turn four is back to English. The user cannot predict what language the next response will be in, which makes the conversation feel unstable and unreliable.
+
+## The Compounding Effect
+
+Each layer's failure amplifies the next, creating a cascade that is worse than the sum of its parts.
+
+Misdetected language leads to wrong pipeline routing, which leads to wrong embedding space, which leads to irrelevant retrieval results, which leads to a generation grounded in the wrong context, which leads to a response in the wrong language. The user asked a question in Hinglish about their bank account. The system detected the input as English, embedded it in an English-only space, retrieved English-only documents that partially matched the English tokens but missed the Hindi-specific intent, and generated an English response that answered a different question.
+
+The cascade also affects safety. A code-switched message that contains harmful content split across two languages may evade detection at the language identification layer because the classifier only sees one language. The safety classifier, designed for that one language, evaluates only the tokens it recognizes and passes the message through. The harmful intent, distributed across two languages, survives every filter.
+
+Consider the real path of a code-switched input through a typical pipeline. The user sends: "Mujhe batao how to make a fake Aadhaar card for my friend." This is a Hinglish sentence requesting help with identity fraud. If the language detector classifies it as English, the safety classifier evaluates it in English and might catch "fake Aadhaar card." But if the user distributes the harmful intent more evenly across languages -- embedding the fraudulent request in Hindi morphology while keeping only innocuous words in English -- the English safety classifier sees fragments that look benign and passes the message through.
+
+## Quantifying the Damage
+
+The CS-FLEURS benchmark provides the clearest numbers for speech systems. Whisper Large v3 showed character error rates more than double on code-switched input compared to monolingual FLEURS input. For distinct-script language pairs, error rates were on average three times higher. These numbers mean that a speech system performing at 5 percent error rate on monolingual English performs at 10 to 15 percent error rate on English-Hindi code-switched speech.
+
+For text systems, the picture is less well-benchmarked but consistently directional. The 2025 survey "Beyond Monolingual Assumptions" documented that multilingual LLMs, despite their broad language capabilities, do not inherently handle code-switched text well. Fine-tuned models of much smaller scale outperformed frontier LLMs on code-switched tasks, suggesting that the problem is not model capacity but training data distribution. The models have seen billions of monolingual examples and almost no code-switched examples.
+
+For retrieval systems, the gap is most acute in low-resource language pairs. Hindi-English and Spanish-English code-switching has enough representation in training data that models partially handle it. Korean-English, Arabic-French, Tamil-English, and Swahili-English have far less representation. For these pairs, the retrieval quality drop can exceed 30 percent, effectively making the retrieval component unreliable for code-switching users.
+
+## Why Standard Fixes Fall Short
+
+The obvious fix -- "just train on code-switched data" -- is correct in principle but difficult in practice. Code-switched training data is scarce. Unlike monolingual text, which is available in enormous quantities from the web, code-switched text is concentrated in informal communication channels: social media, messaging apps, and spoken conversation. It is harder to collect, harder to annotate, and harder to quality-control because annotation requires bilingual annotators who can accurately label language boundaries at the word level.
+
+The MaskLID approach, presented at ACL 2024, demonstrated a clever workaround for language detection: use standard language identification models iteratively, masking the features of the detected dominant language at each step to reveal the secondary language. This requires no additional training data and works with existing FastText-based classifiers like GlotLID and OpenLID. But it addresses only the detection layer. The embedding and generation failures remain.
+
+Another common approach is to translate the code-switched input into a single language before processing. This normalizes the input but destroys the nuance that the code-switching carried. When a user deliberately chose English words for technical concepts and Hindi words for emotional expression, flattening everything to one language loses information the user intended to convey. For some applications -- factual question answering, customer support routing -- this loss is acceptable. For applications where tone, register, and cultural nuance matter -- mental health support, creative writing, social interaction -- it is not.
+
+## The Uncomfortable Implication
+
+The three-layer failure means that code-switching users receive measurably worse service from every component of your system. Worse detection, worse retrieval, worse generation, worse safety. And because most evaluation pipelines test with monolingual input, this degradation is invisible in your metrics.
+
+Your quality dashboard shows one number. Your code-switching users experience a different number. The gap between those two numbers is the size of the problem you do not know you have.
+
+The next subchapter addresses the first layer in detail: how to detect and identify languages in code-switched text, moving beyond single-label classification to word-level and span-level language identification that gives your downstream pipeline the information it actually needs.

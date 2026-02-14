@@ -1,0 +1,67 @@
+# 27.26 — NVLink, NVSwitch, and GPU-to-GPU Interconnect Topology
+
+The fastest network between two GPUs is not a network at all. It is a direct memory bus. When two GPUs share an NVLink connection, data moves between them at 900 gigabytes per second on current-generation Hopper hardware and 1.8 terabytes per second on Blackwell — bandwidths that no network fabric, no matter how expensive, can match. NVLink turns eight separate GPUs into something that behaves like a single device with aggregate memory, and the boundary between "same GPU" and "different GPU" nearly disappears from a performance standpoint. This interconnect is the reason a single eight-GPU server can train models that would otherwise require multi-node distributed training, and it is the reason that not all eight-GPU configurations deliver the same performance.
+
+Understanding NVLink, NVSwitch, and the domain boundaries they create is essential for anyone making GPU infrastructure decisions. The choice between "eight GPUs connected by NVLink" and "eight GPUs that happen to be in the same server" is the difference between a training job that saturates its hardware and one that wastes half its compute budget waiting for data to crawl across PCIe.
+
+## NVLink Generations and Bandwidth
+
+**NVLink** is NVIDIA's proprietary high-bandwidth interconnect for GPU-to-GPU communication. Each generation has roughly doubled the bandwidth of the previous one, tracking the growth of model sizes and the data volumes that distributed training demands.
+
+The A100 generation, based on the Ampere architecture, provided 600 gigabytes per second of bidirectional bandwidth per GPU. This was sufficient for models up to roughly 13 billion parameters in data-parallel training across eight GPUs without communication becoming the dominant bottleneck. Beyond that model size, or beyond eight GPUs, the NVLink bandwidth became a constraint.
+
+The H100 and H200 generation, based on Hopper architecture, increased NVLink bandwidth to 900 gigabytes per second per GPU using fourth-generation NVLink. This 50 percent increase was not just a speed bump — it extended the range of model sizes that could train efficiently within a single NVLink domain. A 70-billion-parameter model running tensor parallelism across eight H100 GPUs could keep its communication overhead below 15 percent of step time, something that was impossible on A100 NVLink without careful optimization.
+
+The Blackwell generation — B200, GB200, and their variants — doubles bandwidth again to 1.8 terabytes per second per GPU with fifth-generation NVLink. Each NVLink link operates at 200 gigabits per second, a doubling of the per-link signaling rate from Hopper. This bandwidth matches what many high-end storage arrays deliver as their total throughput, but it connects a single GPU to its neighbors. The practical effect is that workloads that were communication-bound on Hopper become compute-bound on Blackwell, assuming the interconnect topology is properly configured.
+
+## NVSwitch: All-to-All Within a Node
+
+Raw NVLink bandwidth tells you how fast two GPUs can talk. **NVSwitch** determines which GPUs can talk to which GPUs at that speed — and this distinction matters enormously.
+
+Without NVSwitch, NVLink connections are point-to-point. Each GPU has a fixed number of NVLink ports, and those ports connect directly to specific neighboring GPUs. On the A100 DGX system, each GPU had twelve NVLink ports forming six bidirectional links. These links connected GPUs in a mesh pattern, but the mesh was not fully connected — some GPU pairs had direct NVLink links, while others had to route through an intermediate GPU, halving effective bandwidth. This partial connectivity created uneven communication performance depending on which GPUs needed to exchange data.
+
+NVSwitch eliminates this problem by providing a centralized switching fabric that connects every GPU to every other GPU at full NVLink bandwidth simultaneously. In the DGX H100, three third-generation NVSwitch chips create an all-to-all mesh across all eight GPUs. Any GPU can communicate with any other GPU at the full 900 gigabytes per second — no intermediate hops, no reduced bandwidth for distant pairs, no topology-dependent performance variation. This uniform connectivity is what makes the eight-GPU node behave like a single large GPU for collective operations. An all-reduce across eight NVSwitch-connected GPUs approaches the theoretical bandwidth limit because every GPU can send and receive simultaneously without contention.
+
+The third-generation NVSwitch in Hopper systems supports 64 NVLink ports per switch chip, switching 13.6 terabits per second of aggregate bandwidth. Each DGX H100 uses three NVSwitch chips, together providing the cross-GPU fabric. The fourth-generation NVSwitch in Blackwell systems scales further, supporting the higher per-link bandwidth of fifth-generation NVLink and enabling larger domain sizes.
+
+## The NVLink Domain: The Fundamental Unit of GPU Topology
+
+An **NVLink domain** is the set of GPUs that can communicate with each other at NVLink speeds. This is the most important concept in GPU infrastructure planning because it defines the performance boundary between "fast communication" and "slow communication."
+
+In Hopper-generation servers, the NVLink domain is typically eight GPUs — the full complement of a DGX H100 or HGX H100 system. All eight GPUs communicate through NVSwitch at 900 gigabytes per second. When a workload fits within this eight-GPU domain, every collective operation runs at NVLink speed. When a workload exceeds the domain — requiring sixteen, thirty-two, or more GPUs — communication between GPUs in different domains must traverse the inter-server network. That network, even with InfiniBand at 400 Gbps (roughly 50 gigabytes per second), is eighteen times slower than NVLink.
+
+This creates a performance cliff. A training step that takes 200 milliseconds within an eight-GPU NVLink domain might take 350 milliseconds when the same workload spans two eight-GPU nodes, because the cross-node gradient synchronization now bottlenecks on the network interconnect. The computation is identical. The difference is entirely in the communication path. Teams that plan workloads around NVLink domain boundaries — sizing tensor parallelism to fit within a single node, using data parallelism across nodes — consistently achieve 30 to 50 percent higher throughput than teams that treat all GPU communication paths as equivalent.
+
+For your scheduler and your capacity planning, the NVLink domain is the atomic unit. "Allocate eight GPUs" means nothing without specifying that those eight GPUs must share an NVLink domain. Eight GPUs scattered across two servers, or eight GPUs on a server where some are connected only by PCIe, deliver fundamentally different performance characteristics.
+
+## NVLink Network: Extending the Domain Across Nodes
+
+The Blackwell architecture introduces a radical change to the NVLink domain model. **NVLink Network**, deployed in the GB200 NVL72 configuration, extends NVLink connectivity across server boundaries. Instead of an eight-GPU domain limited to a single server, the NVL72 creates a 72-GPU domain spanning an entire rack that communicates at NVLink speeds.
+
+The GB200 NVL72 rack contains 36 Grace CPUs and 72 Blackwell GPUs. Nine NVLink Switch trays, each containing two NVLink Switch chips with 144 ports, interconnect all 72 GPUs through a single NVLink fabric. The aggregate fabric bandwidth is 130 terabytes per second — sufficient for all 72 GPUs to participate in collective operations without the cross-node bandwidth cliff that defined previous generations.
+
+The practical consequence is profound. A training workload that previously required careful partitioning to minimize cross-node communication — using tensor parallelism within a node and data or pipeline parallelism across nodes — can now treat 72 GPUs as a single NVLink domain. Communication patterns that were prohibitively expensive across the network become trivial within the NVLink fabric. Pipeline parallelism, which requires point-to-point transfers between specific GPU pairs across pipeline stages, runs at NVLink speed across the full 72-GPU domain instead of bottlenecking at network boundaries.
+
+The total unified memory across the 72-GPU domain reaches 30 terabytes — enough to hold even trillion-parameter models without offloading to host memory or disk. Combined with the 130 terabytes per second of interconnect bandwidth, the NVL72 effectively creates an exascale-class compute node from a single rack. NVIDIA's benchmarks show 30x inference performance improvement over the same GPU count in H100 configurations for large language model workloads, driven primarily by the elimination of network bottlenecks in the attention computation.
+
+## The Performance Cliff at Domain Boundaries
+
+Understanding where NVLink ends and the network begins is not an academic exercise. It directly determines how you size workloads, how you partition models, and how you schedule jobs.
+
+Within an NVLink domain, bandwidth is measured in hundreds of gigabytes per second to terabytes per second. At the domain boundary, bandwidth drops to tens of gigabytes per second — a 10x to 30x reduction depending on the network fabric. This cliff creates a sharp dividing line in workload architecture. Operations that are latency-sensitive and bandwidth-intensive — tensor parallelism, attention computation across model shards, activation checkpointing transfers — must stay within the NVLink domain. Operations that are less sensitive to latency and can tolerate lower bandwidth — data-parallel gradient synchronization, pipeline stage boundaries, expert routing in mixture-of-experts models — can cross domain boundaries, ideally with communication overlapping computation to hide the latency.
+
+The cliff also affects inference workloads. A large language model served with tensor parallelism across four GPUs generates inter-GPU transfers at every transformer layer during the forward pass. If those four GPUs share NVLink, each transfer completes in microseconds. If they communicate over PCIe or the network, each transfer takes tens of microseconds to milliseconds, and this delay compounds across the 80 to 128 layers of a modern large model. At the 99th percentile, the accumulated latency from non-NVLink communication paths can add 40 to 60 percent to generation time. Your users experience this as slow first-token latency that no amount of serving framework optimization can fix because the bottleneck is in the physical interconnect.
+
+The performance cliff explains why "any eight GPUs" is never the same as "the right eight GPUs." A scheduler that places a tensor-parallel workload across GPUs that span two NVLink domains — four GPUs on one server and four on another, or four NVLink-connected and four PCIe-only — delivers a fundamentally degraded experience. The monitoring dashboard might show eight GPUs at 60 percent utilization and conclude the job is running well. In reality, 40 percent of each GPU's time is spent waiting for slow communication, and the job is completing at half the speed it would achieve on properly connected hardware.
+
+## Topology Discovery and Platform Decisions
+
+Knowing your NVLink topology is a prerequisite for making correct infrastructure decisions. NVIDIA provides the nvidia-smi topo -m command, which displays the interconnect matrix for all GPUs in a system — showing which pairs are connected by NVLink, which by PCIe, and which by SYS (cross-socket NUMA). The NVIDIA GPU Operator in Kubernetes exposes this topology information through node labels and device plugin annotations, making it available to the scheduler.
+
+The critical platform decisions that depend on topology information include workload sizing — how many GPUs to request for a job and whether to specify NVLink affinity. They include capacity planning — how many NVLink domains your cluster provides and whether your workload mix matches that capacity. They include hardware procurement — whether to buy systems with full NVLink connectivity (DGX, HGX) or cheaper configurations with partial or no NVLink (individual PCIe GPUs in commodity servers). And they include scheduling policy — whether to enforce NVLink domain constraints or allow the scheduler to split workloads across domain boundaries when capacity is tight.
+
+Getting these decisions right requires treating the NVLink domain as the fundamental unit of your GPU infrastructure, the way you treat the CPU core as the fundamental unit of your compute infrastructure. Not all GPUs are equal, and the interconnect that links them determines what they can accomplish together.
+
+---
+
+NVLink and NVSwitch move data between GPUs within a domain. But the software that orchestrates those transfers — deciding which GPUs send what data to which other GPUs, choosing the algorithm, and handling failures — is NCCL, the NVIDIA Collective Communications Library. The next subchapter examines how NCCL works at scale, why it fails, and what you can do when cryptic timeout errors bring a thousand-GPU training run to a halt.

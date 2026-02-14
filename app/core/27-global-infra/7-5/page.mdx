@@ -1,0 +1,71 @@
+# 27.52 — Model Updates at the Edge: Deploying to Thousands of Devices
+
+Deploying a model to a cloud cluster means updating ten to a hundred pods. Deploying to the edge means updating ten thousand to ten million devices, each with different hardware, different connectivity, and different availability windows. Cloud deploys are centralized and controllable. You trigger a rollout, watch the pods cycle, validate metrics, and either proceed or roll back. The feedback loop is minutes. Edge deploys are distributed, asynchronous, and partially connected. You push an update, and some devices pick it up in seconds, some in hours, some not for days. You do not control when the device is online, whether it has bandwidth, or how much battery it has left. Every assumption that makes cloud deployment manageable -- immediate propagation, reliable networking, homogeneous hardware -- breaks at the edge.
+
+This asymmetry is not a minor operational inconvenience. It is a fundamentally different deployment paradigm, and the teams that treat edge model updates like cloud deployments discover this distinction through outages, version fragmentation, and bricked devices.
+
+## The OTA Update Pipeline
+
+**Over-the-air updates** are the standard mechanism for pushing new model versions to edge devices. The pipeline follows a pattern that has matured through firmware and operating system updates but gains additional complexity when the payload is a machine learning model. A central model registry holds the artifact -- the quantized model file, the runtime configuration, and a manifest describing hardware compatibility and minimum resource requirements. The update orchestrator determines which devices should receive the new version, in what order, and under what conditions. The device agent, a lightweight service running on each edge device, periodically checks for available updates, downloads the payload when conditions are met, validates the integrity of the download, swaps the active model, and reports the result.
+
+Each step in this pipeline is a potential failure point. The registry must serve downloads to thousands of devices concurrently without becoming a bottleneck. The orchestrator must respect constraints -- battery level, connectivity type, time of day, current workload -- that vary per device. The device agent must handle interrupted downloads, corrupted files, and insufficient storage gracefully. And the reporting path must work even when the device has intermittent connectivity, which means buffering telemetry locally and transmitting when a connection is available.
+
+By 2026, platforms like Mender, Balena, and Edge Impulse have matured OTA infrastructure to handle these challenges at scale, but the model-specific requirements around validation and rollback still require custom engineering for most teams deploying AI at the edge.
+
+## Staged Rollouts: Canary, Early Adopter, Full Fleet
+
+Pushing a model update to an entire fleet simultaneously is the edge equivalent of deploying untested code to production on a Friday afternoon. Staged rollouts are not optional -- they are the mechanism that prevents a single bad model from degrading service across your entire device population.
+
+The standard progression follows three tiers. The first is the **canary group** -- typically one to two percent of the fleet, selected to represent the full range of hardware variants, geographies, and usage patterns. The new model deploys to these devices first. You collect inference metrics -- latency, confidence distributions, error rates, crash frequency -- for 24 to 72 hours before making a promotion decision. If the canary group shows degradation against any key metric, you halt the rollout and investigate.
+
+The second tier is the **early adopter group** -- ten to twenty percent of the fleet. These are devices whose operators have opted into faster update cycles or devices in environments where the consequences of a bad model are lower. The early adopter group validates at scale what the canary group validated in miniature. Problems that emerge at two percent -- rare edge cases, hardware-specific failures, interactions with specific OS versions -- often surface at ten percent with statistical significance.
+
+The third tier is **full fleet deployment**. Only after the canary and early adopter groups have run the new model for an acceptable duration with no metric regression does the update propagate to the remaining eighty to ninety percent of devices. Even at this stage, the rollout is not instantaneous -- devices update on their own schedules based on connectivity and resource constraints -- but the orchestrator marks the update as approved for all devices.
+
+The entire staged rollout for a model update typically takes five to fourteen days. Teams accustomed to cloud deployment cadences find this timeline frustrating, but it reflects the reality that you cannot restart an edge device the way you can restart a Kubernetes pod. A bad model on a device stays bad until the device connects and receives the rollback.
+
+## Differential Updates: Sending Changes, Not Full Models
+
+Bandwidth is a hard constraint at the edge. A quantized seven-billion-parameter model is roughly four gigabytes. Pushing the full model to ten thousand devices over cellular connections would consume forty terabytes of bandwidth -- a meaningful cost and a multiday operation for devices with limited connectivity. **Differential updates** solve this by computing the binary diff between the current model version on the device and the new version, then transmitting only the changed bytes.
+
+For minor model updates -- a fine-tuning run that adjusts a small subset of layers, a quantization parameter change, a vocabulary extension -- the diff is typically five to fifteen percent of the full model size. For a four-gigabyte model, that means sending 200 to 600 megabytes instead of the full file. Industry reports from OTA platform providers show bandwidth reductions of 70 to 90 percent for incremental model updates, which translates directly into faster propagation, lower cellular costs, and reduced battery drain during downloads.
+
+The tradeoff is computational. The device must apply the diff to reconstruct the new model, which requires holding both the current model and the diff in memory or storage during the patch operation. Devices with constrained storage -- less than 16 gigabytes of available space -- may not have room for the current model, the diff, and the reconstructed new model simultaneously. Your update pipeline must account for storage headroom or support streaming patch application that overwrites in place, which adds complexity and risk if the process is interrupted.
+
+## Update Scheduling and Device Constraints
+
+Edge devices do not exist in a vacuum. They are embedded in environments with their own constraints -- power, connectivity, thermal limits, and user expectations. A model update that triggers on a delivery driver's phone mid-route is a user experience disaster. A model update that drains a security camera's backup battery renders it useless during a power outage. Update scheduling must respect the device's current context, not just the update's availability.
+
+The common scheduling constraints include connectivity type (update only on WiFi, never on metered cellular), battery level (update only above 50 percent charge or while connected to power), time windows (update during overnight hours or during designated maintenance periods), and workload state (update only when the model is not actively serving inference requests). The device agent evaluates these constraints locally before initiating a download. The orchestrator can express constraints as policies that apply to device cohorts -- all retail kiosk devices update between 2 AM and 5 AM local time, all vehicle-mounted devices update only while parked and charging.
+
+Respecting these constraints means accepting that your fleet will never be fully updated simultaneously. At any given moment, your device population runs a distribution of model versions. This version spread is normal and manageable. What is not manageable is having no visibility into which devices are running which version, which brings the update pipeline back to the observability challenge that the next subchapters address.
+
+## Rollback at the Device Level
+
+Cloud rollbacks are centralized -- you change the deployment configuration and Kubernetes handles the rest. Edge rollbacks must happen autonomously on the device, because the device may not have connectivity to receive a rollback command from the orchestrator. The device must be its own safety net.
+
+The standard approach is **dual-slot deployment**. The device maintains two model slots -- an active slot running the current model and an inactive slot that holds the previous version. When an update arrives, the new model is written to the inactive slot, validated (checksum verification, a short inference sanity test on a known input), and then promoted to active. The previous model remains in the other slot. If the new model fails validation, or if post-deployment monitoring detects anomalies -- inference latency exceeding a threshold, confidence scores collapsing, crash loops -- the device autonomously reverts to the previous slot.
+
+This approach requires enough storage for two complete models plus the differential update payload during the transition. For a four-gigabyte model, the dual-slot requirement is approximately nine gigabytes of model-related storage -- two four-gigabyte models plus workspace for the update operation. On devices with limited storage, this constraint becomes the binding factor that determines the maximum model size you can deploy.
+
+Automated rollback triggers must be conservative. A false positive -- rolling back a perfectly good model because of a transient latency spike -- wastes bandwidth and delays adoption. A false negative -- keeping a bad model because the threshold was too lenient -- degrades user experience until the next manual intervention. Teams typically set rollback thresholds at two to three standard deviations from the baseline on their primary metrics, measured over a 30-minute stabilization window after the model swap.
+
+## Version Management Across the Fleet
+
+When your fleet spans thousands of devices across multiple hardware variants, operating system versions, and connectivity profiles, tracking which model version runs on each device becomes a first-class operational concern. **Fleet version management** is the discipline of maintaining a real-time inventory of device model versions and using that inventory to drive update decisions, debug issues, and ensure compliance.
+
+The version registry maps each device identifier to its current model version, the timestamp of its last update, the result of its last update attempt (success, failure with reason, pending), and its hardware and software profile. The orchestrator queries this registry to determine rollout progress -- what percentage of the fleet has adopted the new version, which devices are stuck on old versions and why, and whether any device cohort shows disproportionate update failures.
+
+A common failure mode is **version drift without visibility**. A device fails an update silently -- the download is interrupted, the validation check fails, the storage is full -- and reverts to its old version. If the failure is not reported (because the device lost connectivity after the failure), the orchestrator believes the update succeeded. Over time, the fleet accumulates devices running outdated models with no record in the central system. The fix is bidirectional verification: the device reports its active model version on every telemetry heartbeat, and the orchestrator compares the reported version to the expected version, flagging discrepancies for investigation.
+
+## Compliance Windows and Forced Updates
+
+In regulated industries, you cannot tolerate indefinite version spread. A healthcare AI running on diagnostic devices must ensure that all devices are running an approved model version within a defined compliance window -- typically seven to thirty days after a mandated update. A financial services AI deployed on point-of-sale terminals may need to ensure that a security patch reaches every device within 72 hours.
+
+Compliance enforcement creates tension with the scheduling constraints described above. You want devices to update under ideal conditions -- on WiFi, while charging, during low-usage hours. But a compliance window that is closing forces you to relax those constraints. The orchestrator must escalate: first, expand the update window to include daytime hours. Then, allow updates on cellular connections. Finally, display a prompt requiring the user or operator to initiate the update manually before the device can resume normal operation.
+
+This escalation ladder must be designed in advance, not improvised during a compliance crunch. Document the stages, the timelines, and the approval required to escalate from one stage to the next. The worst outcome is discovering that fifteen percent of your fleet missed a compliance deadline because you were unwilling to allow cellular updates and had no escalation path.
+
+---
+
+Pushing updates to thousands of devices is only half the challenge. The other half is what happens when those devices lose the network connection that makes centralized management possible. The next subchapter examines how to build edge AI systems that operate reliably without guaranteed connectivity -- where offline is not an error state but the expected mode of operation.

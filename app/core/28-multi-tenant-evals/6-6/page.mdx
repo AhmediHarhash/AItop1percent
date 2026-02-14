@@ -1,0 +1,103 @@
+# 28.6 — Rollback Complexity: Why Reverting a Multi-Tenant Change Is Not the Inverse of Deploying It
+
+Why is rollback harder than deployment? In a single-tenant system, the question barely makes sense. You deployed version N, it broke something, you redeploy version N-minus-one. The system returns to its previous state. Rollback is deployment in reverse, and the reverse is clean because only one customer, one configuration, and one state timeline exist.
+
+In a multi-tenant system, rollback is not the inverse of deployment. It is a different operation entirely, with different failure modes, different blast radii, and different success criteria. The reason is **state divergence** — the fact that during the window between deployment and rollback, your tenants did not stand still. Some absorbed the change into their workflows. Some modified their configurations in response to the change. Some retrained adapters against the new model weights. Some adjusted their quality thresholds based on new score distributions. Rolling back the platform does not roll back those tenant-level adaptations. You revert the platform to its previous state and leave your tenants stranded in a state that was built for a world that no longer exists.
+
+This asymmetry is the fundamental challenge. Deployment adds something new. Rollback must subtract something that has already been incorporated into hundreds of independent tenant states. That subtraction is never clean.
+
+## The Rollback Asymmetry
+
+Deployment flows in one direction: from the platform to tenants. You update the base model, the serving infrastructure, or the evaluation pipeline, and the change propagates outward. Each tenant receives the same update, though they experience it through their unique configuration. The deployment is a single event with a uniform starting state.
+
+Rollback attempts to flow in the opposite direction, but the starting state is no longer uniform. After a staged rollout to 400 tenants, the platform's state looks like this: 120 tenants received the update in wave one, three days ago. 180 tenants received it in wave two, yesterday. 100 tenants are still on the previous version, waiting for wave three. Among the 120 wave-one tenants, 40 have already run evaluation cycles against the new model and generated quality reports that reflect the new behavior. Fifteen have adjusted their alert thresholds based on the new score distributions. Eight have retrained their per-tenant LoRA adapters against the new base model weights. Three have communicated new quality baselines to their internal stakeholders based on the post-update scores.
+
+Rolling back to the previous version must account for all of these states simultaneously. The 100 tenants in wave three are easy — they never received the change, so there is nothing to roll back. The 180 wave-two tenants are moderately complex — they received the change recently enough that most have not adapted to it, but some may have already run automated processes that consumed the new model's outputs. The 120 wave-one tenants are where the real complexity lives, and within that group, the eight who retrained adapters represent the hardest rollback problem of all.
+
+## State Divergence During Rollout
+
+**State divergence** is what makes multi-tenant rollback fundamentally different from single-tenant rollback. It is the accumulation of tenant-specific actions that occur between the moment of deployment and the moment of rollback, actions that assume the deployed change will persist.
+
+The most common forms of state divergence are configuration adjustments, adapter retraining, threshold recalibration, and downstream communication.
+
+Configuration adjustments happen when tenants or their automated systems modify settings in response to the new model behavior. A tenant whose quality scores shifted after the model update might adjust their rubric weights to compensate. A tenant whose response latency changed might modify their timeout configurations. A tenant whose output format subtly shifted might update their post-processing rules. Each of these adjustments was rational given the new model behavior. Each becomes harmful when the old model behavior returns, because the adjustments now compensate for behavior that no longer exists.
+
+Adapter retraining is the most dangerous form of state divergence. When a tenant retrains their per-tenant LoRA adapter against the new base model, the adapter's weights are optimized for the new model's internal representations. If you roll back to the previous base model, the adapter weights are now mismatched — trained for one set of internal representations but applied to another. As we covered in Chapter 4, the interaction between adapter weights and base model weights is not additive. It is multiplicative. A mismatched adapter does not simply perform slightly worse. It can produce outputs that are qualitatively different from what either the old system or the new system would have produced. The rollback creates a third state that nobody tested and nobody intended.
+
+Threshold recalibration creates a subtler problem. If a tenant's automated monitoring adjusted quality alert thresholds based on the new model's score distributions — perhaps raising the alert threshold from 78 to 82 because the new model produced consistently higher scores — rolling back to the old model means the old, lower score distribution is evaluated against the new, higher thresholds. The tenant's alerting system triggers false alarms on every evaluation cycle, not because quality degraded but because the thresholds no longer match the model's natural distribution.
+
+Downstream communication compounds all of these. When a tenant tells their internal stakeholders, "Our AI quality baseline is now 89 percent," and you roll back to a model that produces an 83 percent baseline, the tenant faces an internal credibility problem. The numbers went down not because quality degraded but because the platform reverted a change. Explaining this to a non-technical executive who just reported 89 percent quality to their board is a conversation nobody wants to have.
+
+## Partial Rollback: Reverting Only for Affected Tenants
+
+The first instinct during a rollback is to revert the entire platform. This instinct is wrong in multi-tenant systems. A platform-wide rollback affects all tenants, including the majority who were not experiencing problems with the new version. If the deployment caused quality degradation for 20 of your 400 tenants, a full rollback disrupts all 400 to fix a problem for 20.
+
+**Partial rollback** reverts the change only for affected tenants while leaving unaffected tenants on the new version. This is the correct approach, but it requires infrastructure that most platforms do not build until they need it — which is always too late.
+
+Partial rollback requires per-tenant version routing. Your serving infrastructure must be capable of routing different tenants to different model versions simultaneously. In practice, this means maintaining two active model deployments — the new version and the previous version — and routing each tenant to the appropriate one based on their rollback status. If you are using a serving framework like vLLM or a gateway like Portkey, the routing can be implemented at the request level using tenant identifiers in the request metadata. If your infrastructure serves all tenants from a single model deployment, partial rollback is impossible, and you are forced into the all-or-nothing choice that harms the majority to fix the minority.
+
+Partial rollback also requires per-tenant state management. For each tenant being rolled back, you need to identify and reverse the state divergence that occurred during the deployment window. Adapter weights that were retrained against the new model need to revert to their pre-update versions — which means you must have retained those versions. Configuration changes that were made in response to the new model behavior need to be identified and flagged for tenant review. Quality reports generated against the new model may need to be marked as generated under a different model version so that trend analysis remains coherent.
+
+The operational complexity of partial rollback is significant. Your team must maintain a **rollback state matrix** that tracks, for each tenant, their current deployment version, their adapter version, their configuration change history since deployment, and their evaluation history since deployment. This matrix determines what "rollback" means for each individual tenant — and it will be different for every one of them.
+
+## The Cascade Problem
+
+The hardest rollback scenario involves **cascading dependencies** between the base model and per-tenant adapters. When you roll back the base model, you cannot simply leave the adapters in place. Adapters trained against one base model version and applied to a different base model version produce unpredictable behavior. The cascade is unavoidable: rolling back the base model requires rolling back every adapter that was trained against that base model.
+
+But not every adapter was retrained during the deployment window. Some adapters were trained against an even older base model version and happened to work acceptably with the new one. Rolling those adapters back to their pre-deployment state might mean reverting to adapter weights that were trained against a third base model version — creating a new mismatch rather than resolving an existing one.
+
+The cascade problem has no clean solution. There are three approaches, each with trade-offs.
+
+The first approach is **full cascade rollback**: revert the base model, then revert every adapter to the version that was last validated against the previous base model. This is the safest option but the most disruptive. Tenants whose adapters had been recently retrained against the new base model lose that training work entirely. If the retraining took two weeks and cost $12,000 in compute, the tenant has lost both time and money.
+
+The second approach is **adapter compatibility testing**: revert the base model, then test each adapter against the reverted base model before deciding whether to revert the adapter. Adapters that produce acceptable quality on the old base model stay in place. Adapters that produce degraded quality are reverted. This approach preserves more tenant work but takes longer — testing hundreds of adapters against a reverted base model can take 24 to 48 hours, during which those tenants are running in an untested configuration.
+
+The third approach is **adapter freezing with fallback**: revert the base model and immediately switch all tenants to the platform's default adapter (or no adapter) until their tenant-specific adapters can be validated or retrained. This is the fastest approach but produces the largest quality disruption, because tenants who depended on their custom adapters for quality are now running on a generic configuration.
+
+In practice, most platforms use a combination. Tenants who did not retrain adapters during the deployment window get the full cascade rollback — their pre-deployment adapter paired with the pre-deployment base model, which is a tested combination. Tenants who did retrain get adapter compatibility testing, with a fallback to the generic configuration if testing takes too long or produces ambiguous results.
+
+## Rollback Testing
+
+If you do not test your rollback procedures, you do not have rollback procedures. You have rollback hopes.
+
+**Rollback testing** must be a regular part of your release process, not something you discover you need during an incident. The testing should validate three things: that the technical mechanics of reverting the model and routing work correctly, that the state management for adapter and configuration rollback works correctly, and that the tenant experience during and after rollback is acceptable.
+
+Technical rollback testing is the simplest. Deploy a new version to a staging environment, verify it works, then execute the rollback and verify that the previous version serves correctly. This test should run with every release candidate and should include per-tenant routing validation — confirm that individual tenants can be rolled back while others remain on the new version.
+
+State management testing is harder. You need to simulate state divergence — create test tenants that retrain adapters, modify configurations, and generate evaluation reports against the new version, then execute a rollback and verify that each form of state divergence is handled correctly. The adapter compatibility testing path should be validated. The configuration flagging system should be validated. The evaluation history annotation system that marks pre-rollback and post-rollback data points should be validated.
+
+Tenant experience testing is the hardest and the most important. After a rollback, does the tenant's quality return to pre-deployment levels? Do their dashboards show a coherent trend line or a confusing discontinuity? Do their alerts fire appropriately or produce false alarms? Do their quality reports accurately reflect the rollback, or do they show an unexplained quality drop? These are questions that can only be answered by running the full tenant evaluation pipeline against simulated rollback scenarios.
+
+The investment in rollback testing feels excessive until the first time you need it. A platform that skipped rollback testing and attempted its first real multi-tenant rollback during a production incident in late 2025 spent 14 hours on what should have been a 90-minute operation. The base model reverted correctly, but the adapter rollback process had never been tested. Twelve adapters failed compatibility testing because the testing framework had a bug that returned false negatives. Those twelve tenants spent six hours on a generic fallback configuration before the bug was identified and the correct adapters were restored. The customer impact was contained, but the engineering team spent three weeks afterward building the rollback testing infrastructure they should have built before the first deployment.
+
+## The Time Window: Reversible Versus Irreversible
+
+Not every change can be rolled back, and the window for rollback shrinks with time. Understanding the **rollback horizon** — the point after which rollback becomes impractical or impossible — is critical for release planning.
+
+Model serving changes have the longest rollback horizon. If you can maintain dual deployments, you can route tenants back to the previous model version at any time. The horizon is limited only by how long you are willing to pay for the infrastructure to run both versions simultaneously. In practice, most platforms retain the previous version for 14 to 30 days after a full rollout completes.
+
+Adapter changes have a medium rollback horizon. Adapter weights can be reverted as long as the previous weights are retained in storage. But the longer the new adapter has been in production, the more evaluation data has been generated against it, the more quality reports have been sent to the customer, and the more the tenant has adapted their expectations to the new behavior. After 30 to 45 days, reverting an adapter is technically possible but operationally disruptive.
+
+Evaluation pipeline changes have the shortest rollback horizon. If you change the evaluation methodology — new rubrics, new scoring algorithms, new judge models — every quality report generated since the change uses the new methodology. Rolling back the methodology means that historical reports were generated on one basis and future reports will be generated on another, creating a discontinuity in the quality trend line that confuses customers and undermines trust in the reporting system. After more than two evaluation cycles on the new methodology, most platforms find it better to continue forward and address quality issues within the new methodology rather than create a break in the historical record.
+
+The practical implication is that your release process must define, for each type of change, the rollback horizon beyond which the platform commits to the change and manages any issues forward rather than backward. Communicating this horizon to affected tenants — as covered in Section 19 on deployment and runtime control — gives them the information they need to escalate concerns within the window when rollback is still practical.
+
+## The Operational Playbook
+
+When a rollback decision is made, the execution must follow a defined playbook, not improvisation. The playbook has seven steps and the order matters.
+
+First, declare the rollback scope. Which tenants are affected. Which are being rolled back. Which are staying on the current version. Document this in a shared incident channel where all stakeholders — engineering, customer success, and support — can see it.
+
+Second, freeze all automated processes. Stop adapter retraining jobs, evaluation pipeline runs, quality report generation, and threshold adjustment processes for affected tenants. Every automated process that continues during the rollback window can create additional state divergence that the rollback must account for.
+
+Third, execute the model routing change. Route affected tenants to the previous model version. Verify serving health for each routed tenant. This is the point of no return for the partial rollback — once tenants are on different versions, the complexity is committed.
+
+Fourth, execute the adapter rollback or compatibility testing. For each affected tenant, determine the correct adapter state and either revert, test, or fall back to generic as appropriate.
+
+Fifth, flag configuration divergences. For each affected tenant, identify any configuration changes made since the deployment and notify the tenant's customer success manager. These configurations may need manual review — the automated system can detect the changes but cannot always determine whether they should be reverted.
+
+Sixth, annotate evaluation histories. Mark the deployment and rollback timestamps in each affected tenant's evaluation timeline. Quality reports that span the boundary between versions should carry a clear annotation explaining the version change, so that trend analysis does not mistake the rollback for a quality event.
+
+Seventh, communicate. The next subchapter covers the notification problem in detail, but the immediate rollback communication must answer three questions for each affected tenant: what changed, why it was rolled back, and what the tenant's current state is.
+
+Every step in this playbook is something that could be skipped under time pressure. And every step that gets skipped during a rollback creates a downstream problem that takes longer to fix than the step would have taken to execute. Rollback discipline is release discipline. The next subchapter examines the communication side of this challenge — how to tell customers about quality changes without eroding trust or creating notification fatigue.

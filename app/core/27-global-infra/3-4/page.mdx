@@ -1,0 +1,85 @@
+# 27.20 — Cluster Upgrades Without Outages: Version Skew, Drivers, and Rollback
+
+**The big-bang upgrade** is the most dangerous pattern in GPU cluster management. It works like this: a platform team falls behind on Kubernetes versions, accumulates six months of version debt, and then attempts to upgrade Kubernetes, the NVIDIA GPU Operator, the GPU drivers, the CUDA toolkit, and the container runtime in a single maintenance window. Individually, each upgrade is manageable. Together, they create a combinatorial explosion of compatibility risks. The Kubernetes version requires a minimum kubelet version. The GPU Operator version requires a minimum Kubernetes version. The GPU driver requires a specific kernel version. The CUDA toolkit in the container images requires a minimum driver version. Miss one dependency in the chain and GPU pods fail to start with cryptic errors about missing device files or incompatible driver versions. The team spends the maintenance window debugging, the window overruns, and either they roll back everything — losing the entire upgrade effort — or they push forward with an untested configuration that produces intermittent failures for weeks. Every organization that runs GPU infrastructure at scale has a big-bang horror story. The teams that avoid it treat upgrades as continuous small steps rather than periodic large jumps.
+
+## The Compatibility Matrix
+
+Upgrading a Kubernetes cluster that runs GPU workloads requires tracking compatibility across five layers simultaneously, and each layer has its own versioning, its own release cadence, and its own backward compatibility guarantees.
+
+The first layer is **Kubernetes itself**. Kubernetes supports a version skew of N-2 between the control plane and the kubelet on worker nodes. If your control plane runs version 1.32, your kubelets can run 1.30, 1.31, or 1.32. This gives you a window for rolling upgrades: update the control plane first, then update node pools one at a time. But this window assumes all controllers and operators running on the cluster also support the new API version. A custom training operator built against the 1.30 API that uses a deprecated field removed in 1.32 will break silently.
+
+The second layer is the **NVIDIA GPU Operator**, which manages the lifecycle of GPU software components on your nodes — the device plugin, the driver container, the CUDA toolkit, the DCGM exporter, the GFD node labeler. Each GPU Operator release supports a specific range of Kubernetes versions. Upgrading Kubernetes beyond the GPU Operator's supported range breaks GPU scheduling.
+
+The third layer is the **GPU driver**. NVIDIA releases driver branches every few months, and each branch supports a specific range of GPU hardware and CUDA toolkit versions. The driver runs on the host OS, outside the container, and is either installed as a host package or deployed as a container through the GPU Operator. Driver version mismatches between the host and the CUDA toolkit inside your containers are the single most common cause of GPU pod failures after an upgrade.
+
+The fourth layer is the **CUDA toolkit** embedded in your container images. When your training or inference containers are built, they bundle a specific CUDA version. That CUDA version requires a minimum driver version on the host. If you upgrade the driver to a newer major branch without rebuilding your container images, the existing images may work — NVIDIA maintains forward compatibility so newer drivers support older CUDA versions — but if you downgrade the driver or skip too many versions, the CUDA calls inside your containers will fail.
+
+The fifth layer is the **container runtime and device plugin**. The NVIDIA Container Toolkit and the device plugin that exposes GPUs to Kubernetes must be compatible with both the driver version and the Kubernetes version. In 2026, with Dynamic Resource Allocation replacing the traditional device plugin model, this layer adds DRA driver compatibility as a sixth concern.
+
+## Rolling Upgrades: Control Plane First, Then Node Pools
+
+The only safe upgrade strategy for production GPU clusters is rolling: change one layer at a time, validate, then proceed.
+
+Start with the control plane. In managed Kubernetes services, this is often a single-click operation that the provider handles. In self-managed clusters, upgrade the API server, controller manager, and scheduler on the control plane nodes first. The N-2 skew policy means worker nodes running the old version continue to function normally. Validate the control plane upgrade by checking API server response times, scheduler health, and controller reconciliation rates before touching any worker nodes.
+
+Next, upgrade node pools one at a time. Create a new node pool running the upgraded kubelet version alongside the old node pools. Cordon and drain nodes from the old pool — this evicts running pods and prevents new pods from being scheduled on them. For training workloads, draining requires coordination with the workload itself. A training job that receives an eviction notice must checkpoint its progress before the pod terminates. If your training framework does not support graceful checkpointing on eviction, you lose all progress since the last periodic checkpoint. Set terminationGracePeriodSeconds high enough for a checkpoint to complete — often five to fifteen minutes for large model training.
+
+For inference workloads, draining requires the serving infrastructure to reroute traffic before the pod terminates. If you use a service mesh or an ingress controller with health checking, the rerouting happens automatically as the pod enters the terminating state. If you rely on Kubernetes services alone, there is a brief window where traffic is still routed to a pod that is shutting down. PodDisruptionBudgets ensure that the drain process does not evict more inference pods simultaneously than your service can tolerate.
+
+## GPU Driver Upgrades
+
+Driver upgrades are the highest-risk component of the GPU upgrade chain because the driver runs on the host and affects every GPU workload on that node simultaneously.
+
+The NVIDIA GPU Operator supports rolling driver upgrades as of 2025. When you update the driver version in the ClusterPolicy custom resource, the Operator performs a rolling update of the driver DaemonSet. It cordons a node, drains its GPU workloads, stops the old driver, installs the new driver, and uncordons the node. This process happens one node at a time by default, which is safe but slow. On a 200-node cluster, a rolling driver upgrade can take days if each node requires thirty minutes to drain, upgrade, and validate.
+
+You can accelerate the process by increasing the maxUnavailable setting on the DaemonSet update strategy, allowing multiple nodes to upgrade in parallel. But each additional parallel upgrade increases the risk of a widespread failure if the new driver has an issue. The safe approach is to upgrade a single canary node first, run your full GPU validation suite on it — DCGM diagnostics, a short training run, an inference latency test — and only then increase parallelism for the remaining nodes.
+
+For more granular control, set the DaemonSet update strategy to OnDelete. With this setting, the Operator does not automatically roll out the new driver. Instead, you manually delete the driver pod on each node when you are ready to upgrade it. This gives operations teams full control over the rollout timing, allowing them to upgrade nodes during low-utilization windows specific to each node's workload pattern.
+
+## The Canary Node Pool Pattern
+
+Never upgrade your entire cluster simultaneously. The **canary node pool** pattern creates a small pool of nodes — typically two to four — running the new software stack while the rest of the cluster remains on the old version.
+
+Upgrade the canary pool to the new Kubernetes version, GPU Operator version, and driver version. Then route a subset of workloads to the canary pool using node selectors or node affinity rules. Run these workloads for at least 48 hours, monitoring for GPU errors, performance regression, and unexpected pod restarts. Check DCGM error counters for Xid errors, which indicate GPU hardware or driver issues. Compare training throughput on the canary pool against the production pool — a regression of more than five percent warrants investigation before proceeding.
+
+If the canary pool is healthy after the validation period, upgrade the next pool. Continue pool by pool until the entire cluster is running the new version. If the canary pool shows problems, you have a clean rollback path: drain the canary pool, route workloads back to the production pools, and investigate the issue without any production impact.
+
+The canary approach adds time to the upgrade process — a full cluster upgrade that could be done in a day with a big-bang approach takes one to two weeks with canary validation. That time is an insurance premium. The cost of a failed big-bang upgrade — hours of downtime, lost training progress, emergency debugging at 3am — is always higher.
+
+## CUDA Toolkit and Container Image Coordination
+
+Upgrading the CUDA toolkit is a container-side operation that requires rebuilding your training and inference images. This is deceptively complex because different teams may use different base images with different CUDA versions, and they all need to remain compatible with the driver version on the cluster.
+
+NVIDIA's compatibility model helps here. GPU drivers are forward-compatible with CUDA: a driver that supports CUDA 12.6 also supports containers built with CUDA 12.0, 12.2, or 12.4. This means you can upgrade the host driver without immediately rebuilding every container image. The containers built against older CUDA versions continue to work. But new features and performance optimizations in newer CUDA versions are only available if the container image is rebuilt with the newer toolkit.
+
+The practical approach is to maintain a small set of approved base images — for example, one for CUDA 12.4 and one for CUDA 12.6 — and let teams build on whichever version their workload requires. When you upgrade the host driver, verify that both base image versions are compatible. When you add a new CUDA version to the approved set, publish it as a new base image and let teams migrate on their own timeline. Forced migration — declaring that all containers must use CUDA 12.6 by a specific date — creates unnecessary pressure and inevitably produces broken builds from teams that waited until the deadline.
+
+## Rollback Planning
+
+Every upgrade must have a rollback plan, and the rollback plan must be tested before the upgrade begins.
+
+For Kubernetes version upgrades, rollback means reverting the control plane to the previous version and re-creating the old node pools. In managed services, control plane rollback is straightforward — most providers support it natively. In self-managed clusters, control plane rollback is harder and may require restoring etcd from a backup. Always take an etcd snapshot before starting a Kubernetes version upgrade.
+
+For GPU driver rollbacks, the process depends on your deployment model. If using the GPU Operator with driver containers, rollback means updating the ClusterPolicy to reference the old driver version and letting the Operator perform a rolling update back to the previous driver. This is functionally identical to the upgrade process and takes the same amount of time. If using host-installed drivers, rollback requires re-imaging nodes or running package downgrades, which is slower and riskier.
+
+For CUDA toolkit rollbacks, the process is simple: redeploy the previous container images. Since CUDA is bundled inside the container, there is no host-side change required. This is one reason to never install CUDA on the host — keep it in the container where rollback is a simple image tag change.
+
+Document the rollback trigger criteria before starting the upgrade. Specific thresholds — Xid error rate above a threshold, training throughput regression beyond five percent, inference latency increase beyond ten percent, any pod crash loop attributable to GPU errors — should automatically trigger a rollback without waiting for a meeting or an approval chain.
+
+## The Maintenance Window Myth
+
+Traditional infrastructure assumes maintenance windows — periods of low traffic where upgrades can happen with minimal impact. AI workloads do not have maintenance windows. Training jobs run continuously, often for days or weeks. Inference services serve users across every timezone. Batch processing pipelines run overnight. There is no quiet period.
+
+The teams that wait for a maintenance window to upgrade their GPU cluster never upgrade. The version debt accumulates, the compatibility matrix grows, and eventually they are forced into the big-bang pattern they were trying to avoid.
+
+The alternative is treating upgrades as a continuous operation rather than a periodic event. Monthly security patches applied through rolling node replacement. Quarterly minor version upgrades applied through the canary pool pattern. GPU driver updates applied on the Operator's rolling schedule. No single upgrade is large enough to require a maintenance window because no upgrade is deferred long enough to become large. The cluster is always within one minor version of current. The compatibility matrix never has more than one variable changing at a time.
+
+## Frequency and Version Discipline
+
+The rule is simple: never fall more than two minor versions behind on any component. For Kubernetes, this means upgrading at least once every six months — every two minor releases. For the GPU Operator, this means upgrading within one month of a new release that includes security fixes. For GPU drivers, this means staying within one branch of the latest production branch.
+
+Teams that maintain this discipline find that upgrades are routine, low-risk, and completed in under a week. Teams that defer upgrades find that each deferred upgrade makes the next one harder, until they are facing a multi-version jump with cascading compatibility issues and no validated migration path. Version discipline is not overhead. It is the cheapest form of reliability insurance your platform team can buy.
+
+---
+
+A well-governed, well-maintained cluster is a powerful platform for one team in one region. But AI workloads increasingly span multiple clusters, multiple regions, and multiple cloud providers. The next subchapter examines how cluster federation and multi-cluster management extend your AI platform beyond the boundaries of a single Kubernetes cluster.

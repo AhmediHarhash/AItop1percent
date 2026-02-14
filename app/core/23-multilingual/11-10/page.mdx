@@ -1,0 +1,95 @@
+# 11.10 — Distillation for Multilingual Small Models
+
+The frontier model handles your language perfectly. Your latency budget does not allow you to use it. This is the defining tension of multilingual AI in production: the models with the best cross-lingual capabilities are the ones you cannot afford to serve at scale. GPT-5 produces fluent, culturally appropriate output in forty languages. It also costs twenty to fifty times more per request than the small model your infrastructure can sustain. Claude Opus 4.6 handles nuanced Japanese legal text and informal Brazilian Portuguese with equal skill. Your 200-millisecond latency requirement eliminates it from consideration. The gap between what is possible and what is deployable is where distillation lives, and for multilingual systems, distillation is not a nice-to-have optimization. It is the mechanism that makes multilingual AI economically viable.
+
+**Distillation** is the process of training a smaller model — the student — to reproduce the behavior of a larger model — the teacher — on the tasks you care about. The student does not need to learn everything the teacher knows. It needs to learn the specific capabilities required by your application, across the specific languages you support, at a quality level that meets your production thresholds. When done correctly for multilingual applications, a 7-billion-parameter student can capture 90 to 95 percent of a 400-billion-parameter teacher's quality across five to eight languages, at a fraction of the inference cost and latency.
+
+## The Distillation Pipeline for Multilingual Systems
+
+Multilingual distillation follows the same general structure as monolingual distillation, but the data generation phase is where the complexity multiplies.
+
+The first step is generating teacher outputs across all target languages. You prepare a set of input prompts that represent the range of tasks and inputs your production system will encounter, and you generate them in every language you intend to support. For a customer service system supporting English, Spanish, Japanese, Korean, Portuguese, Hindi, Arabic, and Thai, you need teacher-generated responses for each of those languages across your full range of customer intents. The volume matters. You typically need 5,000 to 20,000 high-quality teacher outputs per language for the student to learn the teacher's behavior reliably. With eight languages, that is 40,000 to 160,000 teacher-generated examples before you begin training.
+
+The teacher generation phase is the most expensive part of distillation, because you are running a frontier model at scale. If GPT-5 costs 0.015 dollars per 1,000 output tokens and your average response is 300 tokens, generating 15,000 outputs per language across eight languages costs approximately 540 dollars in API fees alone. That sounds modest, but it assumes a single pass. In practice, you generate multiple teacher outputs per input, filter for quality, and regenerate failures. The actual cost is typically two to four times the single-pass estimate — 1,000 to 2,200 dollars for the teacher generation phase of an eight-language distillation project. Manageable, but not negligible when you account for the iteration cycles that follow.
+
+The second step is quality verification of teacher outputs per language. This is the step most teams skip, and it is the step that determines whether distillation succeeds or produces a student model that faithfully reproduces the teacher's mistakes.
+
+## The Teacher Quality Gap Across Languages
+
+Not all teacher outputs are created equal, and the quality gap between languages is the most dangerous blind spot in multilingual distillation.
+
+A frontier model like GPT-5 or Gemini 3 Pro produces near-perfect English output. Its Spanish output is excellent. Its Japanese output is very good. Its Thai output is good but noticeably below its English quality. Its Yoruba output, if you are distilling for it, may contain errors that a native speaker would immediately flag. These quality differences are inherent to how the teacher model was trained — more pretraining data in a language generally means better output quality, and the language coverage of frontier models, while vastly improved from 2024, is still uneven.
+
+When you distill without checking teacher quality per language, the student inherits every gap the teacher has. Worse, the student amplifies those gaps, because a smaller model has less capacity to compensate for noisy training signal. If 8 percent of the teacher's Thai outputs contain fluency errors and the student trains on all of them, the student's Thai fluency will be measurably worse than the teacher's, because the student learned from both the teacher's good outputs and the teacher's mistakes.
+
+The verification process is straightforward. Before using teacher outputs for training, sample 100 to 200 outputs per language and have native speakers rate them for task accuracy, fluency, and correctness. Calculate the error rate per language. For languages where the teacher error rate exceeds 5 percent, you have two options: filter aggressively and remove the faulty examples, or switch to a different teacher for that language. A teacher error rate above 10 percent in a language means distillation from that teacher in that language will produce a student that does not meet production quality. You are better off using a different approach for that language entirely.
+
+## Multi-Teacher Distillation Across Languages
+
+The quality gap across languages leads to a powerful technique: **multi-teacher distillation**, where different teacher models generate the training data for different languages.
+
+No single frontier model is best at every language. GPT-5 might produce the strongest output in English, Spanish, and Portuguese. Claude Opus 4.6 might be superior for Japanese and Korean, where its nuanced handling of honorifics and register produces more natural output. Gemini 3 Pro, trained with strong multilingual emphasis by Google, might produce the best results in Hindi, Arabic, and Southeast Asian languages. A model from the Qwen family might outperform all of them on Chinese, given its Chinese-language training emphasis.
+
+Multi-teacher distillation exploits these differences. For each target language, you evaluate two or three candidate teacher models on a sample of your production inputs. You select the teacher that produces the highest quality output for that language. You generate the full training set from the best teacher per language, then combine all the language-specific datasets to train a single student.
+
+The student does not need to know which teacher generated which example. It learns from the combined dataset as if it came from a single source. The result is a student that inherits the best capability of each teacher for each language — better than any single teacher could provide across the board.
+
+The operational complexity of multi-teacher distillation is moderate. You need API access to multiple providers, a quality evaluation pipeline that can compare outputs across teachers, and a generation pipeline that routes requests to different teachers based on language. The cost is roughly the same as single-teacher distillation, since you generate the same total volume of outputs. The additional work is in the evaluation and routing, which typically takes one to two days of engineering time.
+
+Research presented at Interspeech 2025 validated this approach for speech and language systems. Language-aware multi-teacher knowledge distillation, where each teacher is specialized in a different language, produced student models that outperformed both single-teacher distillation and simple data pooling across teachers. The key insight was that cosine similarity scoring between teacher and student representations allowed the student to dynamically weight each teacher's contribution based on language-specific expertise, producing more balanced and robust cross-lingual capability.
+
+## Quality Verification Before Training
+
+Never distill from outputs the teacher got wrong. This principle sounds obvious, but the practice is harder than it appears.
+
+For task accuracy, you can often verify teacher outputs automatically. If the task is classification, you check the teacher's label against a gold-standard label set. If the task is extraction, you verify that extracted entities exist in the source document. If the task is summarization, you can use automated metrics like ROUGE or BERTScore against reference summaries, combined with a factual consistency check. Any teacher output that fails the automated quality check is removed from the distillation training set.
+
+For fluency and naturalness, automated verification is harder. You are asking whether a native speaker would find this output well-formed, and automated metrics for this are less reliable, especially in low-resource languages. The practical approach is to build a small fluency classifier per language — a model trained on human fluency ratings of 200 to 500 examples per language — and use it to flag potentially disfluent teacher outputs for review. Outputs flagged as disfluent are either corrected by a native speaker or removed.
+
+For safety, you run your safety evaluation suite on the teacher outputs before including them in the training set. If the teacher produced an output that violates your safety policy — even if the teacher was not explicitly prompted to do so — that output must not appear in the distillation training set. The student will learn to reproduce whatever the teacher demonstrates, including safety failures.
+
+The filtering process typically removes 3 to 12 percent of teacher outputs depending on language and task. For high-resource languages where the teacher is strong, the removal rate is at the low end. For low-resource languages where the teacher is weaker, the removal rate is higher. After filtering, you may need to regenerate outputs to fill the gaps, adding another round of teacher generation and verification. Budget for two to three rounds of generation and filtering per language before you have a clean training set.
+
+## The Cost Equation
+
+Distillation is an upfront investment that pays back through inference savings. The economics are compelling, but you need to model them accurately for your specific case.
+
+On the cost side, you have teacher generation costs, quality verification costs, student training costs, and multilingual evaluation costs. For an eight-language distillation targeting a 7B student model, these typically total 8,000 to 25,000 dollars depending on the teacher model costs, data volume, and training compute. The variance is driven primarily by how many languages require multi-round generation due to quality filtering and how much human review is needed for low-resource language verification.
+
+On the savings side, the difference is in per-request inference cost. A frontier model like GPT-5 or Claude Opus 4.6 might cost 0.01 to 0.03 dollars per request for a typical customer service interaction. A self-hosted 7B student model on optimized inference infrastructure might cost 0.0003 to 0.001 dollars per request — a reduction of 10 to 100 times depending on configuration. If your system handles 50,000 requests per day, the daily savings range from 200 to 1,400 dollars. At that rate, distillation breaks even within two to four weeks of production traffic.
+
+The break-even calculation is even more favorable when you factor in latency. A frontier model responds in 800 to 2,000 milliseconds for a typical request. A 7B model on dedicated inference hardware responds in 80 to 200 milliseconds. For applications where latency directly affects user experience — customer service chat, search, real-time translation — the latency improvement alone justifies distillation, and the cost savings are a bonus.
+
+The catch is maintenance. When the teacher model updates — and frontier models update every few months — you face a choice. You can continue serving the student distilled from the old teacher, accepting that the old teacher's quality ceiling is now your ceiling. Or you can re-distill from the new teacher, incurring the full distillation cost again but capturing whatever quality improvements the new teacher offers. For most teams, the right cadence is re-distillation every six to twelve months or when a significant teacher model update substantially improves quality in languages where the student is weakest.
+
+## Size Targets for Multilingual Students
+
+For multilingual distillation, the student model typically needs to be larger than a monolingual equivalent would require. This is a critical sizing decision that affects both cost and quality.
+
+A 3-billion-parameter model might handle English-only customer service with 92 percent of the teacher's quality. The same 3B model, when trained on eight-language distillation data, often captures only 78 to 83 percent of the teacher's quality across languages. The model does not have enough capacity to represent all the linguistic knowledge required for eight languages at the level the teacher demonstrates. It learns approximations, and those approximations are least accurate for the languages with the most distinct grammars and writing systems.
+
+Moving to a 7B or 8B model — the Llama 4 Scout 17B active-parameter range for Mixture-of-Experts architectures, or dense models in the 7B to 13B range — typically recovers 88 to 95 percent of teacher quality across five to eight languages. The additional capacity gives the model enough room to represent language-specific patterns without them competing for the same parameters.
+
+For applications requiring more than eight languages or languages with particularly complex morphology — Turkish, Finnish, Hungarian, Arabic, Korean — the student may need to be larger still. A 13B to 20B student trained on twelve-language distillation data typically maintains 90 percent or above of teacher quality across all languages, though the inference cost savings relative to a frontier model are smaller.
+
+The sizing decision depends on your latency and cost requirements. A 7B model on four-bit quantized inference serves most multilingual production use cases with acceptable latency and cost. A 3B model is cheaper and faster but may require you to accept quality degradation in your lower-resource languages or reduce the number of languages you serve. Plot the teacher quality, student quality at each size tier, and inference cost per request on the same chart. The right student size is the one that meets your quality floor across all languages at a cost your unit economics can sustain.
+
+## Language-Specific Post-Training After Distillation
+
+Distillation gives you a student that mimics the teacher across all languages. For some languages, you may want to go further.
+
+If the distilled student meets your quality bar for six of your eight languages but falls short in Korean and Arabic, you have two paths. The first is to re-distill with more Korean and Arabic data, regenerating additional teacher outputs in those languages and retraining the student with a higher proportion of Korean and Arabic examples. This is the simplest fix but risks degrading other languages if the data balance shifts too aggressively.
+
+The second path is to apply language-specific fine-tuning on top of the distilled model. After distillation is complete, you take the student model and apply a small LoRA adapter trained on curated Korean data and another adapter for Arabic. These adapters are lightweight — typically adding less than 1 percent of the model's parameters — and they can be applied selectively at inference time. When a Korean request arrives, the Korean adapter activates. When an English request arrives, no adapter is needed and the base distilled model handles it.
+
+This adapter-on-top-of-distillation pattern is increasingly common in production multilingual systems as of 2026. It combines the broad multilingual capability of distillation with the surgical precision of language-specific adaptation, without requiring the full cost and risk of end-to-end fine-tuning.
+
+## When Distillation Is Not the Answer
+
+Distillation solves the cost-quality trade-off for languages where the teacher model is strong. It does not solve the problem of languages where no teacher model produces acceptable output.
+
+If the best frontier model available to you produces Thai output at 68 percent quality and your production threshold is 80 percent, no amount of distillation will produce a student that meets that threshold. The student can approach but never exceed the teacher's quality. For these languages, the path forward is not distillation — it is either fine-tuning the teacher model on Thai data to improve its quality first and then distilling, or routing Thai traffic to a different model that handles Thai better, such as a regional model with stronger Thai pretraining.
+
+Distillation also has limits for tasks that require deep reasoning across languages. A frontier model that chains multi-step reasoning in English and translates the result produces different output than a model that reasons natively in the target language. A distilled student that learns to mimic the teacher's output without understanding the teacher's reasoning chain may produce correct-looking responses that fail on edge cases the teacher would have caught through reasoning. For high-stakes, reasoning-heavy tasks — legal analysis, medical decision support, complex financial calculations — validate the distilled student's reasoning path, not just its final output, before committing to production deployment.
+
+The next subchapter presents the multilingual fine-tuning decision tree — a single framework that synthesizes everything covered in this chapter into a step-by-step decision process for when to prompt, when to fine-tune, when to distill, and when to route.

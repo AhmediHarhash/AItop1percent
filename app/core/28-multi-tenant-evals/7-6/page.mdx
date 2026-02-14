@@ -1,0 +1,75 @@
+# 28.66 — Fair Resource Allocation for Eval Jobs Across Hundreds of Customers
+
+Why does one customer's eval report arrive in ninety minutes while another waits sixteen hours? If your answer involves the words "it depends on the queue," you have a scheduling problem. If your answer involves the words "we treat everyone equally," you have a fairness problem. And if you cannot answer at all, you have both.
+
+Eval jobs are not free. Every per-customer eval run consumes GPU cycles for model inference, API quota for judge model calls, human reviewer hours for manual quality checks, and storage for results and audit trails. When a platform serves forty customers, these resources feel abundant — jobs run when submitted, results arrive promptly, and nobody waits long enough to notice. When the platform serves four hundred customers, the same resources become contested. Jobs queue. Results delay. And the customers who notice first are always the ones paying the most.
+
+**Fair resource allocation** for eval jobs is not equal allocation. Equal allocation gives the same resources to a $15,000-per-year self-service customer and a $600,000-per-year enterprise customer with a contractual SLA requiring eval results within two hours. That is not fairness. That is a contractual breach waiting to happen. Fair allocation is proportional allocation — weighted by contract tier, SLA commitments, risk profile, and the business consequences of delayed eval results.
+
+## The Scheduling Problem
+
+At its core, eval job scheduling is a multi-queue prioritization problem with heterogeneous job sizes and strict per-customer latency constraints. Each customer's eval run has a different size — determined by their golden set count, the number of quality dimensions, the judge configuration complexity, and whether human review is required. Each customer has a different latency expectation — ranging from two hours for tier-1 enterprise customers to 24 hours for tier-3 self-service accounts. And new jobs arrive continuously as production traffic triggers eval runs, scheduled eval cadences fire, and customers manually request ad hoc evaluations.
+
+The scheduling system must balance three objectives simultaneously. First, **SLA compliance**: no customer's eval results should arrive later than their contractual or tier-based latency commitment. Second, **resource efficiency**: eval compute should not sit idle while jobs wait in queue, which means smaller jobs should fill gaps between larger jobs. Third, **starvation prevention**: no customer's eval job should wait indefinitely, even if higher-priority jobs keep arriving. A tier-3 customer whose eval is perpetually preempted by tier-1 jobs is effectively receiving no eval service at all.
+
+The standard approach is **weighted fair queuing with priority classes**. Eval jobs are assigned to one of three or four priority classes based on the customer's tier. Within each class, jobs are scheduled in submission order. The scheduler allocates a weighted share of total eval compute to each class — for example, 50 percent to tier-1, 30 percent to tier-2, and 20 percent to tier-3. When a class is not using its full allocation, the unused capacity is redistributed to other classes. When a class exceeds its allocation, jobs in that class queue until capacity is available or until a starvation timer triggers forced scheduling.
+
+## The Noisy Neighbor Problem in Eval Compute
+
+The **noisy neighbor problem** — borrowed from cloud computing — manifests in eval systems when one customer's eval run monopolizes shared resources, degrading performance for everyone else. In multi-tenant eval, the noisy neighbor is typically a customer with an unusually large golden set, a complex multi-dimensional rubric, or a judge configuration that requires expensive multi-turn evaluation.
+
+Consider a financial services customer whose golden set contains 4,800 examples, each evaluated across seven quality dimensions using a Claude Opus 4.6 judge that performs chain-of-thought reasoning before scoring. A single eval run for this customer consumes 33,600 judge API calls — 4,800 examples times seven dimensions. At typical judge API throughput, that run takes three to four hours of sustained API quota. During those hours, every other customer's eval job competes for the remaining API quota. If the platform's total judge API budget supports 12,000 calls per hour and the financial services customer is consuming 8,400 of them, the remaining 3,600 calls per hour must serve the other 399 customers. Queue depths spike. Latency climbs. Tier-1 customers miss their two-hour SLA.
+
+The mitigation is a **per-customer resource cap** that limits how much of the shared resource pool any single customer can consume at any given time. The cap is expressed as a percentage of total capacity — typically 15 to 25 percent for tier-1 customers and 5 to 10 percent for lower tiers. When a customer's eval job would exceed their cap, the job is throttled — it continues executing but at a reduced rate, stretching the run over a longer period. The financial services customer's eval run still completes, but instead of consuming 70 percent of API quota for four hours, it consumes 20 percent of quota for twelve hours, leaving the remaining 80 percent available for other customers.
+
+The trade-off is explicit: capping resource consumption per customer increases the latency of large eval runs. The financial services customer's eval that would have completed in four hours now takes twelve. This trade-off must be communicated in the SLA — large eval runs with golden sets above a certain size carry a longer latency commitment. The customer can choose between a smaller, faster golden set and a larger, slower one. The platform provides the tooling to help them make that choice, including estimates of eval run duration based on golden set size and judge configuration.
+
+## Judge API Rate Limiting Across Tenants
+
+Judge API calls are often the tightest bottleneck in multi-tenant eval. Whether you use GPT-5, Claude Opus 4.6, or Gemini 3 as your judge model, API rate limits are finite and shared across all tenants. Managing this shared resource requires three mechanisms working together.
+
+**Budget caps** set a maximum number of judge API calls per customer per billing period — typically per month. A tier-1 customer with a $400,000 annual contract might receive a monthly judge API budget of 50,000 calls. A tier-3 customer on a $20,000 contract might receive 5,000 calls. When a customer exhausts their monthly budget, their eval runs either pause until the next billing period or continue at a reduced sampling rate — evaluating every tenth production output instead of every output. The customer is notified when they reach 80 percent of their budget so they can adjust their eval cadence or request a budget increase.
+
+**Burst allowances** handle the reality that eval demand is not uniform. A customer who normally uses 2,000 judge calls per week may need 15,000 in a single day because they are validating a major prompt change or running a pre-release eval sweep. Burst allowances permit temporary overages — up to two or three times the customer's weekly average — without triggering throttling, as long as the monthly budget is not exceeded. This flexibility prevents customers from being penalized for responsible eval behavior (testing changes before deploying them) while maintaining the total budget constraint.
+
+**Throttling policies** activate when a customer exceeds their burst allowance or when the platform's total API quota is under pressure from concurrent demand. Throttling reduces the customer's eval throughput rather than blocking it entirely. A throttled customer's eval run takes longer but still completes. The throttling policy is transparent — the customer's eval dashboard shows the current throughput rate and estimated completion time, so they are never wondering why their results are late.
+
+## Human Reviewer Allocation
+
+Human review is the scarcest eval resource. Judge APIs can scale with budget. Compute can scale with cloud capacity. Human reviewers with domain expertise cannot scale on demand. A platform with a pool of 40 human reviewers serving 400 customers must allocate those reviewers deliberately.
+
+**Dedicated reviewers** for tier-1 customers solve the allocation problem for the highest-value accounts. A healthcare customer paying $500,000 per year whose eval requires reviewers with clinical knowledge gets two dedicated reviewers who learn the customer's rubric, develop fluency with the customer's domain vocabulary, and produce consistent, calibrated scores. Dedicated reviewers are expensive — their cost is attributed entirely to the customer they serve — but they eliminate the quality variance that comes from rotating reviewers across unfamiliar domains.
+
+**Shared reviewer pools** serve tier-2 and tier-3 customers. Reviewers in the shared pool are assigned to eval tasks based on domain match and availability. A reviewer with legal expertise handles tasks for three or four legal-industry customers. A reviewer with financial knowledge handles tasks for five or six financial services customers. The assignment algorithm optimizes for domain match first, then for load balancing — no reviewer should be assigned more than three customer domains simultaneously, because domain-switching degrades review quality.
+
+**On-demand reviewer scaling** handles spikes. When a quarterly business review cycle triggers simultaneous eval runs for fifty enterprise customers, the reviewer pool may be insufficient. On-demand scaling options include trained contractor pools that can be activated with 48 to 72 hours notice, customer-provided reviewers who know their domain and are trained on the platform's annotation interface, and selective deferral of non-urgent eval tasks for tier-3 customers until the spike passes.
+
+## Handling Eval Job Failures Without Starving Other Tenants
+
+Eval jobs fail. A judge API returns errors. A human reviewer is unavailable. A customer's golden set contains a corrupted entry that crashes the scoring pipeline. When an eval job fails, the recovery process must not consume resources that other customers need.
+
+The failure recovery policy follows three rules. First, **bounded retries**: a failed eval job is retried up to three times with exponential backoff. If it fails three times, it is moved to a dead letter queue for manual investigation rather than continuing to consume resources. Second, **resource release on failure**: when a job fails, the resources it was consuming — API quota, compute allocation, reviewer assignment — are immediately released back to the shared pool, not held in reserve for the retry. Third, **failure isolation**: a failure in one customer's eval job must never cascade to other customers. If a corrupted golden set entry causes a scoring pipeline crash, the crash is contained within that customer's eval context. Other customers' eval runs continue unaffected.
+
+## Monitoring Queue Depth and Wait Times
+
+The platform team needs real-time visibility into eval resource utilization and per-customer wait times. The monitoring system tracks four key metrics.
+
+**Queue depth per priority class** shows how many eval jobs are waiting at each tier. A queue depth of zero for tier-1 and twenty for tier-3 is normal. A queue depth of five for tier-1 is an emerging SLA risk that requires immediate attention.
+
+**Wait time per customer** tracks how long each customer's most recent eval job waited before execution began. Wait times that approach the customer's SLA commitment trigger an alert. Wait times that exceed the SLA trigger an incident. The monitoring system computes the wait time as a percentile distribution, not just an average — the p95 wait time matters more than the mean because SLA commitments are about worst-case experience, not typical experience.
+
+**Resource utilization per class** shows what percentage of the allocated capacity each priority class is consuming. Sustained utilization above 85 percent in any class means the class is approaching saturation and either needs more capacity or its constituent customers need their eval jobs optimized for efficiency.
+
+**Cross-class redistribution rate** tracks how often unused capacity from one class is being borrowed by another. A high redistribution rate from tier-3 to tier-1 means tier-1 demand is consistently exceeding its allocation, and the allocation weights need adjustment. A high redistribution rate from tier-1 to lower tiers means tier-1 is over-provisioned and those resources could be permanently reallocated.
+
+## Communicating Latency Expectations Without Creating Second-Class Citizens
+
+The organizational challenge of tiered resource allocation is explaining to tier-3 customers why their eval results take longer without making them feel deprioritized. The framing matters enormously.
+
+The wrong framing: "Your tier receives lower priority, so your eval jobs wait longer." This tells the customer they are less important, which is true in a business sense but destructive in a relationship sense.
+
+The right framing: "Your plan includes eval results delivered within 24 hours. Your most recent eval completed in 18 hours, well within your plan's commitment. Enterprise plans include faster delivery — within 2 hours — along with dedicated reviewer allocation and expanded judge API budgets." This frames the tier difference as a feature of the plan, not a judgment of the customer's importance. The customer understands what they are getting, sees that they are getting it reliably, and knows what upgrading would provide. The conversation shifts from "why am I waiting" to "what would I get if I upgraded."
+
+Quality reports for all tiers should include the eval completion time and the tier commitment, so the customer always sees that their SLA is being met. A tier-3 customer who consistently sees "Eval completed: 14 hours. Plan commitment: 24 hours" feels well-served. The same customer who only sees "Eval completed: 14 hours" without context may feel they are waiting too long.
+
+Fair resource allocation ensures every customer gets eval results within their committed timeframe. But latency is only one dimension of satisfaction. A customer whose eval results arrive on time but whose scores seem wrong faces a different kind of frustration — one that requires a fundamentally different resolution process. The next subchapter addresses what happens when customers dispute the quality scores themselves.

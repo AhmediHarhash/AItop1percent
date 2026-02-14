@@ -1,0 +1,117 @@
+# 5.8 — Pipeline Reliability: Retries, Dead Letters, Partial Failures, and Recovery
+
+In late 2025, an education-technology company's eval pipeline processed eighty thousand evaluations per day — scoring student-facing tutoring outputs for accuracy, pedagogical quality, and age-appropriateness. One morning, the LLM judge API returned 503 errors for forty-five minutes. The pipeline had no retry logic. It received the error, logged it, and moved on to the next item. Forty-five minutes of production outputs were silently dropped from evaluation. Those outputs included the first responses from a newly deployed model version, a version that had passed staging evaluation but exhibited a subtle regression on multi-step math explanations. The regression went undetected for three days — not because the eval system couldn't catch it, but because the eval system never saw the outputs where the regression was most visible. Three days of students receiving degraded math tutoring, three days of parents noticing before the engineering team did.
+
+The root cause wasn't the API outage. API outages happen. The root cause was that the eval pipeline treated "I couldn't evaluate this output" the same as "this output doesn't need evaluation." A dropped eval is not a skipped eval. It is a blind spot. And at scale, blind spots compound into systematic quality gaps that are invisible precisely because the system designed to make them visible was the system that failed.
+
+## The Fragility of Eval Pipelines
+
+Eval pipelines have a unique fragility compared to production serving pipelines. When a production API goes down, users see errors immediately. Monitoring fires. The on-call engineer gets paged. The incident is visible because users experience it directly.
+
+When an eval pipeline goes down, nobody experiences it directly. No user is waiting for an eval result. No dashboard updates in real time for most teams. The eval pipeline processes results asynchronously — scores accumulate in a database, dashboards refresh periodically, and alerts trigger on aggregate metrics. If the pipeline drops twenty percent of evaluations during an outage, the dashboard doesn't show a quality drop. It shows fewer data points. The quality metrics for the remaining eighty percent might look perfectly normal. The problem is invisible in the metrics that teams actually watch.
+
+This asymmetry — production failures are loud, eval failures are silent — means that eval pipeline reliability requires explicit engineering. You cannot rely on the natural feedback loops that make production reliability self-correcting. You need to build those feedback loops deliberately: retries that recover from transient failures, dead letter queues that preserve failed evaluations for later processing, partial failure handling that doesn't discard entire batches because of a few errors, and recovery strategies that manage the backlog after an extended outage.
+
+## Retry Strategies for Transient Failures
+
+Most eval pipeline failures are transient. The LLM judge API returns a 503 because the provider's infrastructure is momentarily overloaded. A network timeout occurs because of a brief routing issue. A rate limit error fires because a burst of evaluations exceeded the provider's per-minute quota. These failures resolve themselves within seconds to minutes. The correct response is to retry.
+
+**Exponential backoff** is the foundation of retry logic for transient failures. The first retry happens after a short delay — one second. If it fails, the second retry waits two seconds. The third waits four seconds. The fourth waits eight. Each successive retry doubles the wait time, up to a maximum backoff ceiling — typically sixty to one hundred twenty seconds. This pattern prevents the eval pipeline from hammering an already-overloaded API with rapid retries, which would worsen the overload and delay recovery.
+
+Adding jitter to the backoff is essential when your eval pipeline runs multiple parallel workers. Without jitter, all workers that fail simultaneously will retry simultaneously — at one second, then at two seconds, then at four seconds — creating synchronized bursts that reproduce the exact overload condition that caused the original failure. This is the **thundering herd problem**. Adding random jitter — a random delay of zero to fifty percent of the backoff interval — desynchronizes retries across workers. Instead of all fifty workers retrying at exactly the four-second mark, they retry at random points between two and six seconds, spreading the load.
+
+Not every error deserves a retry. A 503 or 429 (rate limit) is transient — retry it. A 400 (bad request) is not transient — retrying the same malformed request will produce the same 400. A timeout might be transient, but it might also indicate that the evaluation input is too large for the judge model's context window, which will fail on every retry. The retry logic must classify errors into retriable and non-retriable categories, and route non-retriable failures directly to the dead letter queue instead of wasting retry attempts on failures that cannot succeed.
+
+The maximum retry count matters. Too few retries and transient failures become permanent drops. Too many retries and a genuinely broken evaluation consumes retry capacity for minutes before finally giving up. Three to five retries with exponential backoff and a sixty-second maximum backoff is the standard configuration — it covers outages of up to five minutes while failing within a reasonable time for persistent errors.
+
+## Idempotent Evaluation
+
+Retrying an evaluation must not produce duplicate results. If the eval pipeline retries a scoring request and the retry succeeds, the system must ensure that only one score is recorded — not two. This is the **idempotency requirement**, and it is surprisingly easy to violate.
+
+The most common violation occurs when the original request actually succeeded but the response was lost due to a network timeout. The eval pipeline thinks the request failed and retries it. The judge API processes the retry as a new request. Both the original and the retry produce scores, and both scores get written to the eval database. The result is a duplicate — two eval records for the same output, which skews aggregate metrics and creates phantom data points in quality dashboards.
+
+The solution is to assign each evaluation a unique identifier before it enters the pipeline. This identifier is included in the eval request and used as a deduplication key when writing results. If a result with the same identifier already exists in the database, the write is silently dropped. This makes the evaluation pipeline idempotent — sending the same evaluation twice produces the same result as sending it once.
+
+Implementing idempotency requires coordination between the pipeline's request layer and its storage layer. The request layer generates the identifier and includes it in every retry. The storage layer checks for the identifier before inserting a new result. The cost is minimal — a unique identifier lookup before each write — but the benefit is significant. Without idempotency, every retry is a potential duplicate, and duplicate eval results corrupt the quality data that your entire eval system depends on.
+
+## The Dead Letter Queue
+
+Not every failed evaluation can be recovered through retries. Some failures persist beyond the maximum retry count — the judge API is down for an hour, the eval input triggers a consistent error in the judge model, or a configuration error routes evaluations to a nonexistent endpoint. These permanently failed evaluations need somewhere to go.
+
+**The dead letter queue** is a secondary queue where evaluations that have exhausted their retry attempts are stored for later inspection and reprocessing. It is the safety net beneath the retry logic. Without a dead letter queue, a permanently failed evaluation simply disappears — the pipeline moves on to the next item, and the failed evaluation is lost. With a dead letter queue, the failed evaluation is preserved with its full context: the original input, the output that was supposed to be evaluated, the error messages from each retry attempt, and the timestamp of the original failure.
+
+The dead letter queue serves two functions. The first is recovery. When the underlying failure is resolved — the API comes back online, the configuration error is fixed — the dead letter queue can be reprocessed. Every evaluation in the queue gets another chance. The second function is diagnosis. The dead letter queue is a catalog of everything that went wrong. Reviewing the queue daily reveals patterns: are most failures API timeouts? Rate limit errors? Specific input patterns that consistently cause judge failures? These patterns guide pipeline improvements. If sixty percent of dead letter items are rate limit errors, the pipeline needs better rate limiting. If twenty percent are inputs that exceed the judge's context window, the pipeline needs input truncation logic.
+
+Dead letter queue management is its own discipline. The queue should have a maximum retention period — typically seven to fourteen days. Evaluations older than the retention period are archived (not deleted — archived to cold storage where they can still be analyzed) and no longer eligible for automatic reprocessing. Without a retention period, the dead letter queue grows without bound during extended outages, and reprocessing a massive backlog after recovery can overwhelm the pipeline.
+
+The queue should also have alerts. When the dead letter queue size exceeds a threshold — say, more than five hundred items in a twenty-four-hour window — the eval team should be notified. A growing dead letter queue is a leading indicator of a pipeline problem that retries alone cannot solve. Ignoring it means the blind spot is growing.
+
+## Partial Failure Handling
+
+Production eval pipelines process evaluations in batches — fifty, one hundred, or five hundred at a time — because batching is more efficient than processing one evaluation at a time. But batching creates a partial failure problem: what happens when a batch of five hundred evaluations fails for fifteen of them?
+
+The naive approach is to retry the entire batch. This wastes compute — four hundred eighty-five evaluations that already succeeded are re-evaluated, consuming judge API calls and budget for no incremental value. Worse, if the fifteen failures are caused by something specific to those inputs — an unusual format, excessive length, an edge case in the judge prompt — retrying the entire batch will succeed for the same four hundred eighty-five and fail for the same fifteen, in an infinite loop.
+
+The correct approach is **granular job tracking**. Each evaluation within a batch has its own status: pending, in-progress, succeeded, failed. When a batch completes with partial failures, only the failed evaluations are retried. The succeeded evaluations are committed to the eval database. The failed evaluations are retried individually — not as a batch — because individual retries isolate the failure to the specific problematic inputs rather than coupling them to unrelated evaluations.
+
+Granular job tracking requires slightly more infrastructure than batch-level tracking. Each evaluation needs its own record in the job queue, not just a batch-level record. The pipeline needs logic to split failed batch items into individual retry requests. The storage layer needs to handle results arriving out of order — the batch results for four hundred eighty-five items arrive first, and the individual retry results for the remaining fifteen trickle in later. This is not complex, but it is additional engineering that teams often skip during initial implementation, only to discover the need when they lose evaluations to the all-or-nothing batch retry problem.
+
+## Recovery After Extended Outages
+
+Short outages — minutes to an hour — are handled by retries and the dead letter queue. Extended outages — several hours or longer — create a different problem: the backlog. While the eval pipeline was down, production kept running. Outputs accumulated that were never evaluated. When the pipeline comes back, it faces a queue of thousands or tens of thousands of evaluations that need processing.
+
+Processing the entire backlog is the instinctive response, but it's often the wrong one. A backlog of fifty thousand evaluations sent to the judge API all at once will trigger rate limits, overwhelm the pipeline's processing capacity, and potentially cause another outage. The backlog must be managed, not dumped.
+
+The first recovery strategy is **recency prioritization**. Not all backlogged evaluations are equally valuable. A production output from five minutes ago is more relevant than one from five hours ago. The recovery process should work backward through the backlog, evaluating the most recent outputs first. If the backlog is too large to process entirely, the recent outputs — the ones that reflect the current state of the system — provide more useful quality signal than the older outputs.
+
+The second strategy is **backlog sampling**. If the backlog contains twenty thousand evaluations and your pipeline can process two thousand per hour at normal capacity, clearing the backlog takes ten hours — during which new evaluations continue arriving. Instead of processing every backlogged item, sample the backlog. Evaluate a random twenty percent of the backlogged items — four thousand evaluations — which provides a statistically valid quality signal for the outage period while clearing in two hours instead of ten.
+
+The third strategy is **maximum backlog age**. Define a cutoff — outputs older than a certain number of hours (typically six to twelve) are marked as "unevaluated" in the system rather than queued for evaluation. These outputs are tagged with metadata indicating they were missed due to an outage. This tagging is important — it prevents the gap from being confused with "everything was fine during that period." It explicitly records that the eval system has no data for those outputs, which is different from recording that those outputs passed evaluation.
+
+The choice between these strategies depends on the severity of the outage and the pipeline's capacity. A two-hour outage with a manageable backlog can often be fully reprocessed. A twelve-hour outage during peak traffic may require sampling and age cutoffs. The key is having these strategies designed and documented before the outage occurs. During an outage recovery, the team is already stressed by the incident itself — they shouldn't be designing the recovery strategy from scratch at the same time.
+
+## Rate Limiting and Backpressure
+
+Even without outages, eval pipelines face capacity constraints. The LLM judge API has rate limits. The eval database has write throughput limits. The pipeline's workers have CPU and memory limits. When evaluation demand exceeds capacity, the pipeline needs a strategy for managing the excess — this is **backpressure**.
+
+Backpressure propagates capacity constraints backward through the pipeline. When the eval database is saturated, it signals the scoring workers to slow down. When the scoring workers slow down, the queue fills up. When the queue fills to a high-water mark, the sampling stage reduces its sampling rate temporarily. The system degrades gracefully — producing fewer evaluations during peak load rather than crashing entirely.
+
+Without backpressure, the failure mode is more violent. The queue grows without bound, consuming memory until the pipeline process crashes. Or the scoring workers send requests faster than the judge API accepts them, every request gets rate-limited, and the retry logic creates a feedback loop of escalating retries that overwhelms the system further. Backpressure is the mechanism that converts catastrophic failure into graceful degradation.
+
+The practical implementation involves high-water and low-water marks on every queue in the pipeline. When a queue reaches its high-water mark, the upstream producer pauses or slows down. When the queue drains below its low-water mark, the producer resumes normal speed. These marks should be tuned based on the pipeline's observed throughput — set the high-water mark at a level that provides enough buffer for bursty traffic without allowing the queue to consume excessive memory.
+
+## Circuit Breakers
+
+**Circuit breakers** are a pattern borrowed from electrical engineering and applied to distributed systems. When the eval pipeline detects a sustained failure condition — the judge API returning errors for more than a defined period, say five consecutive minutes — the circuit breaker "opens." While open, the pipeline stops sending requests to the failing service entirely. Failed evaluations are routed directly to the dead letter queue without attempting retries.
+
+The circuit breaker serves two purposes. First, it prevents the pipeline from wasting resources on requests that will certainly fail. During a sustained outage, retrying every evaluation with exponential backoff consumes time and compute for zero return. The circuit breaker eliminates this waste by acknowledging the outage explicitly. Second, it prevents the pipeline from contributing to the outage. If the judge API is overloaded, sending retry requests makes the overload worse. The circuit breaker gives the API time to recover by removing the load.
+
+After a cooldown period — typically thirty to sixty seconds — the circuit breaker enters a "half-open" state. It sends a single probe request to the failing service. If the probe succeeds, the circuit breaker closes and normal operation resumes. If the probe fails, the circuit breaker stays open for another cooldown period. This probe-and-check pattern avoids both premature recovery attempts and unnecessarily prolonged outage states.
+
+The circuit breaker state should be visible on the pipeline's monitoring dashboard. An open circuit breaker is an active incident — it means the eval system is not processing evaluations for the affected judge model. The team should know immediately when a circuit breaker opens, not discover it hours later when they notice gaps in their quality data.
+
+## Pipeline Health Monitoring
+
+Eval pipeline reliability depends on monitoring that is specific to eval pipelines, not just general infrastructure monitoring. CPU utilization and memory usage tell you whether the servers are healthy, but they don't tell you whether evaluations are being processed correctly.
+
+The five eval-specific metrics every pipeline should track are retry rate, dead letter queue depth, backlog depth, evaluation latency, and completion rate.
+
+Retry rate is the percentage of evaluations that require at least one retry. A healthy pipeline has a retry rate below two percent. A retry rate above five percent indicates a persistent problem — frequent API errors, undersized rate limits, or judge prompts that trigger occasional failures. Rising retry rates are an early warning sign that precedes more serious failures.
+
+Dead letter queue depth is the number of evaluations currently in the dead letter queue. This number should decrease over time as failed evaluations are reprocessed or aged out. A growing dead letter queue means failures are accumulating faster than they're being resolved. Any dead letter queue depth above zero deserves daily attention.
+
+Backlog depth is the number of evaluations waiting to be processed. In a healthy pipeline, the backlog is near zero — evaluations are processed as fast as they arrive. A growing backlog means the pipeline is falling behind production volume. If the backlog grows consistently, the pipeline needs more capacity. If it grows in bursts during peak hours and drains during off-peak, the pipeline may need auto-scaling or load-smoothing.
+
+Evaluation latency is the time between when an output is produced and when its evaluation score is available. This metric has different acceptable ranges for different tiers. Pull request evals should complete in minutes. Online production evals should complete within the sampling and batching window — typically five to fifteen minutes. If latency exceeds these ranges, something in the pipeline is bottlenecked.
+
+Completion rate is the most important metric. It is the percentage of evaluations that enter the pipeline and produce a final result — either a score or a confirmed failure recorded in the dead letter queue. A completion rate below ninety-nine percent means evaluations are being lost. They're entering the pipeline and disappearing without producing a result or a failure record. This is the most dangerous pipeline failure because it is completely invisible without explicit tracking. The eval was supposed to happen, nothing said it failed, but no result exists. These ghost evaluations are the blind spots that the education-technology company experienced — outputs that were supposed to be evaluated but never were.
+
+## Building the Monitoring Before the Pipeline
+
+Here is a principle that experienced infrastructure teams learn the hard way: build the monitoring before you build the pipeline. If you build the pipeline first and add monitoring later, there is always a gap — a period where the pipeline is running without visibility, and failures during that period go undetected.
+
+When you design an eval pipeline, design the dashboard at the same time. Define the five metrics before writing the first line of pipeline logic. Instrument every stage of the pipeline to emit metrics from the start. Set alert thresholds before the pipeline processes its first real evaluation. This front-loaded investment feels excessive during development but pays for itself within the first month of production operation.
+
+The teams that treat eval pipeline monitoring as a post-launch task consistently report the same experience: the pipeline ran for weeks with undetected issues — dropped evaluations, growing backlogs, silent failures — and the quality data collected during that period was unreliable. They had to discard weeks of evaluation data and start over. Building monitoring first prevents this waste.
+
+Retries, dead letter queues, and health monitoring keep individual evaluations from falling through the cracks. But what happens when the problem is not a single failed evaluation but a systemic breakdown — when the entire eval platform stops working, or worse, keeps running but produces incorrect results? The next subchapter covers the failure modes that affect the eval platform as a whole: backlog explosions, silent failures, and cascading breakdowns that threaten the integrity of your quality data.

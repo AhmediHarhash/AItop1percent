@@ -1,0 +1,75 @@
+# 28.71 — Confirming Non-Exfiltration: Proving Data Never Crossed Regions
+
+In March 2026, a healthcare analytics platform serving hospital networks across the European Union lost its second-largest customer over a single line in an audit log. The platform ran per-tenant evaluations that scored clinical summarization quality using an LLM judge hosted on a US-based cloud region. The eval inputs were patient discharge summaries — de-identified, but still classified as sensitive health data under GDPR and the customer's internal data governance policy. The platform's engineering team believed the data was safe because the summaries were de-identified. The customer's data protection officer saw it differently: de-identified health data sent to a US region for scoring by an American provider's API was a cross-border data transfer that violated the customer's data processing agreement, which specified that all processing — including quality evaluation — must occur within EU-West regions. The platform had no mechanism to prove the data stayed in-region because the data had not stayed in-region. The LLM judge call routed through the provider's default endpoint, which resolved to a US datacenter. The customer terminated a contract worth 1.4 million euros annually. The audit log that revealed the cross-region call was 14 characters long: a datacenter identifier that started with "us-east."
+
+This failure was not caused by negligence about model quality or evaluation design. It was caused by treating the eval pipeline as a technical system rather than a data processing system subject to the same residency constraints as the production pipeline. Every component of your eval pipeline that touches customer data — inputs, outputs, golden sets, judge prompts, scores, and traces — is potentially subject to data residency requirements. If you cannot prove that every one of those components stayed within the customer's designated region, you have a compliance gap that your customer's auditors will eventually find.
+
+## The Data Residency Surface in Eval Pipelines
+
+The eval pipeline touches customer data in more places than most teams realize. Mapping the complete residency surface is the first step toward controlling it.
+
+**Eval inputs** are the model inputs being evaluated — the customer's actual or representative data. For a healthcare customer, these are clinical notes. For a financial services customer, these are transaction records or compliance documents. For a government customer, these are citizen communications. These inputs are unambiguously subject to whatever data residency constraints apply to the customer's production data because they are the same data or synthetic representations derived from it.
+
+**Model outputs** are the AI-generated responses being scored. Outputs may contain reflections of input data — a summarization output contains information from the input document, a classification output reveals the category of the input. Outputs inherit the residency constraints of the inputs they are derived from. A clinical summary generated from a German patient's discharge note is German health data regardless of where the summary was generated.
+
+**Golden sets** are reference examples that define quality for the customer. Golden sets often contain real or realistic customer data, selected specifically because they represent the customer's production scenarios. A golden set for a legal customer may contain excerpts from actual contracts. A golden set for a healthcare customer may contain de-identified but realistic clinical scenarios. These examples carry residency constraints tied to the domain and the customer's data governance policy.
+
+**Judge prompts and scoring context** are the instructions and context provided to the LLM judge when scoring an evaluation. Judge prompts may embed customer-specific information — rubric definitions that reference the customer's domain vocabulary, scoring examples drawn from the customer's golden set, or contextual instructions that describe the customer's use case. If the judge prompt contains customer data, the judge API call carries that data to wherever the judge model runs.
+
+**Scores and traces** are the outputs of the evaluation — numerical scores, judge reasoning, and the complete input-output-score triplets stored for evidence packages. Scores may seem innocuous, but in aggregate, they reveal information about the customer's AI quality and operational patterns. Traces contain the full data chain. All of these are subject to the customer's storage residency requirements.
+
+## What "Proof" Means Technically
+
+Promising that data stays in-region is a policy statement. Proving it is an engineering and audit discipline. Three categories of evidence establish non-exfiltration.
+
+The first is **network-level proof**. Network logs showing that no data packets left the designated region during eval execution. This requires that your eval pipeline runs on infrastructure with network-level controls — VPC configurations, firewall rules, or network policies that prevent outbound traffic to endpoints outside the designated region. The logs must show that these controls were active during every eval job and that no exceptions were triggered. For platforms running on Kubernetes in multi-region configurations, network policies can enforce pod-level egress restrictions that prevent eval workloads from communicating with services outside their designated region, as discussed in Section 27.
+
+The second is **compute provenance**. Proof that the compute nodes that executed the eval job were physically located in the designated region. Cloud providers expose instance metadata that includes the availability zone and region of each node. Your eval pipeline should log this metadata for every eval job — not just the region you requested, but the region the cloud provider actually provisioned. In rare cases, cloud providers may schedule workloads on nodes in adjacent regions during capacity constraints. Your pipeline must verify, not assume, that the actual compute region matches the required compute region.
+
+The third is **storage audit trails**. Proof that eval data — inputs, outputs, golden sets, scores, traces — was written to and read from storage in the designated region only. Cloud storage services provide access logs that include the storage region for every read and write operation. Your evidence package, described in the previous subchapter, should include these storage access logs as part of the operational metadata section.
+
+## The Judge API Problem
+
+The most common source of data residency violations in eval pipelines is not the eval infrastructure itself — it is the LLM judge call. When your eval pipeline scores a customer's outputs using an LLM-as-judge approach, the judge call sends customer data to whatever endpoint the LLM provider's API resolves to. If you are calling a commercial API — OpenAI's GPT-5, Anthropic's Claude Opus 4.6, Google's Gemini 3 — the routing of that API call is controlled by the provider, not by you.
+
+Most major providers offer region-specific endpoints in 2026. Anthropic and OpenAI both provide EU-region API endpoints for enterprise customers. Google Cloud's Vertex AI allows model serving to be pinned to specific regions. But using a region-specific endpoint is not the same as proving the data stayed in-region. You need to verify that the DNS resolution of the endpoint mapped to an IP address within the designated region, that the TLS connection was established with a server in that region, and that the provider's infrastructure did not route the request to a different region for load balancing or failover.
+
+For customers with the strictest residency requirements — government contracts, healthcare customers subject to national health data laws, financial institutions under local banking regulations — the commercial API approach may not provide sufficient assurance. These customers need the judge model to run on infrastructure you control within the designated region. This means deploying open-source judge models (Llama 4 Maverick, Mistral Large 3, or similar) on your own region-pinned compute, or using the commercial provider's dedicated deployment options that guarantee single-region execution. The cost is higher — self-hosted judge models require GPU infrastructure in every region where you serve residency-constrained customers. The compliance assurance is categorically stronger.
+
+## Building Region-Locked Eval Pipelines
+
+A **region-locked eval pipeline** is one where every component — compute, storage, judge models, and network egress — is technically constrained to a single region. Building one requires four engineering decisions.
+
+First, **region-pinned compute**. Eval jobs for a given customer must run on nodes in the customer's designated region. In Kubernetes, this means node affinity rules tied to region labels and namespace-level enforcement that prevents eval pods from scheduling on out-of-region nodes. In managed cloud services, this means selecting the correct region at job submission time and verifying region placement after scheduling.
+
+Second, **region-pinned storage**. Golden sets, eval inputs, scores, traces, and evidence packages must be stored in region-specific storage buckets or databases. Cross-region replication must be disabled for customer-specific eval data. If your platform uses a global data lake for analytics, eval data for residency-constrained customers must be excluded from the global lake or included only as anonymized, aggregated statistics that no longer carry residency constraints.
+
+Third, **region-pinned judges**. If using LLM-as-judge, the judge model must be accessible within the designated region without cross-region routing. Self-hosted judges on region-pinned GPU nodes provide the strongest guarantee. Region-specific commercial API endpoints provide a moderate guarantee. Default commercial API endpoints with no region controls provide no guarantee.
+
+Fourth, **network egress controls**. The eval pipeline's network configuration must prevent outbound connections to endpoints outside the designated region. This is the safety net that catches configuration errors in the other three components. If an eval job accidentally references a global API endpoint instead of the regional one, the network egress control blocks the call rather than silently routing customer data to the wrong region.
+
+## Automated Compliance Verification
+
+Region controls are only as good as their enforcement. Configuration drift, infrastructure changes, and human error can all undermine region-locking controls that were correctly set up initially. Automated compliance verification runs after every eval job and confirms that the residency constraints were honored.
+
+The verification pipeline checks four things. Did the compute nodes that ran the eval job match the customer's designated region? Did all storage reads and writes occur in the designated region? Did all external API calls (particularly judge calls) resolve to endpoints in the designated region? Did any network egress events occur that targeted out-of-region destinations?
+
+If any check fails, the verification pipeline raises an alert, flags the eval job as non-compliant, quarantines the results, and notifies both the platform operations team and the customer's designated compliance contact. A failed verification does not necessarily mean data was exfiltrated — it may mean a log was missing or a metadata field was ambiguous. But the response must be conservative: treat any unverifiable eval job as potentially non-compliant until proven otherwise.
+
+For enterprise customers, the compliance verification results are included in the evidence package. This means the customer's auditors can see not just the eval scores but the specific verification checks that confirmed their data stayed in-region. When a customer asks "can you prove our data never left Frankfurt?" the answer is not "we have policies in place." The answer is "here are the compute provenance logs, network egress logs, and storage access logs for every eval job we ran on your data in Q3, and here is the automated verification result confirming that all jobs passed all region checks."
+
+## The Delivery Problem
+
+There is an irony in non-exfiltration proof: the evidence package that proves data stayed in-region must itself be delivered to the customer without crossing a region boundary. If the customer's compliance team is in Munich and you generate the evidence package in your EU-West storage, delivering it via a global CDN or a US-based email service may itself constitute a cross-region data transfer.
+
+For most customers, encrypted delivery through a region-hosted portal resolves this. The customer logs into a portal hosted in their designated region and downloads the evidence package directly from region-local storage. No cross-region transfer occurs. For customers with the strictest requirements, you may need to provide the evidence package through a dedicated secure channel — an SFTP endpoint in the designated region, or even physical media in extreme cases.
+
+The delivery mechanism should be specified in the customer's data processing agreement so that both parties agree on how evidence is transferred before the first audit request arrives. Discovering at audit time that your delivery mechanism violates the very residency constraints you are trying to prove is a credibility-destroying outcome that no amount of technical evidence can repair.
+
+## Why This Matters More in 2026
+
+Data residency proof for eval pipelines is transitioning from a nice-to-have to a procurement requirement. Three trends are driving the shift. The EU AI Act's technical documentation requirements, enforceable from August 2026, explicitly require providers to document where data is processed throughout the AI system lifecycle — and evaluation is part of that lifecycle. National data localization laws in India, Brazil, Indonesia, and others are expanding the set of countries with explicit in-country processing requirements. And enterprise procurement teams, having been burned by cloud providers whose "regional" services silently routed data through global infrastructure, are demanding provable residency guarantees rather than policy promises.
+
+For multi-tenant platforms, this means the cost of non-exfiltration proof scales with the number of distinct residency zones you support. A platform serving customers in three regions needs three sets of region-locked infrastructure. A platform serving customers in twelve regions needs twelve. This cost must be factored into your per-customer economics, as discussed in Section 24, and reflected in your pricing tiers, as explored in Section 30.
+
+The next subchapter shifts from what you prove to what you invest, addressing the principle that not every customer deserves the same depth of evaluation and how to design tiered eval coverage that matches investment to value.

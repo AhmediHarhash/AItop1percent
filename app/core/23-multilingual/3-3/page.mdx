@@ -1,0 +1,101 @@
+# 3.3 — Context Window Starvation: When Your Prompt Budget Disappears
+
+In late 2025, a legal technology company in Tokyo launched a RAG-based contract review assistant. The system worked brilliantly for English-language contracts. Engineers had tuned the retrieval pipeline to pull six relevant contract clauses into a 128,000-token context window alongside a detailed system prompt, three few-shot examples, and the user's query. English contracts left roughly 40% of the context window unused — comfortable headroom for complex queries. When the same system was deployed for Japanese legal documents, the team expected a minor adjustment. What they got was a crisis. Japanese contract text consumed 3.2 times more tokens than semantically equivalent English text. The six retrieved clauses that fit easily in English now overflowed the token budget. The system silently truncated context to stay within limits, dropping the last two clauses and half of the third. Retrieval quality — measured by answer accuracy against a gold-standard evaluation set — fell by 41%. The model still produced fluent Japanese answers. They were just wrong, because the context that contained the correct information had been quietly thrown away.
+
+This failure pattern has a name. It is **Context Window Starvation** — the effective shrinking of usable context for non-English languages due to token inflation from the tokenizer. The context window size that your model advertises is a token count, not a word count and not a concept count. When your language costs more tokens per concept, the window holds fewer concepts. Your model starves.
+
+## The Arithmetic of Starvation
+
+The math is straightforward but the consequences are not intuitive until you work through the numbers.
+
+A 128,000-token context window holds approximately 96,000 to 110,000 words of English text, depending on vocabulary complexity. That is roughly 250 to 300 pages of a typical English business document. For a RAG application, you might allocate 2,000 tokens for the system prompt, 3,000 tokens for few-shot examples, 5,000 tokens for conversation history, 100,000 tokens for retrieved documents, and reserve 18,000 tokens for the model's generation. This budget feels generous. You have room for fifteen to twenty full document pages of retrieved context.
+
+Now apply the Japanese token tax. Japanese legal text, with its mixture of kanji, hiragana, katakana, and occasional Latin characters, achieves a fertility ratio of approximately 2.8 to 3.2 times English on most tokenizers. Your system prompt, written in Japanese, now costs 5,600 to 6,400 tokens instead of 2,000. Your few-shot examples cost 8,400 to 9,600 tokens instead of 3,000. Conversation history costs 14,000 to 16,000 instead of 5,000. Before you retrieve a single document, you have consumed 28,000 to 32,000 tokens — compared to 10,000 in English. Your retrieval budget shrinks from 100,000 tokens to roughly 78,000 to 82,000 tokens. But each retrieved document page also costs 2.8 to 3.2 times more tokens. The fifteen pages you could retrieve in English become five to six pages in Japanese.
+
+That gap — fifteen pages versus five pages — is the difference between an answer grounded in comprehensive context and an answer that misses critical clauses. The model does not know it is starving. It processes whatever tokens it receives and generates the best answer it can. The failure is silent. No error message, no warning, no truncation notification to the end user. The answer just gets worse.
+
+## How Starvation Hits RAG Pipelines
+
+RAG is the architecture most vulnerable to context window starvation because it depends on fitting external knowledge into the context window alongside everything else. The standard RAG pipeline retrieves the top-k most relevant chunks from a vector database and concatenates them into the prompt. The implicit assumption is that k is constant across languages — you always retrieve the same number of chunks.
+
+That assumption is wrong when token costs vary by language. If each chunk is 500 tokens in English but 1,400 tokens in Arabic, retrieving ten chunks costs 5,000 tokens in English and 14,000 in Arabic. You have three options, and all of them degrade quality.
+
+First, you can keep k constant and accept that Arabic queries consume three times more of the context budget. This means less room for system prompt, conversation history, and generation. For models with smaller context windows — 8,000 or 32,000 tokens — this can push the total token count past the limit, forcing hard truncation.
+
+Second, you can reduce k for high-fertility languages — retrieve four Arabic chunks instead of ten English chunks. This preserves the overall token budget but gives the Arabic query less evidence to work with. If the correct answer is in chunk seven, the English query finds it and the Arabic query does not.
+
+Third, you can reduce chunk size for high-fertility languages — break Arabic documents into smaller segments so that each chunk costs fewer tokens. This preserves k but fragments the context in ways that can separate related sentences, break paragraphs mid-thought, and strip away the surrounding text that disambiguates meaning.
+
+None of these options is a clean solution. Each one trades one form of quality degradation for another. The underlying problem is that the RAG pipeline was designed with English token economics in mind, and it becomes a different pipeline with different constraints when the language changes.
+
+## System Prompt Overflow
+
+Your system prompt is the foundation of your model's behavior. It defines the persona, the rules, the format, the constraints, and the domain knowledge that shape every response. In English, a detailed system prompt for a customer support bot might run 800 to 1,500 tokens. In Arabic, the same instructions occupy 1,600 to 4,500 tokens. In Thai, 2,000 to 6,000 tokens.
+
+Teams that develop their system prompts in English and then translate them for other markets often discover that the translated prompt no longer fits within the budget they allocated. The choices are painful: shorten the prompt, which means removing rules or constraints the model needs to behave correctly, or accept that the system prompt consumes a larger share of the context window, which means less room for everything else.
+
+The insidious version of this problem appears when the system prompt technically fits but consumes so much of the budget that the model's behavior degrades in subtle ways. A system prompt that uses 3% of the context window in English might use 9% in Arabic. The model still follows instructions, but with less remaining context, it is more likely to lose track of earlier conversation turns, more likely to produce responses that contradict previous statements, and more likely to hallucinate when the retrieved context is thin.
+
+## Conversation History Compression
+
+Multi-turn conversations compound the starvation problem with every exchange. Each user message and assistant response adds to the conversation history that the model must process. In English, a ten-turn conversation might accumulate 3,000 to 5,000 tokens of history. In Korean, with a fertility ratio of 2.36, the same ten-turn conversation accumulates 7,000 to 12,000 tokens. In Thai, with a fertility ratio of 3.0 to 3.5, it could reach 9,000 to 17,500 tokens.
+
+The practical consequence is that non-English conversations hit the context window limit faster. An English user might enjoy twenty turns of conversation before the system starts dropping early history. A Thai user might hit that limit at eight turns. The Thai user experiences a product that "forgets" what was discussed earlier in the conversation — not because the model lacks memory capabilities, but because the tokenizer consumed the budget that would have held those memories.
+
+This creates a measurable user experience gap. English users get a coherent, context-aware assistant that remembers everything they said. Thai users get an assistant that starts contradicting itself or repeating questions after a few exchanges. If your team is not tracking conversation depth per language, you will not detect this disparity until users complain — and many users will simply stop using the product rather than complain.
+
+## Few-Shot Example Starvation
+
+Few-shot prompting — including example inputs and outputs in the prompt to guide the model's behavior — is a powerful technique that becomes expensive in high-fertility languages. Each example takes more tokens. You can afford fewer examples. The model receives less guidance.
+
+Consider a classification task where you include five examples to demonstrate the expected format and reasoning. In English, five examples might cost 1,200 tokens. In Japanese, the same five examples cost 3,400 to 3,800 tokens. If your total prompt budget is tight, you may need to drop to two or three Japanese examples. Research consistently shows that few-shot performance scales with the number of examples up to a saturation point. Going from five examples to two in Japanese means your Japanese classification accuracy drops — not because the model understands Japanese worse, but because you gave it fewer examples of what you want.
+
+The compounding effect is particularly damaging. You have fewer examples AND less retrieved context AND a more expensive system prompt AND shorter conversation history. Each constraint independently reduces quality by a few percentage points. Together, they can produce a quality gap of 15 to 30% between English and a high-fertility language like Thai or Japanese — a gap that users notice immediately and that no amount of prompt engineering in English will fix.
+
+## The Silent Truncation Problem
+
+The most dangerous aspect of context window starvation is that most systems handle it silently. When the total token count exceeds the context window, the standard behavior is to truncate from the beginning of the context — dropping the oldest messages, the earliest retrieved chunks, or the first portion of the system prompt. Some frameworks truncate from the middle. Some drop entire chunks. The behavior varies by implementation, and in many cases the development team does not know exactly what gets dropped.
+
+This silent truncation means your system is producing answers based on incomplete context without telling anyone. The answer looks fluent. The format looks correct. But the information the model needed to produce an accurate answer was in the truncated portion. You have no error log, no alert, no metric that directly flags "this answer was produced with 40% less context than intended."
+
+The detection method is indirect. Track the actual token count of your full prompt — system prompt, examples, history, retrieved context, and query — for every request, broken down by language. Compare this to the model's context window. Any request where the full prompt exceeds the window triggers truncation. If 5% of your English requests trigger truncation but 35% of your Japanese requests do, you have a starvation problem. That 30-percentage-point gap represents thousands of Japanese users receiving degraded answers every day.
+
+## Language-Aware Token Budgeting
+
+The mitigation starts with abandoning the assumption that one token budget fits all languages. Instead, build a **language-aware token budgeting system** that adjusts allocations based on the fertility ratio of the active language.
+
+Start with a token budget table that specifies allocations per component — system prompt, few-shot examples, conversation history, retrieved context, and generation reserve — with separate columns for each supported language. The allocations should not be equal in tokens. They should be equal in semantic content. If your English system prompt is 1,500 tokens and conveys twenty rules, your Japanese system prompt should also convey twenty rules — which might cost 4,200 tokens. Your budget must account for that.
+
+When the total budget exceeds the context window, the table forces explicit trade-off decisions. You might decide that the Japanese deployment uses a shorter system prompt — fifteen rules instead of twenty — and compensates with stricter few-shot examples. Or you might decide that Japanese queries retrieve four chunks instead of six but each chunk is more carefully selected. Or you might invest in a larger context window model specifically for high-fertility languages, accepting the higher per-request cost as the price of quality parity.
+
+The key is that these trade-offs are visible and deliberate, not hidden and accidental. A budget table reviewed by the team creates accountability. Silent truncation creates mystery bugs that nobody can diagnose.
+
+## Dynamic Chunk Sizing by Language
+
+For RAG applications, one of the most effective mitigations is dynamic chunk sizing — adjusting the size of your document chunks based on the target language's token fertility.
+
+The standard approach is to chunk documents into segments of a fixed token count — say 500 tokens per chunk. This works for English because 500 tokens corresponds to roughly 375 to 420 words, which is about two to three paragraphs. But 500 tokens of Thai text is only 125 to 170 words — barely one paragraph. The Thai chunk contains less information, which means less context per retrieval slot.
+
+The alternative is to chunk by semantic unit rather than token count. Define a chunk as a logical section — a paragraph, a contract clause, a policy statement. Then measure the token cost of each chunk in the target language. If a clause costs 1,200 tokens in Thai instead of 400 in English, you know that retrieving five Thai clauses costs 6,000 tokens while five English clauses cost 2,000. Your retrieval strategy adjusts accordingly: retrieve fewer but more targeted Thai chunks, use more aggressive re-ranking to ensure the most relevant chunks are selected, and allocate a larger share of the total token budget to retrieved context for Thai queries.
+
+Some teams go further and implement language-specific summarization in the retrieval pipeline. Before inserting a Thai document chunk into the context, a lightweight model summarizes it — compressing the meaning into fewer tokens at the cost of losing some detail. The compressed chunk fits into the budget, and the model receives more chunks. The trade-off is that summarization introduces information loss, but in many cases, the loss from summarization is smaller than the loss from truncation.
+
+## Prompt Compression for High-Fertility Languages
+
+When your system prompt, few-shot examples, and instructions are too expensive in the target language, prompt compression techniques can recover some of the lost budget.
+
+The most straightforward technique is writing the system prompt in English and instructing the model to respond in the user's language. Most major models in 2026 handle cross-lingual prompting well — they can follow English instructions and produce fluent output in Japanese, Arabic, or Thai. The English system prompt costs fewer tokens, leaving more budget for user content and retrieved context. The trade-off is that the model's instruction-following may be slightly less precise when the instructions and the output language differ, especially for nuanced formatting or cultural conventions.
+
+A second technique is to create compressed versions of your system prompt for each high-fertility language. These are not direct translations. They are reformulations that convey the same constraints in fewer words, taking advantage of the target language's own compression mechanisms. Japanese, for example, can express some concepts more concisely than English due to its writing system, even though the per-character token cost is higher. A skilled bilingual prompt engineer can sometimes reduce the token cost of a Japanese system prompt by 15 to 25% compared to a direct translation.
+
+A third technique is prompt caching. If your API provider supports prefix caching — where repeated prompt prefixes are stored and reused without re-processing — you can partially offset the token cost by ensuring your system prompt is stable across requests. The tokens still count against the context window, but the processing cost and latency are reduced for cached portions.
+
+## Monitoring Starvation in Production
+
+Once your multilingual system is live, you need ongoing monitoring to detect starvation before it reaches users.
+
+Build a dashboard that tracks three metrics per language, per day. First, **average context utilization** — the percentage of the context window consumed by a typical request. If English averages 45% and Japanese averages 92%, your Japanese deployment is living on the edge of truncation. Second, **truncation rate** — the percentage of requests where the full prompt exceeds the context window and triggers any form of truncation. This should be near zero for all languages. If any language exceeds 5%, you have a starvation problem. Third, **effective retrieval depth** — for RAG applications, the average number of chunks actually included in the final prompt per language. If English queries include eight chunks and Thai queries include three, your Thai users are receiving answers based on less than half the evidence.
+
+These three metrics make the invisible visible. They turn "Japanese output quality seems worse" from a vague complaint into a precise engineering problem: "Japanese requests use 89% of the context window, trigger truncation on 22% of requests, and include an average of 3.4 retrieval chunks compared to 7.8 for English." That level of specificity tells you exactly where to invest — larger context windows, shorter prompts, better retrieval selection, or language-specific chunking strategies.
+
+Context window starvation is the most consequential operational effect of the token tax. It is where the abstract cost disparity of the previous subchapter becomes a concrete quality disparity that users feel in every interaction. But starvation is only half the story. The next subchapter examines what happens to the quality of the tokens themselves — how fragmentation degrades the model's ability to produce correct, fluent text in languages where every word is shattered into pieces.

@@ -1,0 +1,109 @@
+# 6.6 — Reranking and Second-Stage Retrieval Costs: The Price of Precision
+
+Reranking improves retrieval quality. It also adds a per-query cost that most teams never measure against the value it delivers. The default assumption — that higher retrieval precision is always worth paying for — ignores the math. Reranking is a cost-quality trade-off, and like every trade-off in this chapter, it has a break-even point. Below that point, reranking saves you money by reducing wasted context tokens in the inference call. Above that point, reranking costs more than it saves, and you are paying a precision premium with no return. The teams that treat reranking as a universal quality boost waste money. The teams that calculate the break-even and apply reranking selectively turn it into one of the highest-ROI optimizations in their retrieval stack.
+
+## How Two-Stage Retrieval Works
+
+The **two-stage retrieval** pattern separates the cheap, fast search from the expensive, precise scoring. In the first stage, a vector similarity search retrieves a broad set of candidates from your corpus — typically the top 20 to 50 documents ranked by embedding similarity. This stage is fast because approximate nearest neighbor algorithms can search millions of vectors in single-digit milliseconds. It is also imprecise because embedding similarity captures general topical relevance, not fine-grained semantic match to the specific query.
+
+In the second stage, a **reranker** — typically a cross-encoder model — scores each candidate against the query with much higher precision. A cross-encoder takes the query and a candidate document as a single input pair and outputs a relevance score. Unlike embedding similarity, which compares pre-computed vectors independently, a cross-encoder processes the query and the document together, allowing it to capture nuanced interactions between the query terms and the document content. This joint processing is why cross-encoders are more accurate than embedding similarity. It is also why they are more expensive: instead of a single vector comparison, each candidate requires a full model forward pass.
+
+The output of the reranking stage is a re-ordered list of candidates, scored by the cross-encoder's relevance judgment. You take the top three to five after reranking and pass them to your language model as context. The candidates that scored poorly are discarded. The theory is simple: if the reranker is good, the top three reranked candidates are more relevant than the top three from vector search alone, which means fewer wasted context tokens and better answer quality.
+
+## The Cost of a Reranking Call
+
+Reranking costs depend on the provider, the model, and how many candidates you rank per query. The pricing models vary, but the dominant providers in 2026 price reranking per search rather than per token.
+
+Cohere's Rerank 3.5 — the most widely used commercial reranker in production — costs $2.00 per 1,000 searches. Each "search" is one query reranked against up to 100 document chunks. If your retrieval pipeline retrieves 20 candidates and reranks them, that counts as one search, costing $0.002. If you retrieve 150 candidates, Cohere counts that as two searches because the first 100 fill one unit and the remaining 50 start another, costing $0.004. The per-search pricing model makes Cohere's cost predictable and independent of document or query length, unlike token-based pricing that fluctuates with content size.
+
+Jina AI's reranker offers competitive pricing at roughly $0.02 per 1,000 tokens of combined query and document text. For a query of 50 tokens reranked against 20 candidates of 300 tokens each, the total reranking input is 50 plus 6,000 equals 6,050 tokens, costing approximately $0.00012. This token-based pricing is cheaper than Cohere per query for short documents but becomes more expensive for long documents.
+
+Self-hosted cross-encoders — open-source models like BGE-reranker-v2, ms-marco-MiniLM, or Jina's open-source reranker — cost nothing per query. Your cost is the GPU compute to run inference. A single mid-range GPU can serve a cross-encoder reranker at thousands of queries per second, making the per-query cost effectively $0.0001 to $0.0005 depending on your hardware cost and utilization. For high-volume systems processing millions of queries per day, self-hosting a reranker saves 80% to 95% compared to API pricing.
+
+## Calculating the Per-Query Reranking Cost
+
+To understand whether reranking is worth it for your system, you need the per-query cost at your specific volume and configuration. Start with the numbers.
+
+Your retrieval pipeline retrieves 20 candidates per query. You use Cohere Rerank 3.5 at $2.00 per 1,000 searches. Each query is one search. Your per-query reranking cost is $0.002.
+
+At 100,000 queries per day, daily reranking cost is $200, monthly is $6,000, annual is $73,000. At 10,000 queries per day, daily cost is $20, monthly is $600, annual is $7,300. At one million queries per day, daily cost is $2,000, monthly is $60,000, annual is $730,000.
+
+These numbers demand scrutiny. A $73,000 annual reranking bill for a system serving 100,000 queries per day is not trivially justified. It needs to deliver measurable value that exceeds its cost. That value comes in two forms: improved answer quality (which is hard to dollarize directly) and reduced inference cost (which is easy to calculate).
+
+## The Break-Even Calculation
+
+The measurable financial value of reranking comes from its effect on context tokens. Better precision means fewer irrelevant chunks in the context window, which means fewer input tokens to your language model. If reranking reduces your average context by removing irrelevant chunks, the inference savings can offset or exceed the reranking cost.
+
+Here is the calculation. Without reranking, you retrieve the top 5 chunks from vector search and include all of them in the context window. Average context length: 1,500 tokens. Retrieval precision: 50%, meaning 2.5 of 5 chunks are relevant. You are paying for 750 tokens of irrelevant context per query.
+
+With reranking, you retrieve 20 candidates, rerank to the top 3, and include those 3 in the context window. Average context length: 900 tokens. Retrieval precision: 85%, meaning 2.55 of 3 chunks are relevant. You are paying for 135 tokens of irrelevant context per query. The context reduction is 600 tokens per query — from 1,500 to 900.
+
+The inference saving per query depends on your model pricing. On GPT-5-mini at $0.75 per million input tokens, 600 fewer tokens saves $0.00045 per query. On Claude Sonnet 4.5 at $3.00 per million input tokens, the saving is $0.0018. On GPT-5 at $2.50 per million input tokens, the saving is $0.0015. On Claude Opus 4.6 at $15.00 per million input tokens, the saving is $0.009.
+
+The reranking cost is $0.002 per query with Cohere. On GPT-5-mini, the inference saving of $0.00045 does not cover the reranking cost of $0.002. You lose $0.00155 per query. On Claude Sonnet 4.5, the inference saving of $0.0018 is close but still does not break even. You lose $0.0002 per query. On GPT-5, the inference saving of $0.0015 does not quite cover the cost. You lose $0.0005 per query. On Claude Opus 4.6, the inference saving of $0.009 greatly exceeds the reranking cost. You gain $0.007 per query.
+
+The break-even depends on your inference model pricing. Reranking pays for itself in pure token savings only when your inference model is expensive enough that the context reduction saves more than the reranking costs. For the numbers above, the break-even occurs at roughly $3.50 per million input tokens. Below that threshold, reranking costs more in API fees than it saves in context tokens. Above that threshold, reranking delivers net savings.
+
+## When Reranking Pays for Itself
+
+The break-even calculation above only counts the direct token savings. There are three additional value streams that shift the economics in reranking's favor, even when the raw token math does not break even.
+
+The first is **answer quality improvement**. Reranking typically improves retrieval precision by 15% to 35%, depending on the baseline quality of your vector search. Higher precision means more relevant context, which means better answers. If better answers reduce customer support tickets, increase user retention, or improve conversion rates, the business value of those improvements dwarfs the reranking cost. A support chatbot that answers correctly 82% of the time instead of 74% of the time because of reranking delivers measurable business value that is difficult to capture in a per-token calculation but very real on the revenue side.
+
+The second is **reduced output token waste**. When the language model receives irrelevant context, it sometimes generates longer, more hedged, or less focused responses. Relevant context tends to produce shorter, more direct answers because the model has what it needs and does not need to equivocate. If reranking reduces average output length by even 10% to 15% by eliminating irrelevant context that triggers verbose responses, the output token savings add to the input token savings. On expensive models with high output pricing, this can shift the break-even significantly.
+
+The third is **error reduction cost avoidance**. Irrelevant context does not just waste tokens — it can cause wrong answers. If a retrieved chunk about return policies appears in the context for a shipping question, the model might incorporate return policy details into its shipping answer, producing a response that is confidently incorrect. Wrong answers generate support tickets, erode user trust, and in regulated industries can create compliance risk. Reranking reduces wrong-context errors by ensuring only relevant chunks reach the model. The cost of avoiding even a small number of these errors per month can justify the reranking investment.
+
+For most production systems running inference on mid-tier to premium models, reranking pays for itself when you account for all three value streams — not just the direct token savings. The teams that conclude reranking is not worth it are usually running the break-even calculation on cheap models while ignoring the quality and error-reduction benefits.
+
+## Optimizing Reranking Cost
+
+If you have decided that reranking delivers value but want to minimize what you pay for it, four optimization strategies apply.
+
+The first is **reducing the candidate set size**. If you retrieve 50 candidates and rerank all 50, you are paying more per query than if you retrieve 20 and rerank those. The question is whether the extra 30 candidates meaningfully improve the final top-3 quality. In most cases, retrieving more than 20 to 30 candidates provides diminishing returns for reranking — the candidates ranked 31st through 50th by vector similarity are rarely promoted to the top 3 by the reranker. Test this on your data: measure reranking quality at candidate set sizes of 10, 20, 30, and 50. If quality plateaus at 20, there is no reason to pay for 50. With Cohere's pricing model, staying under 100 candidates keeps you at one search unit per query. Exceeding 100 doubles the cost.
+
+The second is **conditional reranking** — applying reranking only when it is likely to change the results. If the first-stage retrieval returns candidates with very high and tightly clustered similarity scores, the query has a clear answer and reranking is unlikely to reorder the top results significantly. If the similarity scores are spread across a wide range, the ranking is uncertain and reranking will add the most value. A simple heuristic: if the similarity score of the top candidate exceeds a threshold (say, 0.92) and the gap between the first and fifth candidate is less than 0.05, skip reranking for that query. This conditional approach can reduce reranking volume by 20% to 40% for systems with a mix of easy and hard queries.
+
+The third is **self-hosted reranking for high volume**. If you process more than 500,000 queries per day, the API cost of a commercial reranker becomes a significant line item. At one million queries per day, Cohere Rerank costs $2,000 per day or $60,000 per month. A self-hosted cross-encoder running on two GPUs handles the same volume at an infrastructure cost of $2,000 to $4,000 per month — a 93% to 97% reduction. The trade-off is engineering complexity: you manage the model deployment, the GPU infrastructure, the model updates, and the failover. But at $60,000 per month, you can hire a half-time engineer to manage the infrastructure and still save $40,000 per month.
+
+The fourth is **choosing the right reranker for the task**. Not all queries need the most powerful reranker. A lightweight reranker — a smaller cross-encoder or a distilled model — runs faster, costs less in compute, and provides most of the quality improvement for straightforward queries. Reserve the heavyweight reranker for queries where the first-stage results are ambiguous or where the stakes are high. This tiered approach mirrors the model routing strategy described earlier in this section: use the cheapest tool that meets the quality bar for each request.
+
+## The Reranking Budget Formula
+
+To budget reranking costs for a new deployment, use this formula. Multiply your expected daily query volume by the per-query reranking cost, then multiply by 30 for monthly cost. Apply a 20% buffer for volume growth and unexpected spikes.
+
+For a system expecting 200,000 queries per day using Cohere Rerank at $0.002 per query: daily cost is $400, monthly is $12,000, annual is $146,000. With a 20% buffer, budget $175,000 annually for reranking. If that number shocks you, run the break-even calculation. If your inference model costs $5.00 per million input tokens and reranking reduces average context by 500 tokens, the inference saving is $0.0025 per query, which at 200,000 queries per day saves $500 per day, or $15,000 per month. Net reranking cost after inference savings is negative $3,000 per month — meaning reranking saves you $3,000 per month net. But if your inference model costs $1.00 per million input tokens, the inference saving is only $0.0005 per query, which saves $100 per day or $3,000 per month. Net reranking cost is positive $9,000 per month — meaning reranking costs you $9,000 per month more than it saves in tokens.
+
+The formula makes the decision concrete. Reranking is a financial instrument, not a quality checkbox. Deploy it when the numbers work. Skip it or optimize it when they do not.
+
+## Reranking in the Full Retrieval Cost Stack
+
+Reranking does not exist in isolation. It sits within a retrieval cost stack that includes embedding generation, vector database queries, the reranking call itself, and the downstream inference call. Understanding how reranking cost relates to these other components helps you prioritize optimizations.
+
+For a typical mid-volume RAG system serving 200,000 queries per day on Claude Sonnet 4.5, the monthly cost stack looks approximately like this. Query-time embedding costs $20 per month. Vector database query costs $300 to $800 per month. Reranking costs $12,000 per month. Inference on retrieved context costs $30,000 to $50,000 per month. The total retrieval-plus-inference cost is $42,000 to $63,000 per month.
+
+In this stack, reranking represents roughly 20% to 30% of the total retrieval-plus-inference cost. That is significant — it is the second-largest component after inference itself. But the question is not whether reranking is expensive. The question is whether the alternative is more expensive. Without reranking, your context window is 40% to 60% larger because you include more irrelevant chunks. That larger context increases inference cost by 40% to 60%, adding $12,000 to $30,000 per month in extra inference tokens. At the high end, removing reranking to save $12,000 per month in reranker fees costs you $30,000 per month in extra inference fees. The net cost of not reranking is $18,000 per month. This is the math that justifies reranking for most production systems using mid-to-premium models.
+
+For systems using cheap models — GPT-5-mini, GPT-5-nano, or open-source models with low per-token costs — the inference savings from reranking are proportionally smaller. In those cases, reranking may not be justified on pure cost grounds, and the decision shifts to whether the quality improvement alone justifies the expense.
+
+## When to Skip Reranking Entirely
+
+Reranking is not always the right answer. Several scenarios make it an unnecessary cost.
+
+If your vector search already achieves retrieval precision above 80%, reranking adds marginal improvement at disproportionate cost. Test your baseline precision before adding a reranker. If your embeddings, chunking strategy, and metadata filtering already produce highly relevant top-K results, you may not need a second-stage scoring step.
+
+If your corpus is small and domain-specific — under 100,000 chunks covering a narrow topic — vector similarity alone often produces highly relevant results because the embedding space is dense with related content. Reranking adds the most value on large, diverse corpora where topically adjacent but irrelevant chunks frequently appear in the top results.
+
+If your query volume is low — under 5,000 queries per day — the absolute cost of reranking is small regardless of the per-query price. At 5,000 queries per day and $0.002 per query, reranking costs $10 per day or $300 per month. At that scale, deploy it for the quality benefit without overthinking the economics. The decision framework matters for high-volume systems where the monthly bill is measured in thousands or tens of thousands of dollars.
+
+If your inference model is cheap enough that context tokens cost very little, the token savings from reranking may never cover the reranking cost. On a model charging $0.15 per million input tokens, even removing 1,000 tokens of irrelevant context per query saves only $0.00015, which is an order of magnitude less than the $0.002 reranking cost. In that case, the quality argument must stand on its own.
+
+## Monitoring Reranking ROI in Production
+
+Deploy reranking with instrumentation from day one. Log four metrics per query: the reranking latency, the reranking cost, the context size before and after reranking, and the resulting answer quality score if you have an automated evaluator.
+
+Track the monthly ROI by comparing reranking cost against inference savings. If your average context reduction from reranking is shrinking over time — because your first-stage retrieval has improved or your corpus has changed — the ROI of reranking is declining. If reranking latency is increasing because you are sending larger candidate sets, the user experience cost is rising alongside the financial cost. If reranking quality is degrading because your corpus has drifted from the reranker's training distribution, you may need to switch reranking models or fine-tune.
+
+The teams that extract the most value from reranking are the ones that treat it as a living optimization, not a set-and-forget configuration. They measure its contribution monthly, adjust the candidate set size quarterly, and evaluate whether self-hosting would be cheaper annually. Reranking is a powerful tool when deployed with financial discipline. Without that discipline, it becomes a quiet drain on your retrieval budget that nobody questions because "precision is always worth it."
+
+Search indexes, like vector databases, have their own cost surfaces that scale with corpus freshness and query volume. The next subchapter examines those costs — the price of keeping your search index current as documents change, and the infrastructure economics of maintaining real-time search freshness.

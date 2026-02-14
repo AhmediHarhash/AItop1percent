@@ -1,0 +1,67 @@
+# 27.12 — Multi-Instance GPU and Time-Slicing: Sharing Expensive Accelerators
+
+**The whole-GPU-per-pod default** is the most expensive anti-pattern in AI infrastructure, and almost every organization runs it without realizing it. Out of the box, Kubernetes treats a GPU as an indivisible resource. When a pod requests one unit of nvidia.com/gpu, it gets exclusive access to an entire physical device — all the compute cores, all the memory, all the bandwidth. For large training jobs that genuinely saturate every transistor on the chip, this makes sense. For inference workloads serving a small language model or a classification endpoint, it is like renting an entire apartment building to house a single tenant. The GPU sits at twelve to eighteen percent utilization, burning the same electricity and costing the same hourly rate as it would at full load.
+
+An infrastructure team at a mid-sized fintech company discovered this pattern across their inference cluster in early 2025. They were running twenty-three inference endpoints on twenty-three A100-80GB GPUs. Average utilization across the fleet sat at fourteen percent. Their monthly GPU bill exceeded ninety thousand dollars. After implementing GPU sharing, they consolidated those twenty-three workloads onto eight GPUs, pushed average utilization above sixty percent, and cut their monthly spend to under thirty-five thousand dollars. The models performed identically. The only thing that changed was how the hardware was divided.
+
+Two mechanisms exist for sharing GPUs across multiple workloads in Kubernetes, and choosing the wrong one for your situation will either waste money or cause production incidents. Understanding both — their mechanics, their trade-offs, and their failure modes — is essential for anyone operating GPU infrastructure at any scale.
+
+## Multi-Instance GPU: Hardware-Level Partitioning
+
+**Multi-Instance GPU**, or MIG, is NVIDIA's answer to the utilization problem at the hardware level. Available on A100, H100, H200, and the Blackwell Ultra B300 architecture, MIG physically divides a single GPU die into up to seven isolated instances. Each instance gets its own dedicated compute cores, its own dedicated memory slice, and its own dedicated L2 cache. From the perspective of Kubernetes and the applications running on it, each MIG instance appears as a completely separate GPU device with its own resource name.
+
+The isolation is real and enforced by the hardware, not by software scheduling. If a workload running in one MIG instance has a memory leak that fills its allocated VRAM, the other instances on the same physical GPU are completely unaffected. If one instance crashes, the others continue serving traffic. This is not a software abstraction layered on top of shared hardware. The GPU's memory controllers and compute engines are physically segmented so that each partition operates independently.
+
+On an A100-80GB, the available MIG profiles define the partition sizes. The smallest profile, 1g.10gb, provides one-seventh of the compute and ten gigabytes of memory. A 2g.20gb profile doubles both. A 3g.40gb profile provides three-sevenths of the compute and forty gigabytes. A 4g.40gb profile gives four-sevenths of compute with forty gigabytes of memory. The 7g.80gb profile is the full GPU — effectively MIG disabled. On the H100, the profiles scale proportionally with the larger die, and the Blackwell Ultra B300 extends MIG to support instances with up to 140 gigabytes of memory, enabling partitions large enough for serving mid-sized language models with billions of parameters.
+
+The constraint with MIG is rigidity. You cannot mix arbitrary partition sizes on a single GPU. The hardware supports specific combinations — for example, you can configure an A100 as seven 1g.10gb instances, or as one 3g.40gb and two 2g.20gb instances, but not every possible arrangement. Changing the MIG configuration on a node requires draining all workloads from that GPU, reconfiguring the partitions, and allowing the NVIDIA GPU Operator's MIG Manager to re-register the new devices with Kubernetes. This is not a hot operation. It typically takes one to three minutes per GPU and requires advance planning.
+
+## Time-Slicing: Software-Level Sharing
+
+**Time-slicing** takes the opposite approach. Instead of physically dividing the GPU into isolated partitions, time-slicing allows multiple pods to share a single GPU by taking turns. The NVIDIA device plugin advertises a configurable number of "virtual GPUs" per physical device — you might configure a single A100 to appear as four nvidia.com/gpu resources. Four pods can then schedule onto that device, each believing it has a dedicated GPU. In reality, they share the same compute cores, the same memory, and the same bandwidth, with the GPU driver context-switching between them.
+
+The advantage is flexibility. Time-slicing works on any NVIDIA GPU that supports CUDA. There is no minimum hardware generation, no specific MIG-capable die required. You can configure the oversubscription ratio on the fly — change from four-way sharing to eight-way sharing without draining nodes or reconfiguring hardware. Workloads do not need to fit into predefined partition sizes. A model that needs fifteen gigabytes of VRAM and a model that needs five gigabytes can share a forty-gigabyte GPU through time-slicing without worrying about whether MIG supports a profile that matches.
+
+The disadvantage is that the isolation is entirely absent. Every pod sharing the GPU through time-slicing has access to the full GPU memory space. One pod's memory leak can exhaust the total VRAM and crash every other pod on the same device. Latency becomes unpredictable because a compute-heavy workload in one pod can starve the others of GPU cycles while it occupies the execution engines. There is no guaranteed bandwidth, no reserved memory, no fault isolation. If the first pod triggers a CUDA fatal error, every pod on that GPU goes down together.
+
+## When to Use MIG Versus Time-Slicing
+
+The decision between MIG and time-slicing is not a matter of preference. It is a risk and workload assessment.
+
+Use MIG when you need latency guarantees. Inference endpoints with SLAs — where the ninety-ninth percentile response time must stay below a contractual threshold — require the predictable performance that only hardware isolation can provide. Use MIG when workloads from different teams or different security contexts share the same physical GPU, because memory isolation prevents data leakage between instances. Use MIG when the cost of a shared failure exceeds the cost of slightly lower utilization — in healthcare, finance, or any domain where one endpoint crashing another is unacceptable.
+
+Use time-slicing for development and staging environments where latency predictability matters less than cost. Use it for batch inference workloads that can tolerate variable throughput. Use it for experimentation clusters where data scientists are iterating on prompts or small model variants and the workloads are lightweight and short-lived. Use it when your GPU fleet includes older hardware that does not support MIG — anything before the A100 generation.
+
+The most sophisticated operators combine both. They configure MIG on production inference nodes, carving each H100 into two or three instances that serve latency-sensitive endpoints with full isolation. Then they enable time-slicing within development clusters where the workloads are transient and the consequences of interference are low. Some organizations even time-slice within a MIG partition — dividing a 3g.40gb MIG instance into two virtual GPUs via time-slicing — to maximize density for workloads that genuinely need neither full isolation nor full compute.
+
+## The NVIDIA GPU Operator and MIG Manager
+
+Managing MIG configurations manually across a fleet of GPU nodes is a recipe for operational disaster. The **NVIDIA GPU Operator** automates the lifecycle of GPU software components — device drivers, container toolkit, device plugin, DCGM metrics exporter, and the MIG Manager — deploying and updating them as DaemonSets within Kubernetes. The MIG Manager specifically handles applying MIG configurations to nodes based on labels you define.
+
+The workflow is label-driven. You label a node with a desired MIG configuration — for example, specifying a mixed strategy with specific profiles. The MIG Manager detects the label, drains the GPU workloads on that node, reconfigures the GPU's MIG layout, re-registers the new MIG devices with the device plugin, and marks the node as ready. This process integrates with Kubernetes' native cordon-and-drain mechanics, so workloads are gracefully evicted before any reconfiguration occurs.
+
+In production, teams define two or three standard MIG configurations and assign them to node pools based on workload type. An inference-focused node pool might run a configuration optimized for many small instances — seven 1g.10gb partitions on an A100 for serving lightweight classification models. A mixed workload pool might use a combination of one 4g.40gb instance for a larger language model and three 1g.10gb instances for smaller endpoints. Standardizing these configurations, rather than allowing per-node customization, dramatically reduces operational complexity and makes capacity planning predictable.
+
+## The Economics of Sharing
+
+The financial impact of GPU sharing is not incremental. It is transformational. A single A100-80GB on-demand from a major cloud provider costs roughly two dollars per hour in early 2026 — approximately fifteen hundred dollars per month. An H100 costs roughly three to four dollars per hour. If your inference workload uses twenty percent of that GPU's capacity, you are paying the full rate for a resource that is eighty percent idle.
+
+With MIG, a single H100 can serve four to seven independent inference workloads. If each workload would otherwise require its own dedicated GPU, the savings are seventy-five to eighty-five percent of your GPU spend for those workloads. For a fleet of fifty inference GPUs running at typical utilization rates, this translates to annual savings measured in hundreds of thousands of dollars — often enough to fund the entire platform engineering team that implements the sharing.
+
+The savings come with operational investment. MIG requires planning node configurations, managing profile transitions, handling the cases where a workload outgrows its assigned partition, and monitoring utilization at the instance level rather than the device level. Time-slicing requires monitoring for memory pressure, setting memory limits that the GPU driver does not natively enforce, and accepting the blast radius when sharing fails. Neither mechanism is free. But both are dramatically cheaper than the whole-GPU-per-pod default.
+
+## Monitoring Shared GPUs
+
+Monitoring shared GPUs requires tooling that understands the sharing mechanism. NVIDIA's DCGM exporter, when configured with MIG awareness, reports utilization, memory consumption, and temperature per MIG instance rather than per physical GPU. This is critical. An aggregate GPU utilization metric of forty percent across a seven-instance MIG configuration tells you nothing useful. You need per-instance metrics to detect the one partition running at ninety-five percent while six others idle at ten percent.
+
+For time-sliced GPUs, monitoring is harder because the driver does not enforce boundaries. You need per-process GPU memory tracking, which DCGM supports through its process-level metrics. Set alerts for total memory consumption approaching the physical limit. When three pods are sharing a forty-gigabyte GPU through time-slicing and total allocated memory reaches thirty-five gigabytes, you are one unexpected allocation spike away from an out-of-memory crash that kills all three.
+
+## The Path Forward: Dynamic Resource Allocation
+
+Kubernetes 1.34 brought **Dynamic Resource Allocation** to general availability, and it changes how GPU sharing works at the orchestration layer. Rather than the static device plugin model where GPUs are advertised as countable integer resources, DRA lets drivers expose GPUs with structured attributes — memory capacity, compute capability, MIG partition status, interconnect topology. Schedulers can then match workloads to GPU resources based on requirements rather than raw counts.
+
+DRA enables scenarios that were previously impossible with the device plugin model. A workload can request "twenty gigabytes of GPU memory with compute capability 9.0 or higher" and the scheduler can satisfy that request from a MIG partition, a time-sliced share, or a whole GPU — whichever is available and cheapest. NVIDIA's DRA driver already supports this model, and as the ecosystem matures through 2026, the rigid boundary between MIG and time-slicing will increasingly be managed by the scheduler rather than by human administrators choosing configurations.
+
+---
+
+GPU sharing decides how efficiently you use individual devices. But the fleet as a whole presents a different challenge — how to organize diverse hardware generations and accelerator types into node pools that the scheduler can reason about. The next subchapter addresses the design of node pools for heterogeneous GPU infrastructure.

@@ -1,0 +1,81 @@
+# 27.59 — Checkpointing Infrastructure: Fault Tolerance for Multi-Day Training Runs
+
+A training run without checkpointing is a bet that nothing will fail for the entire duration of the job. On a 64-GPU cluster running for 72 hours, that bet loses more often than it wins. A single GPU memory error, a driver crash, a network switch reboot, a thermal throttle event, an OS kernel panic on one of eight nodes -- any of these forces the entire distributed training job to halt. Without a checkpoint, you restart from step zero. With a checkpoint, you restart from your last save point. The difference between these two outcomes is the difference between losing thirty minutes of work and losing three days of work. In dollar terms, at roughly $25 per GPU-hour for H100 instances, a 64-GPU job that loses 72 hours of progress has wasted over $115,000. A job that loses 30 minutes has wasted $800. Checkpointing is not a performance optimization. It is insurance, and on large clusters running long jobs, it is insurance you cannot afford to skip.
+
+The engineering challenge is that checkpointing is not free. It introduces what practitioners call **the Checkpoint Tax** -- the overhead in training time, storage bandwidth, and memory that the act of saving state imposes on the system. Minimizing the Checkpoint Tax while maintaining fault tolerance is one of the core infrastructure design problems for training at scale.
+
+## What a Checkpoint Contains
+
+A training checkpoint must capture every piece of state needed to resume training exactly where it stopped. Miss any one of them and the resumed job either crashes or produces subtly different results than it would have without the interruption.
+
+**Model parameters** are the obvious component. For a 70-billion-parameter model in 16-bit precision, the parameters alone are approximately 140 gigabytes. But in a distributed training setup using FSDP or DeepSpeed ZeRO-3, each GPU holds only a shard of the parameters. The checkpoint must either gather all shards into a single consolidated file or save each shard separately and record which shard belongs to which GPU rank. The consolidated approach produces a checkpoint that can be loaded on any number of GPUs. The sharded approach is faster to save but requires the same number of GPUs and the same sharding configuration to restore.
+
+**Optimizer state** is typically the largest component. For the Adam optimizer, the standard for transformer training, each parameter has two additional state tensors: the first moment estimate and the second moment estimate. That means the optimizer state is twice the size of the model parameters -- roughly 280 gigabytes for a 70B model. Some optimizers like Adafactor reduce this, but Adam remains dominant, and its state must be checkpointed in full.
+
+**Gradient state** is less commonly saved because gradients are recomputed on each training step. However, if your training configuration accumulates gradients across multiple micro-steps before performing an optimizer update, and the failure occurs mid-accumulation, the accumulated partial gradients should be checkpointed to avoid redoing the accumulation steps.
+
+**Learning rate scheduler state** records where in the training schedule the job currently sits -- which warm-up phase, which decay phase, what the current learning rate is. Without this, the resumed job may apply the wrong learning rate, which can destabilize training or subtly degrade the final model quality.
+
+**Data loader position** records which training examples have been processed and which remain. Without this, the resumed job may either skip data, creating gaps in the training distribution, or repeat data, creating bias toward the examples that happened to be near the checkpoint boundary. For shuffled data loaders, this means saving the random seed and the current index into the shuffled order.
+
+**Random number generator states** must be saved for every GPU, for both the GPU's random state and the CPU's random state. Dropout layers, data augmentation, and stochastic rounding all depend on random numbers. If these states are not restored, the resumed job follows a different random trajectory than the original would have. Whether this matters depends on your reproducibility requirements, but for regulated industries or published research, exact reproducibility is non-negotiable.
+
+The total checkpoint size for a 70B model is typically 500 gigabytes to 1 terabyte, depending on optimizer choice and what optional state is included. For larger models, checkpoints can exceed several terabytes. These are not small files being quietly written in the background. They are massive data transfers that demand dedicated infrastructure.
+
+## Checkpoint Frequency: The Cost-Risk Tradeoff
+
+How often should you checkpoint? The question is a direct tradeoff between risk and overhead.
+
+Checkpoint every 5 minutes and you lose at most 5 minutes of work on failure. But if each checkpoint write takes 3 minutes, you are spending 37 percent of your training time writing checkpoints instead of training. Checkpoint every 4 hours and the overhead drops to negligible, but a failure at hour 3.5 costs you 3.5 hours of wasted GPU time.
+
+The optimal frequency depends on two factors: the checkpoint write time and the failure rate of your cluster. For a cluster with a mean time between failures of 24 hours -- realistic for a 64-GPU setup when you account for all failure modes including software crashes, not just hardware faults -- and a checkpoint write time of 5 minutes, the expected wasted compute from a failure is half the checkpoint interval. At a 60-minute interval, you lose an expected 30 minutes per failure. At a 30-minute interval, you lose 15 minutes. Going from 60-minute to 30-minute intervals doubles the checkpoint overhead from roughly 8 percent to 16 percent of training time, but halves the expected loss from each failure. Which is cheaper depends on your per-GPU-hour cost and your failure rate.
+
+The practical standard in 2026 for large training runs is checkpointing every 30 to 60 minutes, with the exact interval tuned to the cluster's observed reliability. New clusters with unproven hardware checkpoint more frequently. Established clusters with proven reliability can space checkpoints further apart. And critically: every checkpoint interval should be reviewed after the cluster's failure rate becomes statistically clear, not set once and forgotten.
+
+## The Checkpoint Tax: Where the Time Goes
+
+Writing a 500-gigabyte to 1-terabyte checkpoint is a storage I/O event that competes with training for system resources. Understanding where the time goes reveals where to optimize.
+
+**Phase 1: Gathering state.** In a distributed setup, the checkpoint process must first collect the sharded model state onto the nodes that will write it. In FSDP, each GPU holds a shard of each parameter. Writing a consolidated checkpoint requires an all-gather operation to reconstruct the full parameters on one or more writer nodes. This all-gather competes for the same network bandwidth that training uses for gradient synchronization. Alternatively, each GPU writes its own shard independently, which avoids the all-gather but produces a distributed checkpoint that requires the same topology to restore.
+
+**Phase 2: Writing to storage.** The gathered state must be serialized and written to durable storage. If that storage is a shared filesystem like Lustre, GPFS, or a cloud-managed NFS, the write throughput is limited by the filesystem's bandwidth and by contention from other jobs writing simultaneously. If that storage is local NVMe on each node, the write is fast -- multiple gigabytes per second per node -- but the data is not durable against node failure. If that storage is cloud object storage like S3 or GCS, the write must traverse the network to the storage service, adding latency and bandwidth constraints.
+
+**Phase 3: Verification.** A written checkpoint must be verified before the previous checkpoint is deleted. This means at minimum a size check and ideally a checksum validation. Skipping verification saves a few seconds but risks discovering corruption only when you need to restore, at which point both the current and the previous checkpoints may be unusable.
+
+On a naive implementation -- synchronous, consolidated checkpoint written to a shared filesystem -- these three phases execute sequentially, blocking training for the entire duration. A 500-gigabyte checkpoint written at 2 gigabytes per second takes over 4 minutes just for the write phase. Add gathering and verification, and training blocks for 5 to 8 minutes per checkpoint. At 30-minute intervals, that is 16 to 26 percent of total training time consumed by checkpointing. This is the Checkpoint Tax at its most expensive.
+
+## Asynchronous Checkpointing: Hiding the Tax
+
+The single most impactful optimization for reducing the Checkpoint Tax is **asynchronous checkpointing** -- decoupling the checkpoint write from the training loop so that GPUs resume training while the checkpoint data is written in the background.
+
+The mechanism works in two phases. In Phase 1, the checkpoint data is copied from GPU memory to CPU memory. This is a GPU-to-host transfer that takes a fraction of a second for each GPU's shard, because modern PCIe Gen 5 links provide over 60 gigabytes per second. Training blocks only for this brief transfer. In Phase 2, the data that now resides in CPU memory is written to durable storage by background CPU threads or a separate process. Training continues on the GPUs with no further interruption.
+
+PyTorch's Distributed Checkpoint module added native support for asynchronous saving in 2025, and a major improvement shipped in early 2026 that addressed a subtle but significant performance problem. The original implementation used background threads for Phase 2, but Python's Global Interpreter Lock meant that the background threads competed with the training process for GIL access, causing stalls in the training loop even though the GPU was not directly involved. The fix moved Phase 2 into a separate process with its own Python interpreter, eliminating GIL contention entirely. With this fix, training blocked for less than one second during GPU-to-CPU transfer, and the subsequent multi-minute write to storage happened in a completely independent process with zero impact on training throughput.
+
+The tradeoff of asynchronous checkpointing is memory. During Phase 2, the checkpoint data resides in CPU memory while also still being present in GPU memory as the live training state. This effectively doubles the CPU memory requirement during the checkpoint window. For a 70B model shard of 60 to 80 gigabytes per node, you need that much free CPU RAM to hold the checkpoint copy. On nodes with 512 gigabytes or more of system memory, this is rarely a problem. On nodes with constrained CPU memory, you may need to reduce the per-node shard size or write checkpoints in stages.
+
+## Checkpoint Storage Tiers
+
+Where you store checkpoints affects both performance and durability. Three storage tiers serve different purposes.
+
+**Local NVMe** on each training node provides the fastest write speed -- 5 to 10 gigabytes per second per drive, with modern servers having multiple drives. Writing a shard to local NVMe takes seconds. The limitation is durability: if the node fails, the local checkpoint is lost. Local NVMe is the right first destination for asynchronous checkpoints. Write fast, resume training, then copy to durable storage in the background.
+
+**Shared filesystems** like Lustre, GPFS, or cloud-managed equivalents provide durability and accessibility from any node in the cluster. Write speeds are typically 2 to 10 gigabytes per second depending on configuration and contention. Shared filesystems are the right tier for the checkpoint that you will actually restore from, because any node can read it. The best practice is to asynchronously copy from local NVMe to the shared filesystem after each checkpoint, keeping at least the two most recent checkpoints available.
+
+**Object storage** like S3, GCS, or Azure Blob provides the cheapest long-term storage and the highest durability. Write speeds are adequate but not fast -- typically limited by network bandwidth rather than storage throughput. Object storage is the right tier for archival -- keeping every Nth checkpoint for long-term reproducibility, disaster recovery, or regulatory compliance. You do not restore from object storage during a normal training resumption. You restore from it when the shared filesystem itself has a problem.
+
+The three-tier approach -- write to local NVMe, async copy to shared filesystem, periodically archive to object storage -- gives you speed, durability, and cost efficiency. Each tier handles a different failure scenario: local NVMe handles the common case of training resumption on the same nodes, shared filesystem handles node failure and rescheduling to different nodes, and object storage handles the catastrophic case of filesystem corruption or cluster-wide failure.
+
+## Checkpoint Management at Scale
+
+A 70B model checkpointed every 30 minutes for a 72-hour training run produces 144 checkpoints, each around 500 gigabytes to 1 terabyte. That is 72 to 144 terabytes of checkpoint data from a single training run. Multiply by multiple concurrent training runs, and checkpoint storage quickly dominates your storage infrastructure costs.
+
+**Checkpoint pruning** is essential. Keep the most recent N checkpoints on shared storage, where N is typically 3 to 5 -- enough to handle cascading failures where the most recent checkpoint is itself corrupted. Archive every Mth checkpoint to object storage, where M is typically every 10th or 20th checkpoint. Delete everything else. A well-configured pruning policy reduces storage from 144 terabytes per run to under 5 terabytes on shared storage, plus a few terabytes in object storage for the archived subset.
+
+**Checkpoint indexing** tracks which checkpoints exist, where they are stored, which training job produced them, and what training step they correspond to. This index is a small metadata file or database entry, but its absence creates surprising operational pain. When a job needs to resume, the system must find the most recent valid checkpoint for that specific job, on the correct storage tier, with the correct sharding configuration. Without an index, this becomes a manual search through a filesystem with hundreds of checkpoint directories named by timestamp.
+
+**Validation before resumption** catches corrupted checkpoints before they waste GPU time. At minimum, verify that every expected file exists and has the expected size. For higher assurance, compute checksums at write time and verify them before loading. A checkpoint that loads successfully but contains corrupted optimizer state will not crash -- it will silently produce a model that diverges from its expected training trajectory, producing degraded results that may not be detectable until the training run completes and the final evaluation reveals unexplained quality regression. That failure mode is more expensive than a crash, because the crash at least tells you something went wrong.
+
+---
+
+Checkpointing saves the state. But what happens when the saved state is wrong? The next subchapter examines checkpoint integrity and corruption detection -- the validation systems that ensure the checkpoint you trust actually contains what it should.

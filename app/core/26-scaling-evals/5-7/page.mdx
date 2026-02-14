@@ -1,0 +1,99 @@
+# 5.7 — Eval-as-Code and CI/CD Integration: Tiered Eval Gates from Pull Request to Production
+
+If your evaluation definitions don't live in the same repository as your application code, they will drift apart. This is not a theoretical risk. It is the default outcome. The prompt engineer updates a system prompt on Tuesday. The eval criteria that measure that prompt's quality sit in a separate spreadsheet, a separate dashboard, or a separate tool that nobody remembers to touch. By Friday the system prompt has changed twice more, and the evaluation criteria are measuring a product that no longer exists. The drift is invisible until someone notices that the eval suite gives high marks to outputs that users are complaining about. By then, the credibility of the eval system is damaged, and rebuilding trust takes longer than rebuilding the evals.
+
+**Eval-as-code** is the principle that evaluation definitions — criteria, judge prompts, golden set references, scoring thresholds, sampling configurations — are stored as configuration files in the same repository as the application code, subject to the same version control, the same code review process, and the same deployment pipeline. When a developer changes a system prompt, the pull request includes the updated eval criteria. When a product manager adds a new use case, the pull request includes the new golden set examples. When an eval engineer tightens a quality threshold, the change is reviewed by the same team that will be held accountable when the threshold blocks a release.
+
+This is not a nice-to-have. By 2026, teams running evaluation outside their code repository are running evaluation on borrowed time. The separation creates a class of bugs that are nearly impossible to diagnose: the model seems fine by all metrics, but users are unhappy, and the root cause is that "all metrics" are measuring an outdated version of the product.
+
+## Why Eval-as-Code Changes Everything
+
+The immediate benefit is auditability. When eval definitions live in version control, every change to a scoring criterion, every adjustment to a pass threshold, every modification to a judge prompt is tracked with a timestamp, an author, and a review trail. When someone asks "why did our quality score jump by four points last month?" the answer is in the commit history. Without version control, the answer is usually "someone changed something somewhere, and nobody documented it."
+
+The deeper benefit is co-evolution. Your application code and your evaluation criteria must evolve together because they describe the same system from different perspectives. The application code defines what the system does. The evaluation criteria define what "doing it well" means. When these two definitions evolve at different rates, the result is an evaluation system that measures the wrong things. Eval-as-code enforces synchronization by making it mechanically impossible to merge a code change without considering the corresponding eval change.
+
+The third benefit is reproducibility. When eval definitions are code, any historical version of the evaluation suite can be reconstructed from the commit history. You can answer questions like "what were our eval criteria three months ago?" and "how would today's model score against last quarter's evaluation suite?" These questions are unanswerable when eval definitions live in spreadsheets, dashboards, or the memories of the team members who built them.
+
+## The Anatomy of an Eval Configuration
+
+An eval configuration file contains everything the eval pipeline needs to evaluate a single dimension of quality. It is not code — it is structured configuration that the eval pipeline reads and executes. The specific format varies by team, but the essential components are consistent.
+
+The first component is the evaluation type: whether this is an LLM judge evaluation, a heuristic check, a reference-based comparison, or a human review trigger. The type determines which eval pipeline stage processes this configuration.
+
+The second component is the judge specification — which model to use for LLM judge evaluations, which version, and what temperature setting. Pinning the judge model version is critical. If your judge prompt is calibrated against Claude Opus 4.5 and the pipeline silently upgrades to Claude Opus 4.6, your scores may shift even though nothing about your product changed. The judge model version is part of the eval definition, not an infrastructure detail.
+
+The third component is the judge prompt itself — the full prompt template that instructs the judge model on how to evaluate the output. This prompt is the heart of the evaluation. It defines the scoring rubric, the criteria for each score level, the expected output format, and any context the judge needs. Storing this prompt in version control means it gets reviewed by the same team that reviews the system prompts it evaluates. Changes to the judge prompt are visible in the pull request diff, just like changes to application logic.
+
+The fourth component is the pass threshold — the minimum score an output must achieve to be considered acceptable. Thresholds are not static. They change as the product matures, as user expectations evolve, and as model capabilities improve. When a threshold changes, the commit message should explain why: "Raised relevance threshold from 3.5 to 4.0 because the new model is capable of higher quality and users now expect it."
+
+The fifth component is the golden set reference — a pointer to the specific versioned golden set that this evaluation should use for offline regression testing. The golden set itself may live in a separate data store for size reasons, but the configuration file points to a specific version, ensuring that the eval definition and the test data are locked together.
+
+## The Tiered Eval Gate Model
+
+Not every evaluation runs at every stage. The entire point of tiered evaluation is to match the depth and cost of evaluation to the risk and urgency of the deployment stage. Running your full eval suite on every pull request would make development impossibly slow. Running only a smoke test before production would make deployment recklessly fast.
+
+**Tier one is the pull request gate.** This runs when a developer opens or updates a pull request. The eval must complete in under five minutes — any longer and developers will find ways to bypass it, and the gate becomes decoration. The pull request gate runs three types of checks. First, format validation: do all eval configuration files parse correctly? Are the referenced golden sets accessible? Are the judge prompts well-formed? Second, a fast regression check against a small subset of the golden set — typically fifty to one hundred examples, chosen to cover the most critical quality dimensions. Third, safety smoke tests: a handful of adversarial inputs that verify the model doesn't produce obviously harmful outputs. If any of these checks fail, the pull request cannot merge. The developer sees the failure in their pull request review, fixes the issue, and pushes again.
+
+The pull request gate is about catching obvious regressions and broken configurations, not about comprehensive quality assessment. Its speed is more important than its depth. A five-minute gate that catches eighty percent of regressions is more valuable than a sixty-minute gate that catches ninety-five percent, because the sixty-minute gate will be disabled within a month by frustrated developers.
+
+**Tier two is the staging gate.** This runs after the pull request merges but before the code reaches production — typically in a staging or pre-production environment. The staging gate runs the full golden set evaluation across all quality dimensions. It may take thirty to sixty minutes, which is acceptable because staging deployments don't happen with the frequency of pull requests. The staging gate also runs adversarial evaluation — the full red-team test suite rather than just the smoke test subset. And it runs cross-dimension analysis: checking not just whether individual metrics pass their thresholds but whether the overall quality profile is consistent with the previous release.
+
+The staging gate is where most quality regressions are caught. The full golden set provides coverage that the pull request subset cannot. The adversarial suite tests edge cases that smoke tests miss. The cross-dimension analysis detects trade-offs — cases where improving one metric degraded another, which individual threshold checks won't surface.
+
+**Tier three is the production gate.** This is the progressive rollout evaluation covered in Chapter 4. After the staging gate passes, the new version enters canary deployment. Production traffic is evaluated in real time using the online evaluation pipeline. The production gate doesn't use golden sets — it uses sampled live traffic. The eval criteria are the same ones defined in the eval configuration files, but the inputs are real users rather than test cases. If the canary evaluation shows quality degradation beyond the defined tolerance, the rollout pauses automatically. If the canary period passes without degradation, traffic gradually shifts to the new version.
+
+The three tiers form a funnel. The pull request gate is fast and cheap but shallow. The staging gate is thorough but slower. The production gate is the ultimate test but happens on real users at limited scale. Each tier catches problems that the previous tier missed, and each tier accepts a higher cost in exchange for deeper coverage.
+
+## Solving the Eval-Slower-Than-Release Problem
+
+The most common objection to eval-as-code is speed. "Our eval suite takes two hours. We release four times a day. We can't block every release on a two-hour eval." This objection is valid if you run the same evaluation at every stage. It dissolves when you implement tiered gates.
+
+The **eval-slower-than-release anti-pattern** occurs when the evaluation cycle takes longer than the release cycle, forcing teams to either block releases on slow evals (destroying velocity) or skip evals on some releases (destroying quality assurance). Both outcomes are bad. The team that blocks on slow evals eventually removes the gate. The team that skips evals eventually ships a regression.
+
+Tiered evaluation breaks the problem by distributing evaluation across the development lifecycle. The pull request gate runs in five minutes — it never blocks development. The staging gate runs in thirty to sixty minutes — it blocks deployment but not development. The production gate runs continuously — it never blocks anything but can automatically halt a rollout.
+
+The total evaluation time across all three tiers might still be two hours. But no single tier takes two hours. The developer experiences a five-minute check. The release engineer experiences a thirty-minute check. The production system experiences continuous monitoring. Each person in the chain waits only as long as their tier requires.
+
+The key design principle is that each tier must produce a clear pass or fail decision within its time budget. The pull request gate doesn't produce a partial result that someone needs to interpret. It passes or fails. The staging gate doesn't produce a dashboard that someone needs to review. It passes or fails. When the decision is binary and the time is bounded, the gate is sustainable. When the decision requires human judgment or the time is unbounded, the gate will be bypassed.
+
+## The Eval Change Review Process
+
+When eval definitions are code, they go through code review. This creates a new category of review that most engineering teams haven't practiced: evaluating changes to evaluation criteria.
+
+A good eval change review asks three questions. First, does the change reflect a genuine shift in quality expectations, or is it an attempt to make a failing model pass by loosening the criteria? This is the most important question. Lowering a threshold from 4.0 to 3.5 is legitimate if user research shows that a 3.5 is acceptable. It is professional negligence if the threshold was lowered because the new model can't hit 4.0 and the team doesn't want to block the release.
+
+Second, does the change maintain backward compatibility? If you add a new scoring dimension, do existing evaluations still pass? If you change a judge prompt, have you validated that the new prompt produces scores consistent with the old prompt on the existing golden set? Changing an eval criteria and simultaneously running it on a new golden set makes it impossible to separate "the criteria changed" from "the test data changed."
+
+Third, does the change have a clear rationale in the commit message? Eval criteria changes affect every future release. A commit message that says "update eval config" is useless to the future developer who needs to understand why the threshold changed. A commit message that says "raise safety threshold from 0.85 to 0.92 after Q3 red-team audit identified gaps at the old threshold level" is an organizational asset.
+
+The review process should include at least one reviewer who understands the eval system and at least one who understands the product. The eval engineer validates that the change is technically sound — the configuration parses, the judge prompt is well-formed, the threshold is calibrated. The product owner validates that the change reflects actual quality expectations — the criteria match what users care about, the threshold reflects the quality bar the business has committed to.
+
+## Eval Configuration Ownership
+
+Every eval configuration file needs an owner. Not a team — a person. The owner is responsible for keeping the criteria current, reviewing changes proposed by others, and defending the quality bar against pressure to lower it during tight release cycles.
+
+In practice, ownership usually maps to product areas. The eval configurations for the summarization feature are owned by the engineer who leads summarization quality. The configurations for safety evaluation are owned by the trust and safety lead. The configurations for the customer support bot are owned by the product manager for customer support, with the eval engineer as a required reviewer.
+
+Ownership prevents two failure modes. The first is the abandoned eval — a configuration that was created during initial development and never updated. Without an owner, nobody feels responsible for keeping it current. The criteria drift behind the product, and the eval becomes a historical artifact that passes every model because it's measuring against obsolete expectations. The second is the contested eval — a configuration that two teams want to change in contradictory directions. The product team wants to lower the threshold to ship faster. The quality team wants to raise it. Without a clear owner who makes the final call, the change sits in limbo until someone with enough authority forces a decision.
+
+## Connecting Eval-as-Code to the Deployment Pipeline
+
+The eval configuration files define what to evaluate and what thresholds to enforce. The deployment pipeline reads those files and executes the evaluations at the appropriate tier. The connection between the two must be automatic and reliable.
+
+In practice, this means the CI system is configured to trigger the right tier of evaluation at the right stage. When a pull request is opened, the CI system reads the eval configuration files, identifies the pull request tier checks, runs them against the small golden set subset, and reports pass or fail in the pull request interface. When code merges to the main branch and deploys to staging, the CI system triggers the staging tier checks. When the staging deployment is healthy, the deployment pipeline triggers the production canary with its associated production tier evaluation.
+
+The critical design constraint is that eval configuration files must be the single source of truth. The CI system should not have its own separate list of evaluations to run. The deployment pipeline should not have hardcoded thresholds that override the eval configuration. If the eval configuration says the safety threshold is 0.92, the pipeline enforces 0.92 — not some different number from a pipeline configuration file that was set once and never updated.
+
+When the eval configuration is the single source of truth, changing a threshold is a single-file edit that flows automatically to every tier. When multiple systems maintain their own copies of eval criteria, changes require updates in multiple places, and the inevitable inconsistency creates the exact drift that eval-as-code was designed to prevent.
+
+## When Eval-as-Code Breaks Down
+
+Eval-as-code is not without limitations. The most significant is the tension between eval configuration and eval data. The configuration file can reference a golden set by version, but the golden set itself — potentially thousands of examples with human labels — doesn't fit naturally in a code repository. Large binary files in Git repositories cause performance problems. The standard solution is to store golden sets in a separate data store and reference them by version identifier in the eval configuration. This works but introduces a dependency: the eval configuration file says "use golden set v17," but the actual golden set lives in a different system with its own access controls, its own versioning, and its own failure modes.
+
+The second limitation is judge prompt length. A well-designed judge prompt can be several hundred lines long — context instructions, scoring rubric, example evaluations, format specifications. This prompt is a critical part of the eval definition and belongs in version control. But reviewing a three-hundred-line judge prompt change in a pull request is difficult. Most code review tools are optimized for reviewing code changes, not for reviewing natural language prompt changes. Teams need to develop review practices specific to prompt changes — reading the prompt end to end rather than just the diff, running calibration tests on the new prompt before approving the change.
+
+The third limitation is organizational. Eval-as-code requires that everyone who changes application behavior also considers evaluation impact. For teams where evaluation is a separate function — a quality team that operates independently from the development team — this co-location is culturally difficult. It requires that the quality team participate in code reviews and that the development team understand eval criteria well enough to update them. The technical mechanism is simple. The organizational change is the harder part.
+
+Despite these limitations, eval-as-code is the foundation that makes tiered CI/CD evaluation gates possible. Without version-controlled eval definitions, you cannot automate evaluation at the pull request, staging, or production level. With them, evaluation becomes as natural and as automatic as unit testing — something that runs on every change, catches problems early, and gives the team confidence that what ships to production has been measured against a known quality bar.
+
+CI/CD integration works when everything runs smoothly — when the eval pipeline processes every request, the judges return scores, and the gates make clean pass or fail decisions. The next subchapter covers what happens when things break: retries, dead letter queues, partial failures, and the recovery strategies that keep your eval pipeline reliable at scale.

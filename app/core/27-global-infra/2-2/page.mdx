@@ -1,0 +1,79 @@
+# 27.10 — GPU Device Management: From Device Plugins to Dynamic Resource Allocation
+
+The way Kubernetes sees a GPU determines everything about how well it can schedule GPU workloads. If the scheduler knows only that a node has "four GPUs," it will make scheduling decisions that waste capacity, misplace workloads, and create performance cliffs that your monitoring will struggle to explain. If the scheduler knows that a node has two H100-80GB GPUs connected via NVLink on the first socket and two A100-40GB GPUs on the second socket with PCIe interconnect, it can place a distributed training job on the NVLink pair and an inference workload on the A100s — simultaneously maximizing performance and utilization. The journey from the first model to the second spans nearly eight years of Kubernetes evolution, and understanding each phase is essential because your cluster almost certainly contains artifacts from all of them.
+
+## Phase One: The Device Plugin Model
+
+The NVIDIA device plugin, released in 2017, was the first mechanism for exposing GPUs to the Kubernetes scheduler. Its design reflects the constraints and assumptions of its era. The device plugin registers GPUs as an **extended resource** under the name nvidia.com/gpu. Each GPU on a node increments a counter. When a pod requests nvidia.com/gpu with a value of two, the scheduler looks for a node with at least two available units of that resource and assigns the pod there. The kubelet on the node then calls the device plugin to allocate specific GPU devices to the pod's container — setting environment variables and device mounts so the container runtime maps the correct physical GPUs into the container's namespace.
+
+This model is simple and it works. For a single-GPU inference workload on a cluster with one type of GPU, it is sufficient. The problem is that a counter tells the scheduler almost nothing about the resources it is counting. Two nvidia.com/gpu units on Node A might be H100s with 80 gigabytes of memory each. Two nvidia.com/gpu units on Node B might be T4s with 16 gigabytes. The scheduler treats them identically. It has no concept of GPU memory, compute capability, driver version, interconnect topology, or any other characteristic that determines whether a workload will actually run successfully on the allocated hardware. If your training job needs 70 gigabytes of GPU memory and lands on a T4 node, it will crash with an out-of-memory error after the scheduler confidently reports a successful scheduling decision.
+
+The device plugin API also provides no mechanism for partial GPU allocation. Each GPU is an indivisible unit. You cannot request half a GPU, a quarter of a GPU, or a specific amount of GPU memory. A lightweight inference model that needs two gigabytes of GPU memory consumes an entire device — 80 gigabytes on an H100 — because the abstraction has no concept of fractions. At twenty dollars per GPU-hour for H100 instances, that waste compounds into serious cost when multiplied across dozens of small models.
+
+## Phase Two: The Label and Selector Workaround
+
+Platform teams responded to the device plugin's limitations with the tools Kubernetes already provided — node labels and pod node selectors. The NVIDIA GPU Feature Discovery daemon, which ships as part of the GPU Operator, automatically labels each node with detailed GPU information: model name, memory capacity, CUDA compute capability, driver version, and MIG capability. A node might carry labels like nvidia.com/gpu.product equal to NVIDIA-H100-80GB-HBM3, nvidia.com/gpu.memory equal to 81920, and nvidia.com/cuda.driver.major equal to 560.
+
+With these labels in place, workloads can use nodeSelector or nodeAffinity rules to target specific hardware. A training job that requires H100s with 80 gigabytes adds a node selector for the appropriate product label. An inference workload that can run on any GPU with at least 40 gigabytes of memory uses a node affinity expression matching multiple product labels.
+
+This approach works, and in 2026 it remains the most common pattern in production clusters. But it has significant operational costs. The labels are strings, not structured data, so there is no native way to express "any GPU with at least 40 gigabytes of memory" as a single constraint — you must enumerate every GPU product that meets the threshold. When your cluster adds a new GPU type, you must update every workload selector that should match the new hardware. If a team misspells a label value — NVIDIA-H100-80GB versus NVIDIA-H100-80GB-HBM3 — the pod silently fails to schedule and sits pending with no useful error message. The labels carry no schema, no validation, and no documentation beyond what your platform team maintains internally.
+
+The deeper problem is that this approach pushes hardware awareness into the workload specification. Every team that writes a deployment manifest must understand your cluster's hardware inventory and encode that understanding into their YAML. When the hardware changes — when you add H200s, when you retire A100-40GBs, when you introduce AMD MI300X nodes — every team must update their selectors. The platform team becomes a bottleneck for hardware transitions because every workload manifest is coupled to specific hardware labels.
+
+## Phase Three: Dynamic Resource Allocation
+
+**Dynamic Resource Allocation**, or DRA, reached general availability in Kubernetes 1.34 in September 2025. It represents a fundamental rethinking of how Kubernetes handles specialized hardware. Instead of a counter-based model where you request a quantity and hope for the best, DRA introduces a claim-based model where you describe what you need and the scheduler matches your requirements against what the cluster offers.
+
+The DRA model has three core primitives. A **ResourceClaim** is a workload's declaration of what it needs — not "two GPUs" but "two GPUs with at least 80 gigabytes of memory each, CUDA 12 compatibility, and a specific driver version." A **ResourceSlice** is a node's declaration of what it offers — published by a DRA driver that runs on each node and understands the local hardware in detail. A **DeviceClass** is a cluster-wide template that defines standard device configurations, allowing platform teams to create named classes like "training-gpu" or "inference-gpu" that encode hardware requirements once and reference them everywhere.
+
+The scheduling flow changes significantly with DRA. When the scheduler evaluates a pod with a ResourceClaim, it does not simply check a counter. It examines the structured parameters in the claim and matches them against the structured attributes in available ResourceSlices. The matching is semantic — the scheduler understands that a claim for "80 gigabytes of GPU memory" is satisfied by a node offering an H100-80GB or an H200-141GB but not by a node offering an A100-40GB. This semantic matching eliminates the enumeration problem that plagued the label-based approach. A claim that requests "at least 80 gigabytes of memory" automatically matches any current or future GPU that meets the threshold, without listing specific product names.
+
+Kubernetes 1.34 also introduced a **prioritized list** feature within DRA. A workload can specify a preference order — "ideally one H100, but two A100-80GBs would also work, and in the worst case four A100-40GBs." The scheduler attempts to satisfy each alternative in order, giving the workload the best available option without requiring manual intervention when the preferred hardware is unavailable. This is a significant improvement for clusters with heterogeneous hardware, where rigid requirements lead to scheduling failures even when the cluster has sufficient total capacity to run the workload on alternative hardware.
+
+## The ResourceClaim Lifecycle
+
+Understanding the lifecycle of a ResourceClaim is important for platform teams because it differs from how standard Kubernetes resource requests work.
+
+When a pod references a ResourceClaim, the scheduler first determines whether the claim can be satisfied by any node in the cluster. If no node offers hardware matching the claim's parameters, the pod enters a pending state with a clear reason — not "insufficient resources" but a specific indication of which claim parameters could not be matched. This specificity is a major improvement over the device plugin model, where pending pods provided almost no diagnostic information about why scheduling failed.
+
+Once the scheduler identifies a node that can satisfy the claim, it allocates specific devices on that node. The allocation is recorded in the ResourceClaim's status, creating an audit trail of which physical devices were assigned. The DRA driver on the node then prepares the devices — configuring driver settings, setting up isolation boundaries, and mounting the devices into the pod's container. When the pod terminates, the devices are deallocated and returned to the pool.
+
+ResourceClaims can also be pre-allocated — created and allocated before the pod that will use them exists. This is useful for workloads that need guaranteed access to specific hardware. A team running a long-lived inference endpoint can pre-allocate a ResourceClaim for a specific GPU type, ensuring that even if the endpoint restarts, it returns to the same class of hardware without competing with other workloads during the scheduling decision.
+
+## The NVIDIA GPU Operator and DRA Integration
+
+The NVIDIA GPU Operator has been the primary tool for managing GPU software on Kubernetes nodes since its initial release, and its role expanded significantly with DRA support. Starting with GPU Operator version 24.6 and continuing through the v25.x releases, the operator includes a DRA driver that publishes detailed ResourceSlices for every GPU on a managed node. Each ResourceSlice contains structured attributes — GPU model, memory capacity, CUDA compute capability, driver version, MIG capability, interconnect topology, and thermal status.
+
+The GPU Operator's DRA driver also handles the device preparation phase of the ResourceClaim lifecycle. When the scheduler allocates a GPU to a pod, the DRA driver configures the device — setting the compute mode, configuring MIG partitions if requested, verifying driver compatibility, and mounting the device into the container. This replaces the device plugin's simpler allocation mechanism with a richer preparation step that can validate compatibility before the workload starts.
+
+For platform teams, the practical impact is that the GPU Operator becomes the single component responsible for both hardware lifecycle management and scheduling integration. Driver updates, device discovery, health monitoring, and DRA resource publishing are all managed by one operator with a unified configuration. This consolidation simplifies operations compared to the previous model where the device plugin, GPU Feature Discovery, and the container toolkit were separate components that had to be kept in sync.
+
+## What DRA Changes for Platform Teams
+
+The shift from device plugins to DRA changes the operational model for GPU management in several concrete ways.
+
+First, hardware transitions become smoother. When you add a new GPU type to your cluster, the DRA driver automatically publishes ResourceSlices with the new hardware's attributes. Workloads with claims that match those attributes will automatically schedule onto the new hardware. You do not need to update workload manifests, add new node selectors, or notify application teams. The claim-based model decouples workload requirements from hardware inventory.
+
+Second, scheduling failures become diagnosable. The structured parameters in ResourceClaims produce specific, actionable failure messages. "No node offers a GPU with at least 80 gigabytes of memory and CUDA 12 compatibility" tells a platform engineer exactly what is missing. "Insufficient nvidia.com/gpu" tells them nothing.
+
+Third, resource efficiency improves. DRA supports partial device allocation for GPUs that offer partitioning — a claim can request a specific MIG slice rather than a full GPU. Combined with the prioritized list feature, workloads can express preferences that maximize utilization: "give me a full H100 if available, otherwise a 40-gigabyte MIG partition on a shared H100." The scheduler satisfies the preference without human intervention.
+
+Fourth, multi-vendor hardware becomes manageable. DRA is not NVIDIA-specific. AMD, Intel, and other hardware vendors can implement DRA drivers that publish ResourceSlices for their accelerators. A workload claim that requests "40 gigabytes of accelerator memory with FP16 support" can be satisfied by an NVIDIA A100, an AMD MI300X, or any future accelerator that meets the specification. This vendor-neutral abstraction reduces lock-in and gives platform teams the flexibility to deploy the most cost-effective hardware for each workload profile.
+
+## Migration Path: Device Plugins to DRA
+
+Most production clusters in 2026 run a hybrid model. Existing workloads use the device plugin with label-based selectors. New workloads use DRA ResourceClaims. The GPU Operator supports both simultaneously — it runs the device plugin for backward compatibility and the DRA driver for new workloads on the same nodes. This coexistence is by design, and the Kubernetes project has made clear that device plugins will remain supported for the foreseeable future.
+
+The migration path for platform teams is gradual. Start by deploying the DRA driver alongside your existing device plugin. Create DeviceClass definitions that match your cluster's hardware profiles — a training class, an inference class, an experimentation class. Then, as teams update their workloads, encourage them to adopt ResourceClaims instead of device plugin requests with node selectors. The benefit is immediate: better scheduling decisions, clearer failure messages, and automatic adaptation to hardware changes.
+
+Do not attempt a forced migration. Workloads that function correctly with the device plugin model will continue to function correctly. The migration to DRA should be driven by the tangible benefits — better scheduling, vendor flexibility, partial allocation — not by a mandate to adopt the latest API.
+
+## Where DRA Is Heading
+
+Kubernetes 1.35, released in December 2025, expanded DRA with several features relevant to AI platforms. DRA is now stable and enabled by default, meaning new clusters get it without opting in. The ResourceSlice model gained support for network topology attributes, allowing claims to express requirements about GPU interconnect — "these two GPUs must be on the same NVLink domain" — which is critical for distributed training performance. Admin access policies were added to control which users and namespaces can claim which device classes, providing a security boundary around expensive hardware.
+
+The 2026 roadmap includes further extensions for dynamic partitioning — allowing a physical GPU to be split into multiple ResourceSlices that can be independently allocated — and for cross-node claims that describe multi-node hardware requirements for distributed workloads. These features will address the remaining gap between DRA and the scheduling intelligence that custom schedulers like KAI Scheduler provide today.
+
+---
+
+With device management established — how GPUs are discovered, described, and allocated to workloads — the next challenge is what happens before scheduling: how workloads queue, how teams share finite GPU capacity fairly, and how the platform prevents the chaos that erupts when dozens of teams compete for the same hardware pool without coordination.

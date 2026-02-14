@@ -1,0 +1,123 @@
+# 6.7 — Query Language Detection and Routing
+
+**The Language Guess Pattern** is the most common and most avoidable failure in multilingual retrieval pipelines. It works like this: instead of detecting the language of the actual query text, the system guesses the language from proxy signals -- the user's browser locale, their account settings, the country of their IP address, the language of the interface they are using. A Japanese executive using a US-configured laptop with English browser settings types a query in Japanese. The system sees the English locale and routes the query to the English retrieval pipeline. The English pipeline receives Japanese text, the embedding model encodes it as if it were English, the sparse retrieval finds no matching English keywords, and the results are garbage. The user sees irrelevant English documents, types the query again, gets the same results, and concludes the search system does not work.
+
+The Language Guess Pattern persists because it avoids the engineering cost of actual language detection. Browser locale is already available in the HTTP headers. Account language is already in the user profile database. IP geolocation is a single API call. Real language detection requires analyzing the query text, which means adding a detection model to the query pipeline, handling edge cases, and managing the latency it introduces. Teams choose the easy path and pay for it in retrieval quality for every user whose proxy signals do not match their actual query language. In global enterprises, that is a large fraction of users.
+
+## Why Detection Matters for Every Downstream Decision
+
+Query language detection is not a nice-to-have feature. It is a routing decision that determines which pipeline the query enters, and getting it wrong cascades through every downstream component.
+
+In a language-partitioned index architecture, the detected language determines which index receives the query. Japanese query goes to the Japanese index. English query goes to the English index. A misdetection sends the query to the wrong index, where it finds no relevant documents. The user sees empty results or irrelevant noise. This is not a degradation -- it is a complete failure.
+
+In a hybrid architecture with query fan-out, the detected language determines which index gets the primary query and which indexes receive translated versions. If the system detects Japanese, it sends the original query to the Japanese index and a translated version to the English index. If it misdetects the query as Korean, it sends the query to the Korean index (wrong) and translates from Korean to English (producing a bad translation of Japanese text).
+
+Beyond indexing, the detected language also determines the reranking model's calibration parameters, the language-match bonus applied to scoring, the relevance threshold for filtering, and the language the generation model should respond in. A single misdetection corrupts the entire query lifecycle.
+
+## Detection Methods: From Lightweight to Expensive
+
+Language detection methods span a wide range of accuracy, latency, and cost. The right choice depends on your query characteristics and your tolerance for error.
+
+**fastText language identification** is the workhorse of production language detection. Meta released two pre-trained models for language identification that recognize 176 languages. The smaller model runs in under 0.1 milliseconds per query -- essentially free from a latency perspective. It analyzes character n-grams and their frequency distributions to classify text. For queries longer than 20 characters, fastText achieves over 95 percent accuracy across most languages. It handles Latin, Cyrillic, CJK, Arabic, Devanagari, and Thai scripts reliably. The model is small enough to load into memory alongside your other query processing components without meaningful resource overhead.
+
+FastText's weakness is short queries. A five-character query provides very few n-grams for the model to analyze, and accuracy drops to 70 to 80 percent for queries under 10 characters. Single-word queries like "Python" or "Amazon" are ambiguous -- they could be English, German, French, or several other languages. FastText makes a guess based on character patterns, but with so little signal, the guess is unreliable.
+
+**Google CLD3** (Compact Language Detector 3) is a neural network-based language detector that uses character n-gram features. It is more accurate than older CLD2, particularly for short texts and closely related languages. CLD3 provides a confidence score alongside its prediction, which allows you to route low-confidence detections to a fallback strategy rather than trusting an uncertain classification. Latency is under 1 millisecond per query, making it practical for production use.
+
+**Dedicated transformer-based detectors** like GlotLID or XLM-based classifiers offer higher accuracy than fastText or CLD3, particularly for low-resource languages and short texts. These models use contextual understanding rather than just n-gram statistics, which helps them disambiguate similar languages (for example, Bosnian, Croatian, and Serbian, which share vocabulary and script). The trade-off is latency: transformer-based detectors require 5 to 20 milliseconds per query on GPU, or 50 to 200 milliseconds on CPU. For high-throughput production systems, this latency may be prohibitive unless you batch queries.
+
+**LLM-based detection** is the most accurate and the most expensive. You can ask GPT-5-mini, Claude Haiku 4.5, or Gemini 3 Flash to identify the language of a short text, and the model will correctly detect languages even from a single word with remarkable accuracy, because it draws on vast knowledge of vocabulary, grammar, and world context. "Rechnung" is unambiguously German. "Python" in isolation is probably English based on frequency, but the model can consider surrounding context. LLM-based detection costs 10 to 100 milliseconds and consumes API credits or GPU compute for every query. It is impractical as a primary detection method for high-traffic systems but valuable as a fallback for ambiguous queries.
+
+## The Short Query Problem
+
+Short queries are the hardest case for language detection, and they are common. In enterprise search systems, the average query length is 3 to 5 words. In conversational AI, initial queries are often single phrases or even single words. In support chatbots, users frequently type product names, error codes, or technical terms that have no clear language affiliation.
+
+A query like "SAP" has no language. It is an acronym used globally. "Python" is an English word that is also used untranslated in dozens of other languages. "LTE" is a technical abbreviation. "COVID" is a global term. Numbers, URLs, email addresses, and code snippets carry no language signal at all.
+
+For queries under 10 characters, two strategies work in practice.
+
+**Strategy one: default to the user's conversation language.** If the user's previous queries in the same session were in Japanese, a short ambiguous query is probably also intended to be Japanese. This heuristic is wrong when users switch languages mid-session, but it is right far more often than it is wrong. The session context acts as a prior: in the absence of strong text-level signal, the session language is the best guess.
+
+**Strategy two: multi-index search.** When detection confidence is below a threshold -- say, below 80 percent -- do not route to a single index. Search multiple indexes and merge the results. A five-character query gets sent to the English, Japanese, and Korean indexes simultaneously. The results are merged with reciprocal rank fusion. The user sees the most relevant documents regardless of which index found them. This strategy trades latency for accuracy: searching three indexes takes longer than searching one, but the user gets usable results rather than garbage from a misrouted query.
+
+The confidence threshold is critical. Set it too high and you multi-index-search too many queries, wasting compute. Set it too low and you single-index-route queries that the detector got wrong. Start at 80 percent confidence -- queries where the detector is 80 percent or more sure go to the detected language index; queries below 80 percent go to multi-index search. Adjust based on your false routing rate: the percentage of queries that were routed to the wrong index as measured by comparing detection results against ground truth annotations on a sample of queries.
+
+## Code-Switched Queries: When One Query Contains Two Languages
+
+Code-switching is the practice of mixing two or more languages within a single utterance. It is not an edge case. In bilingual communities and multinational workplaces, code-switching is the norm. "I need the Rechnung for Q3" mixes English and German. "Can you check the keiyaku details" mixes English and Japanese (keiyaku means contract). "Send me the rapport from last week" could be English with the French word for report, or it could be entirely English (since "rapport" is also an English word meaning relationship).
+
+Standard language detectors handle code-switched queries poorly because they are designed to classify the entire query as one language. FastText will assign the query "I need the Rechnung for Q3" to either English or German, depending on which language's n-gram patterns dominate. It might choose English (because five of six words are English) or German (because "Rechnung" is a strong German signal). Neither classification is fully correct. The query is both.
+
+Three approaches handle code-switched queries in production.
+
+**Dominant-language detection with cross-lingual search.** Detect the dominant language of the query and route to that language's index, but use a multilingual embedding model that can handle mixed-language input. The embedding model encodes the semantic intent of the full query, including the foreign-language terms, and retrieves relevant documents regardless of their language. This works well when the code-switching is incidental -- a few foreign words in an otherwise monolingual query.
+
+**Segment-level detection.** Split the query into segments and detect the language of each segment independently. "I need the" is English. "Rechnung" is German. "for Q3" is English. Use the segment-level detection to fan out queries to multiple indexes or to construct expanded queries in each detected language. This approach is more accurate but more complex: you need a segmentation strategy for the query text, and you need to handle the case where a single segment is too short for reliable detection.
+
+**Bypass detection entirely.** For systems built on a unified index with a strong multilingual embedding model, code-switched queries can be handled without any language detection. The embedding model encodes the mixed-language query into a single vector, and the unified index returns the most semantically similar documents regardless of language. This is the simplest approach but only works with unified indexes -- partitioned indexes still need detection for routing.
+
+## Session Context as a Detection Signal
+
+A single query is often ambiguous. A session of queries rarely is. If a user's first three queries were in Korean, their fourth query -- even if it is a single ambiguous word -- is almost certainly intended as Korean. Session context is the most underused signal in query language detection.
+
+Implementing session-aware detection is straightforward. Maintain a running language history for each active session. Each time a query is confidently classified (above 90 percent confidence), update the session language. When a new query arrives with low detection confidence, use the session language as the default. If the query has moderate confidence for a language that matches the session language, boost that confidence. If the query has moderate confidence for a different language, flag it as a potential language switch and consider multi-index search.
+
+Language switches within a session are real but infrequent. A bilingual user working in a multinational company might switch from Japanese to English mid-conversation because they are searching for a document they know is in English. The detection system must allow this switch rather than locking the user into the session language. The heuristic: if a new query has high confidence (above 90 percent) for a language different from the session language, respect the detection and update the session language. If the confidence is moderate (60 to 85 percent), check both languages. If the confidence is low (below 60 percent), default to the session language.
+
+This approach handles the common case -- consistent language within a session -- while allowing the uncommon case -- mid-session language switches -- to be handled gracefully.
+
+## User Preferences vs Detected Language
+
+Some systems allow users to set an explicit language preference. A user profile might specify "Japanese" as the preferred language. Should the system respect this preference or defer to the detected query language?
+
+The answer depends on the type of system. For search and knowledge base applications, the detected query language should take precedence. If a Japanese user sets Japanese as their preferred language but types a query in English, they are probably looking for English-language documents. Routing the English query to the Japanese index because of a profile setting is a disservice. The detected language reflects intent; the profile setting reflects preference.
+
+For conversational AI and chatbot applications, the relationship is inverted. The user's language preference determines the response language. A user who sets their preference to Japanese expects the system to answer in Japanese, even if they occasionally include English technical terms in their queries. Here, the preference setting matters more for generation language control (which subchapter 6.8 covers) while the detected language still matters for retrieval routing.
+
+The most robust design separates these concerns. Detection determines the retrieval language -- which indexes to search, which queries to construct. Preference determines the generation language -- what language the response is produced in. These are independent decisions. A Japanese user who queries in English should get retrieval routed to the English index (because the query is in English) but should receive a response in Japanese (because their preference is Japanese). Conflating detection and preference into a single language signal causes problems when they disagree.
+
+## Detection Accuracy Targets
+
+What accuracy do you need from your language detection system? The answer depends on the downstream impact of misdetection.
+
+For partitioned index architectures, misdetection is a hard failure -- the query goes to the wrong index and returns irrelevant results. Accuracy requirements are stringent. Target above 97 percent for queries over 20 characters and above 90 percent for queries between 10 and 20 characters. Below 10 characters, accept that detection is unreliable and use fallback strategies (multi-index search, session context, user preference).
+
+For unified index architectures with metadata filtering, misdetection is a soft failure -- the filter restricts results to the wrong language, but the retrieval engine still searches the same index. The user gets wrong-language results but might still find relevant content if they can read multiple languages. Accuracy requirements are slightly more forgiving. Target above 95 percent for queries over 20 characters and above 85 percent for shorter queries.
+
+For hybrid architectures, the impact depends on which component receives the misdetected signal. If misdetection affects only the fan-out translation (translating from the wrong source language), the primary language index still receives the original query and produces correct results. The cross-lingual results are degraded but the monolingual results are fine. If misdetection affects the primary routing, it is a hard failure as in the partitioned case.
+
+Measure detection accuracy monthly on a sample of real production queries. Annotate 500 to 1,000 queries with their true language (you will need multilingual annotators for this) and compare against the detector's classifications. Track accuracy per language -- some languages are detected accurately while others are consistently confused. Script-unique languages (Japanese, Korean, Thai, Arabic) are almost never misdetected because their character sets are distinctive. Languages that share a script and vocabulary (Bosnian/Croatian/Serbian, Malay/Indonesian, Hindi/Urdu in Latin transliteration) are frequently confused.
+
+## Building the Detection Pipeline
+
+A production-grade detection pipeline has three layers.
+
+**Layer 1: Script detection.** Before running any statistical or neural model, inspect the characters in the query. If the query contains CJK characters, it is Chinese, Japanese, or Korean. If it contains Thai script, it is Thai. If it contains Arabic script, it is Arabic, Persian, or Urdu. Script detection is deterministic, takes microseconds, and narrows the candidate language set dramatically. A query in Thai script will never be misdetected as French. Script detection eliminates the easy cases and lets the statistical model focus on the hard cases -- queries in Latin script that could be English, French, German, Spanish, Portuguese, or a dozen other languages.
+
+**Layer 2: Statistical or neural detection.** Run fastText, CLD3, or a transformer-based detector on the query text. This produces a language prediction with a confidence score. For queries where the script detection already narrowed the candidate set (CJK characters, for example), this step disambiguates within the script family -- is it Chinese, Japanese, or Korean? For Latin-script queries, this step does the primary classification.
+
+**Layer 3: Contextual fallback.** If the Layer 2 confidence is below your threshold, apply contextual signals: session language history, user preference, the language of recent conversations, the dominant language of the user's organization. These signals resolve ambiguity that the text-level detector cannot handle.
+
+The three-layer pipeline handles the full spectrum of queries: easy cases (script-unique languages) are resolved in microseconds at Layer 1, standard cases (Latin-script languages with sufficient text) are resolved in under a millisecond at Layer 2, and ambiguous cases (short queries, code-switched input, ambiguous vocabulary) are resolved with context at Layer 3.
+
+## Monitoring Detection in Production
+
+Detection accuracy degrades silently. The model does not throw errors when it misclassifies a query. The user does not always report the problem -- they just see bad results and try a different search term, or give up. Without monitoring, you do not know that your detection accuracy for Indonesian dropped from 94 percent to 81 percent after your user base shifted.
+
+Monitor three signals.
+
+**Detection confidence distribution.** Track the percentage of queries that fall below your confidence threshold per language, per day. A sudden increase in low-confidence queries for a specific language might indicate a new user population whose query patterns differ from your training data. A gradual increase might indicate vocabulary drift as your users adopt new terms the detector has not seen.
+
+**Retrieval quality by detected language.** If a specific detected-language segment shows declining retrieval quality (measured by user click-through, reformulation rate, or explicit feedback), investigate whether misdetection is the cause. A drop in retrieval quality for "Korean" queries might mean the detector is misclassifying Japanese queries as Korean, sending them to the wrong index.
+
+**Detection-to-preference mismatch rate.** For users with explicit language preferences, track how often the detected language disagrees with the preference. A 10 percent mismatch rate is normal -- users with Japanese preferences sometimes query in English. A 40 percent mismatch rate suggests systematic detection errors for that preference group.
+
+These monitoring signals do not require ground truth annotation for every query. They provide proxy signals that alert you to detection problems early enough to investigate and fix them before user experience degrades noticeably.
+
+## The Cost of Getting It Wrong
+
+Detection errors have asymmetric costs. Misdetecting a language and routing to the wrong index costs one failed query -- but if the user's next attempt is also misdetected, they experience repeated failure and lose trust in the system. Misdetecting the generation language costs a response the user cannot read. Misdetecting a code-switched query costs a partially correct routing that may produce mediocre results.
+
+The cheapest insurance is the multi-index fallback for low-confidence queries. If you cannot confidently detect the language, search broadly and let the retrieval quality sort out the results. This costs extra compute on a small fraction of queries (typically 5 to 15 percent of queries fall below the confidence threshold) but eliminates the worst detection failures. The compute cost is predictable and bounded. The user experience cost of a misdetected query is unpredictable and potentially severe.
+
+The next subchapter moves from detection to control: once you know what language the user is querying in, how do you ensure the generation model responds in the right language -- and stays in that language throughout the response, even when the retrieved documents are in a different language?

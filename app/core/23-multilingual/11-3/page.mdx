@@ -1,0 +1,97 @@
+# 11.3 — The Catastrophic Forgetting Problem in Multilingual Models
+
+The team reviews the dashboard and everything looks right. The fine-tuned model scores 91 on Japanese medical summarization, up from 63 on the base model. Latency is within budget. The deployment passed all automated checks. Then a product manager in Paris opens the internal testing tool and asks the model to summarize a patient intake form in French. The output is barely coherent — fragments of French mixed with English, medical terms transliterated rather than translated, sentences that trail off into grammatically broken clauses. She tries again with a simpler prompt. The result is worse. She checks the eval history: before fine-tuning, French medical summarization scored 79. Nobody has measured it since.
+
+When the team finally runs the full multilingual eval suite, the results are devastating. French dropped from 79 to 41. German from 76 to 52. Spanish held at 73, but Portuguese collapsed from 70 to 38. The model did not just degrade in these languages. It forgot them.
+
+## What Catastrophic Forgetting Actually Is
+
+**Catastrophic forgetting** is the phenomenon where fine-tuning a neural network on new data causes it to lose previously learned capabilities. It is not gradual. It is not proportional. A model can retain 95 percent of its English ability while losing 50 percent of its French ability in the same fine-tuning run, because the forgetting depends on which weights were updated and which capabilities those weights encoded.
+
+In monolingual settings, catastrophic forgetting typically manifests as a model losing general knowledge when fine-tuned on a narrow domain. The model becomes excellent at legal contract analysis but can no longer hold a general conversation. In multilingual settings, the problem is worse, because the capability surface is vastly larger. Every language, every register, every domain combination is a dimension that can degrade independently. A model supporting 20 languages across 5 task types has 100 capability dimensions that can fail, and your fine-tuning eval typically measures fewer than 10 of them.
+
+The insidious part is that your task-specific eval improves even as the model loses capabilities your users depend on. The Japanese medical summarization metric climbs steadily during training. At no point does the training process signal that French is degrading. The loss function only sees Japanese medical text. It optimizes for exactly that, and the optimization comes at the expense of everything the loss function cannot see.
+
+## The Forgetting Tax
+
+Here is the named concept your team needs: **the Forgetting Tax**. Every fine-tuning run on a multilingual model imposes a tax on every language and task that is not represented in the fine-tuning data. The tax is paid in degraded capability, and the bill arrives silently — typically weeks after deployment, when users in the affected languages start complaining, or worse, when they silently abandon the product.
+
+The Forgetting Tax is not fixed. It varies based on four factors.
+
+The first factor is the ratio of model size to fine-tuning data size. Research from the Multilingual Representation Learning workshop at ACL 2025 confirmed that the relative scale between model and fine-tuning data is a primary determinant of forgetting severity. A 70 billion parameter model fine-tuned on 5,000 examples in one language experiences less forgetting than a 7 billion parameter model fine-tuned on the same 5,000 examples, because the larger model has more parametric capacity to absorb the new knowledge without overwriting existing representations. Conversely, a small model fine-tuned on a large dataset pays a steep tax — there is not enough capacity to hold both the old and new knowledge.
+
+The second factor is the linguistic distance between the fine-tuning language and the forgotten language. Languages that share representational infrastructure with the fine-tuning target forget faster, as we covered in the previous subchapter on cross-lingual transfer. But catastrophic forgetting goes beyond the gradual degradation of negative transfer. Forgetting is the point where degradation crosses a threshold and the model can no longer produce usable output in the affected language at all.
+
+The third factor is the homogeneity of the fine-tuning data. If your fine-tuning data is exclusively Japanese medical text, every gradient update pushes in the same direction — toward Japanese medical representations. This concentrated, unidirectional pressure on the weights is what makes forgetting catastrophic rather than gradual. Mixed-language, mixed-domain fine-tuning data spreads the gradient updates across many directions, reducing the pressure on any single set of representations.
+
+The fourth factor is the number of fine-tuning steps. Forgetting is not instantaneous, but it accelerates faster than most teams expect. The **forgetting curve** — the relationship between fine-tuning steps and non-target language quality — is typically steep in the first few hundred steps, then flattens as the model settles into its new configuration. A team that trains for 2,000 steps might see most of the forgetting happen in the first 300. By the time the task-specific metric is still climbing between step 1,500 and step 2,000, the forgetting has already been paid.
+
+## How to Detect Forgetting Before Your Users Do
+
+Detection requires one thing: evaluating non-target languages during training, not just after.
+
+The minimum viable approach is checkpoint evaluation. Every 100 to 200 training steps, save a checkpoint and run your abbreviated multilingual eval suite against it. This gives you the forgetting curve in real time. You can see exactly when French starts dropping, how fast it falls, and whether it stabilizes or continues declining. If you only evaluate at the end of training, you see the final score but not the trajectory, and the trajectory is where the actionable information lives.
+
+Your abbreviated multilingual eval suite does not need to be comprehensive. For forgetting detection, 100 to 200 examples per non-target language is sufficient. The goal is to catch drops larger than five to eight points, not to produce a publication-quality assessment of every language. Speed matters here because you are running this eval dozens of times during a single training run. A suite that takes four hours to run is useless for checkpoint evaluation. A suite that takes fifteen minutes is invaluable.
+
+The forgetting detection threshold should be defined before training starts. Decide: if French drops by more than X points, we stop training and investigate. If Korean drops by more than Y points, we adjust the training recipe. These thresholds are not arbitrary — they are derived from your business requirements, specifically from the minimum acceptable quality for each language in production.
+
+Teams that do not build forgetting detection into their training pipeline discover the problem through user complaints. The delay between deployment and complaint is typically two to four weeks — long enough for the degraded model to affect thousands of interactions in the forgotten languages. By the time you roll back, the damage to user trust is done.
+
+## Mitigation Strategy One: Multilingual Data Mixing
+
+The most effective single mitigation against catastrophic forgetting is including non-target language data in your fine-tuning batches. If you are fine-tuning on Japanese medical text, include 15 to 25 percent non-Japanese data in every batch. The non-Japanese data does not need to be medical. General-purpose instruction-following data in French, Korean, Spanish, and your other supported languages is enough to maintain the representations those languages depend on.
+
+The mechanism is simple: gradient updates from the non-target language data counterbalance the gradient updates from the target language data. Instead of all updates pushing the model toward Japanese medical specialization, some updates pull it back toward general multilingual competence. The result is slower convergence on the target task — you might need 30 to 50 percent more training steps to reach the same Japanese quality — but dramatically less forgetting.
+
+The mixing ratio matters. Below 10 percent non-target data, the balancing effect is too weak to prevent forgetting in the most vulnerable languages. Above 30 percent, you dilute the fine-tuning signal so much that convergence slows to the point of inefficiency. The sweet spot for most configurations is 15 to 20 percent non-target data, with the specific ratio depending on how many languages you need to protect and how distant they are from the target language.
+
+Data selection within the non-target mix also matters. Prioritize the languages most at risk of forgetting — those linguistically closest to the target language and those most important to your business. If you are fine-tuning on Japanese and your most important non-Japanese markets are Korean and Chinese, weight the non-target mix toward Korean and Chinese rather than distributing evenly across all 20 supported languages.
+
+## Mitigation Strategy Two: Parameter-Efficient Fine-Tuning
+
+If multilingual data mixing is the brute-force solution, parameter-efficient fine-tuning (PEFT) is the surgical one. Methods like LoRA, QLoRA, and language-specific adapters limit the number of model weights that change during fine-tuning. By restricting updates to a small subset of parameters — typically 0.1 to 2 percent of the total — you leave the vast majority of the model's multilingual knowledge untouched.
+
+LoRA works by adding small trainable low-rank matrices to each attention layer. During fine-tuning, only these added matrices are updated. The original weights, which encode the model's multilingual capabilities, remain frozen. The result is that the model learns the new task through the added parameters without overwriting the existing ones. Research from 2025 consistently shows that LoRA-based fine-tuning produces 40 to 70 percent less forgetting than full fine-tuning on the same data, depending on the rank and which layers receive adapters.
+
+However, the relationship between PEFT and forgetting is nuanced. Research presented at the MRL 2025 workshop found that parameter-efficient fine-tuning offers no inherent advantage over full fine-tuning in preventing forgetting when the fine-tuning budget (total parameter updates) is matched. The advantage comes from the restriction itself — PEFT methods work because they update fewer parameters, not because the parameters they update are somehow safer. If you increase the LoRA rank until the trainable parameter count approaches full fine-tuning, the forgetting advantage disappears.
+
+The practical implication: use PEFT with modest ranks. A LoRA rank of 8 to 16 is typically sufficient for language-specific fine-tuning tasks and provides meaningful forgetting protection. Ranks above 64 start to lose the protective effect because too many parameters are being updated.
+
+## Mitigation Strategy Three: Regularization
+
+Regularization techniques explicitly penalize the model for changing weights that were important to previously learned tasks. The most established approach is **elastic weight consolidation**, or EWC. EWC computes a Fisher information matrix over the pretrained model's parameters, identifying which weights are most important for the model's existing capabilities. During fine-tuning, weight changes to important parameters are penalized — the model can still update them, but the gradient must fight against the regularization penalty to do so.
+
+Research from 2025 on applying EWC to Gemma2 for Lithuanian language adaptation showed that EWC regularization not only preserved English fluency during Lithuanian fine-tuning but in some cases actually improved Lithuanian learning compared to unregularized fine-tuning. The explanation is that EWC forces the model to find parameter configurations that serve both the old and new tasks, rather than configurations that serve only the new task by overwriting the old. This constrained search can produce better solutions than the unconstrained search that leads to forgetting.
+
+A newer approach, FR-LoRA, combines Fisher regularization with LoRA — each language-specific LoRA module is regularized using the Fisher information matrix computed from previous languages. This approach showed consistent improvements in retaining prior language knowledge across multilingual marketplace applications tested in 2025, outperforming both standard LoRA and standard EWC alone.
+
+The downside of regularization is complexity. Computing the Fisher information matrix is expensive — it requires a forward and backward pass over a representative sample of pretraining data. Storing the matrix adds memory overhead. And tuning the regularization strength requires experimentation: too weak and forgetting still occurs, too strong and the model cannot learn the new task.
+
+## Mitigation Strategy Four: Language-Specific Adapters
+
+The most architecturally clean solution is to avoid touching shared weights entirely. Language-specific adapter modules are small neural network components inserted between the model's existing layers. Each adapter is trained on data for a single language or language group. During inference, the system routes the request to the appropriate adapter based on the detected input language.
+
+Because each adapter has its own parameters and the base model's weights remain frozen, updating the Japanese adapter has zero effect on the French adapter. There is no forgetting because there is no shared parameter competition. Each language's capabilities are isolated in its own module.
+
+The trade-offs are operational complexity and slight latency overhead. You need a language detection system that routes to the correct adapter. You need to manage adapter storage, versioning, and deployment. You need to handle the case where language detection fails or the input is code-switched, as we covered in Chapter 10. And each adapter adds a small amount of latency — typically 5 to 15 milliseconds — because the model must activate the adapter parameters in addition to the base model weights.
+
+Despite the complexity, language-specific adapters are the approach most adopted by teams supporting ten or more languages in production. The operational overhead of managing adapters is lower than the operational overhead of managing catastrophic forgetting across ten languages simultaneously.
+
+## Mitigation Strategy Five: Periodic Checkpoint Evaluation and Early Stopping
+
+This is less a mitigation strategy and more a safety net, but it is one of the most practical tools available. During fine-tuning, evaluate checkpoints at regular intervals against your full language suite. When any non-target language crosses your forgetting threshold, stop training and use the last checkpoint where all languages were within acceptable bounds.
+
+The trade-off is explicit: you accept a lower final score on the target task in exchange for preserving quality across all other languages. A model that scores 85 on Japanese but 75 on French is often more valuable than a model that scores 91 on Japanese but 41 on French. The checkpoint where this balance is best is rarely the final checkpoint.
+
+This approach pairs well with the other mitigations. Use multilingual data mixing, LoRA, and regularization to push the forgetting boundary later in training, then use checkpoint evaluation to find the optimal stopping point within that extended safe zone.
+
+## The Trade-Off You Cannot Escape
+
+Every mitigation strategy slows down target-language learning. Multilingual data mixing dilutes the training signal. LoRA restricts the model's capacity to absorb new information. Regularization penalizes the weight changes the model needs to make. Early stopping cuts training short. There is no free lunch. More forgetting protection means slower or lower task-specific improvement. Less forgetting protection means higher risk of multilingual degradation.
+
+The right balance depends on your specific situation. If you support two languages and one is ten times more important than the other, you can tolerate more forgetting in the minor language. If you support twenty languages and each matters, you need aggressive protection even at the cost of slower convergence. If you are fine-tuning a very large model on a small dataset, the forgetting risk is lower and you can afford less protection. If you are fine-tuning a smaller model on a large dataset, the risk is higher and you need every mitigation available.
+
+The teams that handle this well treat forgetting protection as a parameter in their training recipe, not an afterthought. They decide the acceptable trade-off before training starts, build the detection infrastructure to monitor it during training, and adjust their mitigation stack based on what the checkpoints reveal. The teams that handle it poorly discover the Forgetting Tax when their users do.
+
+The next subchapter tackles the problem upstream of fine-tuning: where do you get training data for languages that have little written presence on the internet, and what goes wrong when you get it from the wrong sources?

@@ -1,0 +1,103 @@
+# 4.3 — Shadow Deployments: Testing Models on Live Traffic Without User Impact
+
+Shadow deployment is the safest way to test a new model on production traffic. You route real requests to the new model in parallel with the current model, score both outputs, and compare — but only serve the current model's output to the user. The user's experience is unchanged. The new model's output is captured, evaluated, and discarded. The result is a direct, controlled comparison between two models on identical production inputs with zero risk to the user experience.
+
+This simplicity is what makes shadows so effective. No statistical gymnastics to account for non-determinism. No population-level randomization to worry about. No risk that a bad model degrades real interactions. Both models process the same input, both produce an output, both get scored, and you compare. If the shadow model is catastrophically broken — generating toxic content, hallucinating wildly, timing out on half of requests — you discover this without a single user being affected.
+
+## How Shadow Deployments Work
+
+The architecture of a shadow deployment has four components that work together in a specific sequence. Understanding each one matters because cutting corners on any of them undermines the comparison.
+
+The first component is the **traffic duplicator**. Every incoming production request — or a configured percentage of them — is copied and sent to both the production model and the shadow model. The duplication must be exact: the shadow model receives the same prompt, the same context, the same system instructions, the same retrieved documents, and the same conversation history as the production model. If the shadow model sees a different input than the production model, the comparison is contaminated. Most modern serving frameworks support traffic mirroring natively. Kubernetes service meshes like Istio can mirror traffic at the network layer without any application code changes. Custom routing layers can duplicate requests at the application layer.
+
+The second component is the **parallel inference path**. The shadow model processes the duplicated request through its own inference pipeline. This path must be isolated from the production path. If the shadow model is slow, its latency should not affect the production response. If the shadow model crashes, the production request should complete normally. In practice, this means the shadow inference runs asynchronously — the production response is sent to the user as soon as the production model completes, regardless of whether the shadow model has finished. The shadow inference is a background operation with no blocking dependency on the user-facing response.
+
+The third component is the **dual scorer**. Both the production model's output and the shadow model's output are sent to the same evaluation pipeline, scored using the same rubrics and the same judges. This is critical for fair comparison. If the production model's outputs are scored by one evaluator and the shadow model's outputs by another, differences in scoring methodology introduce noise that has nothing to do with model quality. The dual scorer ensures that both outputs are evaluated under identical conditions.
+
+The fourth component is the **comparison aggregator**. The raw per-request scores — production model quality, shadow model quality, on each dimension — are collected and aggregated over time. The aggregator computes running statistics: the mean quality difference, the variance of the difference, the percentage of requests where the shadow model scored higher, scored the same, or scored lower. It computes these statistics both overall and per segment — by query type, by complexity level, by product surface, by user demographic if available. The aggregated results are what the team uses to decide whether the shadow model is ready for live traffic.
+
+## Why Shadows Are Powerful
+
+The power of shadow deployments comes from three properties that no other online experimentation method provides simultaneously.
+
+The first is **zero user risk**. No matter how badly the shadow model performs, no user is affected. The production model continues serving all traffic exactly as before. This is not just a safety property — it is a political one. Shadow deployments don't require buy-in from product managers worried about user experience degradation. They don't require sign-off from legal teams concerned about model behavior. They don't trigger customer-facing incident response. You can run shadows on your most sensitive traffic without stakeholder anxiety, because the users never see the shadow output.
+
+The second is **identical input comparison**. Both models process the same input. This eliminates the confounding variable that plagues A/B testing: the possibility that quality differences reflect differences in the input population rather than differences in model capability. When the shadow model scores five percent lower than the production model on the same thousand queries, that five percent reflects a real quality difference. There is no population confound to explain away.
+
+The third is **production distribution testing**. The inputs the shadow model processes are real production queries, not curated test sets. This means the shadow test reflects the actual distribution of user behavior — the real frequency of edge cases, the real complexity distribution, the real mix of query types. If your test set over-represents simple queries and under-represents complex ones, offline evaluation gives you an optimistic view of the shadow model's quality. Shadow deployment on production traffic gives you the realistic view.
+
+Together, these three properties make shadow deployment the gold standard for the first stage of any model transition. Before you expose a single user to a new model, run it as a shadow. If it can't match the production model on real traffic with zero user impact, it certainly won't match it under the additional pressures of live serving.
+
+## The Cost Reality
+
+Shadow deployments have a cost that teams must plan for: you are running two models on every shadowed request. If your production inference costs ten dollars per thousand requests, shadowing one hundred percent of traffic doubles that to twenty dollars per thousand. For a system processing a million requests per day at a penny per request, that is ten thousand dollars per day in additional inference cost for the duration of the shadow test.
+
+This cost is real, and it scales linearly with the percentage of traffic you shadow. At one hundred percent shadow coverage, you double your inference bill. At fifty percent, you increase it by fifty percent. At ten percent, the increase is ten percent. The evaluation cost — scoring both outputs — is on top of this, though as Chapter 3 of this section covers, evaluation cost management has its own set of levers.
+
+The cost is also time-bounded. You run a shadow deployment for a defined period — one day, three days, a week — and then you stop it. The question is how long you need to run to get reliable comparison data, which depends on your traffic volume, your required statistical confidence, and the magnitude of the quality difference you're trying to detect. A high-traffic system processing a million requests per day can detect a two-percent quality difference with high confidence in a single day of shadow deployment. A low-traffic system processing ten thousand requests per day might need a full week.
+
+Teams that balk at shadow costs should consider the alternative. A model upgrade that degrades quality for even two hours in production, affecting a hundred thousand users, has costs that dwarf a week of shadow testing: user trust erosion, support ticket volume, potential revenue loss, and the engineering time to investigate and roll back. Shadow deployment is expensive in absolute terms and cheap relative to the cost of a bad production deployment.
+
+## Partial Shadows: Managing the Cost
+
+You don't need to shadow one hundred percent of traffic to get valuable comparison data. **Partial shadowing** — routing ten, fifteen, or twenty-five percent of production traffic to the shadow model — dramatically reduces cost while still providing strong statistical signal.
+
+The key insight is that evaluation quality depends on the number of scored comparisons, not the percentage of traffic. If you need a thousand paired comparisons to detect a meaningful quality difference, and your system processes a hundred thousand requests per day, ten-percent shadowing produces ten thousand shadow requests per day. You have your thousand comparisons within hours. Shadowing one hundred percent of traffic gets you there faster, but the additional cost buys speed, not precision.
+
+The standard practice in 2026 for most production teams is to shadow between ten and twenty-five percent of traffic. This range balances cost against time-to-decision. At ten percent, you typically accumulate sufficient comparison data in one to three days for a system processing fifty thousand or more requests per day. At twenty-five percent, you can often reach a reliable conclusion within a single day.
+
+Partial shadowing introduces a sampling consideration: the shadowed traffic should be a random sample of production traffic, not a specific segment. If you shadow only traffic from a particular geographic region or product surface, your shadow comparison reflects that segment's distribution, not the full production distribution. The shadow model might look great on the easy queries from your highest-traffic region and fail on the complex queries from a smaller region that was excluded from the shadow sample. Random sampling avoids this bias.
+
+## What Shadows Reveal That Offline Eval Doesn't
+
+The unique value of shadow deployment is in the category of things it catches that your offline test suite cannot.
+
+Distribution mismatch is the most common discovery. Teams routinely find that their shadow model performs differently on production traffic than on their test set, even when the test set was designed to be representative. A legal document analysis system ran a shadow deployment and discovered that the shadow model scored eight percent lower on production traffic than on the test set. Investigation revealed the cause: the test set contained primarily short, well-structured contract clauses, while production traffic included lengthy, poorly formatted documents scanned from physical originals with OCR artifacts. The offline evaluation had been testing the model on clean inputs that didn't reflect the messy reality of production.
+
+Latency characteristics under real load are another shadow discovery. A model that responds in two hundred milliseconds during offline testing might respond in four hundred milliseconds under production load due to contention for GPU resources, network latency to the inference endpoint, or queueing effects during traffic spikes. Shadow deployment reveals the actual latency distribution because the shadow model operates under real production infrastructure conditions. If the shadow model's latency is materially worse than the production model's, you know before any user experiences the slowdown.
+
+Error patterns on real inputs are a third category. Every model has inputs it handles poorly — queries that trigger hallucinations, prompts that cause the model to refuse when it should respond, contexts that produce degraded output. Your test set contains the failure cases you know about. Shadow deployment on production traffic surfaces the failure cases you don't know about. A shadow running for three days on a customer support system might reveal that the model consistently mishandles queries involving product returns from international orders — a pattern that occurred in two percent of production traffic but was entirely absent from the test set.
+
+## What Shadows Miss
+
+Shadow deployments have a specific and important blind spot: they cannot observe user interaction effects. In production, the model's response influences what the user does next. A helpful response leads the user to a successful outcome. A confusing response leads to a follow-up question. A wrong response leads to frustration and abandonment. These downstream effects are part of the model's real-world quality, and they are invisible in shadow mode because the user never sees the shadow model's output.
+
+Consider a travel booking assistant. The production model suggests a flight, the user accepts it, and the conversation proceeds to seat selection. The shadow model, processing the same initial query, might suggest a different flight. In shadow mode, you can score both suggestions for accuracy and helpfulness. But you cannot observe whether the shadow model's suggestion would have led the user to accept it, continue the conversation, and complete the booking. The production model's response shapes the user's behavior. The shadow model's response shapes nothing, because it was never shown.
+
+This limitation means shadow deployments are excellent for assessing output quality in isolation — is the response accurate, appropriate, well-formed? — but they cannot assess user experience quality — does the response lead to a good outcome? For that, you need to actually serve the model's output to users, which is where progressive rollouts and interleaving experiments come in.
+
+Shadow deployments also cannot evaluate how the model performs in multi-turn interactions. In shadow mode, you can duplicate the first turn of a conversation and score both models' responses. But the second turn depends on the user's reaction to the first turn's response. Since the user only saw the production model's response, the conversation continues based on that response. The shadow model never gets to participate in turns two through five, which means you can't evaluate its multi-turn capabilities. You can shadow individual requests, but you can't shadow conversations.
+
+## The Shadow Score Differential
+
+The primary output of a shadow deployment is what experienced teams call **the Shadow Score Differential**: the difference in eval scores between the shadow model and the production model, tracked over time across each quality dimension. This metric is the decision engine for model transitions.
+
+The Shadow Score Differential is not a single number — it is a time series per dimension. On day one, the shadow model might score 0.03 higher on accuracy than the production model. On day two, 0.02 higher. On day three, 0.025 higher. The differential stabilizes as more data accumulates and the sample becomes more representative of the full traffic distribution. When the differential stabilizes — when adding more data doesn't change the estimate meaningfully — you have a reliable comparison.
+
+Stability is the key readiness signal. If the differential is still shifting on day three, you don't have enough data yet. If it stabilized on day one, you accumulated enough comparisons quickly and can make your decision sooner. The stabilization point depends on traffic volume, quality variance, and the magnitude of the difference. Large quality differences stabilize quickly — you don't need many comparisons to confirm that one model is twenty percent better. Small differences take longer to distinguish from noise.
+
+The per-dimension view is essential because the overall average can hide critical trade-offs. A shadow model might show a positive overall differential while being significantly worse on the safety dimension. The overall average says "ship it." The per-dimension view says "wait — investigate the safety regression first." Mature teams set explicit thresholds on each dimension independently: the shadow model must be at or above the production model on safety and accuracy, and within a defined tolerance on tone and completeness. A positive overall average does not override a negative differential on a critical dimension.
+
+## When to Use Shadows vs. Alternatives
+
+Shadow deployments are the right choice for initial model validation — the first comparison of a new model against production before any user sees the new model's output. They're ideal for model upgrades (switching from GPT-5-mini to Claude Sonnet 4.5, or from one fine-tuned checkpoint to another), for major prompt revisions, and for infrastructure changes that might affect output quality (new retrieval pipeline, new caching strategy, new serving framework).
+
+Shadows are less ideal for prompt changes that produce subtle quality differences. A prompt tweak that slightly adjusts tone or verbosity might produce a Shadow Score Differential that is real but small — say, 0.01 on a five-point scale. Detecting this reliably requires either very high traffic volume or very long shadow periods. For small, iterative prompt changes, progressive rollouts with eval gates are often more practical — you serve the new prompt to a small percentage of users, score the outputs, and expand if quality holds.
+
+Shadows are also less ideal when you need to evaluate user interaction effects, as discussed above. If the question is "do users prefer Model B's responses?" rather than "are Model B's responses higher quality?" you need users to actually experience Model B's responses. Shadow deployments answer the quality question but not the preference question.
+
+The practical decision framework is: start with shadows for any model change that carries meaningful risk. If the shadow comparison is positive across all dimensions, proceed to a progressive rollout to validate user interaction effects. If the shadow comparison is negative or mixed, investigate the quality gaps before exposing any users. Shadows are your first line of defense. They are not your last.
+
+## Running Your First Shadow
+
+For teams that haven't run a shadow deployment before, the minimum viable implementation is straightforward. Set up a second inference endpoint serving the candidate model. At your routing layer, configure traffic mirroring for ten to fifteen percent of requests. Ensure the mirrored requests include the full context — prompt, system instructions, conversation history, retrieved documents. Run both responses through your evaluation pipeline. Store the paired scores. After twenty-four to forty-eight hours, examine the Shadow Score Differential per dimension.
+
+Don't over-engineer the first shadow. The goal is not a production-grade shadow testing platform. The goal is your first real comparison of two models on live traffic. Start with the simplest implementation that produces paired scores, validate the architecture, then invest in automation and tooling for subsequent shadows.
+
+One critical implementation detail: make sure your shadow inference is truly isolated from your production path. If the shadow model is slow and the request duplication is synchronous, shadow latency adds to production latency. If the shadow model errors and the error handling is not clean, shadow failures can affect production availability. Test the isolation before you start the shadow — send deliberately malformed requests to the shadow endpoint and verify that the production path is unaffected.
+
+## From Shadow to Live
+
+A successful shadow deployment ends with a clear signal: the shadow model meets or exceeds the production model on quality dimensions you care about, under real production conditions, with sufficient data to be confident in the comparison. The natural next step is exposing real users to the new model's output — through a progressive rollout with eval gates, as subchapter 4.6 covers.
+
+But between shadow validation and progressive rollout, there's an intermediate technique for cases where you need to compare two models on the same user and observe the user's actual reaction. When you need to know not just "which model produces higher-quality output" but "which model do users actually prefer in practice," interleaving experiments are the tool. The next subchapter covers how interleaving works, why it produces faster and more reliable preference signals than A/B testing, and when it's the right choice for your AI system.

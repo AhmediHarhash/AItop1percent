@@ -1,0 +1,111 @@
+# 5.9 — Eval Platform Failure Modes: Backlog Explosions, Silent Failures, and Cascading Breakdowns
+
+Production systems have well-understood failure modes and well-documented recovery playbooks. Eval systems rarely have either. When your production AI goes down, everyone knows immediately — users see errors, dashboards light up, the on-call engineer's phone rings within minutes. When your eval system goes down, the silence is the problem. No users are waiting for eval results. No customer-facing dashboard depends on eval latency. The eval system could stop processing entirely, and the only visible symptom would be a quality dashboard that stops updating — which most teams would notice days later, if at all.
+
+This asymmetry is not a technical limitation. It is an organizational one. Teams invest in production reliability because production failures have immediate consequences. Eval failures have delayed consequences — quality regressions go undetected, safety issues reach users, and the team loses the visibility they need to make good deployment decisions. The damage from eval downtime is real, but it manifests as a slow accumulation of risk rather than an immediate crisis. By the time the damage is visible, the quality data gap is irrecoverable. You can restart the eval pipeline. You cannot retroactively evaluate the outputs that were never scored.
+
+## Failure Mode One: Backlog Explosion
+
+**The backlog explosion** happens when the eval pipeline falls behind production volume and cannot catch up. The mechanism is simple. Production generates outputs at a certain rate — say, fifty thousand per hour. The eval pipeline processes evaluations at a certain capacity — say, forty-five thousand per hour at a five percent sampling rate. Under normal conditions, the pipeline keeps pace. But when something disrupts throughput — a judge API slowdown, a worker node failure, a spike in production traffic — the pipeline falls behind. The backlog grows.
+
+The dangerous part is not the initial lag. A backlog of a few thousand evaluations is manageable. The danger is the compounding effect. While the pipeline processes the backlog, new evaluations continue arriving. If the pipeline's maximum throughput is lower than the combined rate of new arrivals plus backlog drainage, the backlog grows faster than it shrinks. This is the mathematical inevitability of a backlog explosion: once the arrival rate exceeds the processing rate, the queue grows without bound until either the arrival rate drops or the system runs out of memory and crashes.
+
+The symptoms are initially subtle. Evaluation latency increases — results that normally appeared within ten minutes start appearing in thirty, then sixty, then not at all. The quality dashboard shows data that is increasingly stale. If the team is watching the dashboard at all, they notice that the latest scores are from four hours ago, then eight hours ago. Eventually the pipeline's queue management system — whether it's a message broker, a database table, or an in-memory queue — exhausts its capacity. The queue rejects new items. Evaluations are dropped entirely. The pipeline is now not just behind but broken.
+
+Detection requires monitoring the backlog depth and the throughput ratio — the rate at which evaluations are completed divided by the rate at which they arrive. When the throughput ratio drops below 1.0, the backlog is growing. When it stays below 1.0 for more than thirty minutes, you are in the early stages of a backlog explosion. Alert on this metric, not on backlog depth alone. Backlog depth tells you how bad things are. The throughput ratio tells you whether things are getting worse.
+
+Prevention requires capacity planning with headroom. If your peak production volume generates a maximum eval load of fifty thousand per hour, your eval pipeline should have sustained capacity of at least sixty-five thousand per hour — thirty percent above peak. This headroom absorbs traffic spikes, retries, and temporary slowdowns without triggering a backlog explosion. Teams that size their eval pipeline to exactly match average load discover that average load is a fiction — real traffic is bursty, and any burst beyond average starts the backlog spiral.
+
+Recovery from a backlog explosion follows the strategies from the previous subchapter: recency prioritization, backlog sampling, and maximum backlog age. But the more important action is diagnosing why the explosion happened and adding the capacity or architectural change that prevents recurrence. A backlog explosion that happens once is an incident. A backlog explosion that happens monthly is a systemic underinvestment in eval infrastructure.
+
+## Failure Mode Two: The Silent Eval Failure
+
+**The silent eval failure** is the most insidious failure mode because the pipeline appears to be running normally. No errors in the logs. No alerts firing. The dashboard shows quality metrics updating. But the metrics are wrong — the pipeline is evaluating something, just not what it should be evaluating.
+
+The silent failure has several variants. The most common is the sampling gap. A configuration change — perhaps intended to reduce costs — accidentally reduces the sampling rate from five percent to 0.05 percent. The pipeline continues operating. It evaluates outputs. But it evaluates so few that the quality signal is statistically meaningless. The dashboard shows stable quality because the tiny sample happens to include only average outputs. Meanwhile, a quality regression affecting a specific query type goes completely undetected because the sample is too small to include enough examples of that query type.
+
+The second variant is the filter drift. The eval pipeline has filters that determine which outputs are eligible for evaluation — perhaps filtering by product area, by user segment, or by response type. Over time, as the product evolves, these filters fall out of sync with the actual traffic. A new response type that wasn't anticipated when the filters were configured passes through without being sampled. A product area that was renamed in the application code no longer matches the filter string in the eval pipeline. The pipeline evaluates the traffic that matches its filters and silently ignores the rest.
+
+The third variant is the score saturation. The judge model produces scores that are consistently at the ceiling — 4.8, 4.9, 5.0 on a five-point scale — regardless of output quality. This can happen when a judge prompt drifts out of calibration after the production model improves, when a judge model update changes the scoring distribution, or when a prompt change makes the judge more lenient. The dashboard shows excellent quality. The quality is actually mediocre. But because every output scores well, there is no signal to trigger an investigation.
+
+Detection requires proactive checks, not reactive alerts. A reactive alert triggers when a metric crosses a threshold. Silent failures don't cross thresholds — they keep metrics in the normal range by eliminating the data that would show the problem. Instead, you need canary evaluations: a small set of known-quality outputs — some deliberately good, some deliberately bad — that are injected into the eval pipeline periodically. If the deliberately bad outputs receive high scores, the judge is miscalibrated. If the canary outputs never appear in the eval results, the pipeline is dropping items. If the canaries take longer than expected to process, the pipeline is lagging. Canary evaluations are the eval system's eval system — they test whether the testing infrastructure itself is working.
+
+You should also track eval coverage — the percentage of production output categories that received at least one evaluation in the last twenty-four hours. If your product serves ten distinct query types and only seven have evaluation data, three categories are blind spots. Whether the gap is caused by a filter configuration, a sampling quirk, or a dropped connection, the coverage metric surfaces it.
+
+## Failure Mode Three: Sampling Misconfiguration
+
+Sampling configuration deserves its own failure mode category because of how frequently it goes wrong and how difficult the consequences are to detect.
+
+The fundamental problem is that sampling rates are often set globally and rarely re-evaluated. A team sets a five percent sampling rate during initial deployment. Six months later, the product handles ten times more traffic, the eval budget hasn't increased proportionally, and someone reduces the sampling rate to 0.5 percent to control costs. The one-line configuration change seems harmless. But at 0.5 percent sampling on a system that handles three million requests per day, the eval pipeline evaluates fifteen thousand outputs. If those outputs span twenty product features, each feature gets an average of seven hundred fifty evaluations per day — potentially enough for aggregate metrics. But if the distribution is uneven — if two features account for eighty percent of traffic — the low-traffic features may get fewer than one hundred evaluations per day, which is not enough to detect a five-point quality regression with statistical confidence.
+
+The deeper problem is that sampling misconfiguration creates a false signal of stability. When the sample is too small to detect a regression, the dashboard shows flat quality metrics. The team interprets flat metrics as "everything is fine." In reality, flat metrics mean "we don't have enough data to know." This is the worst kind of failure — it doesn't look like a failure. It looks like success.
+
+Detection requires sample size monitoring for each evaluated dimension. If a quality dimension receives fewer than a minimum number of evaluations per day — the specific number depends on the variance of the metric, but two hundred is a reasonable floor for most applications — the dashboard should flag that dimension as having insufficient data. "We measured relevance at 4.2 based on eighty-seven samples" should look different on the dashboard than "we measured relevance at 4.2 based on four thousand samples." The first is an estimate with wide uncertainty. The second is a reliable measurement. Conflating the two leads to decisions based on statistical noise.
+
+## Failure Mode Four: Judge Outage Cascading
+
+When the LLM judge API goes down, the immediate impact is that eval results stop flowing. Retries and dead letter queues handle the short-term recovery, as covered in the previous subchapter. But the secondary effects of a judge outage cascade through the evaluation ecosystem in ways that retries alone cannot fix.
+
+The first cascade is dashboard staleness. Quality dashboards that rely on real-time eval data stop updating. The last-known-good scores remain on screen, creating a false impression of current quality. If the outage coincides with a model deployment — which is exactly when quality visibility matters most — the team is making deployment decisions based on stale data. The dashboard says quality is 4.3. In reality, quality was 4.3 six hours ago, and nobody knows what it is now.
+
+The second cascade is eval gate paralysis. If your CI/CD pipeline includes eval gates, a judge outage means those gates cannot produce a pass or fail decision. The staging gate blocks. Deployments queue up. Developers wait. The pressure to bypass the gate builds. And in many organizations, someone eventually does bypass it — deploying without evaluation because "the eval system is down and we need to ship." This single decision can introduce the exact quality regression that the eval gate was designed to prevent.
+
+The third cascade is the confidence gap. Even after the judge API recovers and evaluations resume, the team has a period of time with no quality data. This gap undermines confidence in the eval system's narrative. "Quality has been stable at 4.3 for the past month" becomes "quality has been stable at 4.3 for the past month, except for a twelve-hour window where we have no data." Any anomaly detected after the gap — is it real, or is it an artifact of the gap? Did quality actually drop, or does it just look that way because the gap reset the baseline? The uncertainty created by a data gap persists long after the gap itself is filled.
+
+Mitigation requires redundancy in judge infrastructure. Don't rely on a single LLM judge provider. Configure a fallback judge — a different model from a different provider — that activates when the primary judge is unavailable. The fallback judge may produce slightly different scores than the primary judge, but slightly different scores are infinitely more useful than no scores at all. Calibrate the fallback against the primary periodically so you understand the scoring offset. When the fallback activates, apply the offset to normalize scores for dashboard consistency.
+
+## Failure Mode Five: Incorrect Metric Aggregation
+
+The most dangerous eval platform failure is the one that produces plausible-looking numbers. Incorrect metric aggregation means the pipeline evaluates outputs correctly, the judges score them accurately, but the aggregation logic that combines individual scores into dashboard metrics contains a bug.
+
+Common aggregation bugs include double-counting evaluations due to idempotency failures, averaging scores across time windows with unequal sample sizes, failing to weight scores by traffic volume when aggregating across product areas, and including dead letter reprocessed results alongside original results without deduplication. Each of these bugs produces a quality score that looks reasonable — it's a number between one and five, it moves smoothly over time, it doesn't trigger obvious alerts. But the number is wrong.
+
+A team at a financial services company discovered an aggregation bug after six months. Their quality dashboard averaged scores across all product areas equally, giving the same weight to a low-traffic feature with fifty daily evaluations and a high-traffic feature with ten thousand. The low-traffic feature had consistently higher scores. When the high-traffic feature degraded, the average was pulled down only slightly because the low-traffic feature's high scores counterbalanced it. The weighted-by-volume metric would have shown a two-point drop. The unweighted average showed a 0.3-point drop that fell within normal variance.
+
+Detection requires periodic metric audits. Once per month, take a random day's worth of individual evaluation scores and manually compute the aggregate metrics. Compare your manual computation against the dashboard value. If they match, the aggregation logic is correct. If they diverge, trace the discrepancy back to the aggregation code. This audit takes a few hours and catches bugs that no amount of automated monitoring can surface — because the monitoring itself relies on the same aggregation logic.
+
+Defense in depth means computing critical metrics through two independent code paths — the production aggregation pipeline and a separate verification pipeline that runs on a delayed schedule. If the two paths produce different numbers for the same metric, something is wrong. This redundancy is expensive — you're essentially building the aggregation logic twice. But for teams where quality metrics drive deployment decisions, the cost of incorrect aggregation is far higher than the cost of a verification pipeline.
+
+## The Meta-Requirement: Eval Systems Need Their Own Monitoring
+
+Every failure mode in this subchapter shares a common thread: the eval system failed, and nobody noticed in time. The root cause is that most organizations treat eval infrastructure as a secondary system — important but not critical, monitored but not rigorously, maintained but not with the urgency reserved for production services.
+
+This must change. Your eval system is the immune system of your AI product. When it fails, the product doesn't crash — it degrades silently. Quality issues reach users undetected. Safety problems go unnoticed. Regression testing becomes theater. The production system stays up, but the quality guarantees it depends on evaporate.
+
+**Eval System SLAs** formalize this requirement. Your eval platform should have defined service level agreements for uptime, latency, coverage, and freshness — just like your production system.
+
+Uptime: the eval pipeline should be operational at least ninety-nine percent of the time. A one-percent monthly downtime allowance translates to about seven hours per month. If the pipeline is down for more than seven hours in a month, that is an SLA violation that requires an incident review and a corrective action.
+
+Latency: pull request evaluations should complete within five minutes. Staging evaluations should complete within sixty minutes. Online production evaluations should produce dashboard-visible scores within thirty minutes of the output being generated. These are not arbitrary numbers — they're the thresholds that keep the eval system relevant. A pull request eval that takes twenty minutes will be bypassed. A staging eval that takes four hours will block releases unreasonably. A production eval that takes six hours to appear on the dashboard provides monitoring that is too stale to act on.
+
+Coverage: every product area that generates production outputs should receive evaluation data every day. A coverage SLA of one hundred percent of product areas with a minimum of two hundred evaluations per area per day ensures that no feature runs blind. When coverage drops below the SLA — because of sampling misconfiguration, filter drift, or traffic changes — the gap is treated as an incident, not as a minor inconvenience.
+
+Freshness: the quality dashboard should never display data older than a defined threshold. If your freshness SLA is two hours, any dashboard metric based on data older than two hours should be visually flagged as stale. This prevents the false confidence that comes from treating six-hour-old data as a current quality reading.
+
+## Building the On-Call Rotation
+
+SLAs without enforcement are aspirations. Enforcement requires an on-call rotation — a designated person who is responsible for the health of the eval platform at any given time, who receives alerts when SLAs are at risk, and who has the authority and the knowledge to intervene.
+
+Most organizations don't have an eval-specific on-call. The eval pipeline is monitored by the general infrastructure on-call, who may not understand eval-specific metrics, may not know the difference between a backlog explosion and normal batch processing, and may not have the access or the context to diagnose eval-specific failures.
+
+The minimum viable on-call structure is a weekly rotation among the eval engineering team — two to four people who understand the pipeline architecture, have access to the monitoring dashboards, and can diagnose the failure modes covered in this subchapter. Each on-call shift should include a handoff document: current backlog depth, any ongoing dead letter queue items, any known issues with judge providers, and any upcoming changes that might affect pipeline stability.
+
+The on-call is paged on two conditions. First, when an eval SLA is at risk — latency exceeding thresholds, completion rate dropping below ninety-nine percent, coverage gaps emerging. Second, when a circuit breaker opens — meaning a judge provider is unreachable and evaluations are being routed to the dead letter queue. These two conditions cover the majority of incidents that require human intervention.
+
+## The Eval Resilience Checklist
+
+Before moving on, assess your eval platform against the five failure modes covered in this subchapter. For each one, ask two questions: can we detect this failure within one hour? And do we have a documented recovery procedure?
+
+Backlog explosion: do you monitor the throughput ratio? Do you have capacity headroom of at least thirty percent above peak load? Do you have a documented backlog recovery procedure that includes recency prioritization and sampling?
+
+Silent eval failure: do you run canary evaluations that test whether the pipeline is producing correct scores? Do you track eval coverage by product area? Do you flag dashboard metrics that are based on statistically insufficient sample sizes?
+
+Sampling misconfiguration: do you require review for sampling rate changes? Do you monitor minimum sample sizes per quality dimension? Do you have alerts for dimensions that fall below the minimum evaluation threshold?
+
+Judge outage cascading: do you have a fallback judge provider? Do your eval gates have a defined timeout and fallback behavior for judge unavailability? Do you track dashboard freshness and flag stale data?
+
+Incorrect metric aggregation: do you perform monthly metric audits? Do you have a separate verification pipeline for critical quality metrics? Do you test your aggregation logic with known inputs and expected outputs?
+
+If the answer to any of these questions is no, that is your next task. The failure mode you haven't prepared for is the one that will catch you.
+
+Pipeline reliability keeps the evaluation infrastructure running. But the data that flows through the pipeline — the golden sets, the benchmarks, the adversarial libraries, the judge calibration sets — determines whether those evaluations measure anything meaningful. The next chapter covers dataset management at scale: versioning, distribution, curation, and the lifecycle management that keeps your evaluation data as reliable as the infrastructure that processes it.

@@ -1,0 +1,107 @@
+# 5.6 — The Freshness-Cost Tradeoff: How Often to Recompute
+
+How stale can your AI's answers be before users notice? The answer to that question determines how much your caching infrastructure saves you — and most teams have never measured it. They pick a refresh cadence based on intuition, anxiety, or whatever the first engineer who set up the cron job thought sounded reasonable. A 24-hour refresh cycle because "daily seems about right." A one-hour cycle because "we cannot afford to be wrong for too long." A real-time refresh that defeats the purpose of caching entirely because someone was afraid of serving a stale answer. These are not engineering decisions. They are guesses dressed as defaults, and they leave enormous money on the table.
+
+The **freshness-cost tradeoff** is the relationship between how often you refresh cached or precomputed results and how much you spend on computation. It is not a single number. It is a curve, and understanding that curve — measuring it, segmenting it, and optimizing against it — is the difference between a caching system that saves 60 percent of your inference cost and one that saves 15 percent because it refreshes too aggressively to capture the full benefit.
+
+## The Freshness Curve
+
+Every cached or precomputed result begins its life perfectly fresh. The moment after generation, it is as accurate as a real-time response. Then it ages. The source data drifts. The world changes. New information emerges. At some point, the cached result becomes meaningfully different from what a fresh inference call would produce. The question is: when?
+
+The **freshness curve** maps the age of a cached result to the probability that it is still correct. At time zero, the probability is 100 percent — the response was just generated. As time passes, the probability declines. The rate of decline depends entirely on the volatility of the underlying domain. For a cached summary of a 2015 Supreme Court opinion, the freshness curve is nearly flat: the probability of correctness is 99 percent after an hour, 99 percent after a day, 99 percent after a month. The source data simply does not change. For a cached answer about a stock's current trading volume, the freshness curve drops like a cliff: the probability of correctness falls below 50 percent within minutes.
+
+Between these extremes lies every real-world AI application. A customer support chatbot's cached answer about the company's refund policy has a freshness curve that stays high for weeks or months — until the policy changes, at which point it drops to zero for that specific entry. A news summarization system's cached summary has a freshness curve that declines steadily over hours as new developments emerge. A product recommendation engine's cached suggestions have a freshness curve that depends on inventory changes, price updates, and seasonal shifts.
+
+The critical insight is that you do not need to guess the shape of this curve. You can measure it. Run a sampling experiment: take a random subset of cached results at various ages — one hour old, six hours old, one day old, three days old, one week old — and regenerate the response with current data. Compare the cached version to the fresh version using your evaluation metrics: semantic similarity, factual accuracy, user satisfaction proxies. Plot the comparison score against age. The resulting curve tells you exactly how fast your cached results degrade and, crucially, where the degradation crosses from imperceptible to unacceptable.
+
+## Measuring Acceptable Staleness
+
+The freshness curve tells you how fast quality degrades. The business context tells you how much degradation you can tolerate. Together, they define your **acceptable staleness window** — the maximum age at which a cached result can be served without meaningfully harming the user experience.
+
+Measuring acceptable staleness requires a user-facing quality signal, not just a technical comparison. Two responses can be semantically different — a fresh response might include a new paragraph about a recent product update — without the difference mattering to the user's actual question. Conversely, a small semantic change — "30-day return window" becoming "14-day return window" — can be enormously consequential even though the embedding similarity between the two responses is high. The measure that matters is whether the staleness changes the user's outcome: do they get the information they needed, do they take the right action, are they satisfied with the response?
+
+There are three practical ways to measure acceptable staleness, each with different costs and signal quality. The first is **A/B testing cached versus fresh responses**: randomly serve some users a cached response and others a fresh response, and compare engagement, satisfaction, and correctness metrics. This gives the highest-quality signal because it measures actual user impact. The cost is that you are intentionally serving some users cached responses that might be stale, which in high-stakes domains is ethically or legally problematic.
+
+The second is **shadow scoring**: always serve the fresh response but simultaneously score the cached response that would have been served, measuring how often the cached response diverges from the fresh one in ways that would have affected the user's outcome. This avoids serving stale responses to real users but requires running both the cache lookup and the full inference pipeline on every request during the measurement period, which doubles your inference cost for the duration of the experiment.
+
+The third is **historical replay**: take a set of past queries with known good responses, generate fresh responses at various simulated staleness intervals, and compare them offline. This is the cheapest approach because it uses past data and runs entirely in batch. The weakness is that it measures staleness for past query patterns, which may not match current or future patterns.
+
+Whichever method you use, the output is a staleness threshold: the age beyond which cached results degrade to an unacceptable level. A customer support system might find that cached responses are indistinguishable from fresh responses for up to 72 hours, degrade slightly between 72 and 168 hours, and become meaningfully stale after a week. That threshold — 72 hours for full quality, 168 hours for acceptable quality — defines the refresh cadence. Anything faster than 72 hours is wasting money on unnecessary refreshes. Anything slower than 168 hours is risking user-facing quality degradation.
+
+## The Cost Curve: Refresh Frequency and Inference Spend
+
+Once you know your freshness threshold, the cost math is straightforward — and the numbers are dramatic.
+
+Consider a system with 20,000 cached entries, each costing $0.04 to regenerate. If you refresh every hour, you run 480,000 regenerations per day. At $0.04 each, that is $19,200 per day, or $576,000 per month just on cache refresh. If your acceptable staleness window is 24 hours, switching to a daily refresh drops the cost to $800 per day — $24,000 per month. The difference is $552,000 per month. If your staleness window is 72 hours, a three-day refresh cycle costs $267 per day — $8,000 per month. The 72x cost difference between hourly and three-day refreshes is the cost of not measuring your staleness threshold.
+
+The relationship between refresh frequency and cost is linear in theory — refreshing twice as often costs twice as much. But in practice, the relationship has nonlinearities that make the cost curve steeper or shallower than you might expect.
+
+The first nonlinearity comes from batch discounts. If your refresh cycle aligns with batch API windows — once per day, processed overnight — you get the 50 percent batch discount from providers like OpenAI and Anthropic. If your refresh cycle is hourly, you are likely running synchronous inference calls that do not qualify for batch pricing. Switching from hourly to daily refreshes can save more than 24x, because you get both the frequency reduction and the pricing tier improvement. The combined effect can be 40x to 48x lower cost.
+
+The second nonlinearity comes from infrastructure overhead. Frequent refreshes require more orchestration infrastructure: job schedulers, queue management, retry logic, monitoring, and alerting. This infrastructure has its own cost — compute, storage, engineering time — that does not scale linearly with refresh frequency. The incremental cost of moving from daily to hourly refreshes is not just 24x the inference cost; it also includes a meaningful increase in infrastructure complexity and maintenance burden.
+
+The third nonlinearity comes from rate limits. Providers impose rate limits on API calls and tokens per minute. A system that needs to refresh 20,000 entries per hour may exceed its rate limit allocation, requiring either a higher-tier API plan (additional cost) or spreading the refresh across a longer window (reducing the actual refresh frequency). Rate limits create a practical ceiling on how fast you can refresh, regardless of budget.
+
+## Freshness Tiers: Segment Your Cache by Refresh Need
+
+Not all cached content has the same staleness tolerance. Treating the entire cache as a single population with one refresh cadence wastes money on stable content and under-serves volatile content. The solution is **freshness tiers** — different refresh cadences for different content categories, based on measured staleness curves and business risk.
+
+A typical three-tier segmentation looks like this.
+
+**Tier one: volatile content**, refreshed every one to four hours. This tier contains cached responses whose source data changes frequently and whose staleness carries high business risk. Examples: cached responses about current pricing, inventory availability, live event information, market data, anything tied to rapidly changing external feeds. This tier is the smallest — typically 5 to 15 percent of total cached entries — but accounts for the majority of refresh cost because of its high frequency.
+
+**Tier two: moderately changing content**, refreshed every one to three days. This tier contains cached responses whose source data changes periodically and whose staleness is noticeable but not critical within a day. Examples: cached product descriptions (which update with feature releases), policy explanations (which change with quarterly reviews), process documentation (which updates with organizational changes). This tier is typically 20 to 35 percent of entries and represents the bulk of your cache by volume.
+
+**Tier three: stable content**, refreshed weekly or less frequently. This tier contains cached responses whose source data rarely changes and whose staleness window is measured in weeks or months. Examples: historical case law summaries, foundational educational content, industry definitions, company history narratives, archived content. This tier is the largest — typically 50 to 70 percent of entries — and costs almost nothing to maintain because refreshes are infrequent.
+
+The economic impact of tiering is substantial. Consider the 20,000-entry cache from the previous example. Without tiering, refreshing all entries daily costs $800 per day. With tiering: 2,000 tier-one entries refreshed every 4 hours (6 times per day) cost $480 per day. 6,000 tier-two entries refreshed daily cost $240 per day. 12,000 tier-three entries refreshed weekly cost $69 per day (averaged). Total: $789 per day — nearly identical to the un-tiered daily cost. But now tier-one content is six times fresher than the un-tiered approach, while the total cost is essentially flat. Alternatively, if you hold the same tier-one freshness and relax tier-three refreshes to biweekly, the total drops to $754 per day. Tiering lets you redistribute your refresh budget toward the content that needs it most.
+
+## Assigning Content to Freshness Tiers
+
+The hardest operational question is not how many tiers to have or what cadences to set. It is how to assign individual cached entries to the right tier. Get the assignment wrong, and your volatile content sits in a slow-refresh tier while your stable content burns refresh budget on unnecessary regenerations.
+
+There are three assignment methods, and the most effective systems use all three in combination.
+
+**Metadata-based assignment** uses properties of the source data to determine the tier. Content linked to data sources with known update frequencies — a pricing database that changes daily, a policy document that changes quarterly — inherits the tier from its source. This is the simplest and most reliable method for content with structured provenance. Its limitation is that it only works when you know the update frequency of the source data, which is not always the case.
+
+**Historical drift assignment** uses past invalidation data to determine the tier. If a cached entry has been invalidated by event-driven or confidence-based checks three times in the past month, it belongs in a higher-freshness tier. If an entry has never been invalidated in six months, it belongs in the lowest tier. This method is data-driven and adapts to actual volatility patterns rather than assumed ones. Its limitation is that it requires a history of invalidation events, so it cannot classify new entries until they have been in the cache long enough to establish a pattern. New entries should default to a middle tier until historical data accumulates.
+
+**Domain-rule assignment** uses human judgment about the content domain to set the tier. An engineering lead or product manager reviews the content categories and assigns tiers based on domain knowledge: "anything related to pricing goes in tier one, anything related to onboarding goes in tier two, anything related to company history goes in tier three." This method is fast to implement and captures expert intuition about volatility. Its limitation is that human judgment is often wrong — people overestimate volatility for content they care about and underestimate it for content they do not think about. Domain rules should be treated as initial assignments that get overridden by historical drift data as it accumulates.
+
+The most robust systems use domain rules for initial assignment, metadata signals for content with clear source linkage, and historical drift analysis for ongoing tier adjustment. Every month, the system reviews the drift data for entries in each tier and promotes entries that drifted more than expected (moving them to a higher tier) or demotes entries that never drifted (moving them to a lower tier). Over time, the tier assignments converge on the actual volatility of the content, and the refresh budget is allocated efficiently.
+
+## The Drift Budget: How Much Staleness You Can Afford
+
+Beyond individual entry tiers, there is a system-level question: across all cached responses served, what is the acceptable aggregate staleness? This is your **drift budget** — the total amount of incorrectness your system tolerates from caching, measured as a percentage of served responses that are meaningfully stale.
+
+A drift budget of 2 percent means that out of every 100 cached responses served, no more than 2 should be materially different from what a fresh inference call would produce. This is a system-level target that your tier assignments, refresh cadences, and invalidation strategies collectively need to meet.
+
+Setting the drift budget requires a business decision, not just a technical one. The question is: what is the cost of a stale response? In a low-stakes application — an internal FAQ bot, a content recommendation engine — the cost of a stale response is minor user inconvenience. A drift budget of 5 percent might be acceptable, which allows very relaxed refresh cadences and maximum cost savings. In a high-stakes application — a medical information system, a legal research tool, a financial advisory platform — the cost of a stale response is potentially severe. A drift budget of 0.5 percent is more appropriate, which requires more aggressive refresh cadences and higher costs.
+
+The drift budget creates an optimization target for your entire caching system. If your current staleness rate is 3.5 percent against a 2 percent budget, you need to tighten something: promote more entries to higher tiers, increase sampling rates for confidence checks, or add event-driven triggers for content categories that are drifting. If your staleness rate is 0.4 percent against a 2 percent budget, you have headroom to relax: demote some entries to lower tiers, reduce confidence check frequency, or extend TTLs. The budget prevents both under-investment (too much staleness) and over-investment (too much refresh cost) by giving you a target to optimize against.
+
+## Monitoring the Tradeoff in Production
+
+The freshness-cost tradeoff is not something you set once and forget. Query patterns change. Source data volatility shifts. Model updates alter how responses differ from cached versions. Seasonal patterns affect what content is queried and how fast it changes. A refresh cadence that was optimal in January may be too aggressive or too relaxed by April.
+
+The monitoring system for freshness-cost needs three dashboards, and the team should review them monthly.
+
+The first dashboard is the **staleness distribution**: a histogram showing the age of cached responses at the time they are served, overlaid with the acceptable staleness threshold. This tells you what fraction of served responses are near or beyond the threshold. If the distribution is clustered well below the threshold, your refresh cadence might be more aggressive than necessary. If a meaningful tail extends beyond the threshold, your refresh cadence or invalidation triggers are not keeping up.
+
+The second dashboard is the **refresh cost breakdown**: the total cost of cache refreshes per day, broken down by tier and by invalidation trigger (time-based, event-driven, confidence-based). This tells you where your refresh budget is going. If tier-three entries — supposed to be stable — account for 40 percent of your refresh cost, your tier assignments need review. If confidence-based checks account for 60 percent of your refresh cost, you might be sampling too aggressively or your confidence threshold might be too tight.
+
+The third dashboard is the **freshness quality correlation**: a plot of user satisfaction or task success metrics against the staleness of the response that was served. This is the ultimate reality check. If user satisfaction is identical for responses that are one hour old and responses that are three days old, you have proof that your three-day-old entries do not need faster refresh. If satisfaction drops sharply at the 12-hour mark, you have proof that 12 hours is your real freshness boundary, regardless of what your staleness threshold analysis suggested.
+
+Together, these three dashboards give you the information needed to tune the tradeoff continuously. Tighten where staleness is causing quality degradation. Relax where freshness exceeds what users need. The goal is not maximum freshness — it is optimal freshness: the point where every additional dollar spent on refreshes produces less than a dollar of quality improvement.
+
+## The Organizational Discipline
+
+The freshness-cost tradeoff is ultimately an organizational decision, not just a technical one. It requires alignment between engineering, product, and finance on what "fresh enough" means.
+
+Engineering wants to refresh infrequently because it simplifies infrastructure and reduces compute cost. Product wants to refresh frequently because stale content is a bad user experience and a reputational risk. Finance wants to minimize refresh cost as long as quality metrics hold. These are not contradictory goals, but they are in tension, and without explicit resolution the tension defaults to whoever had the last production incident. If a user complained about a stale answer last week, product wins and refresh cadence tightens. If the invoice came in over budget last month, finance wins and refresh cadence loosens. The system oscillates without settling on an optimum.
+
+The fix is to make the tradeoff explicit and data-driven. Define the drift budget as a product requirement. Define the refresh cost ceiling as a finance requirement. Let engineering optimize within both constraints. Review the tradeoff quarterly with all three stakeholders at the table, looking at the same dashboards, the same staleness rates, the same cost numbers. Adjust the drift budget and cost ceiling together, not independently.
+
+The teams that treat the freshness-cost tradeoff as a designed system — measured, tiered, budgeted, and reviewed — sustain their caching savings over years. The teams that treat it as a cron job configuration choice find that their savings erode every time someone gets nervous about staleness and halves the refresh interval without checking whether it was necessary.
+
+Freshness determines when cached answers are updated. But there is another dimension to cache design that carries its own tradeoffs: whether cached answers can be shared across users, or whether each user needs isolated results. That boundary between reuse and privacy is the subject of the next subchapter.

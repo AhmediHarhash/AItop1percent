@@ -1,0 +1,103 @@
+# 3.8 — Unicode Normalization and Encoding Failures: NFC vs NFD and the Invisible Bugs
+
+The search pipeline looked perfect. Retrieval worked flawlessly in English, German, and Spanish. Then a product manager in Seoul ran a Korean query through the system and got zero results. She ran it again. Zero. She copied the exact same query text from a support document, pasted it into the search bar, and got twelve results. The queries were identical to the human eye. Character by character, the two strings appeared to contain the same Korean text. But the first query had been typed on a macOS keyboard, and the second had been pasted from a document authored on Windows. One was encoded in NFD. The other in NFC. The retrieval pipeline compared them as raw byte strings, found no match, and returned nothing. No error. No warning. No fallback. Just silence, and a user who concluded the product did not work in Korean.
+
+This is what Unicode normalization bugs look like. They are invisible. They are silent. And they affect every language that uses characters with diacritics, combining marks, or composed forms — which is to say, nearly every language on earth except basic ASCII English.
+
+## What Unicode Normalization Actually Is
+
+The Unicode standard assigns a unique code point to every character in every writing system. But for many characters, Unicode provides more than one way to represent the same visual result. The letter with an accent mark — the kind you see in French, Vietnamese, Korean, and dozens of other languages — can be stored as a single precomposed code point, or as two separate code points: the base letter followed by a combining accent mark. Both representations render identically on screen. Both are valid Unicode. They are not the same bytes.
+
+**NFC**, or Normalization Form Composed, stores characters in their precomposed form whenever a precomposed version exists. The accented letter is a single code point. This is the most compact representation and the one that most developers expect when they think about text as "one character equals one code point."
+
+**NFD**, or Normalization Form Decomposed, stores characters in their decomposed form. The accented letter becomes two code points: the base letter plus the combining mark. This form is longer in byte length but makes it easier to separate base characters from their diacritics programmatically.
+
+Both forms are defined by the Unicode standard. Both are correct. The problem is that they are not byte-equal. A string in NFC and the same string in NFD contain different bytes, different code points, and different lengths. Any operation that compares bytes — string equality, hashing, database lookups, dictionary keys, embedding generation — treats them as different strings.
+
+## Why This Is Not a Theoretical Problem
+
+The Korean writing system makes this concrete. Korean text is composed of Hangul syllable blocks, each of which can be represented as either a single precomposed syllable code point in NFC or a sequence of individual Jamo components — the consonant and vowel parts — in NFD. A single Korean syllable that is one code point in NFC becomes two or three code points in NFD. Multiply that across an entire sentence, and the byte-level difference between NFC and NFD Korean text is substantial.
+
+Japanese faces a similar issue with characters that have dakuten or handakuten marks — the voicing marks that change pronunciation. The character for "ga" can be stored as a single precomposed code point or as the base "ka" character followed by a combining dakuten mark. Vietnamese, which uses extensive diacritical marks, is particularly vulnerable. A single Vietnamese word might contain three combining marks that could each be either composed or decomposed.
+
+European languages are not immune. French accented characters, German umlauts, Spanish tildes, Scandinavian ring-above characters — all of these exist in both NFC and NFD forms. The difference is that European languages use fewer diacritical marks per word, so the byte-level discrepancy is smaller. But smaller does not mean zero. A French name search that compares NFC input against an NFD database will fail on any name containing an accent.
+
+## Where Normalization Mismatches Sneak In
+
+The insidious quality of normalization bugs is that they enter your system through ordinary operations that nobody thinks to audit.
+
+**Operating system differences.** macOS historically uses NFD for filenames. When an application creates a file on macOS, the filesystem stores the filename in NFD form. The same filename created on Windows or Linux is typically stored in NFC form. If your data pipeline ingests files from multiple operating systems and uses filenames as keys or identifiers, the same logical file can appear as two different entries depending on which machine created it. This is a documented, long-standing behavior that has caused bugs in version control systems, file synchronization tools, and media applications through 2025 and into 2026.
+
+**Web scraping and data ingestion.** HTML pages do not enforce a single normalization form. One website may store its Korean text in NFC. Another may store it in NFD. A third may mix both forms within the same page — one paragraph composed, another decomposed — because different text editors and content management systems produce different forms. When you scrape these pages and ingest the text into a database or vector store, you inherit their normalization inconsistencies.
+
+**User input.** Different keyboards, different input method editors, and different operating systems produce different normalization forms for the same typed text. A Korean user on macOS typing in Safari produces different bytes than a Korean user on Windows typing in Chrome for the same visual characters. Your system receives both inputs and treats them as different text.
+
+**Copy-paste.** Copying text from a PDF produces different normalization than copying from a web page, which produces different normalization than typing the same text directly. Users routinely copy-paste queries from documents, emails, and chat messages. Each source may use a different normalization form.
+
+**Database round-trips.** Some databases normalize text on insertion. Others store it exactly as provided. If your application writes NFC text to a database that stores it as-is, then a different service queries that database with NFD text, the lookup fails. Neither service is doing anything wrong individually. The mismatch is in the gap between them.
+
+## The Impact on RAG Pipelines
+
+Retrieval-Augmented Generation is particularly vulnerable because it relies on matching user queries against stored documents. The matching can happen at multiple levels, and normalization inconsistencies corrupt each one.
+
+At the vector embedding level, normalization differences produce different token sequences. A Korean phrase in NFC tokenizes into one set of tokens. The same phrase in NFD tokenizes into a different set — because the tokenizer sees different code points and applies different merge rules. Different token sequences produce different embedding vectors. The cosine similarity between the NFC and NFD versions of the same Korean sentence can differ by 5 to 15%, depending on the density of affected characters. That difference is enough to push a relevant document below the retrieval threshold, causing a miss.
+
+At the keyword matching level, the impact is total. Exact string comparison between NFC and NFD returns false for any string containing a character with a diacritical mark. BM25 scoring, which relies on exact token matching, fails completely when the query tokens and document tokens use different normalization forms.
+
+At the database lookup level, if your document metadata includes titles, authors, or category labels that contain non-ASCII characters, a normalization mismatch between the stored label and the query term means the filter returns no results. The user sees an empty page and concludes the system has no content on their topic.
+
+The pattern is consistent: the system works perfectly in English, because ASCII characters have only one representation. The moment you cross into any language with diacritics or combining marks, invisible normalization bugs create invisible retrieval failures.
+
+## The Impact on Evaluation
+
+Evaluation suites are not immune. In fact, normalization mismatches in eval data can silently inflate or deflate your quality metrics for months without detection.
+
+Consider an exact-match evaluation where the model's output is compared character-by-character against a reference answer. If the reference answer is stored in NFC and the model produces output in NFD — or vice versa — the exact match fails even when the model's answer is semantically and visually identical to the reference. Your eval reports a wrong answer. You investigate, stare at both strings, and see no difference. The characters look the same. But the bytes are not the same, and the comparison function does not lie.
+
+This failure mode is especially damaging for metrics like exact match accuracy, BLEU score, and character error rate, all of which depend on character-level comparison. A multilingual eval suite that does not normalize both the reference and the prediction before comparison can report accuracy five to fifteen percentage points lower than the true accuracy for languages with heavy diacritical usage. Vietnamese, Korean, and Arabic are the most commonly affected. A team that sees 72% exact match accuracy on Vietnamese and concludes the model is underperforming may actually have a model achieving 84% — with the gap entirely explained by normalization mismatches in the eval pipeline.
+
+The fix in evaluation is the same as the fix everywhere else: normalize both the prediction and the reference to the same form before comparison. But this fix only works if someone knows to apply it. Most evaluation frameworks do not normalize by default. The team must add the normalization step explicitly, and they can only do that if they know the problem exists.
+
+## The NFC Standard and Why You Should Adopt It
+
+The Unicode Consortium recommends NFC as the default normalization form for interchange. The W3C recommends NFC for web content. Most programming languages' standard libraries default to NFC when normalization is applied. NFC is the natural form for most text produced by modern applications on Windows and Linux. For all of these reasons, NFC is the correct default for any multilingual AI system.
+
+Adopting NFC means: normalize all text to NFC at the point of ingestion. Every document entering your pipeline, every user query hitting your API, every reference answer in your eval suite, every label in your database — all of it passes through NFC normalization before it touches any downstream component. This is a single function call in every major programming language. Python's unicodedata module provides it. JavaScript's String normalize method provides it. Go, Rust, Java, and every other language used in production AI systems have equivalent functionality.
+
+The cost is negligible. NFC normalization of a typical document takes microseconds. At a million documents, it adds seconds to your ingestion pipeline. The cost of not normalizing — silent retrieval failures, corrupted eval metrics, customer-facing search bugs — is orders of magnitude higher.
+
+## NFKC: The Aggressive Alternative
+
+Beyond NFC and NFD, Unicode defines two additional normalization forms: NFKC and NFKD, where the K stands for compatibility. Compatibility normalization goes further than canonical normalization. It not only composes or decomposes characters but also replaces compatibility variants with their canonical equivalents. A full-width Latin letter A — the kind used in Japanese text to represent English characters in a double-width form — normalizes to a standard Latin A. A superscript number normalizes to a regular number. A ligature like "fi" as a single code point normalizes to the two-character sequence "f" and "i."
+
+NFKC is useful for search and matching because it collapses more visual equivalences. But it is destructive. It changes meaning in some contexts. Full-width characters in Japanese carry a distinct visual purpose. Mathematical symbols lose their semantic specificity. Superscript and subscript numbers lose their positional meaning. If you apply NFKC to text that users will see in output, you may alter the text in ways they notice and object to.
+
+The recommendation: use NFC as your baseline normalization for all text. Use NFKC only for specific comparison operations — search indexing, duplicate detection, eval scoring — where collapsing compatibility variants improves matching accuracy. Never apply NFKC to text that will be displayed to users or stored as the canonical version. Keep the original NFC-normalized text as the source of truth and the NFKC version as a derived index.
+
+## Building a Normalization Layer
+
+A normalization layer is not a single function call. It is a pipeline component that runs at every text boundary in your system. If you normalize at ingestion but not at query time, you have a mismatch. If you normalize user input but not system prompt text, you have a mismatch. The normalization layer must be comprehensive, applied consistently at every point where text enters or moves between components.
+
+The components of a normalization layer are straightforward. First, detect the current normalization form of the input. Most text in practice is either already NFC or unnormalized — a mix of forms with no guarantee of consistency. Second, apply NFC normalization. Third, validate that the output is indeed NFC. This sounds redundant, but edge cases exist: certain character sequences have no NFC equivalent because the Unicode standard does not define a precomposed form for them. These remain in decomposed form even after normalization. Your validation step should flag these cases so you know they exist in your data.
+
+Deploy this layer at four critical points. At the API gateway, where user input enters your system. At the document ingestion pipeline, where knowledge base content is processed. At the eval runner, where model output is compared against references. And at the embedding generation step, where text is converted to vectors. If all four points normalize to NFC, normalization mismatches cannot survive in your pipeline.
+
+## Testing for Normalization Bugs
+
+You cannot rely on visual inspection to catch normalization bugs. The entire nature of the problem is that NFC and NFD text look identical. You need automated tests that specifically check for normalization consistency.
+
+Build a test suite that includes known NFC/NFD pairs for every language your system supports. For Korean, include common syllable blocks in both composed and decomposed form. For Vietnamese, include words with stacked diacritics. For French, include accented names. For Japanese, include characters with dakuten marks. For Arabic, include characters with combining marks like shadda and fatha.
+
+Run these pairs through every component of your pipeline: the search function, the embedding generator, the database lookup, the eval scorer. Verify that NFC and NFD versions of the same text produce identical results at every stage. Any component that returns different results for NFC and NFD input has a normalization bug. The test should run in your CI pipeline on every deployment.
+
+Also test the round-trip: write text to your database, read it back, and verify the normalization form is preserved. Some databases, some serialization formats, and some transport layers alter normalization. A test that writes NFC Korean text to your vector store, retrieves it, and confirms it is still NFC catches a class of bugs that unit tests on individual functions miss.
+
+## The Organizational Dimension
+
+Normalization bugs persist in organizations because no single team owns the problem. The backend team writes the API. The data team builds the ingestion pipeline. The ML team manages the embeddings. The QA team runs the eval suite. Each team normalizes — or does not normalize — independently. The bug lives in the gap between teams.
+
+The fix is organizational as much as technical. Designate NFC as your organization's text normalization standard. Document it in your engineering guidelines. Add normalization checks to your code review checklist. Include normalization-specific test cases in your multilingual QA suite. Make it as routine as UTF-8 encoding — something every engineer knows to handle, not something that only the internationalization specialist thinks about.
+
+The Korean product manager from the opening of this subchapter eventually got her search results. The engineering team added a single normalization step to the query preprocessing pipeline, and the zero-result bug vanished overnight. The fix took less than an hour. Finding the bug had taken three weeks of escalating frustration, because nobody thought to check whether two identical-looking strings were actually identical at the byte level.
+
+The next subchapter moves from characters that look the same but are encoded differently to characters that look the same but are entirely different code points — homoglyphs, zero-width characters, and the script-level robustness failures that turn invisible Unicode into a security vulnerability.

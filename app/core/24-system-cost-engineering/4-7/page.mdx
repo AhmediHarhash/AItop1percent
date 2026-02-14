@@ -1,0 +1,97 @@
+# 4.7 — Retrieval Precision as a Cost Lever: Fewer Chunks, Lower Bills
+
+The engineer has been staring at the traces for twenty minutes. Every query to the customer support RAG pipeline retrieves eight chunks from the vector store, concatenates them into the context window, and sends the full payload to Claude Sonnet 4.5. Eight chunks, roughly 2,400 tokens of retrieved context per request. The traces tell a clear story: for most queries, only two or three of those chunks contain anything relevant to the user's question. The rest are topically adjacent but useless — paragraphs about return policies when the user asked about shipping timelines, warranty language when the question was about product compatibility. The pipeline is paying for 2,400 tokens of context and getting value from about 800. Across 140,000 requests per month, those 1,600 wasted tokens per request add up to 224 million tokens of pure waste. At Claude Sonnet 4.5's input pricing, that is roughly $672 per month in context tokens that contribute nothing to the answer. Multiply across a year, and the team is writing a $8,000 check for chunks the model reads, processes, and ignores.
+
+This is not unusual. It is the default. Most RAG pipelines ship with a fixed top-K retrieval setting that someone chose during prototyping and nobody revisited. The setting was good enough to produce acceptable answers. Nobody measured whether it was good enough to produce cost-efficient answers. And so the pipeline runs in production for months, retrieving more context than it needs, paying for tokens that add no value, and nobody notices because the answer quality is fine. The waste is invisible until someone opens the traces and counts.
+
+## The Precision-Cost Relationship
+
+**Retrieval precision** measures the percentage of retrieved chunks that are actually relevant to the query. If you retrieve ten chunks and seven are relevant, your precision is 70%. If you retrieve ten chunks and three are relevant, your precision is 30%. The math that connects precision to cost is direct and unforgiving.
+
+Every chunk your retriever pulls costs tokens. Those tokens cost money. If your precision is 40%, then 60% of your retrieval context cost is waste. You are paying for ten chunks and getting value from four. The six irrelevant chunks are not free — they consume input tokens, which consume dollars. If your average retrieval context is 3,000 tokens per request and your precision is 40%, you are paying for 3,000 tokens but only 1,200 are doing useful work. The remaining 1,800 tokens per request are dead weight.
+
+Now consider what happens when you improve precision from 40% to 80%. You could retrieve fewer chunks and get the same number of relevant ones. Instead of retrieving ten chunks to get four relevant ones, you retrieve five chunks to get four relevant ones. Your retrieval context drops from 3,000 tokens to 1,500 tokens. You just cut retrieval context cost in half. The answer quality stays the same because you are still providing the same four relevant chunks. You are just not paying for the six irrelevant ones anymore.
+
+At scale, this math becomes serious money. A system processing 500,000 requests per month with 1,500 tokens of wasted context per request burns 750 million unnecessary input tokens per month. On GPT-5 at $1.25 per million input tokens, that is $937 per month. On Claude Opus 4.5 at $5.00 per million input tokens, that is $3,750 per month. On Claude Opus 4.6 at $15.00 per million input tokens, that is $11,250 per month. The more expensive your model, the more retrieval waste costs you. Precision is not just a retrieval quality metric. It is a cost multiplier.
+
+## Why Default Top-K Is Almost Always Too High
+
+Most RAG systems use a fixed top-K parameter — retrieve the top five, or top eight, or top ten chunks for every query. This number gets set during development, when the team is optimizing for answer quality on a handful of test cases. The incentive during development is to err on the side of more context. If you are not sure whether four chunks is enough, retrieve eight. The worst that happens during testing is slightly higher latency. Nobody is tracking cost at the prototyping stage.
+
+The problem is that the number sticks. The top-K that was chosen to be safe during prototyping becomes the top-K that runs in production. And in production, not every query needs the same amount of context. A simple factual question like "what is your return policy" might need exactly one chunk — the paragraph that states the return policy. Retrieving seven additional chunks about unrelated topics wastes tokens and can actually confuse the model by introducing irrelevant context.
+
+A healthcare technology company discovered this pattern in late 2025 when they audited their clinical decision support pipeline. Their system retrieved ten chunks per query from a corpus of medical guidelines. Their average precision was 32% — only about three of the ten chunks were relevant to the clinical question. The seven irrelevant chunks were adding an average of 2,100 tokens of noise to every request. When they reduced top-K to five and added a reranking step, precision jumped to 71% and average retrieval context dropped from 3,000 tokens to 1,500 tokens. Answer quality on their evaluation suite actually improved by 4% because the model was no longer distracted by irrelevant guideline text. Their monthly retrieval context cost dropped by 47%.
+
+## Technique One: Better Embedding Models
+
+The first lever for improving retrieval precision is the quality of your embeddings. If your embeddings do not capture semantic similarity accurately, your retriever will pull chunks that are topically adjacent but not actually relevant. Upgrading from an older embedding model to a more capable one can improve precision significantly without changing any other part of the pipeline.
+
+The embedding landscape in 2026 is mature. Models like OpenAI's text-embedding-3-large, Cohere's embed-v4, and open-source options like BGE-M3 and GTE-Qwen2 offer strong semantic matching. The cost of embedding generation is typically orders of magnitude cheaper than inference — $0.10 to $0.20 per million tokens for most embedding models. Spending slightly more on a better embedding model that improves precision by 15% can save you many times that amount in reduced context tokens at the inference layer. A team spending $200 per month on embeddings but $6,000 per month on wasted context tokens has the equation backwards. Invest in the $0.20 per million embedding model that retrieves more precisely, and the inference savings dwarf the embedding cost increase.
+
+The key metric to track is precision at your operating top-K. If you retrieve five chunks per query, measure what percentage of those five are relevant across a representative sample of queries. If precision is below 60%, your embedding model or your chunking strategy is likely the bottleneck. Swap embedding models and measure the change. The comparison takes a day. The savings persist for the life of the pipeline.
+
+## Technique Two: Reranking Before Inclusion
+
+Reranking is arguably the highest-ROI intervention for retrieval cost optimization. The idea is simple: retrieve broadly, then use a cross-encoder or reranking model to score each chunk for relevance to the specific query, and include only the highest-scoring chunks in the context window.
+
+A typical reranking pipeline works like this. Your vector search retrieves the top 20 or top 30 candidates — deliberately casting a wide net. Then a reranking model, such as Cohere Rerank, Jina Reranker, or an open-source cross-encoder, scores each candidate against the query. You take only the top three or top five after reranking. The reranker is far more accurate than vector similarity alone because cross-encoders process the query and the chunk together, capturing fine-grained relevance that embedding similarity misses.
+
+The cost of reranking is small. A reranking API call for 20 candidates costs a fraction of a cent. The savings come from the precision improvement: instead of stuffing eight mediocre chunks into the context window, you include three highly relevant ones. If reranking improves your precision from 40% to 85%, you can cut your retrieval top-K from eight to three while maintaining or improving answer quality. That cuts your retrieval context tokens by roughly 60%.
+
+A fintech company running a regulatory compliance assistant implemented reranking in January 2026 and measured the impact over a month. Before reranking, they retrieved eight chunks per query at an average precision of 38%. After adding Cohere Rerank with a retrieval stage of 25 candidates narrowed to three, precision rose to 82%. Average retrieval context dropped from 2,400 tokens to 900 tokens. Monthly retrieval context cost dropped from $4,100 to $1,530. The reranking API itself cost $180 per month. Net savings: $2,390 per month for a one-week integration effort. The payback period was negative — they were saving money within the first week.
+
+## Technique Three: Query Decomposition for Targeted Retrieval
+
+Some queries are complex. A user asks a question that spans multiple topics, and a single embedding search retrieves chunks that partially address each topic but fully address none of them. The result is low precision and a context window full of tangentially relevant fragments.
+
+Query decomposition breaks a complex query into sub-queries, each targeting a specific aspect of the original question. Instead of one broad search that returns eight partially relevant chunks, you run three focused searches that each return two or three highly relevant chunks. The total context may be smaller because each sub-query retrieves precisely what it needs.
+
+Consider a query like "Compare the standard and premium plan pricing, and explain what compliance certifications each plan includes." A single embedding search will return chunks about pricing, chunks about compliance, and chunks that vaguely mention both. Many of those chunks will be irrelevant to one or both aspects of the question. Query decomposition splits this into "standard plan pricing details," "premium plan pricing details," and "compliance certifications by plan level." Each sub-query targets a narrow topic and retrieves one or two highly relevant chunks. The total retrieval context might be six chunks instead of eight, but precision jumps from 45% to 90% because every chunk is tightly matched to a specific information need.
+
+The cost of query decomposition is the additional LLM call to decompose the query — typically a small, cheap model call of 100 to 200 tokens. For complex queries where the alternative is retrieving ten low-precision chunks, the decomposition cost is easily recovered by the reduction in context tokens. However, not every query needs decomposition. Simple factual queries are better served by a single search. The skill is in routing: use decomposition for complex, multi-faceted queries, and skip it for straightforward ones.
+
+## Technique Four: Metadata Filtering
+
+Metadata filtering reduces the search space before the vector search even runs. Instead of searching your entire corpus for relevant chunks, you restrict the search to a subset based on structured metadata — document type, date range, product category, customer tier, language, or department.
+
+If a user asks about their enterprise contract terms, and you know from the request context that they are on the enterprise plan, you can filter the search to only chunks tagged with "enterprise" metadata. This eliminates hundreds or thousands of irrelevant chunks from the candidate pool before any similarity scoring happens. The result is higher precision because the retriever is only comparing against chunks that could plausibly be relevant.
+
+Metadata filtering costs virtually nothing — it is a filter operation on the vector database, not an additional model call. But it requires upfront investment in tagging your documents with structured metadata during ingestion. Teams that skip this step during ingestion pay for it at inference time through lower precision and higher context costs. A well-tagged corpus with five to ten metadata fields gives you powerful filtering capabilities that improve precision by 20% to 40% with zero runtime cost.
+
+The compounding effect of metadata filtering with reranking is substantial. Filter first to reduce the candidate pool from 100,000 chunks to 5,000. Run vector search to pull the top 20 from those 5,000. Rerank those 20 down to the top three. The precision of those final three chunks will be dramatically higher than pulling the top three from an unfiltered search of 100,000. You are layering precision improvements, and each layer reduces the number of wasted tokens in the final context.
+
+## Technique Five: Adaptive Top-K
+
+The most sophisticated approach is **adaptive top-K** — varying the number of retrieved chunks based on query characteristics rather than using a fixed number for all queries. Simple queries get fewer chunks. Complex queries get more. The system decides based on signals available at query time.
+
+Several approaches to adaptive top-K emerged in 2025 and became production-ready by 2026. The simplest is score-based cutoff: retrieve up to a maximum of ten chunks, but only include chunks whose similarity score exceeds a threshold. If a query is highly specific and only two chunks score above the threshold, include two. If a query is broad and eight chunks score above, include eight. The threshold acts as a quality gate that naturally adjusts the context size.
+
+A more sophisticated approach, published as Adaptive-K at EMNLP 2025, analyzes the distribution of similarity scores and identifies natural gaps. The method sorts scores in descending order and finds the largest drop — the point where similarity falls off sharply. Chunks above the gap are included; chunks below are excluded. This naturally adapts to each query's information landscape. A query with a clear best match might include only one chunk. A query with several equally relevant passages might include five.
+
+The cost impact of adaptive top-K is significant for high-volume systems. If your fixed top-K is eight but the adaptive method averages 3.4 chunks per query, you have reduced average retrieval context by 57%. At 500,000 requests per month, that reduction compounds into hundreds of dollars saved on cheaper models and thousands on expensive ones. The key requirement is that your eval suite measures quality at varying context sizes. You need to confirm that reducing chunks for simple queries does not degrade quality before you deploy adaptive retrieval in production.
+
+## The Quality-Cost Interaction
+
+Precision optimization is not free of risk. Every chunk you remove from the context window is a chunk the model cannot reference in its answer. If your precision improvements are well-calibrated, you remove only irrelevant chunks, and quality stays the same or improves. But if your filtering, reranking, or adaptive top-K is too aggressive, you will drop relevant chunks, and answer quality will degrade.
+
+The risk is asymmetric. Removing an irrelevant chunk saves tokens and has zero quality impact. Removing a relevant chunk saves tokens and has potentially large quality impact. This means you should test precision optimizations carefully, with an evaluation suite that measures answer quality at different retrieval settings. Run your eval suite at top-K of two, three, five, and eight. Plot the quality-cost curve. Find the point where quality is still above your threshold and cost is minimized. That is your optimal operating point.
+
+The most common mistake is optimizing precision in aggregate without checking tail cases. Your average precision might be excellent, but 5% of queries might have all relevant chunks removed by your aggressive filtering. Those 5% produce terrible answers, your users notice, and the support tickets arrive. Always evaluate precision optimization on your hardest queries, not just the average case. The tail is where precision optimization breaks.
+
+For a comprehensive treatment of RAG architecture, retrieval strategies, and evaluation methods, see Section 7. This subchapter focuses specifically on the cost dimension — the dollar value of every precision point you gain or lose.
+
+## Measuring Retrieval Cost Efficiency
+
+To operationalize retrieval precision as a cost lever, you need two metrics tracked continuously in production. The first is **cost per relevant token** — the total retrieval context cost divided by the number of tokens in relevant chunks. If you spend $0.003 in context tokens for a request and 900 of 2,400 tokens are relevant, your cost per relevant token is $0.003 divided by 900, or $0.0000033 per relevant token. When you improve precision and cut total context to 1,200 tokens with 900 still relevant, the cost drops to $0.002 and the cost per relevant token drops to $0.0000022. You are paying less for the same information density.
+
+The second metric is the **waste ratio** — the percentage of retrieval context tokens that are irrelevant. A waste ratio of 60% means you are paying for 2.5 times the relevant context. A waste ratio of 20% means you are paying for 1.25 times the relevant context. Track this weekly. Set a target. Most teams can reach a waste ratio below 30% with reranking and metadata filtering. Getting below 15% usually requires adaptive top-K or query decomposition.
+
+Combine both metrics into a monthly retrieval cost efficiency report. Show total retrieval context cost, waste ratio, cost per relevant token, and the estimated savings from precision improvements. When you can show leadership that improving retrieval precision from 40% to 75% saved $3,200 per month at no quality cost, you earn the engineering time for the next round of optimization.
+
+## Compounding Precision with Other Optimizations
+
+Retrieval precision gains multiply with other cost optimizations covered in this chapter. If you compress your system prompt by 30% and also improve retrieval precision by 40%, the total input token reduction is larger than either alone. If you combine precision improvements with prompt caching, the cached portion of your prompt becomes a larger share of the total input, increasing your effective cache discount. If you combine precision improvements with model routing — sending simpler queries to cheaper models — the cheaper model needs less context to perform well, amplifying the precision savings.
+
+The teams that achieve the largest cost reductions do not rely on a single lever. They stack optimizations. Precision improvement is typically the second-highest-ROI optimization after caching, and it compounds with everything else. A team that improves retrieval precision, compresses system prompts, implements caching, and routes simple queries to cheaper models can reduce total inference cost by 50% to 70% compared to an unoptimized baseline. The retrieval precision improvement alone might account for 15% to 25% of that total reduction. But because it reduces input tokens, it makes every other optimization more effective per dollar spent.
+
+The next subchapter examines another dimension of output cost that most teams overlook: how the design of your structured output schema directly affects the number of tokens your model generates, and how small schema changes produce large savings at scale.
